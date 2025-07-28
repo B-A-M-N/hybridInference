@@ -1,0 +1,28 @@
+import os
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+client = OpenAI(
+    api_key=os.environ["LLAMA_API_KEY"],
+    base_url="https://api.llama.com/compat/v1/"
+)
+
+# Create chat completion request
+completion = client.chat.completions.create(
+    model="Llama-3.3-8B-Instruct",
+    messages=[
+        {
+            "role": "developer",
+            "content": "You are a helpful assistant."
+        },
+        {
+            "role": "user",
+            "content": "Hello!"
+        }
+    ],
+)
+
+print(completion.choices[0].message.content)
