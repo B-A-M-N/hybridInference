@@ -7,9 +7,9 @@ ALL = 60*60*24*10 # 5269973
 # 
 
 def main():
-    path = 'data/BurstGPT_1.csv'
+    path = '../../data/BurstGPT_1.csv'
     df = load_burst_trace(path)
-    config = load_infra_config("infra_config.yaml")
+    config = load_infra_config("../infra_config.yaml")
 
     model = 'GPT-4'
     local_hw = 'A100'
