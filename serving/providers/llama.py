@@ -27,7 +27,7 @@ class LlamaProvider(LLMProvider):
         
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"{self.base_url}/chat/completions",
+                f"{self.base_url.rstrip('/')}/chat/completions",
                 json=payload,
                 headers=headers
             ) as response:
