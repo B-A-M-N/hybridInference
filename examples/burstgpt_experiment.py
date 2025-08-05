@@ -5,7 +5,7 @@ import time
 from serving.base import LLMRequest, LLMResponse
 from serving.manager import ServiceManager
 from serving.config import get_config
-from client.loaders import BurstGPTLoader
+from client.loader import BurstGPTLoader
 from client.metrics import MetricsCollector
 
 
@@ -61,7 +61,7 @@ async def run_burstgpt_experiment():
     # Load BurstGPT data
     loader = BurstGPTLoader(
         trace_file="data/BurstGPT_1.csv",
-        time_scale=100.0,  # 100x faster
+        time_scale=10,  # 10x faster
         max_requests=50    # Limit for testing
     )
     
