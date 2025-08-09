@@ -2,7 +2,7 @@
 
 # --- Configuration ---
 # Set this variable to "true" to use 8 GPUs (0-7) and tensor_parallel_size 8
-# Set to "false" (or any other value) to use 2 GPUs (6,7) and tensor_parallel_size 2
+# Set to "false" (or any other value) to use 4 GPUs (4,5,6,7) and tensor_parallel_size 4
 use_all_gpu="${USE_ALL_GPU:-false}"
 
 # Port - can be overridden by environment variable
