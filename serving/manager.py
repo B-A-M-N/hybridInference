@@ -6,7 +6,7 @@ from .providers.llama import LlamaProvider
 
 
 class ServiceManager:
-    """Manages multiple LLM providers and routes requests"""
+    """Manages multiple LLM providers"""
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -24,24 +24,18 @@ class ServiceManager:
         if "llama" in self.config:
             self.providers["llama"] = LlamaProvider(self.config["llama"])
     
-    async def generate(self, request: LLMRequest, provider: Optional[str] = None) -> LLMResponse:
-        """Generate completion using specified provider or default routing"""
-        if provider:
-            if provider not in self.providers:
-                raise ValueError(f"Provider {provider} not found")
-            return await self.providers[provider].generate(request)
-        
-        # Simple routing: try local first, fallback to cloud
-        if "local" in self.providers:
-            try:
-                return await self.providers["local"].generate(request)
-            except Exception:
-                # Fallback to cloud providers
-                pass
-        
-        # Try cloud providers
-        for provider_name in ["openai", "llama"]:
-            if provider_name in self.providers:
-                return await self.providers[provider_name].generate(request)
-        
-        raise RuntimeError("No available providers")
+    async def generate(self, request: LLMRequest, provider: str) -> LLMResponse:
+        """Generate completion using specified provider"""
+        if provider not in self.providers:
+            raise ValueError(f"Provider {provider} not found")
+        return await self.providers[provider].generate(request)
+    
+    def get_provider(self, name: str) -> LLMProvider:
+        """Get a provider by name"""
+        if name not in self.providers:
+            raise ValueError(f"Provider {name} not found")
+        return self.providers[name]
+    
+    def list_providers(self) -> Dict[str, LLMProvider]:
+        """Get all registered providers"""
+        return self.providers.copy()

@@ -182,3 +182,5 @@ chroma_db_raw/*
 tmp_run/diag.log
 tmp_run/error.log
 tmp_run/run_cmds.log
+
+**/res
