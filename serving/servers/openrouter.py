@@ -19,7 +19,7 @@ def _get_upstream_bases() -> List[str]:
 def _get_models_path() -> str:
     return os.getenv(
         "OPENROUTER_MODELS_PATH",
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "openrouter_models.json"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config", "openrouter_models.json"),
     )
 
 
