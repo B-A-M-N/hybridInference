@@ -3,6 +3,7 @@ from .base import LLMProvider, LLMRequest, LLMResponse
 from .providers.local import LocalProvider
 from .providers.openai import OpenAIProvider
 from .providers.llama import LlamaProvider
+from .providers.openrouter import OpenRouterProvider
 
 
 class ServiceManager:
@@ -23,6 +24,9 @@ class ServiceManager:
         
         if "llama" in self.config:
             self.providers["llama"] = LlamaProvider(self.config["llama"])
+        
+        if "openrouter" in self.config:
+            self.providers["openrouter"] = OpenRouterProvider(self.config["openrouter"])
     
     async def generate(self, request: LLMRequest, provider: str) -> LLMResponse:
         """Generate completion using specified provider"""

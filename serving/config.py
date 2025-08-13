@@ -17,5 +17,12 @@ def get_config():
         "llama": {
             "api_key": os.getenv("LLAMA_API_KEY"),
             "base_url": os.getenv("LLAMA_BASE_URL", "https://api.llama.com/compat/v1/")
+        },
+        "openrouter": {
+            "base_url": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+            "api_key": os.getenv("OPENROUTER_API_KEY"),
+            # Optional attribution headers for OpenRouter，Site URL and title for rankings on openrouter.ai.
+            "http_referer": os.getenv("OPENROUTER_HTTP_REFERER", None),
+            "x_title": os.getenv("OPENROUTER_X_TITLE", None),
         }
     }
