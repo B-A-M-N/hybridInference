@@ -1,5 +1,5 @@
 import aiohttp
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from ..base import LLMProvider, LLMRequest, LLMResponse
 
@@ -50,4 +50,29 @@ class OpenRouterProvider(LLMProvider):
             model=request.model,
             provider="openrouter",
         )
+    
+    async def list_models(self) -> List[Dict[str, Any]]:
+        """Get list of available models from OpenRouter.
+        
+        Returns:
+            List of model metadata dictionaries following OpenRouter schema
+        """
+        headers: Dict[str, str] = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        
+        # For OpenRouter API, models endpoint is at /api/v1/models
+        # For our local server, it's at /openrouter/models
+        models_url = f"{self.base_url}/models"
+        if "localhost" in self.base_url or "127.0.0.1" in self.base_url:
+            # Use our custom endpoint for local server
+            models_url = self.base_url.replace("/v1", "") + "/openrouter/models"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(models_url, headers=headers) as response:
+                response.raise_for_status()
+                data = await response.json()
+        
+        # OpenRouter returns {"data": [...models...]}
+        return data.get("data", [])
 

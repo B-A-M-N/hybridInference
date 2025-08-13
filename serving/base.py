@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 from dataclasses import dataclass
 import time
 
@@ -29,3 +29,12 @@ class LLMProvider(ABC):
     async def generate(self, request: LLMRequest) -> LLMResponse:
         """Generate a completion for the given request"""
         pass
+    
+    async def list_models(self) -> List[Dict[str, Any]]:
+        """List available models from this provider.
+        
+        Returns:
+            List of model metadata dictionaries.
+            Default implementation returns empty list.
+        """
+        return []
