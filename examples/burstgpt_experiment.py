@@ -2,14 +2,14 @@
 
 import asyncio
 import time
-from serving.base import LLMRequest, LLMResponse
-from serving.manager import ServiceManager
+from serving.base import LLMRequest, LLMResponse, LLMProvider
 from serving.config import get_config
+from serving.providers.local import LocalProvider
 from client.loader import BurstGPTLoader
 from client.metrics import MetricsCollector
 
 
-async def mock_local_handler(request: LLMRequest, request_id: str, service_manager: ServiceManager, metrics: MetricsCollector):
+async def mock_local_handler(request: LLMRequest, request_id: str, provider: LLMProvider, metrics: MetricsCollector):
     """Handle request using local vLLM service."""
     start_time = time.time()
     
@@ -23,7 +23,7 @@ async def mock_local_handler(request: LLMRequest, request_id: str, service_manag
     
     try:
         # Call local service
-        response = await service_manager.generate(request, "local")
+        response = await provider.generate(request)
         
         # Record success
         latency_ms = (time.time() - start_time) * 1000
@@ -55,7 +55,7 @@ async def run_burstgpt_experiment():
     
     # Setup
     config = get_config()
-    service_manager = ServiceManager(config)
+    local_provider = LocalProvider(config["local"])
     metrics = MetricsCollector()
     
     # Load BurstGPT data
@@ -74,7 +74,7 @@ async def run_burstgpt_experiment():
         request_id = f"burst_{request_count}"
         request_count += 1
         
-        await mock_local_handler(request, request_id, service_manager, metrics)
+        await mock_local_handler(request, request_id, local_provider, metrics)
     
     # Process requests
     tasks = []

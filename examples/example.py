@@ -2,17 +2,17 @@ import asyncio
 import sys
 sys.path.append('..')  # Add parent directory to path
 
-from serving.manager import ServiceManager
 from serving.base import LLMRequest
 from serving.config import get_config
+from serving.providers.llama import LlamaProvider
 
 
 async def main():
     # Load configuration
     config = get_config()
     
-    # Initialize service manager
-    manager = ServiceManager(config)
+    # Initialize provider
+    llama_provider = LlamaProvider(config["llama"])
     
     # Create a request
     request = LLMRequest(
@@ -23,7 +23,7 @@ async def main():
     )
     
     # Generate using llama provider directly
-    response = await manager.generate(request, provider="llama")
+    response = await llama_provider.generate(request)
     print(f"Provider: {response.provider}")
     print(f"Response: {response.text}")
 
