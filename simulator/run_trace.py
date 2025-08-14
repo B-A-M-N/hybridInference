@@ -10,7 +10,7 @@ from pathlib import Path
 from serving.config import get_config
 from serving.providers.local import LocalProvider
 from serving.base import LLMRequest
-from client.loader import BurstGPTLoader
+from client.loader import BurstGPTLoader, SplitwiseLoader
 from client.metrics import MetricsCollector
 
 
@@ -31,7 +31,12 @@ async def run_trace(trace_file="data/BurstGPT_1.csv",
     config = get_config()
     provider = LocalProvider(config["local"])
     metrics = MetricsCollector()
-    loader = BurstGPTLoader(trace_file, time_scale=time_scale)
+    
+    # Pick loader based on trace format
+    if 'splitwise' in trace_file.lower():
+        loader = SplitwiseLoader(trace_file, time_scale=time_scale)
+    else:
+        loader = BurstGPTLoader(trace_file, time_scale=time_scale)
     
     model = "/root/.cache/modelscope/hub/models/LLM-Research/Meta-Llama-3-8B"
     start = time.time()
