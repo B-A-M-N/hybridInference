@@ -93,7 +93,8 @@ class LocalProvider(LLMProvider):
                 elif 'vllm:avg_generation_throughput_toks_per_s' in line:
                     metrics.avg_generation_throughput_toks_per_s = float(line.split()[-1])
                 elif 'vllm:gpu_cache_usage_perc' in line:
-                    metrics.gpu_cache_usage_perc = float(line.split()[-1])
+                    # Convert to percentage (multiply by 100)
+                    metrics.gpu_cache_usage_perc = float(line.split()[-1]) * 100
             except (ValueError, IndexError):
                 continue
                 
