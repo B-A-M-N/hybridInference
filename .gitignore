@@ -184,3 +184,5 @@ tmp_run/error.log
 tmp_run/run_cmds.log
 
 **/res
+results/*
+.claude/*
