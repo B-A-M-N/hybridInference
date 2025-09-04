@@ -1,0 +1,36 @@
+# Example models registry for the OpenRouter-compatible server.
+# Values like ${ENV_VAR} will be expanded from environment variables.
+
+models:
+  - id: llama-3.3-70b-instruct
+    name: Llama 3.3 70B Instruct
+    provider: llama
+    base_url: ${LLAMA_BASE_URL}
+    api_key: ${LLAMA_API_KEY}
+    context_length: 131072
+    max_output_length: 8192
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, top_k, min_p, max_tokens, stop, seed]
+    aliases: ["llama-3.3-70b-instruct"]
+    route:
+      - kind: llama
+        weight: 1.0
+        base_url: ${LLAMA_BASE_URL}
+        api_key: ${LLAMA_API_KEY}
+
+  - id: llama-4-scout
+    name: Llama 4 Scout
+    provider: vllm
+    base_url: ${LOCAL_BASE_URL}
+    context_length: 262144
+    max_output_length: 16384
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, top_k, min_p, max_tokens, stop, seed]
+    aliases: ["/models/meta-llama_Llama-4-Scout-17B-16E"]
+    route:
+      - kind: vllm
+        weight: 1.0
+        base_url: ${LOCAL_BASE_URL}
+
