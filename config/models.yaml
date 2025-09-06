@@ -23,6 +23,7 @@ models:
     name: Llama 4 Scout
     provider: vllm
     base_url: ${LOCAL_BASE_URL}
+    provider_model_id: "/models/meta-llama_Llama-4-Scout-17B-16E"
     context_length: 262144
     max_output_length: 16384
     supports_tools: true
@@ -33,4 +34,3 @@ models:
       - kind: vllm
         weight: 1.0
         base_url: ${LOCAL_BASE_URL}
-
