@@ -1,0 +1,21 @@
+groups:
+  - name: service-availability
+    interval: 30s
+    rules:
+      - alert: ServiceDown
+        expr: up{job="app"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "API Service is Down"
+          description: "The API service at {{ $labels.instance }} has been down for more than 30 seconds."
+
+      - alert: ServiceUnavailable
+        expr: absent(up{job="app"}) or up{job="app"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "API Service Unavailable"  
+          description: "Cannot reach the API service for monitoring."

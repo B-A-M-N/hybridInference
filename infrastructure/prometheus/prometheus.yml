@@ -30,9 +30,10 @@ scrape_configs:
 rule_files:
   - rules/slo_burn_rate.yml
   - rules/pipeline_health.yml
+  - rules/service_availability.yml
 
-# Alertmanager (optional): uncomment and configure your Alertmanager endpoint
-# alerting:
-#   alertmanagers:
-#     - static_configs:
-#         - targets: ["localhost:9093"]  # Alertmanager address
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["localhost:9093"]  # Alertmanager address
