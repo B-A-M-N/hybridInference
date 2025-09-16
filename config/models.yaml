@@ -5,14 +5,25 @@ models:
   - id: llama-3.3-70b-instruct
     name: Llama 3.3 70B Instruct
     provider: llama
+    provider_model_id: "Llama-3.3-70B-Instruct"
     base_url: ${LLAMA_BASE_URL}
     api_key: ${LLAMA_API_KEY}
+    quantization: "bf16"
+    input_modalities: ["text"]
+    output_modalities: ["text"]
     context_length: 131072
     max_output_length: 8192
     supports_tools: true
     supports_structured_output: true
     supported_params: [temperature, top_p, top_k, min_p, max_tokens, stop, seed]
     aliases: ["llama-3.3-70b-instruct"]
+    pricing:
+      prompt: "0"
+      completion: "0"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0"
+      input_cache_writes: "0"
     route:
       - kind: llama
         weight: 1.0
@@ -21,16 +32,80 @@ models:
 
   - id: llama-4-scout
     name: Llama 4 Scout
-    provider: vllm
-    base_url: ${LOCAL_BASE_URL}
-    provider_model_id: "/models/meta-llama_Llama-4-Scout-17B-16E"
+    provider: llama
+    provider_model_id: "Llama-4-Scout-17B-16E-Instruct-FP8"
+    base_url: ${LLAMA_BASE_URL}
+    api_key: ${LLAMA_API_KEY}
+    quantization: "bf16"
+    input_modalities: ["text"]
+    output_modalities: ["text"]
     context_length: 262144
     max_output_length: 16384
     supports_tools: true
     supports_structured_output: true
     supported_params: [temperature, top_p, top_k, min_p, max_tokens, stop, seed]
     aliases: ["/models/meta-llama_Llama-4-Scout-17B-16E"]
+    pricing:
+      prompt: "0"
+      completion: "0"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0"
+      input_cache_writes: "0"
     route:
-      - kind: vllm
+      - kind: llama
         weight: 1.0
-        base_url: ${LOCAL_BASE_URL}
+        base_url: ${LLAMA_BASE_URL}
+        api_key: ${LLAMA_API_KEY}
+
+  - id: deepseek-chat
+    name: DeepSeek Chat
+    provider: deepseek
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_API_KEY}
+    quantization: "bf16"
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    context_length: 65536
+    max_output_length: 8192
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, max_tokens, stop, frequency_penalty, presence_penalty]
+    pricing:
+      prompt: "0"
+      completion: "0"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0"
+      input_cache_writes: "0"
+    route:
+      - kind: deepseek
+        weight: 1.0
+        base_url: https://api.deepseek.com/v1
+        api_key: ${DEEPSEEK_API_KEY}
+
+  - id: gemini-2.5-flash
+    name: Gemini 2.5 Flash
+    provider: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    api_key: ${GEMINI_API_KEY}
+    quantization: "bf16"
+    input_modalities: ["text", "image"]
+    output_modalities: ["text"]
+    context_length: 1048576
+    max_output_length: 8192
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, top_k, max_tokens, stop]
+    pricing:
+      prompt: "0"
+      completion: "0"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0"
+      input_cache_writes: "0"
+    route:
+      - kind: gemini
+        weight: 1.0
+        base_url: https://generativelanguage.googleapis.com/v1beta
+        api_key: ${GEMINI_API_KEY}
