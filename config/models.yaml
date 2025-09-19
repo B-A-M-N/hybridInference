@@ -135,10 +135,15 @@ models:
     input_modalities: ["text"]
     output_modalities: ["text"]
     pricing:
-      prompt: "0.001"  # ¥0.001/千tokens
-      completion: "0.001"
+      prompt: "0"  # 1M tokens/hour free tier
+      completion: "0"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0"
+      input_cache_writes: "0"
+      hourly_limit: "1000000"  # 1M tokens per hour
     route:
-      - kind: llama  # Using OpenAI-compatible endpoint
+      - kind: zhipu  # Using dedicated Zhipu adapter
         weight: 1.0
         base_url: https://open.bigmodel.cn/api/paas/v4
         api_key: ${ZAI_API_KEY}
