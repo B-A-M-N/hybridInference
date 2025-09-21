@@ -121,3 +121,30 @@ models:
         weight: 1.0
         base_url: https://generativelanguage.googleapis.com/v1beta
         api_key: ${GEMINI_API_KEY}
+
+  # Zhipu AI models (OpenAI-compatible)
+  - id: glm-4.5
+    name: GLM-4.5
+    provider: zhipu
+    quantization: "fp16"
+    context_length: 128000
+    max_output_length: 4096
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, max_tokens, stop, stream]
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    pricing:
+      prompt: "0"  # 1M tokens/hour free tier
+      completion: "0"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0"
+      input_cache_writes: "0"
+      hourly_limit: "1000000"  # 1M tokens per hour
+    route:
+      - kind: zhipu  # Using dedicated Zhipu adapter
+        weight: 1.0
+        base_url: https://open.bigmodel.cn/api/paas/v4
+        api_key: ${ZAI_API_KEY}
+        provider_model_id: "glm-4.5"
