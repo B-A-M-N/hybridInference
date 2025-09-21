@@ -1,8 +1,86 @@
-## Nginx + lua (v1, current version)
+# FreeInference Deployment
 
-we now use nginx + lua by openresty, providing a high-performance, production ready routing layer for multiple LLM backends using OpenResty (Nginx + Lua). 
+## FastAPI + systemd (current)
+
+We serve OpenRouter-compatible traffic directly through a FastAPI application listening on port 80. Removing Nginx reduces operational overhead, keeps debugging straightforward, and lets `systemd` own the lifecycle of the gateway process.
 
 ### Overview
+
+```bash
+┌─────────────┐      ┌─────────────────┐      ┌────────────────────┐
+│  OpenRouter │─────▶│ FastAPI Gateway │─────▶│ Model Executors... │
+└─────────────┘      └─────────────────┘      └────────────────────┘
+```
+
+- FastAPI binds to `0.0.0.0:80` and exposes `/v1` endpoints consumed by OpenRouter clients.
+- The gateway handles request authentication, routing, and backpressure before invoking the selected model adapter.
+- `systemd` supervises the process, ensuring automatic restarts after crashes or host reboots.
+
+### Deployment Steps
+
+1. **Install runtime dependencies**
+
+   Ensure Python environment and model weights are ready. Confirm the FastAPI entry point (`serving.servers.bootstrap:app`) is reachable via `uvicorn` or the configured launcher script.
+
+2. **Create the unit file**
+
+   ```bash
+   sudo tee /etc/systemd/system/freeinference.service <<'UNIT'
+   [Unit]
+   Description=FreeInference FastAPI service
+   After=network-online.target
+   Wants=network-online.target
+
+   [Service]
+   Type=simple
+   User=ubuntu
+   WorkingDirectory=/home/ubuntu/hybridInference
+   ExecStart=/usr/bin/env uvicorn serving.servers.bootstrap:app --host 0.0.0.0 --port 80
+   Restart=always
+   RestartSec=5
+   Environment=PYTHONUNBUFFERED=1
+
+   [Install]
+   WantedBy=multi-user.target
+   UNIT
+   ```
+
+   Replace `User`, `WorkingDirectory`, and `Environment` entries as needed for the target host.
+   The repository carries a maintained version of this unit at `infrastructure/systemd/hybrid_inference.service`; copy or symlink it into `/etc/systemd/system/freeinference.service` during deploys.
+
+3. **Reload and enable the service**
+
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable freeinference.service
+   sudo systemctl start freeinference.service
+   sudo systemctl status freeinference.service
+   ```
+
+### Runtime Operations
+
+- Restart on demand: `sudo systemctl restart freeinference.service`
+- Follow logs: `journalctl -u freeinference.service -f`
+- Health check: `curl http://freeinference.org/health`
+- List registered models: `curl http://freeinference.org/v1/models | jq`
+
+### Why We Dropped Nginx
+
+- FastAPI already terminates HTTP and exposes the required OpenRouter-compatible endpoints.
+- Nginx added another moving part, increasing failover complexity and opaque error handling.
+- Debugging latency or request routing is simpler when traffic is handled in a single process.
+
+## Legacy Architectures
+
+### Nginx (v2, abandoned)
+
+We briefly fronted FastAPI (running on port 8080) with vanilla Nginx that exposed `http://freeinference.org` on port 80 and terminated TLS for the public endpoint. Once Cloudflare took over edge SSL duties, the extra hop mostly added deployment and observability complexity without material benefit, so the setup was removed.
+
+### Nginx + Lua via OpenResty (v1, abandoned)
+
+We previously relied on OpenResty (Nginx + Lua) to provide a production routing tier across multiple LLM backends. The stack handled model mapping, load balancing, health checks, and error handling. We keep the installation notes for posterity.
+
+#### Overview
 
 ```bash
 ┌─────────────┐      ┌──────────────────┐      ┌─────────────────┐
@@ -16,9 +94,7 @@ we now use nginx + lua by openresty, providing a high-performance, production re
                      └──────────────────┘      └─────────────────┘
 ```
 
-## Installation
-
-1. Install OpenResty
+#### Installation Notes
 
 ```bash
 # Add repository
@@ -30,8 +106,6 @@ echo "deb http://openresty.org/package/ubuntu $(lsb_release -sc) main" | \
 sudo apt-get update
 sudo apt-get install openresty
 ```
-
-1. Deployment
 
 ```bash
 # Create directory
@@ -46,8 +120,6 @@ sudo ln -s /usr/local/openresty/nginx/conf/sites-available/vllm \
            /usr/local/openresty/nginx/conf/sites-enabled/vllm
 ```
 
-1. Modify `/usr/local/openresty/nginx/conf/nginx.conf` 
-
 ```bash
 http {
     # ... Others ...
@@ -60,8 +132,6 @@ http {
     include /usr/local/openresty/nginx/conf/sites-enabled/*;
 }
 ```
-
-1. Enable services
 
 ```bash
 # test openresty config
@@ -76,8 +146,6 @@ sudo systemctl enable openresty
 # reload openresty
 sudo openresty -s reload
 ```
-
-### API Examples
 
 ```bash
 # check service status
@@ -97,7 +165,7 @@ curl -X POST http://freeinference.org/v1/chat/completions \
   -d '{"model": "/models/meta-llama_Llama-4-Scout-17B-16E", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 50}'
 ```
 
-## Nginx (v0, abandoned)
+### Nginx (v0, abandoned)
 
 ```bash
 sudo vim /etc/nginx/sites-available/vllm
