@@ -16,10 +16,11 @@ services:
     container_name: hybridinference-postgres
     restart: unless-stopped
     environment:
-      # Database credentials (override via .env file)
-      POSTGRES_DB: ${DB_NAME:-freeinference_db}
-      POSTGRES_USER: ${DB_USER:-murphy}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-harvardsys}
+      # Database credentials (REQUIRED: must be set in .env file)
+      # SECURITY: No default passwords - you must provide these values
+      POSTGRES_DB: ${DB_NAME:?DB_NAME must be set in .env file}
+      POSTGRES_USER: ${DB_USER:?DB_USER must be set in .env file}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env file}
       # Use C.UTF-8 locale (available by default in postgres:16)
       POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C.UTF-8"
     ports:
@@ -30,7 +31,7 @@ services:
       # Optional: mount initialization scripts
       # - ../../scripts/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-murphy} -d ${DB_NAME:-freeinference_db}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
       interval: 10s
       timeout: 5s
       retries: 5
