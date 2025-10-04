@@ -99,13 +99,14 @@ models:
   - id: gemini-2.5-flash
     name: Gemini 2.5 Flash
     provider: gemini
+    provider_model_id: "gemini-2.5-flash"
     base_url: https://generativelanguage.googleapis.com/v1beta
     api_key: ${GEMINI_API_KEY}
     quantization: "bf16"
     input_modalities: ["text", "image"]
     output_modalities: ["text"]
     context_length: 1048576
-    max_output_length: 8192
+    max_output_length: 65536
     supports_tools: true
     supports_structured_output: true
     supported_params: [temperature, top_p, top_k, max_tokens, stop]
@@ -121,6 +122,35 @@ models:
         weight: 1.0
         base_url: https://generativelanguage.googleapis.com/v1beta
         api_key: ${GEMINI_API_KEY}
+        provider_model_id: "gemini-2.5-flash"
+
+  - id: gemini-2.5-flash-preview-09-2025
+    name: Gemini 2.5 Flash Preview (Sep 2025)
+    provider: gemini
+    provider_model_id: "gemini-2.5-flash-preview-09-2025"
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    api_key: ${GEMINI_API_KEY}
+    quantization: "bf16"
+    input_modalities: ["text", "image"]
+    output_modalities: ["text"]
+    context_length: 1048576
+    max_output_length: 65536
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, top_k, max_tokens, stop]
+    pricing:
+      prompt: "0"
+      completion: "0"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0"
+      input_cache_writes: "0"
+    route:
+      - kind: gemini
+        weight: 1.0
+        base_url: https://generativelanguage.googleapis.com/v1beta
+        api_key: ${GEMINI_API_KEY}
+        provider_model_id: "gemini-2.5-flash-preview-09-2025"
 
   # Zhipu AI models (OpenAI-compatible)
   - id: glm-4.5
