@@ -42,10 +42,10 @@ models:
     provider_model_id: "Llama-4-Scout-17B-16E-Instruct-FP8"
     base_url: ${LLAMA_BASE_URL}
     api_key: ${LLAMA_API_KEY}
-    quantization: "bf16"
+    quantization: "fp8"
     input_modalities: ["text"]
     output_modalities: ["text"]
-    context_length: 262144
+    context_length: 128000
     max_output_length: 16384
     supports_tools: true
     supports_structured_output: true
@@ -59,42 +59,65 @@ models:
       input_cache_reads: "0"
       input_cache_writes: "0"
     route:
-      # Local VLLM endpoint (if available)
-      - kind: vllm
-        weight: 1.0
-        base_url: ${LOCAL_BASE_URL}
-        provider_model_id: "/models/meta-llama_Llama-4-Scout-17B-16E"
       # Remote Llama API endpoint
       - kind: llama
         weight: 1.0
         base_url: ${LLAMA_BASE_URL}
         api_key: ${LLAMA_API_KEY}
 
-  - id: deepseek-chat
-    name: DeepSeek Chat
-    provider: deepseek
-    base_url: https://api.deepseek.com/v1
-    api_key: ${DEEPSEEK_API_KEY}
-    quantization: "bf16"
-    input_modalities: ["text"]
+  - id: llama-4-maverick
+    name: Llama 4 Maverick
+    provider: llama
+    provider_model_id: "Llama-4-Maverick-17B-128E-Instruct-FP8"
+    base_url: ${LLAMA_BASE_URL}
+    api_key: ${LLAMA_API_KEY}
+    quantization: "fp8"
+    input_modalities: ["text", "image"]
     output_modalities: ["text"]
-    context_length: 65536
-    max_output_length: 8192
+    context_length: 128000
+    max_output_length: 16384
     supports_tools: true
     supports_structured_output: true
-    supported_params: [temperature, top_p, max_tokens, stop, frequency_penalty, presence_penalty]
+    supported_params: [temperature, top_p, top_k, min_p, max_tokens, stop, seed]
+    aliases: ["/models/meta-llama_Llama-4-Maverick-17B-128E"]
     pricing:
-      prompt: "0.28"  # Input tokens (cache miss) per 1M tokens
-      completion: "0.42"  # Output tokens per 1M tokens
+      prompt: "0"
+      completion: "0"
       image: "0"
       request: "0"
-      input_cache_reads: "0.028"  # Cache hit tokens per 1M tokens (90% discount)
-      input_cache_writes: "0"  # No separate write cost
+      input_cache_reads: "0"
+      input_cache_writes: "0"
     route:
-      - kind: deepseek
+      - kind: llama
         weight: 1.0
-        base_url: https://api.deepseek.com/v1
-        api_key: ${DEEPSEEK_API_KEY}
+        base_url: ${LLAMA_BASE_URL}
+        api_key: ${LLAMA_API_KEY}
+
+  # - id: deepseek-chat
+  #   name: DeepSeek Chat
+  #   provider: deepseek
+  #   base_url: https://api.deepseek.com/v1
+  #   api_key: ${DEEPSEEK_API_KEY}
+  #   quantization: "bf16"
+  #   input_modalities: ["text"]
+  #   output_modalities: ["text"]
+  #   context_length: 65536
+  #   max_output_length: 8192
+  #   supports_tools: true
+  #   supports_structured_output: true
+  #   supported_params: [temperature, top_p, max_tokens, stop, frequency_penalty, presence_penalty]
+  #   pricing:
+  #     prompt: "0.28"  # Input tokens (cache miss) per 1M tokens
+  #     completion: "0.42"  # Output tokens per 1M tokens
+  #     image: "0"
+  #     request: "0"
+  #     input_cache_reads: "0.028"  # Cache hit tokens per 1M tokens (90% discount)
+  #     input_cache_writes: "0"  # No separate write cost
+  #   route:
+  #     - kind: deepseek
+  #       weight: 1.0
+  #       base_url: https://api.deepseek.com/v1
+  #       api_key: ${DEEPSEEK_API_KEY}
 
   - id: gemini-2.5-flash
     name: Gemini 2.5 Flash
