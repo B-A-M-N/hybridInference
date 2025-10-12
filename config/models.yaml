@@ -84,12 +84,12 @@ models:
     supports_structured_output: true
     supported_params: [temperature, top_p, max_tokens, stop, frequency_penalty, presence_penalty]
     pricing:
-      prompt: "0"
-      completion: "0"
+      prompt: "0.28"  # Input tokens (cache miss) per 1M tokens
+      completion: "0.42"  # Output tokens per 1M tokens
       image: "0"
       request: "0"
-      input_cache_reads: "0"
-      input_cache_writes: "0"
+      input_cache_reads: "0.028"  # Cache hit tokens per 1M tokens (90% discount)
+      input_cache_writes: "0"  # No separate write cost
     route:
       - kind: deepseek
         weight: 1.0
@@ -111,12 +111,12 @@ models:
     supports_structured_output: true
     supported_params: [temperature, top_p, top_k, max_tokens, stop]
     pricing:
-      prompt: "0"
-      completion: "0"
+      prompt: "0.15"  # Input tokens per 1M tokens
+      completion: "1.25"  # Output tokens (including thinking) per 1M tokens
       image: "0"
       request: "0"
-      input_cache_reads: "0"
-      input_cache_writes: "0"
+      input_cache_reads: "0.075"  # Cache hit tokens per 1M tokens (50% discount)
+      input_cache_writes: "1.0"  # Cache storage per 1M tokens per hour
     route:
       - kind: gemini
         weight: 1.0
@@ -139,12 +139,12 @@ models:
     supports_structured_output: true
     supported_params: [temperature, top_p, top_k, max_tokens, stop]
     pricing:
-      prompt: "0"
-      completion: "0"
+      prompt: "0.15"  # Input tokens per 1M tokens (same as stable)
+      completion: "1.25"  # Output tokens (including thinking) per 1M tokens
       image: "0"
       request: "0"
-      input_cache_reads: "0"
-      input_cache_writes: "0"
+      input_cache_reads: "0.075"  # Cache hit tokens per 1M tokens (50% discount)
+      input_cache_writes: "1.0"  # Cache storage per 1M tokens per hour
     route:
       - kind: gemini
         weight: 1.0
@@ -158,20 +158,19 @@ models:
     provider: zhipu
     quantization: "fp16"
     context_length: 128000
-    max_output_length: 4096
+    max_output_length: 96000
     supports_tools: true
     supports_structured_output: true
     supported_params: [temperature, top_p, max_tokens, stop, stream]
     input_modalities: ["text"]
     output_modalities: ["text"]
     pricing:
-      prompt: "0"  # 1M tokens/hour free tier
-      completion: "0"
+      prompt: "0.2"  # Input tokens per 1M tokens
+      completion: "1.1"  # Output tokens per 1M tokens
       image: "0"
       request: "0"
-      input_cache_reads: "0"
-      input_cache_writes: "0"
-      hourly_limit: "1000000"  # 1M tokens per hour
+      input_cache_reads: "0.03"  # Cache hit tokens per 1M tokens (85% discount)
+      input_cache_writes: "0"  # Cache storage is limited time free
     route:
       - kind: zhipu  # Using dedicated Zhipu adapter
         weight: 1.0
