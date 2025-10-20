@@ -11,8 +11,8 @@ receivers:
     # Slack Webhook example
     slack_configs:
       - send_resolved: true
-        api_url: https://hooks.slack.com/services/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
-        channel: '#2025-llm-workload'
+        api_url: https://hooks.slack.com/services/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
+        channel: '#free-inference-alert'
         title: '[ALERT] {{ .CommonAnnotations.summary }}'
         text: >-
           {{ range .Alerts }}
