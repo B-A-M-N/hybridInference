@@ -262,7 +262,7 @@ models:
 
   - id: custom-model-beta # Cursor-friendly aliases
     name: GPT-5
-    provider: openai
+    provider: openai # Azure OpenAI
     provider_model_id: "gpt-5"
     base_url: ${OPENAI_BASE_URL}
     api_key: ${OPENAI_API_KEY}
