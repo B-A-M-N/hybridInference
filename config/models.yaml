@@ -200,3 +200,90 @@ models:
         base_url: https://api.z.ai/api/coding/paas/v4/
         api_key: ${ZAI_API_KEY}
         provider_model_id: "glm-4.5"
+
+  # OpenAI GPT-5 models (Chat Completions-compatible with reasoning)
+  - id: gpt-5
+    name: GPT-5
+    provider: openai
+    provider_model_id: "gpt-5"
+    base_url: ${OPENAI_BASE_URL}
+    api_key: ${OPENAI_API_KEY}
+    quantization: "fp16"
+    input_modalities: ["text", "image"]
+    output_modalities: ["text"]
+    context_length: 128000
+    max_output_length: 16384  # Increased for reasoning tokens + output
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, max_tokens, stop, frequency_penalty, presence_penalty, seed]
+    aliases: ["openai/gpt-5", "gpt-5"]
+    pricing:
+      prompt: "2.0"  # Estimated pricing for GPT-5
+      completion: "6.0"  # Output tokens per 1M tokens
+      image: "0"
+      request: "0"
+      input_cache_reads: "0"
+      input_cache_writes: "0"
+    route:
+      - kind: openai
+        weight: 1.0
+        base_url: ${OPENAI_BASE_URL}
+        api_key: ${OPENAI_API_KEY}
+        provider_model_id: "gpt-5"
+
+  - id: custom-model-alpha # Cursor-friendly aliases
+    name: Claude Opus 4.1
+    provider: claude
+    provider_model_id: "claude-opus-4.1"
+    base_url: ${CLAUDE_BASE_URL}
+    api_key: ${CLAUDE_API_KEY}
+    quantization: "fp16"
+    input_modalities: ["text", "image"]
+    output_modalities: ["text"]
+    context_length: 200000
+    max_output_length: 32000
+    supports_tools: true
+    supports_structured_output: false
+    supported_params: [temperature, top_p, top_k, max_tokens, stop]
+    aliases: ["claude-opus-4.1", "claude/opus-4.1", "opus-4.1", "claude-opus"]
+    pricing:
+      # Vertex AI pricing
+      prompt: "15.0"              # Input tokens per 1M
+      completion: "75.0"          # Output tokens per 1M
+      request: "0"
+      input_cache_reads: "1.5"    # Cache hit tokens per 1M (90% discount vs $15)
+      input_cache_writes: "18.75" # Cache write tokens per 1M (5m TTL only on Vertex AI)
+    route:
+      - kind: claude
+        weight: 1.0
+        base_url: ${CLAUDE_BASE_URL}
+        api_key: ${CLAUDE_API_KEY}
+        provider_model_id: "claude-opus-4.1"
+
+  - id: custom-model-beta # Cursor-friendly aliases
+    name: GPT-5
+    provider: openai # Azure OpenAI
+    provider_model_id: "gpt-5"
+    base_url: ${OPENAI_BASE_URL}
+    api_key: ${OPENAI_API_KEY}
+    quantization: "fp16"
+    input_modalities: ["text", "image"]
+    output_modalities: ["text"]
+    context_length: 400000
+    max_output_length: 128000
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, max_tokens, stop, frequency_penalty, presence_penalty, seed]
+    aliases: ["gpt-5", "gpt5", "openai/gpt-5"]
+    pricing:
+      prompt: "1.25"           # Input per 1M tokens
+      completion: "10"          # Output per 1M tokens
+      request: "0"
+      input_cache_reads: "0.125"  # Cached input per 1M tokens
+      input_cache_writes: "0"    # No explicit write cost
+    route:
+      - kind: openai
+        weight: 1.0
+        base_url: ${OPENAI_BASE_URL}
+        api_key: ${OPENAI_API_KEY}
+        provider_model_id: "gpt-5"
