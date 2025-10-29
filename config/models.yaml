@@ -179,7 +179,32 @@ models:
   - id: glm-4.5
     name: GLM-4.5
     provider: zhipu
-    quantization: "fp16"
+    quantization: "fp8"
+    context_length: 128000
+    max_output_length: 96000
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, max_tokens, stop, stream]
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    pricing:
+      prompt: "0.6"  # Input tokens per 1M tokens
+      completion: "2.2"  # Output tokens per 1M tokens
+      image: "0"
+      request: "0"
+      input_cache_reads: "0.11"
+      input_cache_writes: "0"  # Cache storage is limited time free
+    route:
+      - kind: zhipu  # Using dedicated Zhipu adapter
+        weight: 1.0
+        base_url: https://api.z.ai/api/coding/paas/v4/
+        api_key: ${ZAI_API_KEY}
+        provider_model_id: "glm-4.5"
+
+  - id: glm-4.5-air
+    name: GLM-4.5-Air
+    provider: zhipu
+    quantization: "fp8"
     context_length: 128000
     max_output_length: 96000
     supports_tools: true
@@ -192,14 +217,39 @@ models:
       completion: "1.1"  # Output tokens per 1M tokens
       image: "0"
       request: "0"
-      input_cache_reads: "0.03"  # Cache hit tokens per 1M tokens (85% discount)
+      input_cache_reads: "0.03"
       input_cache_writes: "0"  # Cache storage is limited time free
     route:
       - kind: zhipu  # Using dedicated Zhipu adapter
         weight: 1.0
         base_url: https://api.z.ai/api/coding/paas/v4/
         api_key: ${ZAI_API_KEY}
-        provider_model_id: "glm-4.5"
+        provider_model_id: "glm-4.5-air"
+  - id: glm-4.6
+    name: GLM-4.6
+    provider: zhipu
+    provider_model_id: "glm-4.6"
+    quantization: "fp8"
+    context_length: 200000
+    max_output_length: 128000
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, max_tokens, stop, stream, tool_stream, thinking]
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    pricing:
+      prompt: "0.6"  # Input tokens per 1M tokens
+      completion: "2.2"  # Output tokens per 1M tokens
+      image: "0"
+      request: "0"
+      input_cache_reads: "0.11"
+      input_cache_writes: "0"
+    route:
+      - kind: zhipu
+        weight: 1.0
+        base_url: https://api.z.ai/api/coding/paas/v4/
+        api_key: ${ZAI_API_KEY}
+        provider_model_id: "glm-4.6"
 
   # OpenAI GPT-5 models (Chat Completions-compatible with reasoning)
   - id: gpt-5
