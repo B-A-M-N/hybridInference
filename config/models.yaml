@@ -310,3 +310,24 @@ models:
         pricing:
           prompt: "0"
           completion: "0"
+
+  - id: glm-4.6-featherless
+    name: GLM-4.6 (via Featherless)
+    provider: featherless
+    quantization: "bf16"
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    context_length: 32768
+    max_output_length: 32768
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, max_tokens, stop]
+    route:
+      - kind: featherless
+        weight: 1.0
+        base_url: ${FEATHERLESS_BASE_URL}
+        api_key: ${FEATHERLESS_API_KEY}
+        provider_model_id: "zai-org/GLM-4.6"
+        pricing:
+          prompt: "0"
+          completion: "0"
