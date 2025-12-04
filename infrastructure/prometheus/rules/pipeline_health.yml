@@ -2,23 +2,11 @@ groups:
   - name: pipeline-health
     interval: 30s
     rules:
-      - alert: ExportLagHigh
-        expr: export_lag_seconds > 900
-        for: 10m
-        labels:
-          severity: ticket
-        annotations:
-          summary: "Export lag > 15m"
-          description: "Request tracking export is lagging over 15 minutes."
-
-      - alert: WALBacklogGrowing
-        expr: wal_backlog_bytes > 50000000
-        for: 15m
-        labels:
-          severity: ticket
-        annotations:
-          summary: "WAL backlog > 50MB"
-          description: "Local WAL backlog exceeds threshold; investigate export worker."
+      # Removed unimplemented alerts:
+      # - ExportLagHigh (depends on export_lag_seconds - not implemented)
+      # - WALBacklogGrowing (depends on wal_backlog_bytes - not implemented)
+      # - HighCostRate (depends on api_cost_cents_total - not implemented)
+      # These can be added back when the corresponding metrics are implemented.
 
       - alert: ProviderAvailabilityLow
         expr: provider_availability < 0.90
@@ -26,15 +14,5 @@ groups:
         labels:
           severity: watch
         annotations:
-          summary: "Provider availability < 90%"
-          description: "Provider reports sustained availability degradation."
-
-      # Cost rate alert (example threshold; tune per environment)
-      - alert: HighCostRate
-        expr: sum(rate(api_cost_cents_total[1h])) > 500
-        for: 10m
-        labels:
-          severity: ticket
-        annotations:
-          summary: "Estimated cost > $5/hour"
-          description: "Aggregate estimated cost exceeds $5 per hour."
+          summary: "Provider {{ $labels.provider }} availability < 90%"
+          description: "Provider {{ $labels.provider }} reports sustained availability degradation (current: {{ $value | humanizePercentage }})."
