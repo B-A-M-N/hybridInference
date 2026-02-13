@@ -70,7 +70,7 @@
         "label": "provider",
         "type": "query",
         "datasource": "${DS_PROMETHEUS}",
-        "query": "label_values(provider_availability, provider)",
+        "query": "label_values(provider_request_duration_seconds_bucket, provider)",
         "refresh": 2,
         "includeAll": true,
         "multi": true,
@@ -683,17 +683,6 @@
       ]
     },
     {
-      "type": "bargauge",
-      "title": "Provider Availability",
-      "id": 5,
-      "gridPos": {"h": 8, "w": 8, "x": 4, "y": 12},
-      "datasource": "${DS_PROMETHEUS}",
-      "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []},
-      "targets": [
-        {"expr": "provider_availability{provider=~\"$provider\"}", "legendFormat": "{{provider}}", "refId": "A"}
-      ]
-    },
-    {
       "type": "timeseries",
       "title": "Provider Latency P95 (s)",
       "id": 6,
@@ -729,21 +718,6 @@
         {
           "expr": "histogram_quantile(0.95, sum by (le, model, outcome) (rate(rate_limit_queue_wait_seconds_bucket{model=~\"$model\"}[5m])))",
           "legendFormat": "{{model}} ({{outcome}})",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "type": "timeseries",
-      "title": "Cost Rate ($/h)",
-      "id": 9,
-      "gridPos": {"h": 6, "w": 9, "x": 15, "y": 20},
-      "datasource": "${DS_PROMETHEUS}",
-      "fieldConfig": {"defaults": {"unit": "currencyUSD"}, "overrides": []},
-      "targets": [
-        {
-          "expr": "sum(rate(api_cost_cents_total[5m])) / 100 * 3600",
-          "legendFormat": "total $/h",
           "refId": "A"
         }
       ]
