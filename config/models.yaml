@@ -554,6 +554,26 @@ models:
           prompt: "0"  # Update with actual pricing if needed
           completion: "0"
 
+  # ===== Embedding Models =====
+
+  - id: bge-m3
+    name: BGE-M3
+    type: embedding
+    provider: sglang
+    quantization: "fp16"
+    input_modalities: ["text"]
+    output_modalities: ["embedding"]
+    context_length: 8192
+    max_output_length: 0
+    pricing:
+      prompt: "0"
+      completion: "0"
+    route:
+      - kind: sglang
+        weight: 1.0
+        base_url: "http://localhost:8005"
+        provider_model_id: "bge-m3"
+
   - id: minimax-m2.5
     name: MiniMax M2.5
     provider: minimax
