@@ -289,7 +289,7 @@ models:
   - id: glm-4.7-flash
     name: GLM-4.7-Flash
     provider: zhipu
-    quantization: "fp8"
+    quantization: "q8"
     context_length: 200000
     max_output_length: 128000
     supports_tools: true
@@ -306,6 +306,15 @@ models:
       input_cache_reads: "0.01"
       input_cache_writes: "0"
     route:
+      # Local self-hosted endpoint (Q8 GGUF)
+      - kind: openai_compat
+        weight: 2.0
+        base_url: "http://localhost:8004/v1"
+        provider_model_id: "GLM-4.7-Flash"
+        pricing:
+          prompt: "0"
+          completion: "0"
+      # Remote Zhipu API (fallback)
       - kind: zhipu
         weight: 1.0
         base_url: https://api.z.ai/api/coding/paas/v4/
