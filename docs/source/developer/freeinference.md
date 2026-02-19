@@ -1,20 +1,21 @@
 # FreeInference Deployment
 
-## FastAPI + systemd (current)
+## Cloudflare + Nginx + FastAPI (current)
 
-We serve OpenRouter-compatible traffic directly through a FastAPI application listening on port 80. Removing Nginx reduces operational overhead, keeps debugging straightforward, and lets `systemd` own the lifecycle of the gateway process.
+Traffic flows through three layers before reaching the application:
 
-### Overview
-
-```bash
-┌─────────────┐      ┌─────────────────┐      ┌────────────────────┐
-│  OpenRouter │─────▶│ FastAPI Gateway │─────▶│ Model Executors... │
-└─────────────┘      └─────────────────┘      └────────────────────┘
+```
+Client ──▶ Cloudflare ──▶ Nginx (:443) ──▶ FastAPI (:8080)
+                                      └──▶ Frontend (:3001)
 ```
 
-- FastAPI binds to `0.0.0.0:80` and exposes `/v1` endpoints consumed by OpenRouter clients.
-- The gateway handles request authentication, routing, and backpressure before invoking the selected model adapter.
-- `systemd` supervises the process, ensuring automatic restarts after crashes or host reboots.
+| Layer | Role |
+|-------|------|
+| **Cloudflare** | CDN, DDoS protection, edge SSL termination. SSL/TLS mode set to **Full (strict)** so Cloudflare verifies the origin certificate. `CF-Connecting-IP` header carries the real client IP. |
+| **Nginx** | TLS termination (Let's Encrypt cert), path-based routing (`/v1/`, `/auth/`, `/user/`, `/admin/` → FastAPI; everything else → frontend), request body limits (`client_max_body_size`), WebSocket upgrade. |
+| **FastAPI** | API logic — request authentication, model routing, rate limiting, backpressure, Qdrant proxy, and observability. Listens on `127.0.0.1:8080`. |
+
+`systemd` supervises both the FastAPI backend (`hybrid_inference.service`) and the Next.js frontend (`freeinference-frontend.service`), ensuring automatic restarts after crashes or host reboots.
 
 ### Deployment Steps
 
@@ -35,7 +36,7 @@ We serve OpenRouter-compatible traffic directly through a FastAPI application li
    Type=simple
    User=ubuntu
    WorkingDirectory=/home/ubuntu/hybridInference
-   ExecStart=/usr/bin/env uvicorn serving.servers.bootstrap:app --host 0.0.0.0 --port 80
+   ExecStart=/usr/bin/env uvicorn serving.servers.bootstrap:app --host 127.0.0.1 --port 8080
    Restart=always
    RestartSec=5
    Environment=PYTHONUNBUFFERED=1
@@ -48,7 +49,17 @@ We serve OpenRouter-compatible traffic directly through a FastAPI application li
    Replace `User`, `WorkingDirectory`, and `Environment` entries as needed for the target host.
    The repository carries a maintained version of this unit at `infrastructure/systemd/hybrid_inference.service`; copy or symlink it into `/etc/systemd/system/freeinference.service` during deploys.
 
-3. **Reload and enable the service**
+   **Important**: FastAPI listens on port **8080** (loopback only). Nginx handles public-facing port 443 and routes traffic to FastAPI. Do not bind FastAPI to `0.0.0.0:80` unless running without Nginx.
+
+3. **Install Nginx config**
+
+   ```bash
+   sudo cp infrastructure/nginx/freeinference.conf /etc/nginx/sites-available/
+   sudo ln -sf /etc/nginx/sites-available/freeinference.conf /etc/nginx/sites-enabled/
+   sudo nginx -t && sudo systemctl reload nginx
+   ```
+
+4. **Reload and enable the service**
 
    ```bash
    sudo systemctl daemon-reload
@@ -64,13 +75,19 @@ We serve OpenRouter-compatible traffic directly through a FastAPI application li
 - Health check: `curl https://freeinference.org/health`
 - List registered models: `curl https://freeinference.org/v1/models | jq`
 
-### Why We Dropped Nginx
+### Why Nginx Is Back
 
-- FastAPI already terminates HTTP and exposes the required OpenRouter-compatible endpoints.
-- Nginx added another moving part, increasing failover complexity and opaque error handling.
-- Debugging latency or request routing is simpler when traffic is handled in a single process.
+Nginx was briefly removed (see Legacy section below) when FreeInference was API-only and Cloudflare handled all edge concerns. It was re-introduced when we added:
+
+- **Frontend**: The Next.js web UI runs on port 3001 and needs to share the `freeinference.org` domain with the API. Path-based routing (`/v1/*` → backend, `/*` → frontend) is a natural fit for Nginx.
+- **Body size limits**: Qdrant vector upserts can be large. Nginx's `client_max_body_size` gives a clear, configurable gate before traffic hits FastAPI.
+- **WebSocket upgrade**: Nginx handles the `Upgrade` / `Connection` headers cleanly for SSE and WebSocket-based streaming.
 
 ## Legacy Architectures
+
+### FastAPI direct (v3, abandoned)
+
+We previously served OpenRouter-compatible traffic directly through FastAPI listening on port 80, without Nginx. This was simpler but could not support frontend co-hosting or fine-grained body size limits. Once the frontend was added, we moved back to Nginx.
 
 ### Nginx (v2, abandoned)
 
