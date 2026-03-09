@@ -75,3 +75,10 @@ docker --version
 docker compose version
 uv --version
 ```
+
+## Services Started by the Stack
+After everything starts, the server runs several services:
+- FastAPI Gateway: Main API server for LLM requests (8000)
+- PostgreSQL: Stores logs, users, API keys (5433)
+- Prometheus: Collects application metrics (9091)
+- Grafana: Visual dashboard for metrics (3001)

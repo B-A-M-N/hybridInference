@@ -73,7 +73,7 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
       GF_INSTALL_PLUGINS: ${GRAFANA_PLUGINS:-}
     ports:
-      - "${GRAFANA_PORT:-3001}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
     volumes:
       - grafana_staging_data:/var/lib/grafana
       - ../grafana/dashboards:/etc/grafana/provisioning/dashboards:ro

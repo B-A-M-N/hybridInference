@@ -5,7 +5,7 @@ After=network-online.target docker.service
 
 [Service]
 User=yspark
-Group=yspark
+Group=cache-PG0
 Type=simple
 WorkingDirectory=/users/yspark/hybridInference
 

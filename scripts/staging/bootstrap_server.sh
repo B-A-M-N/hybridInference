@@ -31,5 +31,10 @@ if ! grep -qxF 'source $HOME/.local/bin/env' ~/.bashrc 2>/dev/null; then
   echo 'source $HOME/.local/bin/env' >> ~/.bashrc
 fi
 
+echo "==> Installing systemd service"
+sudo cp "$HOME/hybridInference/infrastructure/systemd/hybrid_inference.staging.service" /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable hybrid_inference.staging
+
 echo "==> Bootstrap complete"
-echo "Reconnect to SSH or run: newgrp docker"
+echo "Reconnect to SSH or run: newgrp docker, then run start_staging.sh"

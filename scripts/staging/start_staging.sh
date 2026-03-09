@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$HOME/hybridInference"
 
 if [ -f "$HOME/.local/bin/env" ]; then
   source "$HOME/.local/bin/env"
 fi
 
-COMPOSE="docker compose -f infrastructure/docker/docker-compose.staging.yml"
+COMPOSE="docker compose -f $HOME/hybridInference/infrastructure/docker/docker-compose.staging.yml --env-file $HOME/hybridInference/.env"
 
 echo "==> Installing Python dependencies"
 uv sync
