@@ -1,5 +1,8 @@
 # Example models registry for the OpenRouter-compatible server.
 # Values like ${ENV_VAR} will be expanded from environment variables.
+#
+# NOTE: Local GPU endpoints use "host.docker.internal" to reach the host machine
+# from inside Docker. For bare-metal (non-Docker) development, replace with "localhost".
 
 models:
   - id: llama-3.3-70b-instruct
@@ -306,17 +309,17 @@ models:
       input_cache_reads: "0.01"
       input_cache_writes: "0"
     route:
-      # Local self-hosted endpoint (Q8 GGUF)
+      # Local self-hosted endpoint (AWQ 4-bit via vLLM)
       - kind: openai_compat
-        weight: 2.0
-        base_url: "http://localhost:8004/v1"
-        provider_model_id: "GLM-4.7-Flash"
+        weight: 1.0
+        base_url: "http://host.docker.internal:8004/v1"
+        provider_model_id: "glm-4.7-flash"
         pricing:
           prompt: "0"
           completion: "0"
-      # Remote Zhipu API (fallback)
+      # Remote Zhipu API (disabled, set weight > 0 to re-enable)
       - kind: zhipu
-        weight: 1.0
+        weight: 0
         base_url: https://api.z.ai/api/coding/paas/v4/
         api_key: ${ZAI_API_KEY}
         provider_model_id: "glm-4.7-flash"
@@ -500,7 +503,7 @@ models:
       # Local sglang endpoint
       - kind: sglang
         weight: 1.0
-        base_url: "http://localhost:8003"
+        base_url: "http://host.docker.internal:8003"
         api_key: "EMPTY"
         provider_model_id: "Qwen3-Coder-30B-A3B-Instruct"
         pricing:
@@ -539,7 +542,7 @@ models:
       # Local sglang endpoint
       - kind: sglang
         weight: 1.0
-        base_url: "http://localhost:12004"
+        base_url: "http://host.docker.internal:12004"
         provider_model_id: "/home/cc/data/models/MiniMax-M2"
         pricing:
           prompt: "0"
@@ -571,7 +574,7 @@ models:
     route:
       - kind: sglang
         weight: 1.0
-        base_url: "http://localhost:8005"
+        base_url: "http://host.docker.internal:8005"
         provider_model_id: "bge-m3"
 
   - id: minimax-m2.5

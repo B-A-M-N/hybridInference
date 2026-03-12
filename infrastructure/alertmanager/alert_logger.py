@@ -71,6 +71,7 @@ def main():
     """Start the alert webhook logger server."""
     parser = argparse.ArgumentParser(description="Alertmanager webhook JSONL logger")
     parser.add_argument("--port", type=int, default=5001)
+    parser.add_argument("--bind", type=str, default="127.0.0.1")
     parser.add_argument("--log-dir", type=str, default=None)
     args = parser.parse_args()
 
@@ -80,8 +81,8 @@ def main():
 
     AlertHandler.log_path = log_path
 
-    server = HTTPServer(("127.0.0.1", args.port), AlertHandler)
-    print(f"alert-logger listening on 127.0.0.1:{args.port}, writing to {log_path}", flush=True)
+    server = HTTPServer((args.bind, args.port), AlertHandler)
+    print(f"alert-logger listening on {args.bind}:{args.port}, writing to {log_path}", flush=True)
     with contextlib.suppress(KeyboardInterrupt):
         server.serve_forever()
     server.server_close()
