@@ -27,6 +27,7 @@ services:
     env_file: ../../.env
     environment:
       DB_HOST: postgres
+      DB_PORT: "5432"     # always use container-internal port; DB_PORT in .env controls host mapping only
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
