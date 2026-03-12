@@ -31,5 +31,5 @@ receivers:
           {{ end }}
   - name: alert-logger
     webhook_configs:
-      - url: 'http://127.0.0.1:5001/alerts'
+      - url: 'http://alert-logger:5001/alerts'
         send_resolved: true
