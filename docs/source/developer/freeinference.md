@@ -15,63 +15,26 @@ Client ──▶ Cloudflare ──▶ Nginx (:443) ──▶ FastAPI (:8080)
 | **Nginx** | TLS termination (Let's Encrypt cert), path-based routing (`/v1/`, `/auth/`, `/user/`, `/admin/` → FastAPI; everything else → frontend), request body limits (`client_max_body_size`), WebSocket upgrade. |
 | **FastAPI** | API logic — request authentication, model routing, rate limiting, backpressure, Qdrant proxy, and observability. Listens on `127.0.0.1:8080`. |
 
-`systemd` supervises both the FastAPI backend (`hybrid_inference.service`) and the Next.js frontend (`freeinference-frontend.service`), ensuring automatic restarts after crashes or host reboots.
+Docker Compose manages all services (backend, frontend, PostgreSQL, Prometheus,
+Alertmanager, alert-logger, Grafana) with automatic restarts via `restart: unless-stopped`.
 
-### Deployment Steps
+### Deployment
 
-1. **Install runtime dependencies**
+All services are defined in `infrastructure/docker/docker-compose.yml`. From the project root:
 
-   Ensure Python environment and model weights are ready. Confirm the FastAPI entry point (`serving.servers.bootstrap:app`) is reachable via `uvicorn` or the configured launcher script.
+```bash
+cp .env.example .env   # Configure secrets
+make up                # Start all services
+make ps                # Verify health
+```
 
-2. **Create the unit file**
-
-   ```bash
-   sudo tee /etc/systemd/system/freeinference.service <<'UNIT'
-   [Unit]
-   Description=FreeInference FastAPI service
-   After=network-online.target
-   Wants=network-online.target
-
-   [Service]
-   Type=simple
-   User=ubuntu
-   WorkingDirectory=/home/ubuntu/hybridInference
-   ExecStart=/usr/bin/env uvicorn serving.servers.bootstrap:app --host 127.0.0.1 --port 8080
-   Restart=always
-   RestartSec=5
-   Environment=PYTHONUNBUFFERED=1
-
-   [Install]
-   WantedBy=multi-user.target
-   UNIT
-   ```
-
-   Replace `User`, `WorkingDirectory`, and `Environment` entries as needed for the target host.
-   The repository carries a maintained version of this unit at `infrastructure/systemd/hybrid_inference.service`; copy or symlink it into `/etc/systemd/system/freeinference.service` during deploys.
-
-   **Important**: FastAPI listens on port **8080** (loopback only). Nginx handles public-facing port 443 and routes traffic to FastAPI. Do not bind FastAPI to `0.0.0.0:80` unless running without Nginx.
-
-3. **Install Nginx config**
-
-   ```bash
-   sudo cp infrastructure/nginx/freeinference.conf /etc/nginx/sites-available/
-   sudo ln -sf /etc/nginx/sites-available/freeinference.conf /etc/nginx/sites-enabled/
-   sudo nginx -t && sudo systemctl reload nginx
-   ```
-
-4. **Reload and enable the service**
-
-   ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable freeinference.service
-   sudo systemctl start freeinference.service
-   sudo systemctl status freeinference.service
-   ```
+Nginx runs on the host (not containerized) for SSL termination. See
+[Deployment](deployment.md) for the full guide.
 
 ### Runtime Operations
 
-- Restart on demand: `sudo systemctl restart freeinference.service`
-- Follow logs: `journalctl -u freeinference.service -f`
+- Restart: `make restart` or `make restart s=backend`
+- Follow logs: `make logs` or `make logs s=backend`
 - Health check: `curl https://freeinference.org/health`
 - List registered models: `curl https://freeinference.org/v1/models | jq`
 
