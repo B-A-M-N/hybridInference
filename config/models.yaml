@@ -603,3 +603,61 @@ models:
         base_url: "https://api.minimax.io/v1"
         api_key: ${MINIMAX_API_KEY}
         provider_model_id: "MiniMax-M2.5"
+
+  # --- Codex Subscription Models (uncomment when accounts are configured) ---
+  # Requires: var/data/codex_accounts.json with valid OAuth credentials.
+  # See docs/codex-subscription-design.md for setup instructions.
+  #
+  # Reasoning effort is controlled via the `reasoning_effort` request param
+  # ("low", "medium", "high") — no separate model entries needed per effort level.
+  #
+  - id: gpt-5.1-codex
+    name: GPT-5.1 Codex
+    provider: codex_sub
+    provider_model_id: "gpt-5.1-codex"
+    base_url: https://chatgpt.com/backend-api/codex
+    context_length: 192000
+    max_output_length: 16384
+    supports_tools: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+    pricing:
+      prompt: "0.50"
+      completion: "1.50"
+    route:
+      - kind: codex_sub
+        weight: 1.0
+        base_url: https://chatgpt.com/backend-api/codex
+  #
+  # - id: gpt-5-codex
+  #   name: GPT-5 Codex
+  #   provider: codex_sub
+  #   provider_model_id: "gpt-5-codex"
+  #   base_url: https://chatgpt.com/backend-api/codex
+  #   context_length: 192000
+  #   max_output_length: 16384
+  #   supports_tools: true
+  #   supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+  #   pricing:
+  #     prompt: "0.50"
+  #     completion: "1.50"
+  #   route:
+  #     - kind: codex_sub
+  #       weight: 1.0
+  #       base_url: https://chatgpt.com/backend-api/codex
+  #
+  # - id: o4-mini-codex
+  #   name: o4-mini Codex
+  #   provider: codex_sub
+  #   provider_model_id: "o4-mini-codex"
+  #   base_url: https://chatgpt.com/backend-api/codex
+  #   context_length: 192000
+  #   max_output_length: 16384
+  #   supports_tools: true
+  #   supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+  #   pricing:
+  #     prompt: "0.40"
+  #     completion: "1.20"
+  #   route:
+  #     - kind: codex_sub
+  #       weight: 1.0
+  #       base_url: https://chatgpt.com/backend-api/codex
