@@ -661,3 +661,45 @@ models:
   #     - kind: codex_sub
   #       weight: 1.0
   #       base_url: https://chatgpt.com/backend-api/codex
+  #
+  # ── Claude Subscription ────────────────────────────────────
+  #
+  - id: claude-sonnet-4.6
+    name: Claude Sonnet 4.6
+    provider: claude_sub
+    provider_model_id: "claude-sonnet-4-6"
+    base_url: https://api.anthropic.com
+    context_length: 200000
+    max_output_length: 64000
+    supports_tools: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, top_p]
+    input_modalities: [text, image]
+    output_modalities: [text]
+    quantization: "none"
+    pricing:
+      prompt: "3.00"
+      completion: "15.00"
+    route:
+      - kind: claude_sub
+        weight: 1.0
+        base_url: https://api.anthropic.com
+  #
+  - id: claude-opus-4.6
+    name: Claude Opus 4.6
+    provider: claude_sub
+    provider_model_id: "claude-opus-4-6"
+    base_url: https://api.anthropic.com
+    context_length: 200000
+    max_output_length: 128000
+    supports_tools: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, top_p]
+    input_modalities: [text, image]
+    output_modalities: [text]
+    quantization: "none"
+    pricing:
+      prompt: "15.00"
+      completion: "75.00"
+    route:
+      - kind: claude_sub
+        weight: 1.0
+        base_url: https://api.anthropic.com
