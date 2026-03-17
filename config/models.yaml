@@ -611,18 +611,101 @@ models:
   # Reasoning effort is controlled via the `reasoning_effort` request param
   # ("low", "medium", "high") — no separate model entries needed per effort level.
   #
-  - id: gpt-5.1-codex
-    name: GPT-5.1 Codex
+  - id: gpt-5.4
+    name: GPT-5.4
     provider: codex_sub
-    provider_model_id: "gpt-5.1-codex"
+    provider_model_id: "gpt-5.4"
     base_url: https://chatgpt.com/backend-api/codex
+    quantization: "none"
+    input_modalities: ["text"]
+    output_modalities: ["text"]
     context_length: 192000
     max_output_length: 16384
     supports_tools: true
     supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
     pricing:
-      prompt: "0.50"
-      completion: "1.50"
+      prompt: "2.50"
+      completion: "10.00"
+    route:
+      - kind: codex_sub
+        weight: 1.0
+        base_url: https://chatgpt.com/backend-api/codex
+
+  - id: gpt-5.3-codex
+    name: GPT-5.3 Codex
+    provider: codex_sub
+    provider_model_id: "gpt-5.3-codex"
+    base_url: https://chatgpt.com/backend-api/codex
+    quantization: "none"
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    context_length: 192000
+    max_output_length: 16384
+    supports_tools: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+    pricing:
+      prompt: "2.50"
+      completion: "10.00"
+    route:
+      - kind: codex_sub
+        weight: 1.0
+        base_url: https://chatgpt.com/backend-api/codex
+
+  - id: gpt-5.2-codex
+    name: GPT-5.2 Codex
+    provider: codex_sub
+    provider_model_id: "gpt-5.2-codex"
+    base_url: https://chatgpt.com/backend-api/codex
+    quantization: "none"
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    context_length: 192000
+    max_output_length: 16384
+    supports_tools: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+    pricing:
+      prompt: "1.25"
+      completion: "10.00"
+    route:
+      - kind: codex_sub
+        weight: 1.0
+        base_url: https://chatgpt.com/backend-api/codex
+
+  - id: gpt-5.2
+    name: GPT-5.2
+    provider: codex_sub
+    provider_model_id: "gpt-5.2"
+    base_url: https://chatgpt.com/backend-api/codex
+    quantization: "none"
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    context_length: 192000
+    max_output_length: 16384
+    supports_tools: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+    pricing:
+      prompt: "1.25"
+      completion: "10.00"
+    route:
+      - kind: codex_sub
+        weight: 1.0
+        base_url: https://chatgpt.com/backend-api/codex
+
+  - id: gpt-5.1-codex
+    name: GPT-5.1 Codex
+    provider: codex_sub
+    provider_model_id: "gpt-5.1-codex"
+    base_url: https://chatgpt.com/backend-api/codex
+    quantization: "none"
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    context_length: 192000
+    max_output_length: 16384
+    supports_tools: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+    pricing:
+      prompt: "1.25"
+      completion: "10.00"
     route:
       - kind: codex_sub
         weight: 1.0
@@ -638,8 +721,8 @@ models:
   #   supports_tools: true
   #   supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
   #   pricing:
-  #     prompt: "0.50"
-  #     completion: "1.50"
+  #     prompt: "1.25"
+  #     completion: "10.00"
   #   route:
   #     - kind: codex_sub
   #       weight: 1.0
@@ -697,8 +780,8 @@ models:
     output_modalities: [text]
     quantization: "none"
     pricing:
-      prompt: "15.00"
-      completion: "75.00"
+      prompt: "5.00"
+      completion: "25.00"
     route:
       - kind: claude_sub
         weight: 1.0
