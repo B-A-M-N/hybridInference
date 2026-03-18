@@ -130,7 +130,8 @@ async def _stream_request(
 
             choices = chunk.get("choices") or []
             if choices:
-                content = (choices[0].get("delta") or {}).get("content") or ""
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content") or delta.get("reasoning_content") or ""
                 if content:
                     if ttft is None:
                         ttft = time.perf_counter() - t_start
