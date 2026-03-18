@@ -323,6 +323,7 @@ models:
         weight: 1.0
         base_url: "http://host.docker.internal:8004/v1"
         provider_model_id: "glm-4.7-flash"
+        processor: default  # vLLM uses standard OpenAI format, not GLM XML
         pricing:
           prompt: "0"
           completion: "0"
