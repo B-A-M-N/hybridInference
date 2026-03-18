@@ -28,7 +28,62 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ext-blackbox-exporter ext-prometheus ext-alertmanager
 ```
 
-## Verify
+## Latency Prober
+
+The latency prober sends a real streaming LLM request to freeinference every 5 minutes and
+measures TTFT and output throughput. It exposes Prometheus metrics on `:9116/metrics`.
+
+### Install
+
+```bash
+# Install Python dependencies (Python 3.10+ required)
+pip3 install -r /etc/external-monitor/latency-prober/requirements.txt
+
+# Copy files
+sudo mkdir -p /etc/external-monitor/latency-prober
+sudo cp latency-prober/prober.py latency-prober/config.yml.example \
+    /etc/external-monitor/latency-prober/
+sudo cp latency-prober/config.yml.example \
+    /etc/external-monitor/latency-prober/config.yml
+# Edit config.yml to set the model name you want to probe.
+
+# Create secrets file (holds the API key — never commit this)
+sudo tee /etc/external-monitor/latency-prober.env > /dev/null <<'EOF'
+FREEINFERENCE_API_KEY=hyi-your-key-here
+EOF
+sudo chmod 600 /etc/external-monitor/latency-prober.env
+
+# Install and start the systemd service
+sudo cp systemd/ext-latency-prober.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ext-latency-prober
+```
+
+### Test before enabling
+
+```bash
+# Run one probe cycle and print results to stdout, then exit
+FREEINFERENCE_API_KEY=hyi-your-key-here \
+    python3 /etc/external-monitor/latency-prober/prober.py \
+    /etc/external-monitor/latency-prober/config.yml --run-once
+```
+
+### Verify
+
+```bash
+# Metrics are being scraped
+curl -s http://127.0.0.1:9116/metrics | grep llm_probe
+
+# Tell Prometheus to reload its config (picks up the new scrape job)
+curl -s -X POST http://127.0.0.1:9090/-/reload
+
+# Confirm the new job appears
+curl -s 'http://127.0.0.1:9090/api/v1/targets' | python3 -m json.tool | grep llm_latency
+```
+
+---
+
+## Verify (blackbox)
 
 ```bash
 # Probe is working (value should be 1)
