@@ -1,5 +1,8 @@
 # Example models registry for the OpenRouter-compatible server.
 # Values like ${ENV_VAR} will be expanded from environment variables.
+#
+# NOTE: Local GPU endpoints use "host.docker.internal" to reach the host machine
+# from inside Docker. For bare-metal (non-Docker) development, replace with "localhost".
 
 models:
   - id: llama-3.3-70b-instruct
@@ -285,6 +288,15 @@ models:
         base_url: https://api.z.ai/api/coding/paas/v4/
         api_key: ${ZAI_API_KEY}
         provider_model_id: "glm-4.7"
+      # Ollama Cloud fallback
+      - kind: ollama
+        weight: 1.0
+        base_url: "https://ollama.com/v1"
+        api_key: ${OLLAMA_API_KEY}
+        provider_model_id: "glm-4.7"
+        pricing:
+          prompt: "0"
+          completion: "0"
 
   - id: glm-4.7-flash
     name: GLM-4.7-Flash
@@ -306,17 +318,17 @@ models:
       input_cache_reads: "0.01"
       input_cache_writes: "0"
     route:
-      # Local self-hosted endpoint (Q8 GGUF)
+      # Local self-hosted endpoint (AWQ 4-bit via vLLM)
       - kind: openai_compat
-        weight: 2.0
-        base_url: "http://localhost:8004/v1"
-        provider_model_id: "GLM-4.7-Flash"
+        weight: 1.0
+        base_url: "http://host.docker.internal:8004/v1"
+        provider_model_id: "glm-4.7-flash"
         pricing:
           prompt: "0"
           completion: "0"
-      # Remote Zhipu API (fallback)
+      # Remote Zhipu API (disabled, set weight > 0 to re-enable)
       - kind: zhipu
-        weight: 1.0
+        weight: 0
         base_url: https://api.z.ai/api/coding/paas/v4/
         api_key: ${ZAI_API_KEY}
         provider_model_id: "glm-4.7-flash"
@@ -346,6 +358,15 @@ models:
         base_url: https://api.z.ai/api/coding/paas/v4/
         api_key: ${ZAI_API_KEY}
         provider_model_id: "glm-5"
+      # Ollama Cloud fallback
+      - kind: ollama
+        weight: 1.0
+        base_url: "https://ollama.com/v1"
+        api_key: ${OLLAMA_API_KEY}
+        provider_model_id: "glm-5"
+        pricing:
+          prompt: "0"
+          completion: "0"
 
   # - id: custom-claude-4.1-opus # Cursor-friendly aliases
   #   name: Claude Opus 4.1
@@ -500,7 +521,7 @@ models:
       # Local sglang endpoint
       - kind: sglang
         weight: 1.0
-        base_url: "http://localhost:8003"
+        base_url: "http://host.docker.internal:8003"
         api_key: "EMPTY"
         provider_model_id: "Qwen3-Coder-30B-A3B-Instruct"
         pricing:
@@ -539,7 +560,7 @@ models:
       # Local sglang endpoint
       - kind: sglang
         weight: 1.0
-        base_url: "http://localhost:12004"
+        base_url: "http://host.docker.internal:12004"
         provider_model_id: "/home/cc/data/models/MiniMax-M2"
         pricing:
           prompt: "0"
@@ -552,6 +573,15 @@ models:
         provider_model_id: "MiniMax-M2"
         pricing:
           prompt: "0"  # Update with actual pricing if needed
+          completion: "0"
+      # Ollama Cloud fallback
+      - kind: ollama
+        weight: 1.0
+        base_url: "https://ollama.com/v1"
+        api_key: ${OLLAMA_API_KEY}
+        provider_model_id: "minimax-m2"
+        pricing:
+          prompt: "0"
           completion: "0"
 
   # ===== Embedding Models =====
@@ -571,7 +601,7 @@ models:
     route:
       - kind: sglang
         weight: 1.0
-        base_url: "http://localhost:8005"
+        base_url: "http://host.docker.internal:8005"
         provider_model_id: "bge-m3"
 
   - id: minimax-m2.5
@@ -600,3 +630,210 @@ models:
         base_url: "https://api.minimax.io/v1"
         api_key: ${MINIMAX_API_KEY}
         provider_model_id: "MiniMax-M2.5"
+      # Ollama Cloud fallback
+      - kind: ollama
+        weight: 1.0
+        base_url: "https://ollama.com/v1"
+        api_key: ${OLLAMA_API_KEY}
+        provider_model_id: "minimax-m2.5"
+        pricing:
+          prompt: "0"
+          completion: "0"
+
+  # --- Codex Subscription Models (uncomment when accounts are configured) ---
+  # Requires: var/data/codex_accounts.json with valid OAuth credentials.
+  # See docs/codex-subscription-design.md for setup instructions.
+  #
+  # Reasoning effort is controlled via the `reasoning_effort` request param
+  # ("low", "medium", "high") — no separate model entries needed per effort level.
+  #
+  - id: gpt-5.4
+    name: GPT-5.4
+    provider: codex_sub
+    admin_only: true
+    provider_model_id: "gpt-5.4"
+    base_url: https://chatgpt.com/backend-api/codex
+    quantization: "none"
+    input_modalities: ["text", "image"]
+    output_modalities: ["text"]
+    context_length: 1050000
+    max_output_length: 128000
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+    pricing:
+      prompt: "2.50"
+      completion: "15.00"
+      input_cache_reads: "0.25"
+    route:
+      - kind: codex_sub
+        weight: 1.0
+        base_url: https://chatgpt.com/backend-api/codex
+
+  - id: gpt-5.3-codex
+    name: GPT-5.3 Codex
+    provider: codex_sub
+    admin_only: true
+    provider_model_id: "gpt-5.3-codex"
+    base_url: https://chatgpt.com/backend-api/codex
+    quantization: "none"
+    input_modalities: ["text", "image"]
+    output_modalities: ["text"]
+    context_length: 400000
+    max_output_length: 128000
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+    pricing:
+      prompt: "1.75"
+      completion: "14.00"
+      input_cache_reads: "0.175"
+    route:
+      - kind: codex_sub
+        weight: 1.0
+        base_url: https://chatgpt.com/backend-api/codex
+
+  - id: gpt-5.2-codex
+    name: GPT-5.2 Codex
+    provider: codex_sub
+    admin_only: true
+    provider_model_id: "gpt-5.2-codex"
+    base_url: https://chatgpt.com/backend-api/codex
+    quantization: "none"
+    input_modalities: ["text", "image"]
+    output_modalities: ["text"]
+    context_length: 400000
+    max_output_length: 128000
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+    pricing:
+      prompt: "1.75"
+      completion: "14.00"
+      input_cache_reads: "0.175"
+    route:
+      - kind: codex_sub
+        weight: 1.0
+        base_url: https://chatgpt.com/backend-api/codex
+
+  - id: gpt-5.2
+    name: GPT-5.2
+    provider: codex_sub
+    admin_only: true
+    provider_model_id: "gpt-5.2"
+    base_url: https://chatgpt.com/backend-api/codex
+    quantization: "none"
+    input_modalities: ["text", "image"]
+    output_modalities: ["text"]
+    context_length: 400000
+    max_output_length: 128000
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+    pricing:
+      prompt: "1.75"
+      completion: "14.00"
+      input_cache_reads: "0.175"
+    route:
+      - kind: codex_sub
+        weight: 1.0
+        base_url: https://chatgpt.com/backend-api/codex
+
+  - id: gpt-5.1-codex
+    name: GPT-5.1 Codex
+    provider: codex_sub
+    admin_only: true
+    provider_model_id: "gpt-5.1-codex"
+    base_url: https://chatgpt.com/backend-api/codex
+    quantization: "none"
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    context_length: 192000
+    max_output_length: 16384
+    supports_tools: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+    pricing:
+      prompt: "1.25"
+      completion: "10.00"
+    route:
+      - kind: codex_sub
+        weight: 1.0
+        base_url: https://chatgpt.com/backend-api/codex
+  #
+  # - id: gpt-5-codex
+  #   name: GPT-5 Codex
+  #   provider: codex_sub
+  #   provider_model_id: "gpt-5-codex"
+  #   base_url: https://chatgpt.com/backend-api/codex
+  #   context_length: 192000
+  #   max_output_length: 16384
+  #   supports_tools: true
+  #   supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+  #   pricing:
+  #     prompt: "1.25"
+  #     completion: "10.00"
+  #   route:
+  #     - kind: codex_sub
+  #       weight: 1.0
+  #       base_url: https://chatgpt.com/backend-api/codex
+  #
+  # - id: o4-mini-codex
+  #   name: o4-mini Codex
+  #   provider: codex_sub
+  #   provider_model_id: "o4-mini-codex"
+  #   base_url: https://chatgpt.com/backend-api/codex
+  #   context_length: 192000
+  #   max_output_length: 16384
+  #   supports_tools: true
+  #   supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+  #   pricing:
+  #     prompt: "0.40"
+  #     completion: "1.20"
+  #   route:
+  #     - kind: codex_sub
+  #       weight: 1.0
+  #       base_url: https://chatgpt.com/backend-api/codex
+  #
+  # ── Claude Subscription ────────────────────────────────────
+  #
+  - id: claude-sonnet-4.6
+    name: Claude Sonnet 4.6
+    provider: claude_sub
+    admin_only: true
+    provider_model_id: "claude-sonnet-4-6"
+    base_url: https://api.anthropic.com
+    context_length: 200000
+    max_output_length: 64000
+    supports_tools: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, top_p]
+    input_modalities: [text, image]
+    output_modalities: [text]
+    quantization: "none"
+    pricing:
+      prompt: "3.00"
+      completion: "15.00"
+    route:
+      - kind: claude_sub
+        weight: 1.0
+        base_url: https://api.anthropic.com
+  #
+  - id: claude-opus-4.6
+    name: Claude Opus 4.6
+    provider: claude_sub
+    admin_only: true
+    provider_model_id: "claude-opus-4-6"
+    base_url: https://api.anthropic.com
+    context_length: 200000
+    max_output_length: 128000
+    supports_tools: true
+    supported_params: [temperature, max_tokens, stop, tools, tool_choice, top_p]
+    input_modalities: [text, image]
+    output_modalities: [text]
+    quantization: "none"
+    pricing:
+      prompt: "5.00"
+      completion: "25.00"
+    route:
+      - kind: claude_sub
+        weight: 1.0
+        base_url: https://api.anthropic.com
