@@ -6,11 +6,11 @@
 #   Stop all:     docker compose -f infrastructure/docker/docker-compose.staging.yml down
 #
 # All services start by default (no profiles required for core stack).
-# Prometheus scrapes the FastAPI app on the host at port 8000.
-
-version: '3.8'
+# The FastAPI app runs on the host via systemd; Prometheus scrapes it at host.docker.internal:8000.
 
 services:
+  # ===== Database =====
+
   postgres:
     image: postgres:16
     container_name: hybridinference-staging-postgres
@@ -42,19 +42,22 @@ services:
     networks:
       - hybridinference-staging
 
+  # ===== Observability =====
+
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.6.0
     container_name: hybridinference-staging-prometheus
     restart: unless-stopped
     extra_hosts:
       # Allows host.docker.internal to resolve on Linux (Docker Desktop handles this automatically on Mac/Windows)
       - "host.docker.internal:host-gateway"
     command:
-      - '--config.file=/etc/prometheus/prometheus.staging.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--storage.tsdb.retention.time=7d'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - "--config.file=/etc/prometheus/prometheus.staging.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
     ports:
       - "127.0.0.1:${PROMETHEUS_PORT:-9091}:9090"
     volumes:
@@ -65,18 +68,20 @@ services:
       - hybridinference-staging
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:12.1.1
     container_name: hybridinference-staging-grafana
     restart: unless-stopped
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
-      GF_INSTALL_PLUGINS: ${GRAFANA_PLUGINS:-}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
     ports:
       - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
     volumes:
       - grafana_staging_data:/var/lib/grafana
-      - ../grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ../grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       - prometheus
     networks:
@@ -92,7 +97,8 @@ services:
       PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@staging.local}
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
       PGADMIN_CONFIG_SERVER_MODE: "${PGADMIN_CONFIG_SERVER_MODE:-False}"
-      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+      SCRIPT_NAME: /pgadmin
     ports:
       - "127.0.0.1:${PGADMIN_PORT:-5051}:80"
     volumes:

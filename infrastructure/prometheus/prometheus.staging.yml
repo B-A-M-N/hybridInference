@@ -15,8 +15,3 @@ rule_files:
   - rules/slo_burn_rate.yml
   - rules/pipeline_health.yml
   - rules/service_availability.yml
-
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets: ["localhost:9093"]
