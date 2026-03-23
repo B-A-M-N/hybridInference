@@ -1,0 +1,33 @@
+settings:
+  port: 9101
+  base_path: "/llm-prober"
+  default_timeout: 30
+  probe_prompt: "Write a short Python function that returns hello world."
+  probe_max_tokens: 32
+  probe_temperature: 0
+  history_size: 100
+  log_level: "INFO"
+
+gateway:
+  base_url: "http://backend:8080"
+  api_key: "${PROBER_API_KEY}"
+  health_interval: 30
+  e2e_interval: 60
+  probe_header: "synthetic"
+
+registry:
+  path: "/app/models.yaml"
+  interval: 60
+
+# Optional manual overrides/additional direct probes.
+providers: []
+
+e2e_models:
+  - model_id: "glm-4.7-flash"
+    streaming: true
+  - model_id: "qwen3-coder-30b"
+    streaming: true
+  - model_id: "minimax-m2"
+    streaming: true
+  - model_id: "bge-m3"
+    type: embedding
