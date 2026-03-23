@@ -3,4 +3,4 @@
 	url = https://github.com/HarvardMadSys/free_inference.git
 [submodule "llm-prober"]
 	path = llm-prober
-	url = https://github.com/HarvardMadSys/freeinference-prober.git
+	url = ../freeinference-prober.git
