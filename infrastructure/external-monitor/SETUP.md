@@ -18,6 +18,7 @@ Place all three in `/usr/local/bin/`.
 sudo mkdir -p /etc/external-monitor/rules
 sudo cp blackbox.yml prometheus.yml alertmanager.yml /etc/external-monitor/
 sudo cp rules/external_probe.yml /etc/external-monitor/rules/
+sudo cp rules/latency_probe.yml /etc/external-monitor/rules/
 
 # Create data directories
 sudo mkdir -p /var/lib/ext-prometheus /var/lib/ext-alertmanager
@@ -33,18 +34,27 @@ sudo systemctl enable --now ext-blackbox-exporter ext-prometheus ext-alertmanage
 The latency prober sends a real streaming LLM request to freeinference every 5 minutes and
 measures TTFT and output throughput. It exposes Prometheus metrics on `:9116/metrics`.
 
+The prober implementation is sourced from the `llm-prober` submodule. This
+repository keeps the Prometheus, Alertmanager, and systemd integration glue,
+but does not keep a second in-tree copy of the prober source.
+
 ### Install
 
 ```bash
+# Initialize the prober submodule in your checkout
+git submodule update --init llm-prober
+
+# Copy files from the llm-prober submodule
+sudo mkdir -p /etc/external-monitor/latency-prober
+sudo cp llm-prober/prober.py llm-prober/config.yml.example \
+    llm-prober/requirements.txt \
+    /etc/external-monitor/latency-prober/
+sudo cp llm-prober/config.yml.example \
+    /etc/external-monitor/latency-prober/config.yml
+
 # Install Python dependencies (Python 3.10+ required)
 pip3 install -r /etc/external-monitor/latency-prober/requirements.txt
 
-# Copy files
-sudo mkdir -p /etc/external-monitor/latency-prober
-sudo cp latency-prober/prober.py latency-prober/config.yml.example \
-    /etc/external-monitor/latency-prober/
-sudo cp latency-prober/config.yml.example \
-    /etc/external-monitor/latency-prober/config.yml
 # Edit config.yml to set the model name you want to probe.
 
 # Create secrets file (holds the API key — never commit this)
