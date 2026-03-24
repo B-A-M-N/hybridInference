@@ -11,23 +11,24 @@ settings:
 gateway:
   base_url: "http://backend:8080"
   api_key: "${PROBER_API_KEY}"
-  health_interval: 30
-  e2e_interval: 60
+  health_interval: 300
+  e2e_interval: 300
   probe_header: "synthetic"
 
 registry:
   path: "/app/models.yaml"
-  interval: 60
+  interval: 300
 
 # Optional manual overrides/additional direct probes.
 providers: []
 
+# Gateway E2E targets are auto-discovered from models.yaml.
+# Manual overrides take priority over auto-discovered entries (matched by model_id).
+# Use probe_max_tokens to give thinking models enough budget for visible output.
 e2e_models:
-  - model_id: "glm-4.7-flash"
+  - model_id: minimax-m2.5
     streaming: true
-  - model_id: "qwen3-coder-30b"
+    probe_max_tokens: 256
+  - model_id: minimax-m2.7
     streaming: true
-  - model_id: "minimax-m2"
-    streaming: true
-  - model_id: "bge-m3"
-    type: embedding
+    probe_max_tokens: 256

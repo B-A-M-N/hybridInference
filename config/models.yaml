@@ -518,55 +518,55 @@ models:
       input_cache_reads: "0"
       input_cache_writes: "0"
     route:
-      - kind: ollama
+      - kind: sglang
         weight: 1.0
-        base_url: "http://host.docker.internal:8007/v1"
+        base_url: "http://host.docker.internal:8007"
         provider_model_id: "Qwen3.5-27B"
         pricing:
           prompt: "0"
           completion: "0"
 
-  - id: qwen3-coder-30b
-    name: Qwen3 Coder 30B A3B Instruct
-    provider: qwen
-    quantization: "bf16"
-    input_modalities: ["text"]
-    output_modalities: ["text"]
-    context_length: 32768
-    max_output_length: 8192
-    supports_tools: true
-    supports_structured_output: true
-    supported_params: [temperature, top_p, top_k, max_tokens, stop, frequency_penalty, presence_penalty, seed]
-    aliases: ["Qwen3-Coder-30B-A3B-Instruct"]
-    pricing:
-      prompt: "0"
-      completion: "0"
-      image: "0"
-      request: "0"
-      input_cache_reads: "0"
-      input_cache_writes: "0"
-    route:
-      # Local sglang endpoint
-      - kind: sglang
-        weight: 1.0
-        base_url: "http://host.docker.internal:8003"
-        api_key: "EMPTY"
-        provider_model_id: "Qwen3-Coder-30B-A3B-Instruct"
-        pricing:
-          prompt: "0"
-          completion: "0"
-      # Remote Chutes API endpoint
-      - kind: chutes
-        weight: 1.0
-        base_url: ${CHUTES_BASE_URL}
-        api_key: ${CHUTES_API_KEY}
-        provider_model_id: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
-        pricing:
-          prompt: "0"
-          completion: "0"
+  # - id: qwen3-coder-30b
+  #   name: Qwen3 Coder 30B A3B Instruct
+  #   provider: qwen
+  #   quantization: "bf16"
+  #   input_modalities: ["text"]
+  #   output_modalities: ["text"]
+  #   context_length: 32768
+  #   max_output_length: 8192
+  #   supports_tools: true
+  #   supports_structured_output: true
+  #   supported_params: [temperature, top_p, top_k, max_tokens, stop, frequency_penalty, presence_penalty, seed]
+  #   aliases: ["Qwen3-Coder-30B-A3B-Instruct"]
+  #   pricing:
+  #     prompt: "0"
+  #     completion: "0"
+  #     image: "0"
+  #     request: "0"
+  #     input_cache_reads: "0"
+  #     input_cache_writes: "0"
+  #   route:
+  #     # Local sglang endpoint
+  #     - kind: sglang
+  #       weight: 1.0
+  #       base_url: "http://host.docker.internal:8003"
+  #       api_key: "EMPTY"
+  #       provider_model_id: "Qwen3-Coder-30B-A3B-Instruct"
+  #       pricing:
+  #         prompt: "0"
+  #         completion: "0"
+  #     # Remote Chutes API endpoint
+  #     - kind: chutes
+  #       weight: 1.0
+  #       base_url: ${CHUTES_BASE_URL}
+  #       api_key: ${CHUTES_API_KEY}
+  #       provider_model_id: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+  #       pricing:
+  #         prompt: "0"
+  #         completion: "0"
 
-  - id: minimax-m2
-    name: MiniMax M2
+  - id: minimax-m2.7
+    name: MiniMax M2.7
     provider: minimax
     quantization: "bf16"
     input_modalities: ["text"]
@@ -576,7 +576,7 @@ models:
     supports_tools: true
     supports_structured_output: true
     supported_params: [temperature, top_p, top_k, max_tokens, stop, seed, stream]
-    aliases: ["MiniMax-M2"]
+    aliases: ["MiniMax-M2.7"]
     pricing:
       prompt: "0"
       completion: "0"
@@ -585,29 +585,21 @@ models:
       input_cache_reads: "0"
       input_cache_writes: "0"
     route:
-      # Local sglang endpoint
-      - kind: sglang
-        weight: 1.0
-        base_url: "http://host.docker.internal:12004"
-        provider_model_id: "/home/cc/data/models/MiniMax-M2"
-        pricing:
-          prompt: "0"
-          completion: "0"
       # Remote MiniMax API endpoint
       - kind: openai_compat
         weight: 1.0
         base_url: "https://api.minimax.io/v1"
         api_key: ${MINIMAX_API_KEY}
-        provider_model_id: "MiniMax-M2"
+        provider_model_id: "MiniMax-M2.7"
         pricing:
-          prompt: "0"  # Update with actual pricing if needed
+          prompt: "0"
           completion: "0"
       # Ollama Cloud fallback
       - kind: ollama
         weight: 1.0
         base_url: "https://ollama.com/v1"
         api_key: ${OLLAMA_API_KEY}
-        provider_model_id: "minimax-m2"
+        provider_model_id: "minimax-m2.7"
         pricing:
           prompt: "0"
           completion: "0"
