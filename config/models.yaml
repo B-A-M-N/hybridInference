@@ -413,6 +413,32 @@ models:
           prompt: "0"
           completion: "0"
 
+  - id: glm-5-turbo
+    name: GLM-5 Turbo
+    provider: zhipu
+    quantization: "fp8"
+    context_length: 200000
+    max_output_length: 128000
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, max_tokens, stop, stream, tool_stream, thinking]
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    aliases: ["freeinference-glm-5-turbo"]
+    pricing:
+      prompt: "0.5"
+      completion: "1.6"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0.1"
+      input_cache_writes: "0"
+    route:
+      - kind: zhipu
+        weight: 1.0
+        base_url: https://api.z.ai/api/coding/paas/v4/
+        api_key: ${ZAI_API_KEY}
+        provider_model_id: "glm-5-turbo"
+
   # - id: custom-claude-4.1-opus # Cursor-friendly aliases
   #   name: Claude Opus 4.1
   #   provider: claude
