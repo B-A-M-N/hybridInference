@@ -51,7 +51,7 @@ services:
       NODE_ENV: production
       PORT: "3001"
     ports:
-      - "127.0.0.1:3001:3001"
+      - "0.0.0.0:3001:3001"
     depends_on:
       backend:
         condition: service_healthy
@@ -169,6 +169,27 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+    networks:
+      - hybridinference
+
+  llm-prober:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile.llm-prober
+    container_name: hybridinference-llm-prober
+    restart: unless-stopped
+    env_file: ../../.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../llm-prober/config.docker.yaml:/app/config.yml:ro
+      - ../../config/models.yaml:/app/models.yaml:ro
+      - ../llm-prober/state:/app/state
+    ports:
+      - "127.0.0.1:9101:9101"
+    depends_on:
+      backend:
+        condition: service_healthy
     networks:
       - hybridinference
 
