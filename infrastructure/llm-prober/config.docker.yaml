@@ -7,6 +7,7 @@ settings:
   probe_temperature: 0
   history_size: 100
   log_level: "INFO"
+  state_path: "/app/state/llm-prober-state.json"
 
 gateway:
   base_url: "http://backend:8080"

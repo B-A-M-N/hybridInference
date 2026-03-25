@@ -184,6 +184,7 @@ services:
     volumes:
       - ../llm-prober/config.docker.yaml:/app/config.yml:ro
       - ../../config/models.yaml:/app/models.yaml:ro
+      - ../llm-prober/state:/app/state
     ports:
       - "127.0.0.1:9101:9101"
     depends_on:
