@@ -9,14 +9,17 @@ changes and for periodic backups in production.
 ### Back up the database
 
 ```bash
-# Run a default backup (keeps 30 days of backups under ./backups)
+# Run a default backup (local only, under ./backups)
 ./scripts/db/backup.sh
 
 # Backup with gzip compression to save space
 ./scripts/db/backup.sh --compress
 
-# Use a custom retention period
-./scripts/db/backup.sh --retention-days 7
+# Backup and upload to S3 (auto-enables compression)
+./scripts/db/backup.sh --s3-bucket s3://freeinference/backup
+
+# Upload to S3 and remove local copy afterwards
+./scripts/db/backup.sh --s3-bucket s3://freeinference/backup --s3-only
 ```
 
 ### Restore the database
@@ -50,11 +53,19 @@ ls -lh backups/
 ./scripts/db/restore.sh --backup-dir backups/backup_20250114_153000
 ```
 
-### Case 2: Scheduled backups
+### Case 2: Scheduled backups (daily to S3)
 
 ```bash
-# Example crontab entry to run a compressed backup every day at 02:00
-0 2 * * * cd /home/murphy/hybridInference && ./scripts/db/backup.sh --compress --retention-days 30
+# Install the cron job (runs daily at 04:00 UTC as the freeinference user)
+sudo cp scripts/db/backup-cron /etc/cron.d/freeinference-backup
+sudo chmod 644 /etc/cron.d/freeinference-backup
+
+# Prerequisites:
+#   sudo usermod -aG docker freeinference   # docker access for pg_dump
+#   AWS credentials in /home/freeinference/.aws/credentials
+
+# Retention: 3 daily + 2 weekly + 1 monthly (GFS rotation)
+# Logs:      /home/freeinference/backup.log
 ```
 
 ## What gets backed up
@@ -91,9 +102,13 @@ Each backup directory contains:
 ### `backup.sh`
 
 ```text
---retention-days N    Keep backups for N days (default: 30)
 --backup-dir PATH     Custom backup root directory (default: ./backups)
 --compress            Compress PostgreSQL dumps with gzip
+--s3-bucket URI       Upload backup to S3 (e.g. s3://freeinference/backup)
+--s3-only             Upload to S3 and remove local backup after success
+--keep-daily N        Keep N most recent daily backups (default: 3)
+--keep-weekly N       Keep N most recent weekly backups (default: 2)
+--keep-monthly N      Keep N most recent monthly backups (default: 1)
 --help                Show help and usage information
 ```
 

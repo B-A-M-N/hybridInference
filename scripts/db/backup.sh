@@ -2,24 +2,37 @@
 # Database Backup Script for hybridInference
 #
 # This script backs up the PostgreSQL database (primary database for API logs,
-# metrics, and user management).
+# metrics, and user management) and optionally uploads to S3.
 #
 # Usage:
 #   ./scripts/db/backup.sh [OPTIONS]
 #
 # Options:
-#   --retention-days N    Keep backups for N days (default: 30)
 #   --backup-dir PATH     Custom backup directory (default: ./backups)
 #   --compress            Compress backups with gzip
+#   --s3-bucket URI       Upload backup to S3 (e.g. s3://freeinference/backup)
+#   --s3-only             Upload to S3 and remove local backup after success
+#   --keep-daily N        Keep N most recent daily backups (default: 3)
+#   --keep-weekly N       Keep N most recent weekly backups (default: 2)
+#   --keep-monthly N      Keep N most recent monthly backups (default: 1)
 #   --help                Show this help message
 #
 # Environment Variables (from .env):
 #   DB_NAME, DB_USER, DB_PASSWORD - PostgreSQL credentials
 #
+# S3 Upload:
+#   Requires AWS CLI v2 configured with credentials.
+#   Credentials are read from ~/.aws/credentials (or env vars).
+#   The freeinference service account (/home/freeinference/.aws/) is used
+#   when running via cron as the freeinference user.
+#
 # Examples:
 #   ./scripts/db/backup.sh
-#   ./scripts/db/backup.sh --retention-days 7 --compress
+#   ./scripts/db/backup.sh --compress
 #   ./scripts/db/backup.sh --backup-dir /mnt/backups
+#   ./scripts/db/backup.sh --compress --s3-bucket s3://freeinference/backup
+#   ./scripts/db/backup.sh --compress --s3-bucket s3://freeinference/backup --s3-only
+#   ./scripts/db/backup.sh --keep-daily 5 --keep-weekly 3 --keep-monthly 2
 
 set -euo pipefail
 
@@ -31,9 +44,13 @@ readonly BLUE='\033[0;34m'
 readonly NC='\033[0m' # No Color
 
 # Default configuration
-RETENTION_DAYS=30
 BACKUP_DIR="./backups"
 COMPRESS=false
+S3_BUCKET=""
+S3_ONLY=false
+KEEP_DAILY=3
+KEEP_WEEKLY=2
+KEEP_MONTHLY=1
 DOCKER_COMPOSE_FILE="infrastructure/docker/docker-compose.yml"
 POSTGRES_CONTAINER="hybridinference-postgres"
 
@@ -58,9 +75,9 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $*" >&2
 }
 
-# Show help message
+# Show help message (prints only the header comment block, stops at first blank line)
 show_help() {
-    grep '^#' "$0" | grep -v '#!/bin/bash' | sed 's/^# //' | sed 's/^#//'
+    sed -n '2,/^$/{ s/^# \?//; p }' "$0"
     exit 0
 }
 
@@ -68,8 +85,16 @@ show_help() {
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --retention-days)
-                RETENTION_DAYS="$2"
+            --keep-daily)
+                KEEP_DAILY="$2"
+                shift 2
+                ;;
+            --keep-weekly)
+                KEEP_WEEKLY="$2"
+                shift 2
+                ;;
+            --keep-monthly)
+                KEEP_MONTHLY="$2"
                 shift 2
                 ;;
             --backup-dir)
@@ -78,6 +103,14 @@ parse_args() {
                 ;;
             --compress)
                 COMPRESS=true
+                shift
+                ;;
+            --s3-bucket)
+                S3_BUCKET="$2"
+                shift 2
+                ;;
+            --s3-only)
+                S3_ONLY=true
                 shift
                 ;;
             --help)
@@ -183,10 +216,207 @@ backup_postgres() {
     fi
 }
 
-# Clean up old backups
-cleanup_old_backups() {
-    log_info "Cleaning up backups older than ${RETENTION_DAYS} days..."
+# Upload backup to S3
+upload_to_s3() {
+    if [[ -z "$S3_BUCKET" ]]; then
+        return 0
+    fi
 
+    # Strip trailing slash from bucket URI
+    S3_BUCKET="${S3_BUCKET%/}"
+
+    log_info "Uploading backup to S3: ${S3_BUCKET}/ ..."
+
+    # Check AWS CLI is available
+    if ! command -v aws &> /dev/null; then
+        log_error "AWS CLI not found. Install it: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+        return 1
+    fi
+
+    # Upload all backup files (excluding summary)
+    local upload_count=0
+    local upload_failed=false
+
+    while IFS= read -r -d '' file; do
+        local basename
+        basename=$(basename "$file")
+        local s3_key="${S3_BUCKET}/${basename}"
+
+        log_info "Uploading ${basename} ..."
+        if aws s3 cp "$file" "$s3_key" --quiet; then
+            log_success "Uploaded: ${s3_key}"
+            ((upload_count++))
+        else
+            log_error "Failed to upload: ${basename}"
+            upload_failed=true
+        fi
+    done < <(find "${BACKUP_DIR}" -type f \( -name "*.sql" -o -name "*.sql.gz" \) -print0)
+
+    if [[ "$upload_failed" == true ]]; then
+        log_error "Some uploads failed"
+        return 1
+    fi
+
+    if [[ $upload_count -eq 0 ]]; then
+        log_warning "No backup files found to upload"
+        return 1
+    fi
+
+    log_success "Uploaded ${upload_count} file(s) to S3"
+
+    # Remove local backup if --s3-only
+    if [[ "$S3_ONLY" == true ]]; then
+        log_info "Removing local backup (--s3-only)..."
+        rm -rf "${BACKUP_DIR}"
+        log_success "Local backup removed"
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# GFS Retention Policy (Grandfather-Father-Son)
+#
+# Given a list of YYYYMMDD dates (one per line, newest first), output the
+# dates that should be KEPT according to the --keep-daily / --keep-weekly /
+# --keep-monthly settings.
+#
+# Algorithm:
+#   1. Keep the N most recent dates as "daily"
+#   2. From remaining dates, keep one per ISO week (most recent in that week),
+#      up to M "weekly" slots
+#   3. From remaining dates, keep one per month (most recent in that month),
+#      up to K "monthly" slots
+# ============================================================================
+compute_keep_set() {
+    # Reads sorted dates (newest first) from stdin, prints dates to keep
+    local dates=()
+    while IFS= read -r d; do
+        [[ -n "$d" ]] && dates+=("$d")
+    done
+
+    if [[ ${#dates[@]} -eq 0 ]]; then
+        return
+    fi
+
+    declare -A keep_set=()
+
+    # --- Daily: keep the first KEEP_DAILY entries ---
+    local daily_count=0
+    for d in "${dates[@]}"; do
+        if [[ $daily_count -lt $KEEP_DAILY ]]; then
+            keep_set["$d"]=1
+            ((daily_count++))
+        fi
+    done
+
+    # --- Weekly: one per ISO week, up to KEEP_WEEKLY ---
+    local weekly_count=0
+    declare -A seen_weeks=()
+    for d in "${dates[@]}"; do
+        [[ -n "${keep_set[$d]:-}" ]] && continue
+        # Compute ISO year-week from YYYYMMDD
+        local iso_week
+        iso_week=$(date -d "${d:0:4}-${d:4:2}-${d:6:2}" +%G-W%V 2>/dev/null) || continue
+        if [[ -z "${seen_weeks[$iso_week]:-}" ]]; then
+            seen_weeks["$iso_week"]=1
+            keep_set["$d"]=1
+            ((weekly_count++))
+            [[ $weekly_count -ge $KEEP_WEEKLY ]] && break
+        fi
+    done
+
+    # --- Monthly: one per month, up to KEEP_MONTHLY ---
+    local monthly_count=0
+    declare -A seen_months=()
+    for d in "${dates[@]}"; do
+        [[ -n "${keep_set[$d]:-}" ]] && continue
+        local month="${d:0:6}"  # YYYYMM
+        if [[ -z "${seen_months[$month]:-}" ]]; then
+            seen_months["$month"]=1
+            keep_set["$d"]=1
+            ((monthly_count++))
+            [[ $monthly_count -ge $KEEP_MONTHLY ]] && break
+        fi
+    done
+
+    # Output keep set
+    for d in "${!keep_set[@]}"; do
+        echo "$d"
+    done
+}
+
+# Clean up S3 backups using GFS retention
+cleanup_old_s3_backups() {
+    if [[ -z "$S3_BUCKET" ]]; then
+        return 0
+    fi
+
+    log_info "Applying GFS retention to S3 (daily=${KEEP_DAILY}, weekly=${KEEP_WEEKLY}, monthly=${KEEP_MONTHLY})..."
+
+    # Collect all S3 backup files with their dates
+    local -A file_by_date=()   # date -> space-separated filenames
+    local all_dates=()
+
+    while IFS= read -r line; do
+        local filename
+        filename=$(echo "$line" | awk '{print $4}')
+        [[ -z "$filename" ]] && continue
+
+        local file_date
+        file_date=$(echo "$filename" | grep -oP '\d{8}(?=_\d{6})' | head -1)
+        [[ -z "$file_date" ]] && continue
+
+        if [[ -z "${file_by_date[$file_date]:-}" ]]; then
+            file_by_date["$file_date"]="$filename"
+            all_dates+=("$file_date")
+        else
+            file_by_date["$file_date"]+=" $filename"
+        fi
+    done < <(aws s3 ls "${S3_BUCKET}/" 2>/dev/null)
+
+    if [[ ${#all_dates[@]} -eq 0 ]]; then
+        log_info "No S3 backups found"
+        return 0
+    fi
+
+    # Sort dates newest first
+    local sorted_dates
+    sorted_dates=$(printf '%s\n' "${all_dates[@]}" | sort -rn)
+
+    # Compute which dates to keep
+    local -A keep_dates=()
+    while IFS= read -r d; do
+        keep_dates["$d"]=1
+    done < <(echo "$sorted_dates" | compute_keep_set)
+
+    # Delete files whose dates are not in the keep set
+    local deleted_count=0
+    for d in "${all_dates[@]}"; do
+        if [[ -z "${keep_dates[$d]:-}" ]]; then
+            for filename in ${file_by_date[$d]}; do
+                log_info "Deleting S3 backup: ${filename} (date: ${d})"
+                if aws s3 rm "${S3_BUCKET}/${filename}" --quiet; then
+                    ((deleted_count++))
+                fi
+            done
+        fi
+    done
+
+    if [[ $deleted_count -gt 0 ]]; then
+        log_success "Deleted ${deleted_count} old S3 backup(s)"
+    else
+        log_info "No old S3 backups to delete"
+    fi
+
+    # Show what's kept
+    local kept_count=0
+    for _ in "${!keep_dates[@]}"; do ((kept_count++)); done
+    log_info "Keeping ${kept_count} S3 backup date(s)"
+}
+
+# Clean up local backups using GFS retention
+cleanup_old_backups() {
     local parent_backup_dir
     parent_backup_dir=$(dirname "${BACKUP_DIR}")
 
@@ -195,19 +425,59 @@ cleanup_old_backups() {
         return 0
     fi
 
-    local deleted_count=0
+    log_info "Applying GFS retention to local backups (daily=${KEEP_DAILY}, weekly=${KEEP_WEEKLY}, monthly=${KEEP_MONTHLY})..."
 
-    # Find and delete old backup directories
-    while IFS= read -r -d '' old_backup; do
-        log_info "Deleting old backup: ${old_backup}"
-        rm -rf "$old_backup"
-        ((deleted_count++))
-    done < <(find "$parent_backup_dir" -maxdepth 1 -type d -name "backup_*" -mtime "+${RETENTION_DAYS}" -print0)
+    # Collect all backup directories with their dates
+    local -A dir_by_date=()
+    local all_dates=()
+
+    while IFS= read -r -d '' dir; do
+        local dirname
+        dirname=$(basename "$dir")
+        # Extract date from directory name: backup_YYYYMMDD_HHMMSS
+        local dir_date
+        dir_date=$(echo "$dirname" | grep -oP '\d{8}(?=_\d{6})' | head -1)
+        [[ -z "$dir_date" ]] && continue
+
+        if [[ -z "${dir_by_date[$dir_date]:-}" ]]; then
+            dir_by_date["$dir_date"]="$dir"
+            all_dates+=("$dir_date")
+        else
+            dir_by_date["$dir_date"]+=" $dir"
+        fi
+    done < <(find "$parent_backup_dir" -maxdepth 1 -type d -name "backup_*" -print0)
+
+    if [[ ${#all_dates[@]} -eq 0 ]]; then
+        log_info "No local backups found"
+        return 0
+    fi
+
+    # Sort dates newest first
+    local sorted_dates
+    sorted_dates=$(printf '%s\n' "${all_dates[@]}" | sort -rn)
+
+    # Compute which dates to keep
+    local -A keep_dates=()
+    while IFS= read -r d; do
+        keep_dates["$d"]=1
+    done < <(echo "$sorted_dates" | compute_keep_set)
+
+    # Delete directories whose dates are not in the keep set
+    local deleted_count=0
+    for d in "${all_dates[@]}"; do
+        if [[ -z "${keep_dates[$d]:-}" ]]; then
+            for dir in ${dir_by_date[$d]}; do
+                log_info "Deleting local backup: ${dir} (date: ${d})"
+                rm -rf "$dir"
+                ((deleted_count++))
+            done
+        fi
+    done
 
     if [[ $deleted_count -gt 0 ]]; then
-        log_success "Deleted ${deleted_count} old backup(s)"
+        log_success "Deleted ${deleted_count} old local backup(s)"
     else
-        log_info "No old backups to delete"
+        log_info "No old local backups to delete"
     fi
 }
 
@@ -222,7 +492,7 @@ create_summary() {
         echo ""
         echo "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
         echo "Backup Directory: ${BACKUP_DIR}"
-        echo "Retention Policy: ${RETENTION_DAYS} days"
+        echo "Retention Policy: ${KEEP_DAILY} daily, ${KEEP_WEEKLY} weekly, ${KEEP_MONTHLY} monthly"
         echo "Compression: ${COMPRESS}"
         echo ""
         echo "--- Backup Contents ---"
@@ -245,22 +515,28 @@ create_summary() {
 
 # Main execution
 main() {
+    # Change to project root
+    cd "$PROJECT_ROOT"
+
+    # Parse arguments (before banner so --help exits cleanly)
+    parse_args "$@"
+
     log_info "==================================="
     log_info "hybridInference Database Backup"
     log_info "==================================="
     echo ""
-
-    # Change to project root
-    cd "$PROJECT_ROOT"
-
-    # Parse arguments
-    parse_args "$@"
 
     # Load environment variables
     load_env || true
 
     # Setup backup directory
     setup_backup_dir
+
+    # Auto-enable compression when uploading to S3 (saves bandwidth)
+    if [[ -n "$S3_BUCKET" ]] && [[ "$COMPRESS" == false ]]; then
+        log_info "Auto-enabling compression for S3 upload"
+        COMPRESS=true
+    fi
 
     # Backup PostgreSQL (primary database)
     if ! backup_postgres; then
@@ -270,13 +546,25 @@ main() {
         exit 1
     fi
 
-    # Create summary
-    echo ""
-    create_summary
+    # Upload to S3 if configured
+    if [[ -n "$S3_BUCKET" ]]; then
+        echo ""
+        if ! upload_to_s3; then
+            log_error "S3 upload failed!"
+            exit 1
+        fi
+    fi
+
+    # Create summary (skip if local files were removed)
+    if [[ -d "${BACKUP_DIR}" ]]; then
+        echo ""
+        create_summary
+    fi
 
     # Cleanup old backups
     echo ""
     cleanup_old_backups
+    cleanup_old_s3_backups
 
     # Final status
     echo ""
