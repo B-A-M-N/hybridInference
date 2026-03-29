@@ -76,6 +76,14 @@ docker compose version
 uv --version
 ```
 
+## Security Note
+
+The staging gateway binds to `0.0.0.0:8000`, making it reachable on the
+server's public IP.  Before exposing the service, either:
+
+- Set `USER_AUTH_ENABLED=1` in `.env` to require API-key authentication, or
+- Restrict access with a firewall rule (e.g. `sudo ufw allow from <your-ip> to any port 8000`).
+
 ## Services Started by the Stack
 After everything starts, the server runs several services:
 - FastAPI Gateway: Main API server for LLM requests (8000)

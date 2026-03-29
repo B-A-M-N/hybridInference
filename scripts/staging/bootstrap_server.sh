@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
 echo "==> Installing base packages"
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl
@@ -32,7 +35,9 @@ if ! grep -qxF 'source $HOME/.local/bin/env' ~/.bashrc 2>/dev/null; then
 fi
 
 echo "==> Installing systemd service"
-sudo cp "$HOME/hybridInference/infrastructure/systemd/hybrid_inference.staging.service" /etc/systemd/system/
+sed -e "s|__USER__|$USER|g" -e "s|__REPO_ROOT__|$REPO_ROOT|g" \
+  "$REPO_ROOT/infrastructure/systemd/hybrid_inference.staging.service" \
+  | sudo tee /etc/systemd/system/hybrid_inference.staging.service >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable hybrid_inference.staging
 

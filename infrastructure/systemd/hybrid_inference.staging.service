@@ -4,17 +4,18 @@ Wants=network-online.target
 After=network-online.target docker.service
 
 [Service]
-User=yspark
-Group=cache-PG0
+User=__USER__
+# Group defaults to the user's primary group.  Override if needed
+# (e.g. Group=cache-PG0 on CloudLab PG0 experiments).
 Type=simple
-WorkingDirectory=/users/yspark/hybridInference
+WorkingDirectory=__REPO_ROOT__
 
-EnvironmentFile=/users/yspark/hybridInference/.env
-Environment=PYTHONPATH=/users/yspark/hybridInference
+EnvironmentFile=__REPO_ROOT__/.env
+Environment=PYTHONPATH=__REPO_ROOT__
 
 # Runs on port 8000, bound to all interfaces so it's reachable on the CloudLab public IP.
 # Change --host to 127.0.0.1 if a reverse proxy is added later.
-ExecStart=/users/yspark/hybridInference/.venv/bin/uvicorn serving.servers.app:app \
+ExecStart=__REPO_ROOT__/.venv/bin/uvicorn serving.servers.app:app \
   --host 0.0.0.0 \
   --port 8000 \
   --no-server-header

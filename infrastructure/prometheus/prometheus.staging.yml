@@ -9,7 +9,6 @@ scrape_configs:
       # host.docker.internal resolves to the host machine from inside Docker.
       # The extra_hosts entry in docker-compose.staging.yml makes this work on Linux too.
       - targets: ["host.docker.internal:8000"]
-    relabel_configs: []
 
 rule_files:
   - rules/slo_burn_rate.yml
