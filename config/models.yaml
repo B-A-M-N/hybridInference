@@ -413,6 +413,32 @@ models:
           prompt: "0"
           completion: "0"
 
+  - id: glm-5.1
+    name: GLM-5.1
+    provider: zhipu
+    quantization: "fp8"
+    context_length: 200000
+    max_output_length: 128000
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, max_tokens, stop, stream, tool_stream, thinking]
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    aliases: ["freeinference-glm-5.1"]
+    pricing:
+      prompt: "1.0"
+      completion: "3.2"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0.2"
+      input_cache_writes: "0"
+    route:
+      - kind: zhipu
+        weight: 1.0
+        base_url: https://api.z.ai/api/coding/paas/v4/
+        api_key: ${ZAI_API_KEY}
+        provider_model_id: "glm-5.1"
+
   - id: glm-5-turbo
     name: GLM-5 Turbo
     provider: zhipu
@@ -768,7 +794,7 @@ models:
   - id: gpt-5.4
     name: GPT-5.4
     provider: codex_sub
-    admin_only: true
+    required_role: internal
     provider_model_id: "gpt-5.4"
     base_url: https://chatgpt.com/backend-api/codex
     quantization: "none"
@@ -791,7 +817,7 @@ models:
   - id: gpt-5.3-codex
     name: GPT-5.3 Codex
     provider: codex_sub
-    admin_only: true
+    required_role: internal
     provider_model_id: "gpt-5.3-codex"
     base_url: https://chatgpt.com/backend-api/codex
     quantization: "none"
@@ -814,7 +840,7 @@ models:
   - id: gpt-5.2-codex
     name: GPT-5.2 Codex
     provider: codex_sub
-    admin_only: true
+    required_role: internal
     provider_model_id: "gpt-5.2-codex"
     base_url: https://chatgpt.com/backend-api/codex
     quantization: "none"
@@ -837,7 +863,7 @@ models:
   - id: gpt-5.2
     name: GPT-5.2
     provider: codex_sub
-    admin_only: true
+    required_role: internal
     provider_model_id: "gpt-5.2"
     base_url: https://chatgpt.com/backend-api/codex
     quantization: "none"
@@ -860,7 +886,7 @@ models:
   - id: gpt-5.1-codex
     name: GPT-5.1 Codex
     provider: codex_sub
-    admin_only: true
+    required_role: internal
     provider_model_id: "gpt-5.1-codex"
     base_url: https://chatgpt.com/backend-api/codex
     quantization: "none"
@@ -917,7 +943,7 @@ models:
   - id: claude-sonnet-4.6
     name: Claude Sonnet 4.6
     provider: claude_sub
-    admin_only: true
+    required_role: internal
     provider_model_id: "claude-sonnet-4-6"
     base_url: https://api.anthropic.com
     context_length: 200000
@@ -938,7 +964,7 @@ models:
   - id: claude-opus-4.6
     name: Claude Opus 4.6
     provider: claude_sub
-    admin_only: true
+    required_role: internal
     provider_model_id: "claude-opus-4-6"
     base_url: https://api.anthropic.com
     context_length: 200000
