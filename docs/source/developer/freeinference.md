@@ -70,7 +70,7 @@ We previously relied on OpenResty (Nginx + Lua) to provide a production routing 
                      │  - Model Mapping │
                      │  - Load Balancing│      ┌─────────────────┐
                      │  - Health Checks │─────▶│  Backend 2      │
-                     │  - Error Handling│      │  (Llama@8001)   │
+                     │  - Error Handling│      │  (Test@8001)   │
                      └──────────────────┘      └─────────────────┘
 ```
 
