@@ -71,6 +71,7 @@ models:
     input_modalities: ["text"]
     output_modalities: ["text"]
     aliases: ["freeinference-glm-4.7"]
+    # Z.AI PAYG https://docs.z.ai/guides/overview/pricing
     pricing:
       prompt: "0.6"
       completion: "2.2"
@@ -90,27 +91,18 @@ models:
         base_url: "https://ollama.com/v1"
         api_key: ${OLLAMA_API_KEY}
         provider_model_id: "glm-4.7"
-        pricing:
-          prompt: "0"
-          completion: "0"
       # Chutes fallback
       - kind: chutes
         weight: 0.01
         base_url: ${CHUTES_BASE_URL}
         api_key: ${CHUTES_API_KEY}
         provider_model_id: "zai-org/GLM-4.7-FP8"
-        pricing:
-          prompt: "0"
-          completion: "0"
       # Featherless fallback
       - kind: featherless
         weight: 0
         base_url: ${FEATHERLESS_BASE_URL}
         api_key: ${FEATHERLESS_API_KEY}
         provider_model_id: "zai-org/GLM-4.7"
-        pricing:
-          prompt: "0"
-          completion: "0"
 
   # - id: glm-4.7-flash
   #   name: GLM-4.7-Flash
@@ -168,6 +160,7 @@ models:
     input_modalities: ["text"]
     output_modalities: ["text"]
     aliases: ["freeinference-glm-5"]
+    # Z.AI PAYG https://docs.z.ai/guides/overview/pricing
     pricing:
       prompt: "1.0"
       completion: "3.2"
@@ -187,27 +180,18 @@ models:
         base_url: "https://ollama.com/v1"
         api_key: ${OLLAMA_API_KEY}
         provider_model_id: "glm-5"
-        pricing:
-          prompt: "0"
-          completion: "0"
       # Chutes fallback
       - kind: chutes
         weight: 0.01
         base_url: ${CHUTES_BASE_URL}
         api_key: ${CHUTES_API_KEY}
         provider_model_id: "zai-org/GLM-5-TEE"
-        pricing:
-          prompt: "0"
-          completion: "0"
       # Featherless fallback
       - kind: featherless
         weight: 0
         base_url: ${FEATHERLESS_BASE_URL}
         api_key: ${FEATHERLESS_API_KEY}
         provider_model_id: "zai-org/GLM-5"
-        pricing:
-          prompt: "0"
-          completion: "0"
 
   - id: glm-5.1
     name: GLM-5.1
@@ -221,12 +205,13 @@ models:
     input_modalities: ["text"]
     output_modalities: ["text"]
     aliases: ["freeinference-glm-5.1"]
+    # Z.AI PAYG https://docs.z.ai/guides/overview/pricing
     pricing:
-      prompt: "1.0"
-      completion: "3.2"
+      prompt: "1.4"
+      completion: "4.4"
       image: "0"
       request: "0"
-      input_cache_reads: "0.2"
+      input_cache_reads: "0.26"
       input_cache_writes: "0"
     route:
       - kind: zhipu
@@ -247,12 +232,13 @@ models:
     input_modalities: ["text"]
     output_modalities: ["text"]
     aliases: ["freeinference-glm-5-turbo"]
+    # Z.AI PAYG https://docs.z.ai/guides/overview/pricing
     pricing:
-      prompt: "0.5"
-      completion: "1.6"
+      prompt: "1.2"
+      completion: "4.0"
       image: "0"
       request: "0"
-      input_cache_reads: "0.1"
+      input_cache_reads: "0.24"
       input_cache_writes: "0"
     route:
       - kind: zhipu
@@ -353,21 +339,19 @@ models:
     supports_structured_output: true
     supported_params: [temperature, top_p, max_tokens, stop, stream]
     aliases: ["qwen3.6:27b"]
+    # Self-hosted: no third-party per-token bill (log cost as zero).
     pricing:
-      prompt: "0.02"
-      completion: "0.1"
+      prompt: "0"
+      completion: "0"
       image: "0"
       request: "0"
-      input_cache_reads: "0.01"
+      input_cache_reads: "0"
       input_cache_writes: "0"
     route:
       - kind: ollama
         weight: 1.0
         base_url: "http://host.docker.internal:8001/v1"
         provider_model_id: "qwen3.6:27b"
-        pricing:
-          prompt: "0"
-          completion: "0"
 
   - id: qwen3.6-35b
     name: Qwen3.6 35B # (Ollama 8001)
@@ -381,9 +365,10 @@ models:
     supports_structured_output: true
     supported_params: [temperature, top_p, max_tokens, stop, stream]
     aliases: ["qwen3.6:35b"]
+    # Self-hosted: no third-party per-token bill (log cost as zero).
     pricing:
-      prompt: "0.02"
-      completion: "0.1"
+      prompt: "0"
+      completion: "0"
       image: "0"
       request: "0"
       input_cache_reads: "0"
@@ -393,9 +378,6 @@ models:
         weight: 1.0
         base_url: "http://host.docker.internal:8001/v1"
         provider_model_id: "qwen3.6:27b"
-        pricing:
-          prompt: "0"
-          completion: "0"
 
   - id: minimax-m2.7
     name: MiniMax M2.7
@@ -409,13 +391,14 @@ models:
     supports_structured_output: true
     supported_params: [temperature, top_p, top_k, max_tokens, stop, seed, stream]
     aliases: ["MiniMax-M2.7"]
+    # MiniMax PAYG https://platform.minimax.io/docs/guides/pricing-paygo
     pricing:
-      prompt: "0"
-      completion: "0"
+      prompt: "0.3"
+      completion: "1.2"
       image: "0"
       request: "0"
-      input_cache_reads: "0"
-      input_cache_writes: "0"
+      input_cache_reads: "0.06"
+      input_cache_writes: "0.375"
     route:
       # Remote MiniMax API endpoint
       - kind: openai_compat
@@ -423,18 +406,12 @@ models:
         base_url: "https://api.minimax.io/v1"
         api_key: ${MINIMAX_API_KEY}
         provider_model_id: "MiniMax-M2.7"
-        pricing:
-          prompt: "0"
-          completion: "0"
       # Ollama Cloud fallback
       - kind: ollama
         weight: 1.0
         base_url: "https://ollama.com/v1"
         api_key: ${OLLAMA_API_KEY}
         provider_model_id: "minimax-m2.7"
-        pricing:
-          prompt: "0"
-          completion: "0"
 
   # ===== Embedding Models =====
 
@@ -468,6 +445,7 @@ models:
     supports_structured_output: true
     supported_params: [temperature, top_p, max_tokens, stop, stream, thinking]
     aliases: ["MiniMax-M2.5"]
+    # MiniMax PAYG https://platform.minimax.io/docs/guides/pricing-paygo
     pricing:
       prompt: "0.3"
       completion: "1.2"
@@ -488,27 +466,18 @@ models:
         base_url: "https://ollama.com/v1"
         api_key: ${OLLAMA_API_KEY}
         provider_model_id: "minimax-m2.5"
-        pricing:
-          prompt: "0"
-          completion: "0"
       # Chutes fallback
       - kind: chutes
         weight: 0.01
         base_url: ${CHUTES_BASE_URL}
         api_key: ${CHUTES_API_KEY}
         provider_model_id: "MiniMaxAI/MiniMax-M2.5-TEE"
-        pricing:
-          prompt: "0"
-          completion: "0"
       # Featherless fallback
       - kind: featherless
         weight: 0
         base_url: ${FEATHERLESS_BASE_URL}
         api_key: ${FEATHERLESS_API_KEY}
         provider_model_id: "MiniMaxAI/MiniMax-M2.5"
-        pricing:
-          prompt: "0"
-          completion: "0"
 
   # --- Codex Subscription Models (uncomment when accounts are configured) ---
   # Requires: var/data/codex_accounts.json with valid OAuth credentials.
@@ -531,10 +500,14 @@ models:
     supports_tools: true
     supports_structured_output: true
     supported_params: [temperature, max_tokens, stop, tools, tool_choice, reasoning_effort]
+    # OpenAI API https://openai.com/api/pricing/ (GPT-5.4)
     pricing:
       prompt: "2.50"
       completion: "15.00"
+      image: "0"
+      request: "0"
       input_cache_reads: "0.25"
+      input_cache_writes: "0"
     route:
       - kind: codex_sub
         weight: 1.0
@@ -555,9 +528,14 @@ models:
     input_modalities: [text, image]
     output_modalities: [text]
     quantization: "none"
+    # Anthropic API https://docs.anthropic.com/en/about-claude/pricing
     pricing:
       prompt: "3.00"
       completion: "15.00"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0.30"
+      input_cache_writes: "3.75"
     route:
       - kind: claude_sub
         weight: 1.0
@@ -576,9 +554,14 @@ models:
     input_modalities: [text, image]
     output_modalities: [text]
     quantization: "none"
+    # Anthropic API https://docs.anthropic.com/en/about-claude/pricing
     pricing:
       prompt: "5.00"
       completion: "25.00"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0.50"
+      input_cache_writes: "6.25"
     route:
       - kind: claude_sub
         weight: 1.0
