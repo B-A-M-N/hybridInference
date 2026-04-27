@@ -200,17 +200,22 @@ services:
 
 volumes:
   postgres_data:
-    driver: local
+    external: true
+    name: hybridinference_postgres_data
   pgadmin_data:
     driver: local
   prometheus_data:
-    driver: local
+    external: true
+    name: hybridinference_prometheus_data
   alertmanager_data:
-    driver: local
+    external: true
+    name: hybridinference_alertmanager_data
   alert_log_data:
-    driver: local
+    external: true
+    name: hybridinference_alert_log_data
   grafana_data:
-    driver: local
+    external: true
+    name: hybridinference_grafana_data
 
 networks:
   hybridinference:
