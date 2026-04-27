@@ -112,49 +112,49 @@ models:
           prompt: "0"
           completion: "0"
 
-  - id: glm-4.7-flash
-    name: GLM-4.7-Flash
-    provider: zhipu
-    quantization: "q8"
-    context_length: 200000
-    max_output_length: 128000
-    supports_tools: true
-    supports_structured_output: true
-    supported_params: [temperature, top_p, max_tokens, stop, stream, tool_stream, thinking]
-    input_modalities: ["text"]
-    output_modalities: ["text"]
-    aliases: ["freeinference-glm-4.7-flash"]
-    pricing:
-      prompt: "0.07"
-      completion: "0.4"
-      image: "0"
-      request: "0"
-      input_cache_reads: "0.01"
-      input_cache_writes: "0"
-    route:
-      # Local self-hosted endpoint (AWQ 4-bit via vLLM)
-      - kind: openai_compat
-        weight: 1.0
-        base_url: "http://host.docker.internal:8004/v1"
-        provider_model_id: "glm-4.7-flash"
-        pricing:
-          prompt: "0"
-          completion: "0"
-      # Remote Zhipu API (disabled, set weight > 0 to re-enable)
-      - kind: zhipu
-        weight: 0
-        base_url: https://api.z.ai/api/coding/paas/v4/
-        api_key: ${ZAI_API_KEY}
-        provider_model_id: "glm-4.7-flash"
-      # Featherless fallback
-      - kind: featherless
-        weight: 0
-        base_url: ${FEATHERLESS_BASE_URL}
-        api_key: ${FEATHERLESS_API_KEY}
-        provider_model_id: "zai-org/GLM-4.7-Flash"
-        pricing:
-          prompt: "0"
-          completion: "0"
+  # - id: glm-4.7-flash
+  #   name: GLM-4.7-Flash
+  #   provider: zhipu
+  #   quantization: "q8"
+  #   context_length: 200000
+  #   max_output_length: 128000
+  #   supports_tools: true
+  #   supports_structured_output: true
+  #   supported_params: [temperature, top_p, max_tokens, stop, stream, tool_stream, thinking]
+  #   input_modalities: ["text"]
+  #   output_modalities: ["text"]
+  #   aliases: ["freeinference-glm-4.7-flash"]
+  #   pricing:
+  #     prompt: "0.07"
+  #     completion: "0.4"
+  #     image: "0"
+  #     request: "0"
+  #     input_cache_reads: "0.01"
+  #     input_cache_writes: "0"
+  #   route:
+  #     # Local self-hosted endpoint (AWQ 4-bit via vLLM)
+  #     - kind: openai_compat
+  #       weight: 1.0
+  #       base_url: "http://host.docker.internal:8004/v1"
+  #       provider_model_id: "glm-4.7-flash"
+  #       pricing:
+  #         prompt: "0"
+  #         completion: "0"
+  #     # Remote Zhipu API (disabled, set weight > 0 to re-enable)
+  #     - kind: zhipu
+  #       weight: 0
+  #       base_url: https://api.z.ai/api/coding/paas/v4/
+  #       api_key: ${ZAI_API_KEY}
+  #       provider_model_id: "glm-4.7-flash"
+  #     # Featherless fallback
+  #     - kind: featherless
+  #       weight: 0
+  #       base_url: ${FEATHERLESS_BASE_URL}
+  #       api_key: ${FEATHERLESS_API_KEY}
+  #       provider_model_id: "zai-org/GLM-4.7-Flash"
+  #       pricing:
+  #         prompt: "0"
+  #         completion: "0"
 
   - id: glm-5
     name: GLM-5
@@ -304,9 +304,46 @@ models:
   #         prompt: "0"
   #         completion: "0"
 
-  - id: qwen3.5-27b
-    name: Qwen3.5 27B
-    provider: qwen
+  # - id: qwen3.5-27b
+  #   name: Qwen3.5 27B
+  #   provider: qwen
+  #   quantization: "unknown"
+  #   input_modalities: ["text"]
+  #   output_modalities: ["text"]
+  #   context_length: 65536
+  #   max_output_length: 8192
+  #   supports_tools: true
+  #   supports_structured_output: true
+  #   supported_params: [temperature, top_p, max_tokens, stop]
+  #   aliases: ["Qwen3.5-27B"]
+  #   pricing:
+  #     prompt: "0"
+  #     completion: "0"
+  #     image: "0"
+  #     request: "0"
+  #     input_cache_reads: "0"
+  #     input_cache_writes: "0"
+  #   route:
+  #     - kind: sglang
+  #       weight: 1.0
+  #       base_url: "http://host.docker.internal:8007"
+  #       provider_model_id: "Qwen3.5-27B"
+  #       pricing:
+  #         prompt: "0"
+  #         completion: "0"
+  #     # Featherless fallback
+  #     - kind: featherless
+  #       weight: 0
+  #       base_url: ${FEATHERLESS_BASE_URL}
+  #       api_key: ${FEATHERLESS_API_KEY}
+  #       provider_model_id: "Qwen/Qwen3.5-27B"
+  #       pricing:
+  #         prompt: "0"
+  #         completion: "0"
+
+  - id: qwen3.6-27b
+    name: Qwen3.6 27B # (Ollama 8001)
+    provider: ollama
     quantization: "unknown"
     input_modalities: ["text"]
     output_modalities: ["text"]
@@ -314,29 +351,48 @@ models:
     max_output_length: 8192
     supports_tools: true
     supports_structured_output: true
-    supported_params: [temperature, top_p, max_tokens, stop]
-    aliases: ["Qwen3.5-27B"]
+    supported_params: [temperature, top_p, max_tokens, stop, stream]
+    aliases: ["qwen3.6:27b"]
     pricing:
-      prompt: "0"
-      completion: "0"
+      prompt: "0.02"
+      completion: "0.1"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0.01"
+      input_cache_writes: "0"
+    route:
+      - kind: ollama
+        weight: 1.0
+        base_url: "http://host.docker.internal:8001/v1"
+        provider_model_id: "qwen3.6:27b"
+        pricing:
+          prompt: "0"
+          completion: "0"
+
+  - id: qwen3.6-35b
+    name: Qwen3.6 35B # (Ollama 8001)
+    provider: ollama
+    quantization: "unknown"
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    context_length: 65536
+    max_output_length: 8192
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, max_tokens, stop, stream]
+    aliases: ["qwen3.6:35b"]
+    pricing:
+      prompt: "0.02"
+      completion: "0.1"
       image: "0"
       request: "0"
       input_cache_reads: "0"
       input_cache_writes: "0"
     route:
-      - kind: sglang
+      - kind: ollama
         weight: 1.0
-        base_url: "http://host.docker.internal:8007"
-        provider_model_id: "Qwen3.5-27B"
-        pricing:
-          prompt: "0"
-          completion: "0"
-      # Featherless fallback
-      - kind: featherless
-        weight: 0
-        base_url: ${FEATHERLESS_BASE_URL}
-        api_key: ${FEATHERLESS_API_KEY}
-        provider_model_id: "Qwen/Qwen3.5-27B"
+        base_url: "http://host.docker.internal:8001/v1"
+        provider_model_id: "qwen3.6:27b"
         pricing:
           prompt: "0"
           completion: "0"
@@ -382,23 +438,23 @@ models:
 
   # ===== Embedding Models =====
 
-  - id: bge-m3
-    name: BGE-M3
-    type: embedding
-    provider: sglang
-    quantization: "fp16"
-    input_modalities: ["text"]
-    output_modalities: ["embedding"]
-    context_length: 8192
-    max_output_length: 0
-    pricing:
-      prompt: "0"
-      completion: "0"
-    route:
-      - kind: sglang
-        weight: 1.0
-        base_url: "http://host.docker.internal:8005"
-        provider_model_id: "bge-m3"
+  # - id: bge-m3
+  #   name: BGE-M3
+  #   type: embedding
+  #   provider: sglang
+  #   quantization: "fp16"
+  #   input_modalities: ["text"]
+  #   output_modalities: ["embedding"]
+  #   context_length: 8192
+  #   max_output_length: 0
+  #   pricing:
+  #     prompt: "0"
+  #     completion: "0"
+  #   route:
+  #     - kind: sglang
+  #       weight: 1.0
+  #       base_url: "http://host.docker.internal:8005"
+  #       provider_model_id: "bge-m3"
 
   - id: minimax-m2.5
     name: MiniMax M2.5
