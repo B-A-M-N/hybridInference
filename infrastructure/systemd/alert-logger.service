@@ -4,9 +4,9 @@ After=network.target alertmanager.service
 
 [Service]
 Type=simple
-User=murphy
+User=freeinference
 WorkingDirectory=/srv/hybridInference
-ExecStart=/usr/bin/python3 /srv/hybridInference/infrastructure/alertmanager/alert_logger.py
+ExecStart=/srv/hybridInference/.venv/bin/python /srv/hybridInference/infrastructure/alertmanager/alert_logger.py
 Restart=on-failure
 RestartSec=5s
 

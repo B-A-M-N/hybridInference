@@ -4,8 +4,8 @@ Wants=network-online.target
 After=network-online.target home.mount
 
 [Service]
-User=murphy
-Group=murphy
+User=freeinference
+Group=freeinference
 Type=simple
 WorkingDirectory=/srv/hybridInference
 ExecStart=/srv/hybridInference/.venv/bin/uvicorn serving.servers.app:app \
