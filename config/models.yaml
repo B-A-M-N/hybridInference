@@ -409,23 +409,21 @@ models:
     supports_structured_output: true
     supported_params: [temperature, top_p, top_k, max_tokens, stop, seed, stream]
     aliases: ["MiniMax-M2.7"]
+    # PAYG per https://platform.minimax.io/docs/guides/pricing-paygo (MiniMax-M2.7)
     pricing:
-      prompt: "0"
-      completion: "0"
+      prompt: "0.3"
+      completion: "1.2"
       image: "0"
       request: "0"
-      input_cache_reads: "0"
-      input_cache_writes: "0"
+      input_cache_reads: "0.06"
+      input_cache_writes: "0.375"
     route:
-      # Remote MiniMax API endpoint
+      # Remote MiniMax API endpoint (inherits model pricing; no route override)
       - kind: openai_compat
         weight: 1.0
         base_url: "https://api.minimax.io/v1"
         api_key: ${MINIMAX_API_KEY}
         provider_model_id: "MiniMax-M2.7"
-        pricing:
-          prompt: "0"
-          completion: "0"
       # Ollama Cloud fallback
       - kind: ollama
         weight: 1.0
