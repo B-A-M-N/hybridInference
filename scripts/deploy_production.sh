@@ -6,6 +6,7 @@ set -Eeuo pipefail
 
 APP_DIR="${APP_DIR:-/srv/hybridInference}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8080/health}"
+FRONTEND_HEALTH_URL="${FRONTEND_HEALTH_URL:-http://127.0.0.1:3001/}"
 TARGET_BRANCH="${TARGET_BRANCH:-main}"
 DEPLOY_SHA="${DEPLOY_SHA:-}"
 COMPOSE=(docker compose -f infrastructure/docker/docker-compose.yml --env-file .env)
@@ -58,6 +59,9 @@ log "Deploying ${target_sha} (current ${current_sha})."
 git reset --hard "$target_sha"
 git submodule update --init --recursive
 
+log "Syncing subscription credentials."
+make sync-subscriptions
+
 log "Rebuilding and restarting Docker Compose services."
 make build
 
@@ -65,7 +69,11 @@ log "Current service state:"
 "${COMPOSE[@]}" ps
 
 log "Checking backend health at ${HEALTH_URL}."
-curl -fsS --retry 5 --retry-delay 2 --retry-connrefused "$HEALTH_URL"
+curl -fsS --retry 30 --retry-delay 5 --retry-connrefused "$HEALTH_URL"
 printf '\n'
+
+log "Checking frontend health at ${FRONTEND_HEALTH_URL}."
+curl -fsS --retry 30 --retry-delay 5 --retry-connrefused --output /dev/null \
+  "$FRONTEND_HEALTH_URL"
 
 log "Production deployment completed."

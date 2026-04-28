@@ -26,6 +26,7 @@ jobs:
       - name: Configure SSH
         env:
           PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_HOST_KEY: ${{ secrets.PROD_HOST_KEY }}
           PROD_PORT: ${{ secrets.PROD_PORT || '22' }}
           PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
@@ -37,10 +38,13 @@ jobs:
           printf '%s\n' "${PROD_SSH_KEY}" > "${HOME}/.ssh/production_deploy_key"
           chmod 600 "${HOME}/.ssh/production_deploy_key"
 
-          ssh-keyscan -p "${PROD_PORT}" -H "${PROD_HOST}" >> "${HOME}/.ssh/known_hosts"
+          printf '%s\n' "${PROD_HOST_KEY}" > "${HOME}/.ssh/known_hosts"
+          chmod 600 "${HOME}/.ssh/known_hosts"
 
       - name: Deploy on production host
         env:
+          # workflow_run deploys the CI-validated commit; manual dispatch uses
+          # the workflow file revision selected in the GitHub UI.
           DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
           PROD_HOST: ${{ secrets.PROD_HOST }}
           PROD_PORT: ${{ secrets.PROD_PORT || '22' }}
