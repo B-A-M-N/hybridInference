@@ -6,7 +6,6 @@ Traffic flows through three layers before reaching the application:
 
 ```
 Client ──▶ Cloudflare ──▶ Nginx (:443) ──▶ FastAPI  (:8080)
-                                      ├──▶ Grafana  (:3000)   [admin-only]
                                       ├──▶ pgAdmin  (:5050)   [admin-only]
                                       └──▶ Frontend (:3001)
 ```
@@ -20,12 +19,12 @@ Client ──▶ Cloudflare ──▶ Nginx (:443) ──▶ FastAPI  (:8080)
 Nginx path routing:
 
 - `/v1/`, `/auth/`, `/user/`, `/admin/`, `/internal/playground/` → FastAPI
-- `/grafana/` → Grafana, `/pgadmin/` → pgAdmin — both gated by `auth_request` against FastAPI's `/internal/verify-*` endpoints, so only admins reach them
+- `/pgadmin/` → pgAdmin — gated by `auth_request` against FastAPI's `/internal/verify-*` endpoints, so only admins reach it
 - everything else → frontend
 
-Docker Compose manages all services (backend, frontend, PostgreSQL, Prometheus,
-Alertmanager, Grafana, plus pgAdmin behind the `admin` profile)
-with automatic restarts via `restart: unless-stopped`.
+Docker Compose manages all services (backend, frontend, PostgreSQL, Alertmanager,
+alert-logger, plus pgAdmin behind the `admin` profile) with automatic restarts
+via `restart: unless-stopped`.
 
 ### Deployment
 

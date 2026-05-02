@@ -1,67 +1,65 @@
-# Alertmanager (internal)
+# Alertmanager
 
-Alertmanager receives alerts from the local Prometheus and forwards an
-allowlisted subset to Slack `#free-inference-alert`. Anything not in the
-allowlist falls to a `blackhole` receiver.
-
-This is the internal stack. The external monitor (separate host) lives
-in `infrastructure/external-monitor/` and runs its own Alertmanager.
+Alertmanager receives alerts from a metrics source (historically Prometheus) and routes them to your notification channels (Slack, Email, etc.). This project no longer ships an in-tree Prometheus, so by default Alertmanager runs without a feeding source — it is kept available for future re-introduction of a metrics pipeline. This folder contains an example configuration you can copy and adapt.
 
 ## Files
+- `alertmanager.yml.example` — Template config demonstrating common receivers and routing.
 
-- `alertmanager.yml` — live config. References the Slack webhook URL
-  via `api_url_file:` (no env-var substitution needed).
-- `alertmanager.yml.example` — copyable template.
+## Quick Start (local)
 
-## Webhook URL
-
-The Slack incoming webhook URL is **not** in git. Alertmanager reads it
-at runtime from the file referenced by `slack_configs[0].api_url_file`
-(`/etc/alertmanager/secrets/slack-webhook-url` inside the container).
-
-Provision the file on the host before bringing the stack up:
+1) Create your config from the template:
 
 ```bash
-sudo install -d -m 700 -o root -g root /etc/freeinference
-sudo install -m 600 /dev/null /etc/freeinference/slack-webhook-url
-echo -n 'https://hooks.slack.com/services/...' | sudo tee /etc/freeinference/slack-webhook-url > /dev/null
+cp infrastructure/alertmanager/alertmanager.yml.example \
+   infrastructure/alertmanager/alertmanager.yml
 ```
 
-Use `echo -n` so no trailing newline is appended — Alertmanager treats
-the entire file content (minus a single trailing newline) as the URL.
+2) Configure a receiver (Slack or Email). Example snippets:
 
-The compose service in `infrastructure/docker/docker-compose.yml`
-mounts this host path read-only into the container at the path
-referenced by `api_url_file`. The mount source is overridable via the
-`ALERTMANAGER_SLACK_WEBHOOK_FILE` env var (set in `.env` if needed),
-defaulting to `/etc/freeinference/slack-webhook-url`.
+Slack:
+```yaml
+route:
+  receiver: slack-default
+receivers:
+  - name: slack-default
+    slack_configs:
+      - send_resolved: true
+        api_url: "https://hooks.slack.com/services/XXX/YYY/ZZZ"  # replace
+        channel: "#alerts"
+```
 
-After updating the webhook file, reload Alertmanager so it re-reads it:
+Email (SMTP):
+```yaml
+route:
+  receiver: email-default
+receivers:
+  - name: email-default
+    email_configs:
+      - to: "alerts@example.com"
+        from: "noreply@example.com"
+        smarthost: "smtp.example.com:587"
+        auth_username: "smtp-user"
+        auth_password: "${SMTP_PASSWORD}"  # mount via env/file; do not commit secrets
+```
+
+3) Run Alertmanager with Docker:
 
 ```bash
-curl -X POST http://127.0.0.1:9093/-/reload
+docker run --rm -p 9093:9093 \
+  -v $(pwd)/infrastructure/alertmanager:/etc/alertmanager \
+  prom/alertmanager:latest \
+  --config.file=/etc/alertmanager/alertmanager.yml
 ```
 
-## Adding a new alert to the Slack route
-
-1. Define the rule in `infrastructure/prometheus/rules/`.
-2. Add the `alertname` to the `match_re` allowlist in `alertmanager.yml`.
-3. Validate: `amtool check-config /path/to/alertmanager.yml`.
-4. Reload Alertmanager.
-
-The allowlist is intentional: a bare top-level Slack receiver would
-page on any rule that fires, including freshly re-enabled rules whose
-noise level has not been verified.
+4) Point your metrics source at Alertmanager (e.g. for Prometheus, configure
+   the `alerting.alertmanagers` block to target `localhost:9093`).
 
 ## Verify
+- Open `http://localhost:9093` for the Alertmanager UI.
+- Health endpoints: `/-/ready` and `/-/healthy`.
 
-- UI: `http://localhost:9093`
-- Health: `/-/ready`, `/-/healthy`
-- Synthetic test: temporarily lower a `for: 2m` rule to `for: 10s` in
-  `infrastructure/prometheus/rules/service_availability.yml`, stop the
-  app process, confirm a Slack message arrives. Revert the rule.
-
-## Related
-
-- Prometheus rules: `infrastructure/prometheus/rules/`.
-- External monitor: `infrastructure/external-monitor/`.
+## Tips
+- Grouping and routing: group by labels such as `alertname`, `env`, `service` to reduce noise.
+- Templating: use Alertmanager templates to include labels like `route`, `provider`, `model` in messages.
+- Secrets: never commit secrets; prefer env vars or mounted files for webhook URLs and SMTP credentials.
+- Reverse proxy: set `--web.external-url` (or `external_url` in config) if exposed behind a proxy.
