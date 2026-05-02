@@ -540,8 +540,8 @@ models:
     route:
       - kind: anthropic
         weight: 1.0
-        base_url: https://api.anthropic.com
-        api_key: ${ANTHROPIC_API_KEY}
+        base_url: http://host.docker.internal:8317
+        api_key: ${CLI_PROXY_API_KEY}
         provider_model_id: "claude-sonnet-4-6"
   #
   - id: claude-opus-4.6
@@ -568,8 +568,8 @@ models:
     route:
       - kind: anthropic
         weight: 1.0
-        base_url: https://api.anthropic.com
-        api_key: ${ANTHROPIC_API_KEY}
+        base_url: http://host.docker.internal:8317
+        api_key: ${CLI_PROXY_API_KEY}
         provider_model_id: "claude-opus-4-6"
   #
   - id: claude-opus-4.7
@@ -577,7 +577,7 @@ models:
     provider: anthropic
     required_role: internal
     provider_model_id: "claude-opus-4-7"
-    context_length: 200000
+    context_length: 1000000
     max_output_length: 128000
     supports_tools: true
     supports_structured_output: true
@@ -596,8 +596,8 @@ models:
     route:
       - kind: anthropic
         weight: 1.0
-        base_url: https://api.anthropic.com
-        api_key: ${ANTHROPIC_API_KEY}
+        base_url: http://host.docker.internal:8317
+        api_key: ${CLI_PROXY_API_KEY}
         provider_model_id: "claude-opus-4-7"
   # ── OpenRouter examples ────────────────────────────────────
   # Bare `kind: openrouter` lets OpenRouter pick the upstream provider
