@@ -82,13 +82,13 @@ models:
     route:
       - kind: zhipu
         weight: 1.0
-        base_url: https://api.z.ai/api/coding/paas/v4/
+        base_url: ${ZAI_BASE_URL}
         api_key: ${ZAI_API_KEY}
         provider_model_id: "glm-4.7"
       # Ollama Cloud fallback
       - kind: ollama
         weight: 1.0
-        base_url: "https://ollama.com/v1"
+        base_url: ${OLLAMA_BASE_URL}
         api_key: ${OLLAMA_API_KEY}
         provider_model_id: "glm-4.7"
       # Chutes fallback
@@ -171,13 +171,13 @@ models:
     route:
       - kind: zhipu
         weight: 1.0
-        base_url: https://api.z.ai/api/coding/paas/v4/
+        base_url: ${ZAI_BASE_URL}
         api_key: ${ZAI_API_KEY}
         provider_model_id: "glm-5"
       # Ollama Cloud fallback
       - kind: ollama
         weight: 1.0
-        base_url: "https://ollama.com/v1"
+        base_url: ${OLLAMA_BASE_URL}
         api_key: ${OLLAMA_API_KEY}
         provider_model_id: "glm-5"
       # Chutes fallback
@@ -216,7 +216,7 @@ models:
     route:
       - kind: zhipu
         weight: 1.0
-        base_url: https://api.z.ai/api/coding/paas/v4/
+        base_url: ${ZAI_BASE_URL}
         api_key: ${ZAI_API_KEY}
         provider_model_id: "glm-5.1"
 
@@ -243,7 +243,7 @@ models:
     route:
       - kind: zhipu
         weight: 1.0
-        base_url: https://api.z.ai/api/coding/paas/v4/
+        base_url: ${ZAI_BASE_URL}
         api_key: ${ZAI_API_KEY}
         provider_model_id: "glm-5-turbo"
 
@@ -350,7 +350,7 @@ models:
     route:
       - kind: ollama
         weight: 1.0
-        base_url: "http://host.docker.internal:8001/v1"
+        base_url: ${LOCAL_OLLAMA_BASE_URL}
         provider_model_id: "qwen3.6:27b"
 
   - id: qwen3.6-35b
@@ -376,7 +376,7 @@ models:
     route:
       - kind: ollama
         weight: 1.0
-        base_url: "http://host.docker.internal:8001/v1"
+        base_url: ${LOCAL_OLLAMA_BASE_URL}
         provider_model_id: "qwen3.6:35b"
 
   - id: minimax-m2.7
@@ -403,13 +403,13 @@ models:
       # Remote MiniMax API endpoint
       - kind: minimax
         weight: 1.0
-        base_url: "https://api.minimax.io/v1"
+        base_url: ${MINIMAX_BASE_URL}
         api_key: ${MINIMAX_API_KEY}
         provider_model_id: "MiniMax-M2.7"
       # Ollama Cloud fallback
       - kind: ollama
         weight: 1.0
-        base_url: "https://ollama.com/v1"
+        base_url: ${OLLAMA_BASE_URL}
         api_key: ${OLLAMA_API_KEY}
         provider_model_id: "minimax-m2.7"
 
@@ -457,13 +457,13 @@ models:
       # Remote MiniMax API endpoint
       - kind: minimax
         weight: 1.0
-        base_url: "https://api.minimax.io/v1"
+        base_url: ${MINIMAX_BASE_URL}
         api_key: ${MINIMAX_API_KEY}
         provider_model_id: "MiniMax-M2.5"
       # Ollama Cloud fallback
       - kind: ollama
         weight: 1.0
-        base_url: "https://ollama.com/v1"
+        base_url: ${OLLAMA_BASE_URL}
         api_key: ${OLLAMA_API_KEY}
         provider_model_id: "minimax-m2.5"
       # Chutes fallback
@@ -491,7 +491,7 @@ models:
     provider: codex_sub
     required_role: internal
     provider_model_id: "gpt-5.4"
-    base_url: https://chatgpt.com/backend-api/codex
+    base_url: ${CODEX_BASE_URL}
     quantization: "none"
     input_modalities: ["text", "image"]
     output_modalities: ["text"]
@@ -511,7 +511,7 @@ models:
     route:
       - kind: codex_sub
         weight: 1.0
-        base_url: https://chatgpt.com/backend-api/codex
+        base_url: ${CODEX_BASE_URL}
 
   # ── Anthropic direct (kind: anthropic) ─────────────────────
   # These models route directly to api.anthropic.com via the AnthropicAdapter.
@@ -540,7 +540,7 @@ models:
     route:
       - kind: anthropic
         weight: 1.0
-        base_url: http://host.docker.internal:8317
+        base_url: ${CLI_PROXY_BASE_URL}
         api_key: ${CLI_PROXY_API_KEY}
         provider_model_id: "claude-sonnet-4-6"
   #
@@ -568,7 +568,7 @@ models:
     route:
       - kind: anthropic
         weight: 1.0
-        base_url: http://host.docker.internal:8317
+        base_url: ${CLI_PROXY_BASE_URL}
         api_key: ${CLI_PROXY_API_KEY}
         provider_model_id: "claude-opus-4-6"
   #
@@ -596,7 +596,7 @@ models:
     route:
       - kind: anthropic
         weight: 1.0
-        base_url: http://host.docker.internal:8317
+        base_url: ${CLI_PROXY_BASE_URL}
         api_key: ${CLI_PROXY_API_KEY}
         provider_model_id: "claude-opus-4-7"
   # ── OpenRouter examples ────────────────────────────────────
