@@ -206,6 +206,94 @@ models:
           - ${ZAI_API_KEY}
         provider_model_id: "glm-5-turbo"
 
+
+  - id: minimax-m2.5
+    name: MiniMax M2.5
+    provider: minimax
+    quantization: "bf16"
+    input_modalities: ["text", "image"]
+    output_modalities: ["text"]
+    context_length: 196608
+    max_output_length: 131072
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, max_tokens, stop, stream, thinking]
+    aliases: ["MiniMax-M2.5"]
+    # MiniMax PAYG https://platform.minimax.io/docs/guides/pricing-paygo
+    pricing:
+      prompt: "0.3"
+      completion: "1.2"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0.03"
+      input_cache_writes: "0.375"
+    route:
+      # Remote MiniMax API endpoint
+      - kind: minimax
+        weight: 1.0
+        base_url: ${MINIMAX_BASE_URL}
+        api_keys:
+          - ${MINIMAX_API_KEY}
+        provider_model_id: "MiniMax-M2.5"
+      # Ollama Cloud fallback
+      - kind: ollama
+        weight: 1.0
+        base_url: ${OLLAMA_BASE_URL}
+        api_keys:
+          - ${OLLAMA_API_KEY}
+        provider_model_id: "minimax-m2.5"
+      # Chutes fallback
+      - kind: chutes
+        weight: 0.01
+        base_url: ${CHUTES_BASE_URL}
+        api_keys:
+          - ${CHUTES_API_KEY}
+        provider_model_id: "MiniMaxAI/MiniMax-M2.5-TEE"
+      # Featherless fallback
+      - kind: featherless
+        weight: 0
+        base_url: ${FEATHERLESS_BASE_URL}
+        api_keys:
+          - ${FEATHERLESS_API_KEY}
+        provider_model_id: "MiniMaxAI/MiniMax-M2.5"
+
+  - id: minimax-m2.7
+    name: MiniMax M2.7
+    provider: minimax
+    quantization: "bf16"
+    input_modalities: ["text"]
+    output_modalities: ["text"]
+    context_length: 196608
+    max_output_length: 8192
+    supports_tools: true
+    supports_structured_output: true
+    supported_params: [temperature, top_p, top_k, max_tokens, stop, seed, stream]
+    aliases: ["MiniMax-M2.7"]
+    # MiniMax PAYG https://platform.minimax.io/docs/guides/pricing-paygo
+    pricing:
+      prompt: "0.3"
+      completion: "1.2"
+      image: "0"
+      request: "0"
+      input_cache_reads: "0.06"
+      input_cache_writes: "0.375"
+    route:
+      # Remote MiniMax API endpoint
+      - kind: minimax
+        weight: 1.0
+        base_url: ${MINIMAX_BASE_URL}
+        api_keys:
+          - ${MINIMAX_API_KEY}
+        provider_model_id: "MiniMax-M2.7"
+      # Ollama Cloud fallback
+      - kind: ollama
+        weight: 1.0
+        base_url: ${OLLAMA_BASE_URL}
+        api_keys:
+          - ${OLLAMA_API_KEY}
+        provider_model_id: "minimax-m2.7"
+
+
   # ===== External Provider =====
   # - id: deepseek-r1
   #   name: DeepSeek R1 (via Chutes)
@@ -291,11 +379,11 @@ models:
 
   - id: qwen3.6-27b
     name: Qwen3.6 27B # (Ollama 8001)
-    provider: ollama
+    provider: vllm
     quantization: "unknown"
     input_modalities: ["text"]
     output_modalities: ["text"]
-    context_length: 65536
+    context_length: 135168
     max_output_length: 8192
     supports_tools: true
     supports_structured_output: true
@@ -310,18 +398,18 @@ models:
       input_cache_reads: "0"
       input_cache_writes: "0"
     route:
-      - kind: ollama
+      - kind: vllm
         weight: 1.0
-        base_url: ${LOCAL_OLLAMA_BASE_URL}
+        base_url: http://host.docker.internal:10800
         provider_model_id: "qwen3.6:27b"
 
   - id: qwen3.6-35b
     name: Qwen3.6 35B # (Ollama 8001)
-    provider: ollama
+    provider: vllm
     quantization: "unknown"
     input_modalities: ["text"]
     output_modalities: ["text"]
-    context_length: 65536
+    context_length: 135168
     max_output_length: 8192
     supports_tools: true
     supports_structured_output: true
@@ -336,46 +424,10 @@ models:
       input_cache_reads: "0"
       input_cache_writes: "0"
     route:
-      - kind: ollama
+      - kind: vllm
         weight: 1.0
-        base_url: ${LOCAL_OLLAMA_BASE_URL}
+        base_url: http://host.docker.internal:10801
         provider_model_id: "qwen3.6:35b"
-
-  - id: minimax-m2.7
-    name: MiniMax M2.7
-    provider: minimax
-    quantization: "bf16"
-    input_modalities: ["text"]
-    output_modalities: ["text"]
-    context_length: 196608
-    max_output_length: 8192
-    supports_tools: true
-    supports_structured_output: true
-    supported_params: [temperature, top_p, top_k, max_tokens, stop, seed, stream]
-    aliases: ["MiniMax-M2.7"]
-    # MiniMax PAYG https://platform.minimax.io/docs/guides/pricing-paygo
-    pricing:
-      prompt: "0.3"
-      completion: "1.2"
-      image: "0"
-      request: "0"
-      input_cache_reads: "0.06"
-      input_cache_writes: "0.375"
-    route:
-      # Remote MiniMax API endpoint
-      - kind: minimax
-        weight: 1.0
-        base_url: ${MINIMAX_BASE_URL}
-        api_keys:
-          - ${MINIMAX_API_KEY}
-        provider_model_id: "MiniMax-M2.7"
-      # Ollama Cloud fallback
-      - kind: ollama
-        weight: 1.0
-        base_url: ${OLLAMA_BASE_URL}
-        api_keys:
-          - ${OLLAMA_API_KEY}
-        provider_model_id: "minimax-m2.7"
 
   # ===== Embedding Models =====
 
@@ -396,56 +448,6 @@ models:
   #       weight: 1.0
   #       base_url: "http://host.docker.internal:8005"
   #       provider_model_id: "bge-m3"
-
-  - id: minimax-m2.5
-    name: MiniMax M2.5
-    provider: minimax
-    quantization: "bf16"
-    input_modalities: ["text", "image"]
-    output_modalities: ["text"]
-    context_length: 196608
-    max_output_length: 131072
-    supports_tools: true
-    supports_structured_output: true
-    supported_params: [temperature, top_p, max_tokens, stop, stream, thinking]
-    aliases: ["MiniMax-M2.5"]
-    # MiniMax PAYG https://platform.minimax.io/docs/guides/pricing-paygo
-    pricing:
-      prompt: "0.3"
-      completion: "1.2"
-      image: "0"
-      request: "0"
-      input_cache_reads: "0.03"
-      input_cache_writes: "0.375"
-    route:
-      # Remote MiniMax API endpoint
-      - kind: minimax
-        weight: 1.0
-        base_url: ${MINIMAX_BASE_URL}
-        api_keys:
-          - ${MINIMAX_API_KEY}
-        provider_model_id: "MiniMax-M2.5"
-      # Ollama Cloud fallback
-      - kind: ollama
-        weight: 1.0
-        base_url: ${OLLAMA_BASE_URL}
-        api_keys:
-          - ${OLLAMA_API_KEY}
-        provider_model_id: "minimax-m2.5"
-      # Chutes fallback
-      - kind: chutes
-        weight: 0.01
-        base_url: ${CHUTES_BASE_URL}
-        api_keys:
-          - ${CHUTES_API_KEY}
-        provider_model_id: "MiniMaxAI/MiniMax-M2.5-TEE"
-      # Featherless fallback
-      - kind: featherless
-        weight: 0
-        base_url: ${FEATHERLESS_BASE_URL}
-        api_keys:
-          - ${FEATHERLESS_API_KEY}
-        provider_model_id: "MiniMaxAI/MiniMax-M2.5"
 
   # ── Anthropic direct (kind: anthropic) ─────────────────────
   # These models route directly to api.anthropic.com via the AnthropicAdapter.
