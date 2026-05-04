@@ -475,8 +475,7 @@ models:
       - kind: anthropic
         weight: 1.0
         base_url: ${CLI_PROXY_BASE_URL}
-        api_keys:
-          - ${CLI_PROXY_API_KEY}
+        api_key: ${CLI_PROXY_API_KEY}
         provider_model_id: "claude-sonnet-4-6"
   #
   - id: claude-opus-4.6
@@ -504,8 +503,7 @@ models:
       - kind: anthropic
         weight: 1.0
         base_url: ${CLI_PROXY_BASE_URL}
-        api_keys:
-          - ${CLI_PROXY_API_KEY}
+        api_key: ${CLI_PROXY_API_KEY}
         provider_model_id: "claude-opus-4-6"
   #
   - id: claude-opus-4.7
@@ -533,8 +531,7 @@ models:
       - kind: anthropic
         weight: 1.0
         base_url: ${CLI_PROXY_BASE_URL}
-        api_keys:
-          - ${CLI_PROXY_API_KEY}
+        api_key: ${CLI_PROXY_API_KEY}
         provider_model_id: "claude-opus-4-7"
   # ── OpenRouter examples ────────────────────────────────────
   # Bare `kind: openrouter` lets OpenRouter pick the upstream provider
