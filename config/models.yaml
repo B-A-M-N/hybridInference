@@ -35,14 +35,14 @@ models:
         provider_model_id: "glm-4.7"
       # Ollama Cloud fallback
       - kind: ollama
-        weight: 1.0
+        weight: 0.24
         base_url: ${OLLAMA_BASE_URL}
         api_keys:
           - ${OLLAMA_API_KEY}
         provider_model_id: "glm-4.7"
       # Chutes fallback
       - kind: chutes
-        weight: 0.01
+        weight: 0.24
         base_url: ${CHUTES_BASE_URL}
         api_keys:
           - ${CHUTES_API_KEY}
@@ -131,7 +131,7 @@ models:
         provider_model_id: "glm-5"
       # Ollama Cloud fallback
       - kind: ollama
-        weight: 1.0
+        weight: 0.24
         base_url: ${OLLAMA_BASE_URL}
         api_keys:
           - ${OLLAMA_API_KEY}
@@ -251,14 +251,14 @@ models:
         provider_model_id: "MiniMax-M2.5"
       # Ollama Cloud fallback
       - kind: ollama
-        weight: 1.0
+        weight: 0.24
         base_url: ${OLLAMA_BASE_URL}
         api_keys:
           - ${OLLAMA_API_KEY}
         provider_model_id: "minimax-m2.5"
       # Chutes fallback
       - kind: chutes
-        weight: 0.01
+        weight: 0.24
         base_url: ${CHUTES_BASE_URL}
         api_keys:
           - ${CHUTES_API_KEY}
@@ -301,7 +301,7 @@ models:
         provider_model_id: "MiniMax-M2.7"
       # Ollama Cloud fallback
       - kind: ollama
-        weight: 1.0
+        weight: 0.24
         base_url: ${OLLAMA_BASE_URL}
         api_keys:
           - ${OLLAMA_API_KEY}
