@@ -61,17 +61,18 @@ Example::
 
 from __future__ import annotations
 
+import contextlib
 import json as _json
 import logging
 import os
 import subprocess
 import threading
 import time
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional
-from urllib.request import Request, urlopen
+from typing import Any
 from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,7 +91,7 @@ DEFAULT_CONFIG_PATH = _SCRIPT_DIR / "models.json"
 MODELS_CONFIG = os.environ.get("MODELS_CONFIG", str(DEFAULT_CONFIG_PATH))
 
 
-def _load_models_config() -> Dict[str, Dict[str, Any]]:
+def _load_models_config() -> dict[str, dict[str, Any]]:
     p = Path(MODELS_CONFIG)
     if not p.exists():
         log.warning("Models config not found at %s — proxy will have no backends.", p)
@@ -99,8 +100,13 @@ def _load_models_config() -> Dict[str, Dict[str, Any]]:
         cfg = _json.load(f)
     log.info("Loaded %d model(s) from %s", len(cfg), p)
     for name, mc in cfg.items():
-        log.info("  %s → container=%s  gpu=%s  port=%s",
-                 name, mc.get("container"), mc.get("gpu_index", "auto"), mc.get("backend_port"))
+        log.info(
+            "  %s → container=%s  gpu=%s  port=%s",
+            name,
+            mc.get("container"),
+            mc.get("gpu_index", "auto"),
+            mc.get("backend_port"),
+        )
     return cfg
 
 
@@ -117,7 +123,9 @@ def _pick_free_gpu(exclude: set[str] | None = None) -> str:
                 "--query-gpu=index,memory.used,memory.total",
                 "--format=csv,noheader,nounits",
             ],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         )
     except FileNotFoundError:
         log.warning("nvidia-smi not found — defaulting to GPU 0.")
@@ -143,7 +151,7 @@ def _pick_free_gpu(exclude: set[str] | None = None) -> str:
 class BackendManager:
     """Manages the lifecycle of a single sglang Docker container."""
 
-    def __init__(self, model_name: str, config: Dict[str, Any]) -> None:
+    def __init__(self, model_name: str, config: dict[str, Any]) -> None:
         self.model_name = model_name
         self.config = config
         self.container: str = config["container"]
@@ -151,9 +159,9 @@ class BackendManager:
         self._lock = threading.Lock()
         self._state: str = "stopped"
         self._last_activity: float = 0.0
-        self._watcher_thread: Optional[threading.Thread] = None
+        self._watcher_thread: threading.Thread | None = None
         self._ready_event = threading.Event()
-        self._start_error: Optional[Exception] = None
+        self._start_error: Exception | None = None
 
     @property
     def state(self) -> str:
@@ -225,24 +233,42 @@ class BackendManager:
         gpu = self._resolve_gpu()
         subprocess.run(
             ["sudo", "docker", "rm", "-f", self.container],
-            check=False, capture_output=True,
+            check=False,
+            capture_output=True,
         )
         cmd = [
-            "sudo", "docker", "run", "-d",
-            "--name", self.container,
-            "--gpus", f"device={gpu}",
-            "--shm-size", "16g",
-            "-p", f"{self.backend_port}:8001",
-            "-v", f"{self.config['model_dir']}:/model:ro",
+            "sudo",
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            self.container,
+            "--gpus",
+            f"device={gpu}",
+            "--shm-size",
+            "16g",
+            "-p",
+            f"{self.backend_port}:8001",
+            "-v",
+            f"{self.config['model_dir']}:/model:ro",
             "lmsysorg/sglang:latest",
-            "python3", "-m", "sglang.launch_server",
-            "--model-path", "/model",
-            "--served-model-name", self.config.get("served_name", self.model_name),
-            "--host", "0.0.0.0",
-            "--port", "8001",
-            "--context-length", str(self.config.get("max_model_len", 131072)),
-            "--mem-fraction-static", str(self.config.get("mem_fraction", "0.90")),
-            "--tp", "1",
+            "python3",
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            "/model",
+            "--served-model-name",
+            self.config.get("served_name", self.model_name),
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8001",
+            "--context-length",
+            str(self.config.get("max_model_len", 131072)),
+            "--mem-fraction-static",
+            str(self.config.get("mem_fraction", "0.90")),
+            "--tp",
+            "1",
         ]
         tcp = self.config.get("tool_call_parser")
         if tcp:
@@ -254,7 +280,8 @@ class BackendManager:
         log.info("[%s] Stopping container %s …", self.model_name, self.container)
         subprocess.run(
             ["sudo", "docker", "rm", "-f", self.container],
-            check=False, capture_output=True,
+            check=False,
+            capture_output=True,
         )
         with self._lock:
             self._state = "stopped"
@@ -293,12 +320,12 @@ class BackendManager:
                 return
 
 
-_backends: Dict[str, BackendManager] = {}
+_backends: dict[str, BackendManager] = {}
 for _name, _cfg in MODELS_CONFIG_DATA.items():
     _backends[_name] = BackendManager(_name, _cfg)
 
 
-def _get_backend(body: bytes) -> Optional[BackendManager]:
+def _get_backend(body: bytes) -> BackendManager | None:
     """Pick the right backend from the ``model`` field in the request body."""
     try:
         model = _json.loads(body).get("model", "")
@@ -335,15 +362,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         backend.touch()
         if backend.state != "ready":
-            is_chat = self.command == "POST" and self.path.startswith(
-                "/v1/chat/completions"
-            )
+            is_chat = self.command == "POST" and self.path.startswith("/v1/chat/completions")
             is_stream = False
             if is_chat and body:
-                try:
+                with contextlib.suppress(Exception):
                     is_stream = _json.loads(body).get("stream", False)
-                except Exception:
-                    pass
 
             if is_chat and is_stream:
                 self._handle_warmup_stream(backend)
@@ -361,8 +384,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _handle_models_list(self) -> None:
         """Return a static /v1/models response from config (no backend needed)."""
         models = [
-            {"id": name, "object": "model", "owned_by": "sglang", "status": "loaded"
-             if mgr.state == "ready" else "not_loaded"}
+            {
+                "id": name,
+                "object": "model",
+                "owned_by": "sglang",
+                "status": "loaded" if mgr.state == "ready" else "not_loaded",
+            }
             for name, mgr in _backends.items()
         ]
         payload = _json.dumps({"object": "list", "data": models}).encode()
@@ -449,8 +476,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 def main() -> None:
     models = list(_backends.keys())
     log.info(
-        "sglang idle proxy listening on :%d  (%d models: %s)  "
-        "(idle timeout %ds)",
+        "sglang idle proxy listening on :%d  (%d models: %s)  (idle timeout %ds)",
         LISTEN_PORT,
         len(models),
         ", ".join(models) if models else "none",
