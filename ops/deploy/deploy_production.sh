@@ -74,7 +74,15 @@ curl -fsS --retry 30 --retry-delay 5 --retry-connrefused "$HEALTH_URL"
 printf '\n'
 
 log "Checking frontend health at ${FRONTEND_HEALTH_URL}."
-curl -fsS --retry 30 --retry-delay 5 --retry-connrefused --output /dev/null \
-  "$FRONTEND_HEALTH_URL"
+for attempt in $(seq 1 30); do
+  if curl -fsS --max-time 5 --output /dev/null "$FRONTEND_HEALTH_URL"; then
+    break
+  fi
+  if [[ "$attempt" -eq 30 ]]; then
+    log "Frontend healthcheck failed after 30 attempts."
+    exit 1
+  fi
+  sleep 5
+done
 
 log "Production deployment completed."
