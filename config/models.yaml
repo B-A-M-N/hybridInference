@@ -440,7 +440,7 @@ models:
     route:
       - kind: sglang
         weight: 1.0
-        base_url: http://host.docker.internal:10801
+        base_url: http://host.docker.internal:8001
         provider_model_id: "Qwen/Qwen3.6-35B-A3B-FP8"
       # # Featherless fallback
       # - kind: featherless
