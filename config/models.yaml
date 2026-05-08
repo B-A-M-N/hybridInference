@@ -35,7 +35,7 @@ models:
         provider_model_id: "glm-4.7"
       # Ollama Cloud fallback
       - kind: ollama
-        weight: 0.24
+        weight: 0.64
         base_url: ${OLLAMA_BASE_URL}
         api_keys:
           - ${OLLAMA_API_KEY}
@@ -47,13 +47,13 @@ models:
         api_keys:
           - ${CHUTES_API_KEY}
         provider_model_id: "zai-org/GLM-4.7-TEE"
-      # # Featherless fallback
-      # - kind: featherless
-      #   weight: 0
-      #   base_url: ${FEATHERLESS_BASE_URL}
-      #   api_keys:
-      #     - ${FEATHERLESS_API_KEY}
-      #   provider_model_id: "zai-org/GLM-4.7"
+      # Featherless fallback
+      - kind: featherless
+        weight: 1.0
+        base_url: ${FEATHERLESS_BASE_URL}
+        api_keys:
+          - ${FEATHERLESS_API_KEY}
+        provider_model_id: "zai-org/GLM-4.7"
 
   # - id: glm-4.7-flash
   #   name: GLM-4.7-Flash
@@ -143,13 +143,13 @@ models:
         api_keys:
           - ${CHUTES_API_KEY}
         provider_model_id: "zai-org/GLM-5-TEE"
-      # # Featherless fallback
-      # - kind: featherless
-      #   weight: 0.64
-      #   base_url: ${FEATHERLESS_BASE_URL}
-      #   api_keys:
-      #     - ${FEATHERLESS_API_KEY}
-      #   provider_model_id: "zai-org/GLM-5"
+      # Featherless fallback
+      - kind: featherless
+        weight: 0.64
+        base_url: ${FEATHERLESS_BASE_URL}
+        api_keys:
+          - ${FEATHERLESS_API_KEY}
+        provider_model_id: "zai-org/GLM-5"
 
   - id: glm-5.1
     name: GLM-5.1
@@ -263,13 +263,13 @@ models:
         api_keys:
           - ${CHUTES_API_KEY}
         provider_model_id: "MiniMaxAI/MiniMax-M2.5-TEE"
-      # # Featherless fallback
-      # - kind: featherless
-      #   weight: 0.24
-      #   base_url: ${FEATHERLESS_BASE_URL}
-      #   api_keys:
-      #     - ${FEATHERLESS_API_KEY}
-      #   provider_model_id: "MiniMaxAI/MiniMax-M2.5"
+      # Featherless fallback
+      - kind: featherless
+        weight: 0.64
+        base_url: ${FEATHERLESS_BASE_URL}
+        api_keys:
+          - ${FEATHERLESS_API_KEY}
+        provider_model_id: "MiniMaxAI/MiniMax-M2.5"
 
   - id: minimax-m2.7
     name: MiniMax M2.7
@@ -361,17 +361,6 @@ models:
         provider_model_id: "Qwen/Qwen3.6-35B-A3B-FP8"
         api_keys:
           - ${LOCAL_API_KEY}
-      # # Featherless fallback
-      # - kind: featherless
-      #   weight: 0
-      #   base_url: ${FEATHERLESS_BASE_URL}
-      #   api_keys:
-      #     - ${FEATHERLESS_API_KEY}
-      #   provider_model_id: "Qwen/Qwen3.5-27B"
-      #   pricing:
-      #     prompt: "0"
-      #     completion: "0"
-
 
 
 
