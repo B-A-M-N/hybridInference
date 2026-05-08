@@ -263,13 +263,13 @@ models:
         api_keys:
           - ${CHUTES_API_KEY}
         provider_model_id: "MiniMaxAI/MiniMax-M2.5-TEE"
-      # Featherless fallback
-      - kind: featherless
-        weight: 0.24
-        base_url: ${FEATHERLESS_BASE_URL}
-        api_keys:
-          - ${FEATHERLESS_API_KEY}
-        provider_model_id: "MiniMaxAI/MiniMax-M2.5"
+      # # Featherless fallback
+      # - kind: featherless
+      #   weight: 0.24
+      #   base_url: ${FEATHERLESS_BASE_URL}
+      #   api_keys:
+      #     - ${FEATHERLESS_API_KEY}
+      #   provider_model_id: "MiniMaxAI/MiniMax-M2.5"
 
   - id: minimax-m2.7
     name: MiniMax M2.7
