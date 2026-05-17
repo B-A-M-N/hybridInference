@@ -442,6 +442,12 @@ models:
         api_keys:
           - ${OLLAMA_API_KEY}
         provider_model_id: "deepseek-v4-flash"
+      - kind: featherless
+        weight: 1.0
+        base_url: ${FEATHERLESS_BASE_URL}
+        api_keys:
+          - ${FEATHERLESS_API_KEY}
+        provider_model_id: "deepseek-ai/DeepSeek-V4-Flash"
 
   - id: deepseek-v4-pro
     name: DeepSeek V4 Pro
@@ -479,6 +485,12 @@ models:
         api_keys:
           - ${OLLAMA_API_KEY}
         provider_model_id: "deepseek-v4-pro"
+      - kind: featherless
+        weight: 1.0
+        base_url: ${FEATHERLESS_BASE_URL}
+        api_keys:
+          - ${FEATHERLESS_API_KEY}
+        provider_model_id: "deepseek-ai/DeepSeek-V4"
 
 
   # ── OpenRouter examples ────────────────────────────────────
