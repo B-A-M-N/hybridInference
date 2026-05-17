@@ -436,6 +436,12 @@ models:
         api_keys:
           - ${DEEPSEEK_API_KEY}
         provider_model_id: "deepseek-v4-flash"
+      - kind: ollama
+        weight: 1.0
+        base_url: ${OLLAMA_BASE_URL}
+        api_keys:
+          - ${OLLAMA_API_KEY}
+        provider_model_id: "deepseek-v4-flash"
 
   - id: deepseek-v4-pro
     name: DeepSeek V4 Pro
@@ -466,6 +472,12 @@ models:
         base_url: https://api.deepseek.com
         api_keys:
           - ${DEEPSEEK_API_KEY}
+        provider_model_id: "deepseek-v4-pro"
+      - kind: ollama
+        weight: 1.0
+        base_url: ${OLLAMA_BASE_URL}
+        api_keys:
+          - ${OLLAMA_API_KEY}
         provider_model_id: "deepseek-v4-pro"
 
 
