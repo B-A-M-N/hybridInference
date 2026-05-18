@@ -490,7 +490,7 @@ models:
         base_url: ${FEATHERLESS_BASE_URL}
         api_keys:
           - ${FEATHERLESS_API_KEY}
-        provider_model_id: "deepseek-ai/DeepSeek-V4"
+        provider_model_id: "deepseek-ai/DeepSeek-V4-Pro"
 
 
   # ── OpenRouter examples ────────────────────────────────────
