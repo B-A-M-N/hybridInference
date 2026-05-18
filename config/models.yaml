@@ -154,6 +154,15 @@ models:
   - id: glm-5.1
     name: GLM-5.1
     provider: zai
+    router: routewise
+    router_params:
+      reference_api_price:
+        prompt: "1.4"
+        completion: "4.4"
+      concurrency_enabled: true
+      # FEATHERLESS_API_KEY1 has 4 concurrency units; GLM-5.1 costs
+      # 4 units/request, so the safe local S_C limit is 1 request.
+      concurrency_limit: 1
     quantization: "fp8"
     context_length: 200000
     max_output_length: 128000
@@ -172,12 +181,31 @@ models:
       input_cache_reads: "0.26"
       input_cache_writes: "0"
     route:
-      - kind: zai
+      - kind: chutes
         weight: 1.0
-        base_url: ${ZAI_BASE_URL}
+        base_url: ${CHUTES_BASE_URL}
         api_keys:
-          - ${ZAI_API_KEY}
-        provider_model_id: "glm-5.1"
+          - ${CHUTES_API_KEY}
+        provider_model_id: "zai-org/GLM-5.1-TEE"
+        subscription_type: quota
+        quota_pool: chutes-glm-5.1-daily
+        quota_source:
+          provider: chutes
+          usage_label: "Daily requests"
+          unit: requests
+        quota:
+          limit: 5000
+          window: daily
+      - kind: featherless
+        weight: 1.0
+        base_url: ${FEATHERLESS_BASE_URL}
+        api_keys:
+          - ${FEATHERLESS_API_KEY}
+        provider_model_id: "zai-org/GLM-5.1"
+        subscription_type: concurrency
+        concurrency_pool: featherless-glm-5.1
+        concurrency:
+          limit: 1
 
   - id: glm-5-turbo
     name: GLM-5 Turbo
