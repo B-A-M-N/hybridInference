@@ -206,6 +206,21 @@ models:
         concurrency_pool: featherless-glm-5.1
         concurrency:
           limit: 1
+      - kind: openrouter[deepinfra]
+        weight: 1.0
+        base_url: https://openrouter.ai/api/v1
+        api_keys:
+          - ${OPENROUTER_API_KEY}
+        provider_model_id: "z-ai/glm-5.1"
+        subscription_type: api
+        # GLM-5.1 real-eval metered DeepInfra price via OpenRouter.
+        pricing:
+          prompt: "1.05"
+          completion: "3.5"
+          image: "0"
+          request: "0"
+          input_cache_reads: "0.205"
+          input_cache_writes: "0"
 
   - id: glm-5-turbo
     name: GLM-5 Turbo
