@@ -154,15 +154,6 @@ models:
   - id: glm-5.1
     name: GLM-5.1
     provider: zai
-    router: routewise
-    router_params:
-      reference_api_price:
-        prompt: "1.4"
-        completion: "4.4"
-      concurrency_enabled: true
-      # FEATHERLESS_API_KEY1 has 4 concurrency units; GLM-5.1 costs
-      # 4 units/request, so the safe local S_C limit is 1 request.
-      concurrency_limit: 1
     quantization: "fp8"
     context_length: 200000
     max_output_length: 128000
@@ -181,46 +172,12 @@ models:
       input_cache_reads: "0.26"
       input_cache_writes: "0"
     route:
-      - kind: chutes
+      - kind: zai
         weight: 1.0
-        base_url: ${CHUTES_BASE_URL}
+        base_url: ${ZAI_BASE_URL}
         api_keys:
-          - ${CHUTES_API_KEY}
-        provider_model_id: "zai-org/GLM-5.1-TEE"
-        subscription_type: quota
-        quota_pool: chutes-glm-5.1-daily
-        quota_source:
-          provider: chutes
-          usage_label: "Daily requests"
-          unit: requests
-        quota:
-          limit: 5000
-          window: daily
-      - kind: featherless
-        weight: 1.0
-        base_url: ${FEATHERLESS_BASE_URL}
-        api_keys:
-          - ${FEATHERLESS_API_KEY}
-        provider_model_id: "zai-org/GLM-5.1"
-        subscription_type: concurrency
-        concurrency_pool: featherless-glm-5.1
-        concurrency:
-          limit: 1
-      - kind: openrouter[deepinfra]
-        weight: 1.0
-        base_url: https://openrouter.ai/api/v1
-        api_keys:
-          - ${OPENROUTER_API_KEY}
-        provider_model_id: "z-ai/glm-5.1"
-        subscription_type: api
-        # GLM-5.1 real-eval metered DeepInfra price via OpenRouter.
-        pricing:
-          prompt: "1.05"
-          completion: "3.5"
-          image: "0"
-          request: "0"
-          input_cache_reads: "0.205"
-          input_cache_writes: "0"
+          - ${ZAI_API_KEY}
+        provider_model_id: "glm-5.1"
 
   - id: glm-5-turbo
     name: GLM-5 Turbo
@@ -267,6 +224,10 @@ models:
   - id: minimax-m2.5
     name: MiniMax M2.5
     provider: minimax
+    router: routewise
+    router_params:
+      concurrency_enabled: true
+      concurrency_limit: 1
     quantization: "bf16"
     input_modalities: ["text", "image"]
     output_modalities: ["text"]
@@ -285,34 +246,48 @@ models:
       input_cache_reads: "0.03"
       input_cache_writes: "0.375"
     route:
-      # Remote MiniMax API endpoint
-      - kind: minimax
-        weight: 1.0
-        base_url: ${MINIMAX_BASE_URL}
-        api_keys:
-          - ${MINIMAX_API_KEY}
-        provider_model_id: "MiniMax-M2.5"
-      # Ollama Cloud fallback
-      - kind: ollama
-        weight: 0.24
-        base_url: ${OLLAMA_BASE_URL}
-        api_keys:
-          - ${OLLAMA_API_KEY}
-        provider_model_id: "minimax-m2.5"
-      # Chutes fallback
+      # S_Q: Chutes subscription quota, using provider quota snapshots.
       - kind: chutes
-        weight: 0.24
+        weight: 1.0
         base_url: ${CHUTES_BASE_URL}
         api_keys:
           - ${CHUTES_API_KEY}
         provider_model_id: "MiniMaxAI/MiniMax-M2.5-TEE"
-      # Featherless fallback
+        subscription_type: quota
+        quota_pool: chutes-minimax-m2.5-daily
+        quota_source:
+          provider: chutes
+          usage_label: "Daily requests"
+          unit: requests
+        quota:
+          limit: 5000
+          window: daily
+      # S_C: Featherless Premium; paper real-eval used C=1 for MiniMax-M2.5.
       - kind: featherless
-        weight: 0.64
+        weight: 1.0
         base_url: ${FEATHERLESS_BASE_URL}
         api_keys:
           - ${FEATHERLESS_API_KEY}
         provider_model_id: "MiniMaxAI/MiniMax-M2.5"
+        subscription_type: concurrency
+        concurrency_pool: featherless-minimax-m2.5
+        concurrency:
+          limit: 1
+      # S_A: OpenRouter-pinned DeepInfra, cheapest/highest-use MiniMax real-eval API leg.
+      - kind: openrouter[deepinfra]
+        weight: 1.0
+        base_url: https://openrouter.ai/api/v1
+        api_keys:
+          - ${OPENROUTER_API_KEY}
+        provider_model_id: "minimax/minimax-m2.5"
+        subscription_type: api
+        pricing:
+          prompt: "0.15"
+          completion: "1.15"
+          image: "0"
+          request: "0"
+          input_cache_reads: "0"
+          input_cache_writes: "0"
 
   - id: minimax-m2.7
     name: MiniMax M2.7
