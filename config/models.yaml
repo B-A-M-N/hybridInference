@@ -447,7 +447,7 @@ models:
   # is strongly preferred by weight, with the pay-per-token Moonshot API kept as
   # a weighted fallback for when the coding-plan endpoint is unhealthy.
   - id: kimi-k2.7-code
-    name: Kimi K2.7 Code
+    name: Kimi K2.7 Code (only support coding agents)
     provider: kimi
     quantization: "bf16"
     input_modalities: ["text"]
@@ -458,72 +458,20 @@ models:
     supports_structured_output: true
     supported_params: [temperature, top_p, max_tokens, stop, stream, thinking]
     aliases: ["Kimi-K2.7-Code", "kimi-for-coding", "kimi-k2.7"]
-    # Metered fallback pricing — Moonshot PAYG https://platform.moonshot.ai/pricing
-    # (verify current rates). Under FixedRouter this is used for cost reporting.
     pricing:
-      prompt: "0.6"
-      completion: "2.5"
-      image: "0"
-      request: "0"
-      input_cache_reads: "0.15"
-      input_cache_writes: "0"
-    route:
-      # Kimi Code coding-plan endpoint (flat fee). The kimi_coding adapter adds
-      # the required User-Agent and prepends the OpenCode system message.
-      # base_url ends in /v1, so the adapter posts to .../coding/v1/chat/completions.
-      - kind: kimi_coding
-        weight: 1.0
-        base_url: ${KIMI_CODING_BASE_URL}
-        api_keys:
-          - ${KIMI_CODING_API_KEY}
-        provider_model_id: "kimi-for-coding"
-      # Moonshot pay-per-token API (metered fallback; small weight so it is used
-      # mainly when the coding-plan circuit opens).
-
-  # Pinned older version, metered providers only (the coding plan serves only the
-  # unified latest model, so K2.6 is not available through it).
-  - id: kimi-k2.6
-    name: Kimi K2.6
-    provider: kimi
-    quantization: "int4"
-    input_modalities: ["text", "image"]
-    output_modalities: ["text"]
-    context_length: 262144
-    max_output_length: 131072
-    supports_tools: true
-    supports_structured_output: true
-    supported_params: [temperature, top_p, max_tokens, stop, stream, thinking]
-    aliases: ["Kimi-K2.6"]
-    pricing:
-      prompt: "0.6"
+      prompt: "0.8"
       completion: "2.5"
       image: "0"
       request: "0"
       input_cache_reads: "0.2"
       input_cache_writes: "0"
     route:
-      # Kimi Code coding-plan endpoint. The kimi_coding adapter adds the required
-      # User-Agent and prepends the OpenCode system message.
       - kind: kimi_coding
         weight: 1.0
         base_url: ${KIMI_CODING_BASE_URL}
         api_keys:
           - ${KIMI_CODING_API_KEY}
         provider_model_id: "kimi-for-coding"
-      - kind: chutes
-        weight: 0.2
-        base_url: ${CHUTES_BASE_URL}
-        api_keys:
-          - ${CHUTES_API_KEY}
-        provider_model_id: "moonshotai/Kimi-K2.6-TEE"
-      # # Featherless fallback
-      # - kind: featherless
-      #   weight: 0.64
-      #   base_url: ${FEATHERLESS_BASE_URL}
-      #   api_keys:
-      #     - ${FEATHERLESS_API_KEY}
-      #   provider_model_id: "moonshotai/Kimi-K2.6"
-
 
   - id: qwen3.6-35b
     name: Qwen3.6 35B (no concurrency limit currently)
