@@ -440,7 +440,7 @@ models:
           - ${OLLAMA_API_KEY}
         provider_model_id: "minimax-m2.7"
 
-  # ── Kimi / Moonshot (kind: kimi) ─────────────────────────
+  # ── Kimi / Moonshot (kind: kimi_coding) ─────────────────────────
   # Flagship served primarily through the Kimi Code coding-plan subscription
   # (flat fee). The coding plan exposes the unified `kimi-for-coding` model
   # (currently the latest K2.7-code). Default FixedRouter: the coding-plan route
@@ -468,9 +468,10 @@ models:
       input_cache_reads: "0.15"
       input_cache_writes: "0"
     route:
-      # Kimi Code coding-plan endpoint (flat fee). base_url ends in /v1, so the
-      # adapter posts to .../coding/v1/chat/completions.
-      - kind: kimi
+      # Kimi Code coding-plan endpoint (flat fee). The kimi_coding adapter adds
+      # the required User-Agent and prepends the OpenCode system message.
+      # base_url ends in /v1, so the adapter posts to .../coding/v1/chat/completions.
+      - kind: kimi_coding
         weight: 1.0
         base_url: ${KIMI_CODING_BASE_URL}
         api_keys:
@@ -501,7 +502,9 @@ models:
       input_cache_reads: "0.2"
       input_cache_writes: "0"
     route:
-      - kind: kimi
+      # Kimi Code coding-plan endpoint. The kimi_coding adapter adds the required
+      # User-Agent and prepends the OpenCode system message.
+      - kind: kimi_coding
         weight: 1.0
         base_url: ${KIMI_CODING_BASE_URL}
         api_keys:
