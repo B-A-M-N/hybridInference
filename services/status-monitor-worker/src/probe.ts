@@ -186,6 +186,77 @@ async function probeEmbedding(
   }
 }
 
+interface StreamProbe {
+  ttftMs: number | null;
+  completionTokens: number | null;
+  latencyMs: number;
+}
+
+/**
+ * Sends one streaming chat completion and measures TTFT, token count, and
+ * end-to-end latency.
+ *
+ * `latencyMs` (the time of the final read) is accurate on Cloudflare Workers
+ * even when the upstream delivers the whole body in one buffered chunk — that
+ * read still happens at a real I/O boundary. Only the *split* between TTFT and
+ * latency collapses in the single-read case, since the clock does not advance
+ * during the pure-compute parsing between the first and last delta. The caller
+ * works around that by measuring TTFT with its own near-empty probe.
+ */
+async function streamProbe(
+  config: Config,
+  apiKey: string,
+  modelId: string,
+  prompt: string,
+  maxTokens: number,
+  extraBody: Record<string, unknown> = {},
+): Promise<StreamProbe> {
+  const started = Date.now();
+  const response = await fetch(`${config.gatewayBaseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: headers(config, apiKey),
+    body: JSON.stringify({
+      model: modelId,
+      messages: [
+        { role: "system", content: "You are OpenCode" },
+        { role: "user", content: prompt },
+      ],
+      max_tokens: maxTokens,
+      temperature: 1,
+      stream: true,
+      stream_options: { include_usage: true },
+      ...extraBody,
+    }),
+    // Total deadline: aborts even when SSE keepalives keep the stream open.
+    signal: AbortSignal.timeout(config.probeDeadlineMs),
+  });
+  if (!response.ok) {
+    throw await httpError(response);
+  }
+  if (!response.body) {
+    throw new Error("no response body");
+  }
+  const { ttftMs, completionTokens } = await consumeSse(response.body, started);
+  return { ttftMs, completionTokens, latencyMs: Date.now() - started };
+}
+
+/**
+ * Decode throughput (tokens/sec) over the post-TTFT window.
+ *
+ * `ttftMs` comes from the one-token TTFT probe (request A); `latencyMs` and
+ * `completionTokens` come from the workload probe (request B). Because these
+ * are two separate requests, the inputs are not guaranteed monotonic.
+ */
+function decodeThroughput(
+  ttftMs: number | null,
+  latencyMs: number,
+  completionTokens: number | null,
+): number | null {
+  if (completionTokens == null || completionTokens <= 1) return null;
+  if (ttftMs == null || latencyMs <= ttftMs) return null;
+  return (completionTokens - 1) / ((latencyMs - ttftMs) / 1000);
+}
+
 /** Sends one synthetic request for a model and returns the measured result. */
 export async function probeModel(
   config: Config,
@@ -209,37 +280,29 @@ export async function probeModel(
       };
     }
 
-    const response = await fetch(`${config.gatewayBaseUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: headers(config, apiKey),
-      body: JSON.stringify({
-        model: target.id,
-        messages: [
-          { role: "system", content: "You are OpenCode" },
-          { role: "user", content: config.probePrompt },
-        ],
-        max_tokens: config.probeMaxTokens,
-        temperature: 1,
-        stream: true,
-        stream_options: { include_usage: true },
-      }),
-      // Total deadline: aborts even when SSE keepalives keep the stream open.
-      signal: AbortSignal.timeout(config.probeDeadlineMs),
+    // Request A — TTFT probe: a one-token "hi" completion with reasoning turned
+    // off, so the single token is plain content rather than a thinking preamble.
+    // With max_tokens=1 the whole response is that one token, so the request's
+    // duration is the time to first (and only) token — a clean TTFT even though
+    // Workers can't see the sub-read timing an in-stream measurement would need.
+    // reasoning_effort/thinking are forwarded only to models that declare them
+    // (the gateway drops unsupported params), so this is a no-op elsewhere.
+    const { ttftMs } = await streamProbe(config, apiKey, target.id, "hi", 1, {
+      reasoning_effort: "none",
+      thinking: { type: "disabled" },
     });
-    if (!response.ok) {
-      throw await httpError(response);
-    }
-    if (!response.body) {
-      throw new Error("no response body");
-    }
-    const { ttftMs, completionTokens } = await consumeSse(response.body, started);
-    const latencyMs = Date.now() - started;
-    // Decode throughput over the post-TTFT window, matching the gateway metric:
-    // (tokens - 1) / (latency - ttft). Excludes queueing/TTFT.
-    const throughputTps =
-      completionTokens && completionTokens > 1 && ttftMs != null && latencyMs > ttftMs
-        ? (completionTokens - 1) / ((latencyMs - ttftMs) / 1000)
-        : null;
+
+    // Request B — throughput probe: the real workload prompt generates enough
+    // tokens to measure decode rate. Latency and token count come from here.
+    const { latencyMs, completionTokens } = await streamProbe(
+      config,
+      apiKey,
+      target.id,
+      config.probePrompt,
+      config.probeMaxTokens,
+    );
+
+    const throughputTps = decodeThroughput(ttftMs, latencyMs, completionTokens);
     return {
       modelId: target.id,
       ok: true,
