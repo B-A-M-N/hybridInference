@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ProbeRow, Snapshot } from "../src/db";
-import { renderDashboard, ttftSparkline } from "../src/dashboard";
+import { renderDashboard, seriesPayload, ttftSparkline } from "../src/dashboard";
 
 function row(ttftMs: number | null, ok = true): ProbeRow {
   return {
@@ -82,6 +82,81 @@ describe("renderDashboard", () => {
     });
     expect(html).toContain("Last probe cycle failed");
     expect(html).toContain("HTTP 502");
+  });
+
+  it("makes each model card a zoom target and includes the zoom overlay + client", () => {
+    const html = renderDashboard(SNAPSHOT);
+    expect(html).toContain('data-model="glm-4.7"');
+    expect(html).toContain('role="button"');
+    expect(html).toContain('id="zoom"');
+    expect(html).toContain("click to zoom");
+    expect(html).toContain("function openZoom");
+    // The detail view charts latency, throughput, and TTFT.
+    expect(html).toContain('"latencyMs"');
+    expect(html).toContain('"throughputTps"');
+    expect(html).toContain("tok/s");
+  });
+
+  it("embeds parseable per-model history that cannot break out of the script tag", () => {
+    const withHistory: Snapshot = {
+      ...SNAPSHOT,
+      models: [
+        {
+          ...SNAPSHOT.models[0],
+          modelId: "a</script>b", // hostile id must be neutralized
+          history: [row(40), row(null, false), row(60)],
+        },
+      ],
+    };
+    const html = renderDashboard(withHistory);
+    const json = html.split('id="model-data" type="application/json">')[1].split("</script>")[0];
+    expect(json).not.toContain("</script>");
+    const parsed = JSON.parse(json);
+    expect(parsed["a</script>b"]).toHaveLength(3);
+    expect(parsed["a</script>b"][0]).toMatchObject({ ok: 1, latencyMs: 100, ttftMs: 40 });
+    expect(parsed["a</script>b"][1].ok).toBe(0);
+  });
+
+  it("buckets probes by the fixed cron cadence to detect skipped cycles", () => {
+    const html = renderDashboard(SNAPSHOT);
+    // 5-minute cron interval in ms; charts floor each timestamp by this.
+    expect(html).toContain("var CYCLE_MS = 300000;");
+  });
+
+  it("uses a noscript fallback for auto-refresh so the zoom view is not interrupted", () => {
+    const html = renderDashboard(SNAPSHOT, undefined, 45);
+    // Auto-refresh only fires without JS; with JS the client pauses it while zoomed.
+    expect(html).toContain('<noscript><meta http-equiv="refresh" content="45"></noscript>');
+    expect(html.match(/http-equiv="refresh"/g)).toHaveLength(1);
+  });
+});
+
+describe("seriesPayload", () => {
+  it("maps each model to a compact JSON-friendly history series", () => {
+    const payload = seriesPayload([
+      {
+        modelId: "glm-4.7",
+        latest: row(40),
+        history: [row(40), row(null, false)],
+        spark: [],
+        uptimeRatio: 0.5,
+      },
+    ]);
+    expect(Object.keys(payload)).toEqual(["glm-4.7"]);
+    expect(payload["glm-4.7"]).toEqual([
+      { ok: 1, t: "2026-06-13T00:00:00.000Z", latencyMs: 100, ttftMs: 40, throughputTps: 50 },
+      { ok: 0, t: "2026-06-13T00:00:00.000Z", latencyMs: 100, ttftMs: null, throughputTps: 50 },
+    ]);
+  });
+
+  it("preserves a model whose id is __proto__ (no prototype-setter swallow)", () => {
+    const payload = seriesPayload([
+      { modelId: "__proto__", latest: row(40), history: [row(40)], spark: [], uptimeRatio: 1 },
+    ]);
+    expect(Object.keys(payload)).toEqual(["__proto__"]);
+    // Survives serialization, which is how it reaches the client.
+    const json = JSON.stringify(payload);
+    expect(JSON.parse(json)["__proto__"]).toHaveLength(1);
   });
 });
 
