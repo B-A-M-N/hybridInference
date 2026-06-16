@@ -80,15 +80,27 @@ export async function prune(db: D1Database, retentionDays: number): Promise<void
  * wipes the dashboard during an outage.)
  */
 export async function reconcileModels(db: D1Database, activeIds: string[]): Promise<void> {
+  // Persist the active model list in a single meta row so getSnapshot can read it
+  // with an O(1) keyed lookup. Deriving it from probe_results (e.g. SELECT
+  // DISTINCT model_id) instead scans the whole covering index, which D1 bills as
+  // rows_read proportional to retained history (~models × probes/day ×
+  // RETENTION_DAYS) — reviving the full-scan cost this module caps history reads
+  // to avoid. Written here because a successful cycle's active set is exactly
+  // what the dashboard should show.
+  const sortedIds = [...activeIds].sort((a, b) => a.localeCompare(b));
+  const setModelIds = db
+    .prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES ('model_ids', ?)`)
+    .bind(JSON.stringify(sortedIds));
+
   if (activeIds.length === 0) {
-    await db.prepare(`DELETE FROM probe_results`).run();
+    await db.batch([db.prepare(`DELETE FROM probe_results`), setModelIds]);
     return;
   }
   const placeholders = activeIds.map(() => "?").join(",");
-  await db
-    .prepare(`DELETE FROM probe_results WHERE model_id NOT IN (${placeholders})`)
-    .bind(...activeIds)
-    .run();
+  await db.batch([
+    db.prepare(`DELETE FROM probe_results WHERE model_id NOT IN (${placeholders})`).bind(...activeIds),
+    setModelIds,
+  ]);
 }
 
 /**
@@ -202,29 +214,71 @@ function toRow(r: RawRow): ProbeRow {
 }
 
 /**
+ * Resolves the active model list for a snapshot.
+ *
+ * The fast path is the single `meta.model_ids` row that {@link reconcileModels}
+ * writes each cycle, read with an O(1) keyed lookup so per-request cost is bound
+ * to model count, not table size. (A `SELECT DISTINCT model_id` instead scans the
+ * whole covering index, which D1 bills as rows_read ~ models × probes/day ×
+ * RETENTION_DAYS.)
+ *
+ * A *written* list — including an empty `[]` for a legitimately empty catalog —
+ * is authoritative. Only when the key is **absent or corrupt** (first deploy
+ * against an existing DB, or a stretch of only-failed cycles that returned before
+ * reconcileModels could write it) do we fall back to a one-off DISTINCT scan, so
+ * existing history still renders instead of a blank dashboard. That scan is
+ * bounded by table size but transient: the next successful cycle writes the keyed
+ * list and reverts reads to O(1).
+ */
+async function readModelIds(db: D1Database): Promise<string[]> {
+  const row = await db
+    .prepare(`SELECT value FROM meta WHERE key = 'model_ids'`)
+    .first<{ value: string }>();
+  if (row?.value != null) {
+    try {
+      const parsed = JSON.parse(row.value);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((id): id is string => typeof id === "string");
+      }
+    } catch {
+      // Corrupt value: fall through to the backfill scan.
+    }
+  }
+  const scan = await db
+    .prepare(`SELECT DISTINCT model_id FROM probe_results ORDER BY model_id ASC`)
+    .all<{ model_id: string }>();
+  return (scan.results ?? []).map((r) => r.model_id);
+}
+
+/**
  * Builds the dashboard snapshot: the most recent {@link HISTORY_LIMIT} rows per
  * model, with the latest result, a sparkline window, and an uptime ratio.
  */
 export async function getSnapshot(db: D1Database): Promise<Snapshot> {
-  // Window function keeps the newest HISTORY_LIMIT rows per model.
-  const result = await db
-    .prepare(
-      `SELECT model_id, ok, latency_ms, ttft_ms, completion_tokens, throughput_tps, error, checked_at
-       FROM (
-         SELECT *, ROW_NUMBER() OVER (PARTITION BY model_id ORDER BY id DESC) AS rn
-         FROM probe_results
-       )
-       WHERE rn <= ?
-       ORDER BY model_id ASC, id ASC`,
-    )
-    .bind(HISTORY_LIMIT)
-    .all<RawRow>();
+  const modelIds = await readModelIds(db);
 
   const byModel = new Map<string, ProbeRow[]>();
-  for (const raw of result.results ?? []) {
-    const list = byModel.get(raw.model_id) ?? [];
-    list.push(toRow(raw));
-    byModel.set(raw.model_id, list);
+  if (modelIds.length > 0) {
+    // Fetch each model's newest HISTORY_LIMIT rows via the (model_id, id DESC)
+    // index — at most HISTORY_LIMIT rows read per model regardless of retention.
+    const stmt = db.prepare(
+      `SELECT model_id, ok, latency_ms, ttft_ms, completion_tokens, throughput_tps, error, checked_at
+       FROM probe_results
+       WHERE model_id = ?
+       ORDER BY id DESC
+       LIMIT ?`,
+    );
+    const batched = await db.batch<RawRow>(modelIds.map((id) => stmt.bind(id, HISTORY_LIMIT)));
+    for (let i = 0; i < modelIds.length; i++) {
+      const rows = batched[i].results ?? [];
+      // A model can be listed but have no rows — pruned or reconciled away
+      // between the list read and this batch, or before its first probe landed.
+      // Skip it so `latest` (history[last]) is never undefined downstream.
+      if (rows.length === 0) continue;
+      // Rows come back newest-first; reverse to oldest→newest so `latest` is the
+      // last element and the sparkline tail is the most recent window.
+      byModel.set(modelIds[i], rows.map(toRow).reverse());
+    }
   }
 
   const models: ModelStatus[] = [];
