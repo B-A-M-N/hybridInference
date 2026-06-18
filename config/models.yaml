@@ -628,7 +628,7 @@ models:
     quantization: "nvfp4"
     input_modalities: ["text"]
     output_modalities: ["text"]
-    context_length: 16384
+    context_length: 65536
     max_output_length: 8192
     supports_tools: true
     supports_structured_output: true
