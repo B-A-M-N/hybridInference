@@ -119,11 +119,11 @@ models:
     aliases: ["freeinference-glm-5.1"]
     # Z.AI PAYG https://docs.z.ai/guides/overview/pricing
     pricing:
-      prompt: "1.4"
-      completion: "4.4"
+      prompt: "2"
+      completion: "6.4"
       image: "0"
       request: "0"
-      input_cache_reads: "0.26"
+      input_cache_reads: "0.8"
       input_cache_writes: "0"
     route:
       - kind: zai
@@ -183,7 +183,7 @@ models:
       completion: "8.8"
       image: "0"
       request: "0"
-      input_cache_reads: "0.52"
+      input_cache_reads: "0.8"
       input_cache_writes: "0"
     route:
       - kind: zai
