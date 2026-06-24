@@ -150,6 +150,12 @@ models:
         api_keys:
           - ${OLLAMA_API_KEY}
         provider_model_id: "glm-5.1"
+      - kind: chutes
+        weight: 0.01
+        base_url: ${CHUTES_BASE_URL}
+        api_keys:
+          - ${CHUTES_API_KEY}
+        provider_model_id: "zai-org/GLM-5.1-TEE"
       # staging.freeinference.org canary fallback (key via STAGING_API_KEY).
       # optional: route is skipped at load when STAGING_API_KEY is unset/blank,
       # so the rest of the model stays available (and staging avoids self-routing
@@ -199,6 +205,12 @@ models:
         api_keys:
           - ${OLLAMA_API_KEY}
         provider_model_id: "glm-5.2"
+      - kind: chutes
+        weight: 0.01
+        base_url: ${CHUTES_BASE_URL}
+        api_keys:
+          - ${CHUTES_API_KEY}
+        provider_model_id: "zai-org/GLM-5.2-TEE"
       # staging.freeinference.org canary fallback (key via STAGING_API_KEY).
       # optional: route is skipped at load when STAGING_API_KEY is unset/blank,
       # so the rest of the model stays available (and staging avoids self-routing
@@ -249,12 +261,12 @@ models:
         api_keys:
           - ${STAGING_API_KEY}
         provider_model_id: "glm-5-turbo"
-      # - kind: chutes
-      #   weight: 0.05
-      #   base_url: ${CHUTES_BASE_URL}
-      #   api_keys:
-      #     - ${CHUTES_API_KEY}
-      #   provider_model_id: "zai-org/GLM-5-Turbo"
+      - kind: chutes
+        weight: 0.01
+        base_url: ${CHUTES_BASE_URL}
+        api_keys:
+          - ${CHUTES_API_KEY}
+        provider_model_id: "zai-org/GLM-5-TEE"
       # # Featherless fallback
       # - kind: featherless
       #   weight: 0
@@ -559,11 +571,17 @@ models:
         provider_model_id: "kimi-for-coding"
       # Ollama Cloud fallback
       - kind: ollama
-        weight: 0.24
+        weight: 0.01
         base_url: ${OLLAMA_BASE_URL}
         api_keys:
           - ${OLLAMA_API_KEY}
         provider_model_id: "kimi-k2.7-code"
+      - kind: chutes
+        weight: 0.01
+        base_url: ${CHUTES_BASE_URL}
+        api_keys:
+          - ${CHUTES_API_KEY}
+        provider_model_id: "moonshotai/Kimi-K2.6-TEE"
       # staging.freeinference.org canary fallback (key via STAGING_API_KEY).
       # optional: route is skipped at load when STAGING_API_KEY is unset/blank,
       # so the rest of the model stays available (and staging avoids self-routing
@@ -589,8 +607,8 @@ models:
     supported_params: [temperature, top_p, max_tokens, stop, stream]
     aliases: ["qwen3.6:35b"]
     pricing:
-      prompt: "0.01"
-      completion: "0.08"
+      prompt: "0.08"
+      completion: "0.28"
       image: "0"
       request: "0"
       input_cache_reads: "0.01"
@@ -616,13 +634,6 @@ models:
         api_keys:
           - ${STAGING_API_KEY}
         provider_model_id: "qwen3.6-35b"
-      # # Ollama Cloud fallback
-      # - kind: ollama
-      #   weight: 0.24
-      #   base_url: ${OLLAMA_BASE_URL}
-      #   api_keys:
-      #     - ${OLLAMA_API_KEY}
-      #   provider_model_id: "qwen-3.6:35b"
 
   # Served on DGX Spark by ops/spark_idle_proxy (vLLM + NVFP4 kernels).
   - id: gpt-oss-20b
@@ -639,11 +650,11 @@ models:
     supports_structured_output: true
     supported_params: [temperature, top_p, max_tokens, stop, stream, tools, tool_choice]
     pricing:
-      prompt: "0"
-      completion: "0"
+      prompt: "0.02"
+      completion: "0.08"
       image: "0"
       request: "0"
-      input_cache_reads: "0"
+      input_cache_reads: "0.01"
       input_cache_writes: "0"
     route:
       - kind: vllm
