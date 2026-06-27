@@ -489,7 +489,7 @@ models:
   - id: kimi-k2.7-code
     name: Kimi K2.7 Code (only support coding agents)
     provider: kimi
-    quantization: "bf16"
+    quantization: "fp8"
     input_modalities: ["text"]
     output_modalities: ["text"]
     context_length: 262144
