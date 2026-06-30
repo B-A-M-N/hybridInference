@@ -53,9 +53,13 @@ def _dsn() -> str:
 
 
 async def _rank(
-    conn: asyncpg.Connection, days: int, order_by: str, limit: int
+    conn: asyncpg.Connection, days: int, order_by: str, limit: int, model: str | None = None
 ) -> list[dict[str, Any]]:
     order_col = "total_tokens" if order_by == "tokens" else "requests"
+    # Optional model filter ($3, a substring matched case-insensitively against model_id).
+    # When set, the per-user aggregates count only that model's traffic.
+    model_clause = "AND model_id ILIKE '%' || $3 || '%'" if model else ""
+    params: list[Any] = [days, limit] + ([model] if model else [])
     rows = await conn.fetch(
         f"""
         WITH agg AS (
@@ -70,12 +74,14 @@ async def _rank(
             FROM api_logs
             WHERE timestamp > now() - make_interval(days => $1)
               AND user_id IS NOT NULL
+              {model_clause}
             GROUP BY user_id
         ),
         top_model AS (
             SELECT DISTINCT ON (user_id) user_id, model_id, count(*) AS n
             FROM api_logs
             WHERE timestamp > now() - make_interval(days => $1) AND user_id IS NOT NULL
+              {model_clause}
             GROUP BY user_id, model_id
             ORDER BY user_id, n DESC
         ),
@@ -83,6 +89,7 @@ async def _rank(
             SELECT DISTINCT ON (user_id) user_id, metadata->>'user_agent' AS ua, count(*) AS n
             FROM api_logs
             WHERE timestamp > now() - make_interval(days => $1) AND user_id IS NOT NULL
+              {model_clause}
             GROUP BY user_id, metadata->>'user_agent'
             ORDER BY user_id, n DESC
         )
@@ -98,8 +105,7 @@ async def _rank(
         ORDER BY a.{order_col} DESC NULLS LAST
         LIMIT $2
         """,
-        days,
-        limit,
+        *params,
     )
     return [dict(r) for r in rows]
 
@@ -108,8 +114,9 @@ def _fmt_dt(v: Any) -> str:
     return v.isoformat(sep=" ", timespec="minutes") if v else "—"
 
 
-def _print_report(rows: list[dict[str, Any]], days: int, order_by: str) -> None:
-    print(f"Top {len(rows)} users by {order_by} over the last {days} day(s)\n")
+def _print_report(rows: list[dict[str, Any]], days: int, order_by: str, model: str | None = None) -> None:
+    scope = f" of model~{model!r}" if model else ""
+    print(f"Top {len(rows)} users by {order_by}{scope} over the last {days} day(s)\n")
     for i, r in enumerate(rows, 1):
         email = r.get("email") or "<no account>"
         toks = r.get("total_tokens") or 0
@@ -130,19 +137,19 @@ def _print_report(rows: list[dict[str, Any]], days: int, order_by: str) -> None:
         print()
 
 
-async def main(days: int, order_by: str, limit: int, as_json: bool) -> int:
+async def main(days: int, order_by: str, limit: int, as_json: bool, model: str | None = None) -> int:
     """Rank top users and print or emit the leaderboard."""
     pool = await asyncpg.create_pool(_dsn(), min_size=1, max_size=2)
     try:
         async with pool.acquire() as conn:
-            rows = await _rank(conn, days, order_by, limit)
+            rows = await _rank(conn, days, order_by, limit, model)
     finally:
         await pool.close()
 
     if as_json:
-        print(json.dumps({"days": days, "by": order_by, "users": rows}, indent=2, default=str))
+        print(json.dumps({"days": days, "by": order_by, "model": model, "users": rows}, indent=2, default=str))
     else:
-        _print_report(rows, days, order_by)
+        _print_report(rows, days, order_by, model)
     return 0
 
 
@@ -166,10 +173,13 @@ def cli() -> None:
     parser.add_argument(
         "--json", action="store_true", help="Emit JSON instead of a human-readable report"
     )
+    parser.add_argument(
+        "-m", "--model", default=None, help="Only count this model_id (substring, case-insensitive)"
+    )
     parser.add_argument("--env-file", default=None, help="Path to .env (default: auto-detect)")
     args = parser.parse_args()
     _load_env(args.env_file)
-    raise SystemExit(asyncio.run(main(args.days, args.by, args.limit, args.json)))
+    raise SystemExit(asyncio.run(main(args.days, args.by, args.limit, args.json, args.model)))
 
 
 if __name__ == "__main__":
