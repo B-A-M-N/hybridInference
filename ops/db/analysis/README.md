@@ -19,8 +19,13 @@ These scripts are intended for one-off analysis work after exporting logs from `
   - profiles one user's traffic shape (per-day/hour, models, clients, sizes) by querying the live DB
 - `user_automation_score.py`
   - scores how script-driven vs. human-driven each user is, by querying the live DB
+- `sample_trajectories.py`
+  - infers agent trajectories from the live DB by message-context overlap
+    (robust to history compaction), prints per-(model, harness) statistics, and
+    writes the longest trajectories per pair to per-pair JSON files (last turn
+    of each request only)
 
-The last two connect directly to PostgreSQL (via `.env` / `DB_*` env vars) rather than reading a JSONL export.
+The last three connect directly to PostgreSQL (via `.env` / `DB_*` env vars) rather than reading a JSONL export.
 
 ## Typical workflows
 
