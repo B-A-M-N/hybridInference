@@ -178,7 +178,8 @@ Models are defined in `local_deployment_proxy/models.json`:
 | `container` | Docker container name |
 | `engine` | serving engine: `sglang` (default) or `vllm` |
 | `gpu_index` | GPU device index, or a comma list for tensor parallelism (e.g. `"0,1,2,3"`); omit to auto-pick |
-| `tensor_parallel_size` | number of GPUs to shard the model across (default `1`); when >1 the launch gets `--tp`/`--tensor-parallel-size N` and Docker `--ipc=host` for NCCL |
+| `tensor_parallel_size` | number of GPUs to shard the model across by tensor parallelism (default `1`); when >1 the launch gets `--tp`/`--tensor-parallel-size N` and Docker `--ipc=host` for NCCL |
+| `pipeline_parallel_size` | number of GPUs to shard the model across **by layer** (pipeline parallelism, default `1`); adds `--pp-size` (sglang) / `--pipeline-parallel-size` (vLLM). Unlike TP it has no attention-head divisibility constraint, so it can use GPU counts TP cannot (e.g. 3). The backend claims `tensor_parallel_size × pipeline_parallel_size` GPUs |
 | `colocate_group` | optional label; models sharing a value run on the same auto-picked GPU |
 | `backend_port` | Host port mapped to the container (→ sglang `8001` / vLLM `8000` internally) |
 | `model_dir` | Host path to model weights |
@@ -226,7 +227,7 @@ When `gpu_index` is not set for a model, the proxy queries `nvidia-smi` at conta
 
 To intentionally **colocate** models on one GPU, give them a shared `colocate_group`. The first member to start auto-picks a free GPU; every other member of the group then follows it onto that same device instead of being excluded from it. Keep the group's combined `mem_fraction` at ~0.9 or below.
 
-For **tensor-parallel** backends (`tensor_parallel_size` > 1), either pin the devices with a comma-list `gpu_index` (e.g. `"0,1,2,3"`) or omit `gpu_index` to auto-pick the N least-used GPUs.
+For **tensor-parallel** or **pipeline-parallel** backends (`tensor_parallel_size` > 1 and/or `pipeline_parallel_size` > 1), either pin the devices with a comma-list `gpu_index` (e.g. `"0,2,3"`) or omit `gpu_index` to auto-pick the `tensor_parallel_size × pipeline_parallel_size` least-used GPUs. A multi-GPU `gpu_index` is passed to Docker as a quoted `--gpus '"device=0,2,3"'` so the daemon does not split the comma list into separate GPU requests.
 
 ## Hardware profiles
 
@@ -234,13 +235,13 @@ The same proxy runs on machines with different GPUs and serves the model set tha
 
 | Detected hardware | Profile | Serves |
 |---|---|---|
-| 4+ × H200 | `models.h200.json` | `deepseek-v4-flash` — sglang, `tensor_parallel_size: 2` on GPUs **0,2** (GPU 1 free) |
+| 4+ × H200 | `models.h200.json` | `deepseek-v4-flash` — sglang, `pipeline_parallel_size: 3` on GPUs **0,2,3** (GPU 1 free) |
 | RTX (PRO) 6000 | `models.rtx6000.json` | `Qwen/Qwen3.6-35B-A3B-FP8` + `BAAI/bge-m3` (single GPU) |
 | anything else / no `nvidia-smi` | `models.json` | default fallback |
 
 A matched-but-missing profile falls back to `models.json`; setting `MODELS_CONFIG` explicitly bypasses detection entirely.
 
-The H200 profile serves `sgl-project/DeepSeek-V4-Flash-FP8` on GPUs 0+2 (TP=2; GPU 1 left free for other workloads). For the dedicated port-8003 service with reverse tunnels to staging and production, prefer [`ops/h200_idle_proxy`](../h200_idle_proxy/README.md). Its `tool_call_parser` / `reasoning_parser` default to the DeepSeek-V3 values (`deepseekv3` / `deepseek-r1`) as the closest registered sglang parsers — adjust if your sglang build ships V4-specific names.
+The H200 profile serves `sgl-project/DeepSeek-V4-Flash-FP8` on GPUs 0,2,3 (PP=3; GPU 1 left free for other workloads). Pipeline parallelism is used because the ~274 GiB of FP8 weights do not fit at TP=2 on two H200s, and TP=3 is illegal (64 attention heads are not divisible by 3). For the dedicated port-8003 service with reverse tunnels to staging and production, prefer [`ops/h200_idle_proxy`](../h200_idle_proxy/README.md). Its `tool_call_parser` / `reasoning_parser` default to the DeepSeek-V3 values (`deepseekv3` / `deepseek-r1`) as the closest registered sglang parsers — adjust if your sglang build ships V4-specific names.
 
 ## On-demand Hugging Face download
 

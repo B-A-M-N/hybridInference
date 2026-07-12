@@ -633,7 +633,7 @@ models:
         provider_model_id: "diffusiongemma"
 
   # ── DeepSeek V4 (kind: deepseek) ─────────────────────────
-  # Local H200 idle proxy: ops/h200_idle_proxy (sglang TP=2 on GPUs 0+2, port 8003).
+  # Local H200 idle proxy: ops/h200_idle_proxy (sglang PP=3 on GPUs 0,2,3, port 8003).
   - id: deepseek-v4-flash
     name: DeepSeek V4 Flash
     provider: deepseek

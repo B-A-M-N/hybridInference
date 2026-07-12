@@ -686,7 +686,7 @@ def _gpu_query_result(stdout: str) -> Any:
 
 
 def test_detect_profile_selects_h200_for_four_h200s(monkeypatch: Any, tmp_path: Path) -> None:
-    # A box with 4x H200 must serve the DeepSeek-V4-Flash (TP=2, skip GPU1) profile.
+    # A box with 4x H200 must serve the DeepSeek-V4-Flash (PP=3 on 0,2,3) profile.
     proxy = _load_proxy(monkeypatch, tmp_path)
     monkeypatch.setattr(
         proxy.subprocess,
@@ -696,8 +696,13 @@ def test_detect_profile_selects_h200_for_four_h200s(monkeypatch: Any, tmp_path: 
     assert proxy._detect_profile_config().name == "models.h200.json"
 
 
-def test_h200_profile_uses_tp2_and_skips_gpu1() -> None:
-    """Canonical H200 profile pins TP=2 on GPUs 0+2 (GPU 1 free)."""
+def test_h200_profile_uses_pp3_and_skips_gpu1() -> None:
+    """Canonical H200 profile shards DeepSeek-V4-Flash with PP=3 on GPUs 0,2,3.
+
+    The 273 GiB of FP8 weights do not fit at TP=2 on two H200s, and TP=3 is
+    illegal (64 attention heads are not divisible by 3). Pipeline parallelism
+    splits by layer, so PP=3 fits on three GPUs while leaving GPU 1 free.
+    """
     import json
     from pathlib import Path
 
@@ -706,9 +711,63 @@ def test_h200_profile_uses_tp2_and_skips_gpu1() -> None:
     )
     cfg = json.loads(cfg_path.read_text())
     model = cfg["deepseek-v4-flash"]
-    assert model["tensor_parallel_size"] == 2
-    assert model["gpu_index"] == "0,2"
+    assert model["pipeline_parallel_size"] == 3
+    assert model["tensor_parallel_size"] == 1
+    assert model["gpu_index"] == "0,2,3"
     assert "1" not in str(model["gpu_index"]).split(",")
+
+
+def test_sglang_pipeline_parallel_sets_pp_size_and_ipc(monkeypatch: Any, tmp_path: Path) -> None:
+    # A pipeline-parallel sglang backend gets --pp-size, --ipc=host, and a quoted
+    # multi-GPU device list; --tp stays at its (1) default.
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    backend = proxy.BackendManager(
+        MODEL_NAME,
+        {
+            "container": "ds-sglang",
+            "engine": "sglang",
+            "gpu_index": "0,2,3",
+            "pipeline_parallel_size": 3,
+            "backend_port": 18003,
+            "model_dir": "/tmp/ds",
+            "served_name": MODEL_NAME,
+            "max_model_len": 4096,
+            "mem_fraction": "0.90",
+        },
+    )
+
+    cmd = backend._sglang_run_cmd("0,2,3")
+
+    assert cmd[cmd.index("--pp-size") + 1] == "3"
+    assert cmd[cmd.index("--tp") + 1] == "1"
+    assert cmd[cmd.index("--gpus") + 1] == '"device=0,2,3"'
+    assert "--ipc=host" in cmd
+
+
+def test_auto_gpu_selection_spans_tp_times_pp_devices(monkeypatch: Any, tmp_path: Path) -> None:
+    # An unpinned backend sharded by both tp and pp must claim tp*pp GPUs.
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    backend = proxy.BackendManager(
+        MODEL_NAME,
+        {
+            "container": "ds",
+            "model_dir": "/tmp/ds",
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 3,
+        },
+    )
+    proxy._backends = {MODEL_NAME: backend}
+
+    captured: dict[str, Any] = {}
+
+    def fake_pick_many(count: int, exclude: set[str] | None = None) -> str:
+        captured["count"] = count
+        return ",".join(str(i) for i in range(count))
+
+    monkeypatch.setattr(proxy, "_pick_free_gpus", fake_pick_many)
+
+    backend._resolve_gpu()
+    assert captured["count"] == 6
 
 
 def test_detect_profile_selects_rtx6000(monkeypatch: Any, tmp_path: Path) -> None:
@@ -772,7 +831,8 @@ def test_vllm_tensor_parallel_spans_multiple_gpus(monkeypatch: Any, tmp_path: Pa
     cmd = backend._vllm_run_cmd("0,1,2,3")
 
     assert cmd[cmd.index("--tensor-parallel-size") + 1] == "4"
-    assert cmd[cmd.index("--gpus") + 1] == "device=0,1,2,3"
+    # A multi-GPU device list must be quoted or docker splits it on commas.
+    assert cmd[cmd.index("--gpus") + 1] == '"device=0,1,2,3"'
     # Multi-GPU NCCL needs host IPC.
     assert "--ipc=host" in cmd
 
@@ -797,7 +857,8 @@ def test_sglang_tensor_parallel_sets_tp_and_ipc(monkeypatch: Any, tmp_path: Path
     cmd = backend._sglang_run_cmd("0,1,2,3")
 
     assert cmd[cmd.index("--tp") + 1] == "4"
-    assert cmd[cmd.index("--gpus") + 1] == "device=0,1,2,3"
+    # A multi-GPU device list must be quoted or docker splits it on commas.
+    assert cmd[cmd.index("--gpus") + 1] == '"device=0,1,2,3"'
     assert "--ipc=host" in cmd
 
 

@@ -29,7 +29,7 @@ MODELS_CONFIG  : Path to a JSON config file               (see below)
 
 When ``MODELS_CONFIG`` is unset the proxy auto-selects a hardware profile from
 ``nvidia-smi``: ``models.h200.json`` on a 4+ x H200 box (DeepSeek-V4-Flash at
-``tensor_parallel_size`` 2 on GPUs 0+2, skipping GPU 1), ``models.rtx6000.json``
+``pipeline_parallel_size`` 3 on GPUs 0,2,3, skipping GPU 1), ``models.rtx6000.json``
 on an RTX (PRO) 6000 (Qwen3.6-35B), else ``models.json``. See
 ``_detect_profile_config``. For the dedicated H200 service (port 8003 +
 staging/prod tunnels) use ``ops/h200_idle_proxy`` instead.
@@ -67,6 +67,16 @@ Example::
 ``tensor_parallel_size`` > 1 to shard one model across several GPUs: pin them
 with a comma-list ``gpu_index`` (e.g. ``"0,1,2,3"``) or omit it to auto-pick N.
 The launch then gets ``--tp`` / ``--tensor-parallel-size N`` and ``--ipc=host``.
+
+Set ``pipeline_parallel_size`` > 1 to shard one model across GPUs *by layer*
+(pipeline parallelism) instead of, or in addition to, tensor parallelism. Unlike
+TP, PP has no attention-head divisibility constraint, so it can use a GPU count
+TP cannot (e.g. 3 GPUs for a 64-head model that must otherwise be TP 1/2/4). The
+backend claims ``tensor_parallel_size * pipeline_parallel_size`` GPUs (pin them
+with ``gpu_index`` or auto-pick that many); the launch gets ``--pp-size``
+(sglang) / ``--pipeline-parallel-size`` (vLLM). A multi-GPU ``gpu_index`` is
+passed to Docker as a *quoted* ``--gpus '"device=0,2,3"'`` so the daemon does
+not split the comma list into separate (and conflicting) device requests.
 
 Give two or more models the same ``colocate_group`` to make them share one
 GPU: the first to start auto-picks a free device and the rest follow it there
@@ -139,7 +149,7 @@ def _detect_profile_config() -> Path:
     machine should serve the model that fits it. We inspect ``nvidia-smi`` once
     at import and map the hardware to a profile JSON next to this script:
 
-      * **4+ x H200**       -> ``models.h200.json``     (DeepSeek-V4-Flash, TP=2 on 0+2)
+      * **4+ x H200**       -> ``models.h200.json``     (DeepSeek-V4-Flash, PP=3 on 0,2,3)
       * **RTX (PRO) 6000**  -> ``models.rtx6000.json``  (Qwen3.6-35B)
       * anything else / no ``nvidia-smi`` → ``models.json`` (default fallback)
 
@@ -266,8 +276,8 @@ def _pick_free_gpu(exclude: set[str] | None = None) -> str:
 def _pick_free_gpus(count: int, exclude: set[str] | None = None) -> str:
     """Return a comma-joined list of the ``count`` least-used GPU indices.
 
-    Used for tensor-parallel backends (``tensor_parallel_size`` > 1) that need
-    several devices. Picks greedily — least-used first, excluding each chosen
+    Used for backends sharded across several devices by tensor and/or pipeline
+    parallelism. Picks greedily — least-used first, excluding each chosen
     device from the next pick — and returns a string like ``"0,1,2,3"`` suitable
     for a Docker ``--gpus device=...`` request.
     """
@@ -278,6 +288,18 @@ def _pick_free_gpus(count: int, exclude: set[str] | None = None) -> str:
         chosen.append(gpu)
         exclude.add(gpu)
     return ",".join(chosen)
+
+
+def _docker_gpu_arg(gpu: str) -> str:
+    """Return the ``--gpus`` value for a device list.
+
+    Docker splits an *unquoted* ``device=0,2,3`` on commas into several separate
+    GPU requests (``device=0``, then ``Count=2``, ``Count=3``), which the daemon
+    rejects with "cannot set both Count and DeviceIDs on device request". Wrapping
+    a multi-GPU list in double quotes makes docker parse it as a single request.
+    A single device (no comma) needs no quoting.
+    """
+    return f'"device={gpu}"' if "," in gpu else f"device={gpu}"
 
 
 class BackendManager:
@@ -430,14 +452,22 @@ class BackendManager:
             if mgr.state in ("starting", "ready") and mgr._current_gpu is not None:
                 used_gpus.update(str(mgr._current_gpu).split(","))
         tp = int(self.config.get("tensor_parallel_size", 1))
+        pp = int(self.config.get("pipeline_parallel_size", 1))
+        # A model sharded by both tensor and pipeline parallelism needs one GPU
+        # per (tp rank x pp stage).
+        n_gpus = tp * pp
         log.info(
-            "[%s] Auto-selecting %d GPU(s) (excluding %s)",
+            "[%s] Auto-selecting %d GPU(s) (tp=%d, pp=%d, excluding %s)",
             self.model_name,
+            n_gpus,
             tp,
+            pp,
             sorted(used_gpus) if used_gpus else "none",
         )
         gpu = (
-            _pick_free_gpus(tp, exclude=used_gpus) if tp > 1 else _pick_free_gpu(exclude=used_gpus)
+            _pick_free_gpus(n_gpus, exclude=used_gpus)
+            if n_gpus > 1
+            else _pick_free_gpu(exclude=used_gpus)
         )
         self._current_gpu = gpu
         return gpu
@@ -487,6 +517,11 @@ class BackendManager:
         the generation parsers are omitted for them.
         """
         tp = int(self.config.get("tensor_parallel_size", 1))
+        pp = int(self.config.get("pipeline_parallel_size", 1))
+        # A backend spans several GPUs when sharded by tensor parallelism,
+        # pipeline parallelism, or both; NCCL then needs host IPC for fast
+        # peer-to-peer transport (the --ipc=host below).
+        multi_gpu = tp * pp > 1
         cmd = [
             "sudo",
             "docker",
@@ -495,12 +530,10 @@ class BackendManager:
             "--name",
             self.container,
             "--gpus",
-            f"device={gpu}",
+            _docker_gpu_arg(gpu),
             "--shm-size",
             "16g",
-            # Tensor-parallel backends span several GPUs inside one container;
-            # NCCL needs host IPC for fast peer-to-peer transport.
-            *(["--ipc=host"] if tp > 1 else []),
+            *(["--ipc=host"] if multi_gpu else []),
             "-p",
             f"{self.backend_port}:8000",
             "-v",
@@ -518,6 +551,7 @@ class BackendManager:
             str(self.config.get("mem_fraction", "0.90")),
             "--tensor-parallel-size",
             str(tp),
+            *(["--pipeline-parallel-size", str(pp)] if pp > 1 else []),
         ]
         if self.config.get("is_embedding"):
             # vLLM >= 0.20 selects the embedding runner with --runner pooling
@@ -550,6 +584,11 @@ class BackendManager:
     def _sglang_run_cmd(self, gpu: str) -> list[str]:
         """Build the ``docker run`` command for an sglang backend."""
         tp = int(self.config.get("tensor_parallel_size", 1))
+        pp = int(self.config.get("pipeline_parallel_size", 1))
+        # A backend spans several GPUs when sharded by tensor parallelism,
+        # pipeline parallelism, or both; NCCL then needs host IPC for fast
+        # peer-to-peer transport (the --ipc=host below).
+        multi_gpu = tp * pp > 1
         cmd = [
             "sudo",
             "docker",
@@ -558,12 +597,10 @@ class BackendManager:
             "--name",
             self.container,
             "--gpus",
-            f"device={gpu}",
+            _docker_gpu_arg(gpu),
             "--shm-size",
             "16g",
-            # Tensor-parallel backends span several GPUs inside one container;
-            # NCCL needs host IPC for fast peer-to-peer transport.
-            *(["--ipc=host"] if tp > 1 else []),
+            *(["--ipc=host"] if multi_gpu else []),
             "-p",
             f"{self.backend_port}:8001",
             "-v",
@@ -587,6 +624,7 @@ class BackendManager:
             str(self.config.get("mem_fraction", "0.90")),
             "--tp",
             str(tp),
+            *(["--pp-size", str(pp)] if pp > 1 else []),
         ]
         if self.config.get("is_embedding"):
             # Embedding models run sglang in encode-only mode; tool-call parsing
