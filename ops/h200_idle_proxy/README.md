@@ -91,6 +91,37 @@ See [`models.json`](models.json):
 > for other tenants. Measured KV capacity at PP=3: `max_total_num_tokens`
 > ≈ 5.7M (FP8 KV cache), i.e. ~5.4× the 1M context.
 
+## Benchmarks
+
+Decode throughput measured on **h200a** (PP=3 on GPUs 0,2,3, FP8 weights + FP8
+KV cache, sglang 0.5.14) with [`bench_decode.sh`](bench_decode.sh) — output
+length fixed via `ignore_eos` to isolate decode from prefill.
+
+**Concurrency sweep** (128-token input, 256-token output):
+
+| Concurrency | Aggregate decode (tok/s) | Per-stream (tok/s) | Median ITL (ms) |
+|---:|---:|---:|---:|
+| 1 | 95 | ~99 | 10.1 |
+| 16 | 531 | ~35 | 28.6 |
+| 64 | 1,443 | ~24 | 41.2 |
+| 128 | 2,216 | ~19 | 52.8 |
+| 256 | 3,369 | ~15 | 65.5 |
+
+Peak ≈ **3.4k tok/s** at concurrency 256 (the `max_running_requests` cap; VRAM
+is not the limit — the KV pool holds ~5.7M tokens).
+
+**Long-context decode** (single stream, 128-token output):
+
+| Context | Median ITL (ms) | Per-stream decode (tok/s) | Prefill (TTFT) |
+|---:|---:|---:|---:|
+| 128 | 10.1 | ~99 | 0.1 s |
+| 32k | 10.2 | ~98 | 1.1 s |
+| 128k | 10.3 | ~97 | 1.7 s |
+
+Decode per-token latency stays ~10 ms from 128 to 128k tokens: MLA
+(Multi-head Latent Attention) keeps the KV cache tiny, so long context costs
+**prefill** (TTFT), not decode.
+
 ## Requirements
 
 - 4× NVIDIA H200 (or at least GPUs 0, 2 and 3 free)
