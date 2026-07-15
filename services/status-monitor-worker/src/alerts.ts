@@ -8,6 +8,16 @@ import {
 } from "./db";
 import type { Config, Env } from "./env";
 import type { ProbeResult } from "./probe";
+import {
+  codexRelayConfig,
+  type CodexAlertEvent,
+  createCodexAlertEvent,
+  hasAlertDestination,
+  modelAlertFingerprint,
+  type NewCodexAlertEvent,
+  postCodexAlert,
+  stormAlertFingerprint,
+} from "./oncall";
 
 /** Local/dev gateway hosts that never indicate a real deployment. */
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"]);
@@ -137,6 +147,161 @@ export async function postSlack(webhookUrl: string, message: string): Promise<bo
   }
 }
 
+function occurredAt(value: string | null | undefined): string {
+  return value && !Number.isNaN(Date.parse(value)) ? value : new Date().toISOString();
+}
+
+function probeContext(result: ProbeResult): Record<string, unknown> {
+  return {
+    model_id: result.modelId,
+    ok: result.ok,
+    checked_at: result.checkedAt,
+    latency_ms: result.latencyMs,
+    ttft_ms: result.ttftMs,
+    completion_tokens: result.completionTokens,
+    throughput_tps: result.throughputTps,
+    error: result.error?.slice(0, 4_000) ?? null,
+  };
+}
+
+function workerAlertEvent(
+  config: Config,
+  event: Omit<NewCodexAlertEvent, "environment">,
+): CodexAlertEvent {
+  return createCodexAlertEvent({
+    ...event,
+    environment: deriveEnvironment(config.gatewayBaseUrl),
+  });
+}
+
+function modelDownEvent(config: Config, result: ProbeResult, threshold: number): CodexAlertEvent {
+  return workerAlertEvent(config, {
+    fingerprint: modelAlertFingerprint(result.modelId),
+    status: "firing",
+    severity: "error",
+    title: `Model down: ${result.modelId}`,
+    occurred_at: occurredAt(result.checkedAt),
+    summary: `${result.modelId} failed ${threshold} consecutive probes: ${result.error ?? "no error message"}`,
+    context: {
+      alert_type: "model",
+      gateway_base_url: config.gatewayBaseUrl,
+      failure_threshold: threshold,
+      probe: probeContext(result),
+    },
+    slack_text: formatModelDownAlert(config, result, threshold),
+  });
+}
+
+function modelRecoveredEvent(
+  config: Config,
+  result: ProbeResult,
+  fingerprint = modelAlertFingerprint(result.modelId),
+): CodexAlertEvent {
+  return workerAlertEvent(config, {
+    fingerprint,
+    status: "resolved",
+    severity: "info",
+    title: `Model recovered: ${result.modelId}`,
+    occurred_at: occurredAt(result.checkedAt),
+    summary: `${result.modelId} recovered after a down alert.`,
+    context: {
+      alert_type: "model",
+      gateway_base_url: config.gatewayBaseUrl,
+      probe: probeContext(result),
+    },
+    slack_text: formatModelRecoveredAlert(config, result),
+  });
+}
+
+function sortedProbeContext(results: ProbeResult[]): Record<string, unknown>[] {
+  return [...results]
+    .sort((a, b) => (a.modelId < b.modelId ? -1 : a.modelId > b.modelId ? 1 : 0))
+    .map(probeContext);
+}
+
+function modelsDownEvent(
+  config: Config,
+  results: ProbeResult[],
+  threshold: number,
+): CodexAlertEvent {
+  return workerAlertEvent(config, {
+    fingerprint: stormAlertFingerprint(results.map((result) => result.modelId)),
+    status: "firing",
+    severity: "critical",
+    title: `${results.length} models down`,
+    occurred_at: occurredAt(results[0]?.checkedAt),
+    summary: `${results.length} models failed ${threshold} consecutive probes.`,
+    context: {
+      alert_type: "model_storm",
+      gateway_base_url: config.gatewayBaseUrl,
+      failure_threshold: threshold,
+      models: sortedProbeContext(results),
+    },
+    slack_text: formatModelsDownSummary(config, results, threshold),
+  });
+}
+
+function modelsRecoveredEvent(
+  config: Config,
+  results: ProbeResult[],
+  fingerprint = stormAlertFingerprint(results.map((result) => result.modelId)),
+): CodexAlertEvent {
+  return workerAlertEvent(config, {
+    fingerprint,
+    status: "resolved",
+    severity: "info",
+    title: `${results.length} models recovered`,
+    occurred_at: occurredAt(results[0]?.checkedAt),
+    summary: `${results.length} models recovered after down alerts.`,
+    context: {
+      alert_type: "model_storm",
+      gateway_base_url: config.gatewayBaseUrl,
+      models: sortedProbeContext(results),
+    },
+    slack_text: formatModelsRecoveredSummary(config, results),
+  });
+}
+
+function cycleEvent(config: Config, status: CycleStatus): CodexAlertEvent {
+  const firing = !status.ok;
+  return workerAlertEvent(config, {
+    fingerprint: "status-monitor:cycle",
+    status: firing ? "firing" : "resolved",
+    severity: firing ? "critical" : "info",
+    title: firing ? "Monitoring cycle failing" : "Monitoring cycle recovered",
+    occurred_at: occurredAt(status.checkedAt),
+    summary: firing
+      ? `The monitoring cycle failed: ${status.error ?? "no error message"}`
+      : "The monitoring cycle recovered.",
+    context: {
+      alert_type: "cycle",
+      gateway_base_url: config.gatewayBaseUrl,
+      cycle: {
+        ok: status.ok,
+        checked_at: status.checkedAt,
+        error: status.error,
+      },
+    },
+    slack_text: firing
+      ? formatCycleDownAlert(config, status)
+      : formatCycleRecoveredAlert(config, status),
+  });
+}
+
+async function deliverAlert(env: Env, event: CodexAlertEvent): Promise<boolean> {
+  const relay = codexRelayConfig(env);
+  if (relay && (await postCodexAlert(relay, event))) return true;
+
+  const webhookUrl = env.SLACK_WEBHOOK_URL?.trim();
+  return webhookUrl ? postSlack(webhookUrl, event.slack_text) : false;
+}
+
+function incidentFingerprint(modelId: string, stateValue: string): string {
+  return stateValue.startsWith("status-monitor:")
+    ? stateValue
+    : modelAlertFingerprint(modelId);
+}
+
 /** Which models to page this cycle, plus the carried-over alert state. */
 export interface AlertDecision {
   /** Models that newly crossed the failure threshold and should page as down. */
@@ -146,7 +311,7 @@ export interface AlertDecision {
   /**
    * `prevState` minus any model no longer probed this cycle (so state can't grow
    * without bound). The down/recovery transitions are intentionally NOT applied
-   * here — the caller commits them only after a confirmed Slack delivery.
+   * here — the caller commits them only after a confirmed delivery.
    */
   baseState: Record<string, string>;
 }
@@ -155,16 +320,17 @@ export interface AlertDecision {
  * Edge-triggered alert decision.
  *
  * `failing` holds the models whose most recent `threshold` probes were all
- * failures. `prevState` maps a model to the ISO time we last alerted it is down;
- * its presence means we've already paged for the current outage. A model is
- * paged *down* only on the transition into the failing set (so a sustained
- * outage pages once, not every 20-minute cron), and *recovered* only when a
- * probe succeeds after a down alert.
+ * failures. `prevState` maps a model to the incident fingerprint used when it
+ * was alerted as down; its presence means we've already paged for the current
+ * outage. Legacy timestamp values are treated as individual model incidents.
+ * A model is paged *down* only on the transition into the failing set (so a
+ * sustained outage pages once, not every 20-minute cron), and *recovered* only
+ * when a probe succeeds after a down alert.
  *
  * This function is pure: it decides *what* to send but does not record that it
  * was sent. {@link runAlerts} applies the state transition only for an alert
- * whose POST actually succeeded, so a Slack outage retries next cycle instead of
- * silently dropping the page.
+ * whose POST actually succeeded, so a destination outage retries next cycle
+ * instead of silently dropping the page.
  */
 export function decideAlerts(
   results: ProbeResult[],
@@ -193,20 +359,19 @@ export function decideAlerts(
 }
 
 /**
- * Evaluates probe results and sends Slack alerts for models that failed
+ * Evaluates probe results and sends alerts for models that failed
  * `config.alertFailureThreshold` consecutive probes (and recovery notices for
- * those that come back). No-op when `SLACK_WEBHOOK_URL` is unset, so the feature
- * is opt-in via a single secret.
+ * those that come back). Codex on-call is attempted first when configured, with
+ * the Slack webhook as a fallback. No-op when neither destination is configured.
  *
  * Runs inside the probe cycle while it holds the cycle lock, so the
  * read-modify-write of the alert state is never raced by an overlapping cron.
  * A model is only recorded as alerted once its page is confirmed delivered, and
- * its state is only cleared once its recovery notice is delivered — so a Slack
- * webhook outage causes a retry on the next cycle rather than a lost alert.
+ * its state is only cleared once its recovery notice is delivered — so a
+ * destination outage causes a retry on the next cycle rather than a lost alert.
  */
 export async function runAlerts(env: Env, config: Config, results: ProbeResult[]): Promise<void> {
-  const webhookUrl = env.SLACK_WEBHOOK_URL;
-  if (!webhookUrl || results.length === 0) return;
+  if (!hasAlertDestination(env) || results.length === 0) return;
 
   const threshold = config.alertFailureThreshold;
   // Only a model that failed *this* cycle can newly cross the threshold; limiting
@@ -226,32 +391,57 @@ export async function runAlerts(env: Env, config: Config, results: ProbeResult[]
   // transition is committed only once its page is confirmed delivered, so a failed
   // POST retries next cycle instead of dropping the alert.
   if (down.length > storm) {
-    if (await postSlack(webhookUrl, formatModelsDownSummary(config, down, threshold))) {
-      for (const r of down) nextState[r.modelId] = r.checkedAt;
+    const event = modelsDownEvent(config, down, threshold);
+    if (await deliverAlert(env, event)) {
+      for (const r of down) nextState[r.modelId] = event.fingerprint;
     }
   } else {
     const sent = await Promise.all(
-      down.map(async (r) => ({
-        modelId: r.modelId,
-        checkedAt: r.checkedAt,
-        ok: await postSlack(webhookUrl, formatModelDownAlert(config, r, threshold)),
-      })),
+      down.map(async (r) => {
+        const event = modelDownEvent(config, r, threshold);
+        return {
+          modelId: r.modelId,
+          fingerprint: event.fingerprint,
+          ok: await deliverAlert(env, event),
+        };
+      }),
     );
-    for (const r of sent) if (r.ok) nextState[r.modelId] = r.checkedAt;
+    for (const r of sent) if (r.ok) nextState[r.modelId] = r.fingerprint;
   }
 
-  if (recovered.length > storm) {
-    if (await postSlack(webhookUrl, formatModelsRecoveredSummary(config, recovered))) {
-      for (const r of recovered) delete nextState[r.modelId];
+  const activeModelsByFingerprint = new Map<string, string[]>();
+  for (const [modelId, stateValue] of Object.entries(baseState)) {
+    const fingerprint = incidentFingerprint(modelId, stateValue);
+    const activeModels = activeModelsByFingerprint.get(fingerprint) ?? [];
+    activeModels.push(modelId);
+    activeModelsByFingerprint.set(fingerprint, activeModels);
+  }
+
+  const recoveredByFingerprint = new Map<string, ProbeResult[]>();
+  for (const result of recovered) {
+    const fingerprint = incidentFingerprint(result.modelId, baseState[result.modelId]);
+    const grouped = recoveredByFingerprint.get(fingerprint) ?? [];
+    grouped.push(result);
+    recoveredByFingerprint.set(fingerprint, grouped);
+  }
+
+  const resolvedModelIds = await Promise.all(
+    [...recoveredByFingerprint.entries()].map(async ([fingerprint, grouped]) => {
+      const activeModelIds = activeModelsByFingerprint.get(fingerprint) ?? [];
+      const stormIncident = fingerprint.startsWith("status-monitor:storm:");
+      if (stormIncident && grouped.length !== activeModelIds.length) {
+        return [];
+      }
+      const event = stormIncident
+        ? modelsRecoveredEvent(config, grouped, fingerprint)
+        : modelRecoveredEvent(config, grouped[0], fingerprint);
+      return (await deliverAlert(env, event)) ? activeModelIds : [];
+    }),
+  );
+  for (const modelIds of resolvedModelIds) {
+    for (const modelId of modelIds) {
+      delete nextState[modelId];
     }
-  } else {
-    const sent = await Promise.all(
-      recovered.map(async (r) => ({
-        modelId: r.modelId,
-        ok: await postSlack(webhookUrl, formatModelRecoveredAlert(config, r)),
-      })),
-    );
-    for (const r of sent) if (r.ok) delete nextState[r.modelId];
   }
 
   if (JSON.stringify(nextState) !== JSON.stringify(prevState)) {
@@ -260,24 +450,23 @@ export async function runAlerts(env: Env, config: Config, results: ProbeResult[]
 }
 
 /**
- * Edge-triggered Slack alert for a *cycle-level* failure — the gateway being
+ * Edge-triggered alert for a *cycle-level* failure — the gateway being
  * unreachable (model discovery failed) or the prober key being rejected
  * account-wide. These paths return before any model is probed, so the per-model
- * alerter never runs; without this, the most severe outages would be silent on
- * Slack. Pages once on the transition to unhealthy and once on recovery, with
+ * alerter never runs; without this, the most severe outages would be silent.
+ * Pages once on the transition to unhealthy and once on recovery, with
  * the same deliver-before-commit guarantee as the per-model path. No-op when
- * `SLACK_WEBHOOK_URL` is unset.
+ * neither the Codex relay nor Slack webhook is configured.
  */
 export async function runCycleAlert(env: Env, config: Config, status: CycleStatus): Promise<void> {
-  const webhookUrl = env.SLACK_WEBHOOK_URL;
-  if (!webhookUrl) return;
+  if (!hasAlertDestination(env)) return;
 
   const alerted = (await readCycleAlertState(env.DB)) != null;
   if (!status.ok) {
-    if (!alerted && (await postSlack(webhookUrl, formatCycleDownAlert(config, status)))) {
+    if (!alerted && (await deliverAlert(env, cycleEvent(config, status)))) {
       await writeCycleAlertState(env.DB, status.checkedAt || "alerted");
     }
-  } else if (alerted && (await postSlack(webhookUrl, formatCycleRecoveredAlert(config, status)))) {
+  } else if (alerted && (await deliverAlert(env, cycleEvent(config, status)))) {
     await writeCycleAlertState(env.DB, null);
   }
 }
