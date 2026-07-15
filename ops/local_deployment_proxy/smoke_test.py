@@ -118,9 +118,11 @@ def check_chat(base, api_key, model, timeout, thinking):
         "messages": [{"role": "user", "content": "Reply with a short greeting."}],
         "max_tokens": 64,
         "temperature": 0,
-        # Reasoning models (e.g. Qwen3.6) otherwise spend the budget "thinking"
-        # and return empty content; the gateway disables thinking the same way.
-        "chat_template_kwargs": {"enable_thinking": thinking},
+        # Reasoning models otherwise spend the budget "thinking" and return
+        # empty content. Qwen-style chat templates read ``enable_thinking``
+        # while DeepSeek-V4 templates read ``thinking``; send both so the
+        # --thinking toggle works everywhere (templates ignore unknown kwargs).
+        "chat_template_kwargs": {"enable_thinking": thinking, "thinking": thinking},
     }
     _note(f"chat: {model} (cold start may take minutes; timeout {timeout}s) ...")
     status, body, dt = request("POST", f"{base}/v1/chat/completions", api_key, payload, timeout)
@@ -129,12 +131,24 @@ def check_chat(base, api_key, model, timeout, thinking):
         return False
     try:
         message = json.loads(body)["choices"][0]["message"]
-        text = (message.get("content") or message.get("reasoning_content") or "").strip()
+        # The answer must be in ``content``: standard OpenAI clients never read
+        # ``reasoning_content``, so falling back to it here would mask a broken
+        # deployment (e.g. a reasoning parser that classifies the entire
+        # generation as reasoning and leaves ``content`` empty).
+        text = (message.get("content") or "").strip()
+        reasoning = (message.get("reasoning_content") or "").strip()
     except Exception as exc:
         _failed(f"chat {model} -> 200 but unparseable: {exc}")
         return False
     if not text:
-        _failed(f"chat {model} -> 200 but empty content ({dt:.1f}s)")
+        if reasoning:
+            _failed(
+                f"chat {model} -> 200 but content is empty; the answer landed in "
+                f"reasoning_content ({dt:.1f}s) — reasoning parser misconfigured, "
+                f"or the thinking budget swallowed the reply"
+            )
+        else:
+            _failed(f"chat {model} -> 200 but empty content ({dt:.1f}s)")
         return False
     _passed(f"chat {model} -> 200 ({dt:.1f}s)")
     _note(f'reply: "{text[:120]}"')
