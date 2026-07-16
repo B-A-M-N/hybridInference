@@ -558,9 +558,7 @@ models:
     supports_tools: true
     supports_structured_output: true
     supported_params: [temperature, top_p, max_tokens, stop, stream]
-    # claude-sonnet-5 / claude-haiku-4-5* are Claude Code's default main and
-    # small-fast model IDs; both land here (fast, non-reasoning, cheapest).
-    aliases: ["qwen3.6:35b", "claude-sonnet-5", "claude-haiku-4-5", "claude-haiku-4-5-20251001"]
+    aliases: ["qwen3.6:35b"]
     pricing:
       prompt: "0.08"
       completion: "0.28"
@@ -635,12 +633,13 @@ models:
   # ── DeepSeek V4 (kind: deepseek) ─────────────────────────
   # Local H200 idle proxy: ops/h200_idle_proxy (sglang PP=3 on GPUs 0,2,3, port 8003).
   - id: deepseek-v4-flash
-    name: DeepSeek V4 Flash
+    name: DeepSeek V4 Flash (high speed high concurrency)
     provider: deepseek
     required_role: internal
     provider_model_id: "deepseek-v4-flash"
     context_length: 1000000
     max_output_length: 393216
+    aliases: ["deepseek-v4-flash", "claude-sonnet-5", "claude-haiku-4-5", "claude-haiku-4-5-20251001"]
     supports_tools: true
     supports_structured_output: true
     supported_params: [temperature, top_p, max_tokens, stop, stream, thinking, reasoning_effort]
