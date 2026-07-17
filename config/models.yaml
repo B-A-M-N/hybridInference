@@ -233,7 +233,7 @@ models:
     supported_params: [temperature, top_p, max_tokens, stop, stream, thinking]
     # claude-opus-4-8 (dash) is the ID Anthropic clients actually send;
     # the dot form is kept for anyone who copied it while it was live config.
-    aliases: ["MiniMax-M3", "claude-opus-4-8", "claude-opus-4.8"]
+    aliases: ["MiniMax-M3"]
     # MiniMax PAYG https://platform.minimax.io/docs/guides/pricing-paygo
     pricing:
       prompt: "0.5"
@@ -510,7 +510,7 @@ models:
     supports_tools: true
     supports_structured_output: true
     supported_params: [temperature, top_p, max_tokens, stop, stream]
-    aliases: ["qwen3.6:35b"]
+    aliases: ["qwen3.6:35b", "claude-sonnet-5", "claude-haiku-4-5", "claude-haiku-4-5-20251001"]
     pricing:
       prompt: "0.08"
       completion: "0.28"
@@ -584,14 +584,14 @@ models:
 
   # ── DeepSeek V4 (kind: deepseek) ─────────────────────────
   # Local H200 idle proxy: ops/h200_idle_proxy (sglang PP=3 on GPUs 0,2,3, port 8003).
-  - id: deepseek-v4-flash
+  - id: deepseek-v4-flash-highspeed
     name: DeepSeek V4 Flash (high speed high concurrency)
     provider: deepseek
     required_role: internal
     provider_model_id: "deepseek-v4-flash"
     context_length: 1000000
     max_output_length: 393216
-    aliases: ["deepseek-v4-flash", "claude-sonnet-5", "claude-haiku-4-5", "claude-haiku-4-5-20251001"]
+    aliases: ["deepseek-v4", "deepseek-v4-flash", "claude-opus-4-8", "claude-opus-4.8", "claude-sonnet-5"]
     supports_tools: true
     supports_structured_output: true
     supported_params: [temperature, top_p, max_tokens, stop, stream, thinking, reasoning_effort]
