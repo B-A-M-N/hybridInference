@@ -500,7 +500,7 @@ models:
         provider_model_id: "kimi-k3"
         
   - id: qwen3.6-35b
-    name: Qwen3.6 35B (no concurrency limit currently)
+    name: Qwen3.6 35B (high speed)
     provider: sglang
     quantization: "fp8"
     input_modalities: ["text"]
@@ -584,10 +584,10 @@ models:
 
   # ── DeepSeek V4 (kind: deepseek) ─────────────────────────
   # Local H200 idle proxy: ops/h200_idle_proxy (sglang PP=3 on GPUs 0,2,3, port 8003).
-  - id: deepseek-v4-flash-highspeed
-    name: DeepSeek V4 Flash (high speed high concurrency)
+  - id: deepseek-v4-flash
+    name: DeepSeek V4 Flash (high speed)
     provider: deepseek
-    required_role: internal
+    required_role: pro
     provider_model_id: "deepseek-v4-flash"
     context_length: 1000000
     max_output_length: 393216
