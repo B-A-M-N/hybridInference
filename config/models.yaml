@@ -498,7 +498,7 @@ models:
         api_keys:
           - ${STAGING_API_KEY}
         provider_model_id: "kimi-k3"
-        
+
   - id: qwen3.6-35b
     name: Qwen3.6 35B (high speed)
     provider: sglang
