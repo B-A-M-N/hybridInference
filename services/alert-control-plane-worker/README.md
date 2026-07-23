@@ -1,17 +1,18 @@
 # Alert Control Plane Worker
 
-This package is the dormant Phase 1 implementation of the unified alert
-control plane described in
+This package contains the staged implementation of the unified alert control
+plane described in
 [`docs/agents/specs/2026-07-20-unified-alert-control-plane-target-design.zh.md`](../../docs/agents/specs/2026-07-20-unified-alert-control-plane-target-design.zh.md).
 
 It owns the canonical alert contract, per-incident Durable Object state,
-SQLite outbox, alarm scheduling, and deterministic rendering. The Phase B
-`SlackSink` implementation is present and unit tested, but it is deliberately
-not registered by `src/index.ts`. The runtime still returns `503` from
-`/v1/events` and uses `DormantActionExecutor`, so no Slack or other external
-action can run after this code is deployed by itself.
+SQLite outbox, alarm scheduling, deterministic rendering, Slack sink, and
+principal quota authority. Phase C1 can compose those executors only when
+`CONTROL_PLANE_MODE=staging-runtime` and every required binding validates.
+The checked-in example has no such mode or credential, so it remains dormant.
+Public `/v1/events` still returns `503` in every mode; no producer has been
+migrated and the existing alert path is unchanged.
 
-## Phase 1 boundaries
+## Current Phase C1 boundaries
 
 - Producers submit one canonical `AlertEvent`; trusted environment, source,
   principal, and deployment fields are injected outside the producer body.
@@ -23,18 +24,27 @@ action can run after this code is deployed by itself.
   any adapter can execute it.
 - The checked-in Wrangler file is an example only. It contains no account ID,
   route, credential, Slack token, or GitHub token.
-- A future environment-specific Slack activation needs `SLACK_BOT_TOKEN`,
-  `SLACK_CHANNEL_ID`, and a stable `SLACK_SINK_ID`. Do not add their values to
-  this repository. The app needs `chat:write` plus the target conversation's
-  history scope (`channels:history`, `groups:history`, `im:history`, or
-  `mpim:history`) and membership/access to that conversation.
+- Active staging composition requires `ROUTE_KEY_V1`, `SLACK_BOT_TOKEN`,
+  `SLACK_CHANNEL_ID`, `SLACK_SINK_ID`, `PRINCIPAL_ACTIVE_LIMIT`,
+  `QUOTA_PENDING_LEASE_MS`, and the `PRINCIPAL_QUOTAS` Durable Object binding.
+  Configuration is fail-closed and health responses expose only stable error
+  codes, never binding values. Do not add real values to this repository.
+- The Slack app needs `chat:write` plus the target conversation's history scope
+  (`channels:history`, `groups:history`, `im:history`, or `mpim:history`) and
+  membership/access to that conversation.
 - Before any producer is enabled, the target workspace must prove that
   `conversations.history` and `conversations.replies` return the full message
   metadata (`include_all_metadata=true`) after post/update/reply. Mock tests do
   not satisfy the strict-single-parent exit criterion.
-- Deployment registry and principal quota persistence primitives are included,
-  but their Durable Object bindings remain disabled until the identity-wiring
-  phase.
+- Principal quota is wired in C1. A reservation stays pending on its first
+  outbox attempt and is confirmed only during reconciliation, so a failed
+  incident-side commit cannot immediately create a permanent quota lease.
+- Deployment registry ingress and producer authentication remain disabled for
+  the identity-wiring phase. C2 must first choose and validate the real
+  CI-attestation verifier; an allow-all/fake verifier is not an acceptable
+  reason to bind an otherwise unusable registry object in C1.
+- `dispatch_analysis` terminates with `analysis_not_enabled`; C1 never pretends
+  that a Codex/GitHub analysis was dispatched.
 - Unknown alert types and unknown context fields are rejected. New producer
   migrations must extend the typed contract deliberately.
 
@@ -87,6 +97,13 @@ The test visibly leaves one `[LIVE GATE]` synthetic parent in the target
 conversation, updates that parent, and adds recovery and analysis replies in
 the same thread. It does not delete these audit artifacts.
 
+The reviewed staging installation passed this gate on 2026-07-23 in channel
+`C09F2UER4R2`: parent/update `1784780331.287929`, recovery
+`1784780335.579209`, and analysis `1784780337.488039`. Independent readback
+found exactly one parent and two replies. This evidence applies only to that
+bot installation and channel; token, app-installation, or destination changes
+must rerun the gate.
+
 For each of the four writes, the transport first verifies that Slack accepted
 the write and then deliberately drops the successful response. The sink must
 return `uncertain`; the gate subsequently calls only reconciliation until it
@@ -99,10 +116,30 @@ original thread. Retry timing always honors Slack's `Retry-After` through
 On success, stdout contains only sanitized evidence: the run, sink, channel,
 parent, update, recovery, and analysis IDs. The token and Slack response bodies
 are never printed. A pass proves the strict-single-parent readback assumption
-for that token/channel at that time. It does not register the sink in the
-Worker, enable `/v1/events`, activate a producer, or replace staging lifecycle
-verification.
+for that token/channel at that time. It does not activate the conditionally
+registered sink, enable `/v1/events`, activate a producer, or replace staging
+lifecycle verification.
 
-Later phases register the reviewed environment bindings and sink, run a
-synthetic Slack lifecycle in staging, and only then enable an authenticated
-producer. None of those activation steps are enabled by this package.
+The next phase provisions reviewed staging identity bindings, enables the
+authenticated ingress, and runs a synthetic lifecycle. The real producer is
+migrated only after that gate; production remains a separate approval.
+
+## Later activation gates
+
+- C2 adds the `DeploymentRegistry` Durable Object only with a reviewed
+  GitHub-OIDC or controlled-CI verifier, then exposes authenticated staging
+  ingress and runs firing → repeat → resolved → re-fire. The live Slack
+  readback gate above remains a separate prerequisite.
+- C3 inventories writers by call path. Today that includes status-monitor's
+  relay/webhook fallback and the backend `alert_slack` helper used by endpoint
+  health, alert rules, the failed-request alerter, and health routes.
+- A migrated producer retries the same canonical `event_id` when the control
+  plane is unavailable. It must not fall back through V1 relay or a direct
+  Slack webhook, and old/new writers must never shadow by both posting.
+- Rollback is owner-aware: new fingerprints can return to legacy, while
+  control-plane-owned active fingerprints keep routing to the control plane
+  until recovery or audited operator close. Turning the control plane dormant
+  while those incidents are active is not a safe rollback.
+- A log-only/fake sink is safe only in a fully isolated namespace that will be
+  discarded. Fake delivery references must never be written into the namespace
+  intended for eventual Slack ownership.
