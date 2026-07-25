@@ -101,10 +101,21 @@ api-key: your-qdrant-key
 
 The following headers are used for client IP resolution when the server is behind a reverse proxy (requires `TRUST_PROXY_HEADERS=1`):
 
+Resolution order (first match wins):
+
 | Header | Description |
 |--------|-------------|
-| `X-Forwarded-For` | Client IP as set by the proxy (first entry is used) |
+| `CF-Connecting-IPv6` | The visitor's real IPv6 address. Sent by Cloudflare only when Pseudo IPv4 is set to "Overwrite headers", where `CF-Connecting-IP` instead carries a synthetic Class E IPv4. Honored only when `CF-Connecting-IP` corroborates it by holding that synthetic — otherwise ignored, since the header is absent (not cleared) on ordinary requests and so is caller-supplied |
+| `CF-Connecting-IP` | Client IP as set by Cloudflare. Preferred over the forwarding headers — Cloudflare always overwrites this one, while it only *appends* to `X-Forwarded-For`. Requires `TRUST_CLOUDFLARE_HEADERS=1`, which must be enabled only when Cloudflare is the immediate proxy |
+| `X-Forwarded-For` | Fallback for non-Cloudflare proxies (first entry is used) |
 | `X-Real-IP` | Fallback client IP header |
+
+If none match — or `TRUST_PROXY_HEADERS` is not `1` — the socket peer address is used.
+
+IPv6 client addresses are logged in full. For per-client rate limits and sticky
+routing they are grouped by `/64`, since a single client is typically delegated
+an entire prefix and its addresses may rotate. IPv4 addresses — including
+IPv4-mapped literals such as `::ffff:192.0.2.1` — are grouped per address.
 
 ## Standard Headers
 
