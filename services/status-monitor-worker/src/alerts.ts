@@ -458,7 +458,20 @@ export async function runAlerts(env: Env, config: Config, results: ProbeResult[]
     prevState,
   );
 
-  const nextState: Record<string, string> = Object.assign(Object.create(null), baseState);
+  // "Absent from this cycle" only means "gone" when this cycle actually observed
+  // a catalog. An empty result set is evidence about nothing, so neither the
+  // state pruning in `decideAlerts` nor the departure inference below may act on
+  // it: pruning would drop each model's fingerprint mapping — stranding its open
+  // incident, because a later healthy probe no longer counts as a recovery — and
+  // departure would resolve every incident at once during what is almost
+  // certainly a total outage. `discoverModels` already fails the cycle before the
+  // alerter runs; this keeps both inferences sound if runAlerts is ever reached
+  // another way.
+  const observedCatalog = results.length > 0;
+  const nextState: Record<string, string> = Object.assign(
+    Object.create(null),
+    observedCatalog ? baseState : prevState,
+  );
   const completionStatements: D1PreparedStatement[] = [];
   const pendingModelIds = new Set<string>();
   for (const pending of pendingEvents) {
@@ -492,16 +505,18 @@ export async function runAlerts(env: Env, config: Config, results: ProbeResult[]
     completionStatements.push(...preparePendingCanonicalEventCompletion(env.DB, pending));
   }
 
-  const presentModelIds = new Set(results.map((result) => result.modelId));
   const departedControlPlaneModels = new Map<string, string>();
-  for (const [modelId, stateValue] of Object.entries(prevState)) {
-    if (presentModelIds.has(modelId) || pendingModelIds.has(modelId)) continue;
-    const fingerprint = incidentFingerprint(modelId, stateValue);
-    const owner = await readDrainOwner(env.DB, fingerprint);
-    if (owner === "control-plane") {
-      departedControlPlaneModels.set(modelId, fingerprint);
-    } else if (owner === "legacy") {
-      completionStatements.push(prepareDrainOwnerRelease(env.DB, fingerprint));
+  if (observedCatalog) {
+    const presentModelIds = new Set(results.map((result) => result.modelId));
+    for (const [modelId, stateValue] of Object.entries(prevState)) {
+      if (presentModelIds.has(modelId) || pendingModelIds.has(modelId)) continue;
+      const fingerprint = incidentFingerprint(modelId, stateValue);
+      const owner = await readDrainOwner(env.DB, fingerprint);
+      if (owner === "control-plane") {
+        departedControlPlaneModels.set(modelId, fingerprint);
+      } else if (owner === "legacy") {
+        completionStatements.push(prepareDrainOwnerRelease(env.DB, fingerprint));
+      }
     }
   }
 
