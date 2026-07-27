@@ -158,8 +158,11 @@ export async function postSlack(webhookUrl: string, message: string): Promise<bo
       console.error(`slack webhook returned HTTP ${resp.status}`);
     }
     return resp.ok;
-  } catch (err) {
-    console.error("slack webhook post failed", err);
+  } catch {
+    // The webhook URL is itself the credential, and a Workers fetch failure can
+    // embed the request URL in its message — so never log the caught error
+    // (mirrors postCodexAlert, which redacts for the same reason).
+    console.error("slack webhook post failed");
     return false;
   }
 }
@@ -310,6 +313,15 @@ async function deliverAlert(env: Env, event: CodexAlertEvent): Promise<boolean> 
   if (relay && (await postCodexAlert(relay, event))) return true;
 
   const webhookUrl = env.SLACK_WEBHOOK_URL?.trim();
+  if (!relay && !webhookUrl) {
+    // Storm, cycle, and legacy-drain alerts have no Control Plane path yet, so a
+    // deployment without either legacy destination drops them with no post ever
+    // attempted. The undelivered edge re-fires next cycle, making this line the
+    // only signal that the most severe alert class is going nowhere. The title
+    // is bounded and public (model ids); slack_text is deliberately excluded.
+    console.error(`legacy alert undeliverable (no relay or webhook configured): ${event.title}`);
+    return false;
+  }
   return webhookUrl ? postSlack(webhookUrl, event.slack_text) : false;
 }
 
@@ -675,12 +687,12 @@ export async function runAlerts(env: Env, config: Config, results: ProbeResult[]
  * account-wide. These paths return before any model is probed, so the per-model
  * alerter never runs; without this, the most severe outages would be silent.
  * Pages once on the transition to unhealthy and once on recovery, with
- * the same deliver-before-commit guarantee as the per-model path. No-op when
- * neither the Codex relay nor Slack webhook is configured.
+ * the same deliver-before-commit guarantee as the per-model path. With no
+ * configured destination the down edge reaches deliverAlert's undeliverable
+ * report and retries next cycle — never a silent no-op at the door, since a
+ * cycle-level outage is the most severe alert class this worker emits.
  */
 export async function runCycleAlert(env: Env, config: Config, status: CycleStatus): Promise<void> {
-  if (!hasAlertDestination(env)) return;
-
   const alerted = (await readCycleAlertState(env.DB)) != null;
   if (!status.ok) {
     if (!alerted && (await deliverAlert(env, cycleEvent(config, status)))) {
