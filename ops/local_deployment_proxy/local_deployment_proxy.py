@@ -28,8 +28,8 @@ HEALTH_INTERVAL: Seconds between health-check polls       (default 10)
 MODELS_CONFIG  : Path to a JSON config file               (see below)
 
 When ``MODELS_CONFIG`` is unset the proxy auto-selects a hardware profile from
-``nvidia-smi``: ``models.h200.json`` on a 4+ x H200 box (DeepSeek-V4-Flash at
-``pipeline_parallel_size`` 3 on GPUs 0,2,3, skipping GPU 1), ``models.rtx6000.json``
+``nvidia-smi``: ``models.h200.json`` on a 4+ x H200 box (DeepSeek-V4-Flash-0731 at
+``tensor_parallel_size`` 2 on GPUs 2,3), ``models.rtx6000.json``
 on an RTX (PRO) 6000 (Qwen3.6-35B), else ``models.json``. See
 ``_detect_profile_config``. For the dedicated H200 service (port 8003 +
 staging/prod tunnels) use ``ops/h200_idle_proxy`` instead.
@@ -102,6 +102,19 @@ tokens) suit a single MTP layer; override with ``speculative_num_steps``,
 ``speculative_algorithm`` if needed. DeepSeek-V4-Flash requires
 ``"speculative_algorithm": "EAGLE"`` (sglang rejects ``NEXTN`` for that arch).
 
+DeepSeek-V4-Flash-**0731** instead ships a DSpark head (3 blocks, plus markov and
+confidence heads) and needs ``"speculative_algorithm": "DSPARK"`` on sglang
+>= 0.5.16; earlier builds only implement the preview checkpoint's single-block
+MTP and load an unpopulated draft head, which serves 500s. For DSPARK the
+step/topk/draft-token knobs are left unset unless configured, so sglang can read
+the draft block size (gamma) from the checkpoint and size the verify window as
+gamma + 1. Pin ``"sglang_image"`` to hold a known-good tag.
+
+Set ``"skip_server_warmup": true`` to pass ``--skip-server-warmup``, and
+``"cache_dir"`` to bind-mount a persistent DeepGEMM/JIT kernel cache at
+``/root/.cache``; both cut startup time on large MoE models. Keep ``cache_dir``
+node-local rather than on shared storage.
+
 Set ``"moe_runner_backend"`` (e.g. ``"marlin"``) to override the MoE runner.
 NVFP4 / FP4-expert checkpoints need ``"marlin"`` on pre-Blackwell (SM90, e.g.
 H200) GPUs; the default ``triton`` runner asserts on the packed FP4 shapes.
@@ -155,7 +168,7 @@ def _detect_profile_config() -> Path:
     machine should serve the model that fits it. We inspect ``nvidia-smi`` once
     at import and map the hardware to a profile JSON next to this script:
 
-      * **4+ x H200**       -> ``models.h200.json``     (DeepSeek-V4-Flash, PP=3 on 0,2,3)
+      * **4+ x H200**       -> ``models.h200.json``     (DeepSeek-V4-Flash-0731, TP=2 on 2,3)
       * **RTX (PRO) 6000**  -> ``models.rtx6000.json``  (Qwen3.6-35B)
       * anything else / no ``nvidia-smi`` → ``models.json`` (default fallback)
 
@@ -611,8 +624,20 @@ class BackendManager:
             f"{self.backend_port}:8001",
             "-v",
             f"{self.config['model_dir']}:/model:ro",
+            # Persist sglang's DeepGEMM/JIT kernel cache across container restarts.
+            # Cold-compiling it costs several minutes on DeepSeek-V4 (~680s to ready
+            # vs ~370s warm), which can outrun the health-check budget after an
+            # idle-timeout teardown. Keep the dir node-local -- a cache shared over
+            # NFS between boxes would have them racing on the same files.
+            *(
+                ["-v", f"{self.config['cache_dir']}:/root/.cache"]
+                if self.config.get("cache_dir")
+                else []
+            ),
             *self._docker_env_args(),
-            "lmsysorg/sglang:latest",
+            # `or`, not a dict default: a key present but explicitly "" or null would
+            # otherwise become the literal image reference "" / "None" and fail the run.
+            str(self.config.get("sglang_image") or "lmsysorg/sglang:latest"),
             "python3",
             "-m",
             "sglang.launch_server",
@@ -638,6 +663,11 @@ class BackendManager:
         moe_backend = self.config.get("moe_runner_backend")
         if moe_backend:
             cmd += ["--moe-runner-backend", str(moe_backend)]
+        # sglang's startup warmup request runs after the scheduler is up and can add
+        # minutes on a large MoE model. The proxy's own health check already gates
+        # readiness, so skipping it keeps slow models inside HEALTH_TIMEOUT.
+        if self.config.get("skip_server_warmup"):
+            cmd += ["--skip-server-warmup"]
         if self.config.get("is_embedding"):
             # Embedding models run sglang in encode-only mode; tool-call parsing
             # and chat-completion endpoints are irrelevant for them.
@@ -665,16 +695,33 @@ class BackendManager:
             # draft model path is needed. The step/topk/draft-token counts are
             # tunable; the defaults suit a single MTP layer (one extra token).
             if self.config.get("mtp"):
-                cmd += [
-                    "--speculative-algorithm",
-                    str(self.config.get("speculative_algorithm", "NEXTN")),
-                    "--speculative-num-steps",
-                    str(self.config.get("speculative_num_steps", 1)),
-                    "--speculative-eagle-topk",
-                    str(self.config.get("speculative_eagle_topk", 1)),
-                    "--speculative-num-draft-tokens",
-                    str(self.config.get("speculative_num_draft_tokens", 2)),
-                ]
+                algo = str(self.config.get("speculative_algorithm", "NEXTN"))
+                cmd += ["--speculative-algorithm", algo]
+                # DSpark (DeepSeek-V4-Flash-0731) carries its own draft geometry in the
+                # checkpoint: sglang reads dspark_block_size (gamma) and derives the
+                # verify window as gamma + 1. The single-MTP-layer defaults below would
+                # override that -- --speculative-num-draft-tokens 2 collapses a 5-token
+                # DSpark block to 1 and gives up most of the speedup -- so pass only the
+                # knobs that were set explicitly and let sglang infer the rest.
+                if algo.upper() == "DSPARK":
+                    for key, flag in (
+                        ("speculative_num_steps", "--speculative-num-steps"),
+                        ("speculative_eagle_topk", "--speculative-eagle-topk"),
+                        ("speculative_num_draft_tokens", "--speculative-num-draft-tokens"),
+                        ("speculative_dspark_block_size", "--speculative-dspark-block-size"),
+                    ):
+                        value = self.config.get(key)
+                        if value is not None:
+                            cmd += [flag, str(value)]
+                else:
+                    cmd += [
+                        "--speculative-num-steps",
+                        str(self.config.get("speculative_num_steps", 1)),
+                        "--speculative-eagle-topk",
+                        str(self.config.get("speculative_eagle_topk", 1)),
+                        "--speculative-num-draft-tokens",
+                        str(self.config.get("speculative_num_draft_tokens", 2)),
+                    ]
                 # Hybrid Mamba/linear-attention models (Qwen3.5/3.6 MoE) reject
                 # spec decoding alongside radix cache unless the Mamba scheduler
                 # reserves extra cache buffers and the v2 spec path is enabled
@@ -905,12 +952,32 @@ def _get_backend(
     return backend
 
 
-WARMUP_THINKING_SSE = (
-    'data: {"id":"warmup","object":"chat.completion.chunk",'
-    '"choices":[{"index":0,"delta":{"role":"assistant",'
-    '"content":"⏳ The model is starting up — this takes about 120 seconds. '
-    'Please wait…"},"finish_reason":null}]}\n\n'
-)
+DEFAULT_STARTUP_ESTIMATE_SECONDS = 120
+
+
+def _warmup_thinking_sse(backend: BackendManager) -> str:
+    """Build the "still starting" SSE chunk, with a per-model time estimate.
+
+    A single hardcoded figure misleads badly on large MoE models: DeepSeek-V4-Flash
+    takes 9-14 minutes to reach ready from cold (weight load, CUDA-graph capture and
+    DeepGEMM JIT), so a flat "about 120 seconds" tells the caller to wait roughly a
+    tenth of the real time. Models can set ``startup_estimate_seconds`` to say how
+    long they actually take.
+    """
+    config = getattr(backend, "config", None) or {}
+    seconds = int(config.get("startup_estimate_seconds", DEFAULT_STARTUP_ESTIMATE_SECONDS))
+    # <= 120 so every model that never sets an estimate keeps the original wording.
+    estimate = (
+        f"about {seconds} seconds" if seconds <= 120 else f"about {round(seconds / 60)} minutes"
+    )
+    return (
+        'data: {"id":"warmup","object":"chat.completion.chunk",'
+        '"choices":[{"index":0,"delta":{"role":"assistant",'
+        f'"content":"⏳ The model is starting up — this takes {estimate}. '
+        'Please wait…"},"finish_reason":null}]}\n\n'
+    )
+
+
 WARMUP_THINKING_SSE_DONE = (
     'data: {"id":"warmup","object":"chat.completion.chunk",'
     '"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
@@ -1032,7 +1099,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
 
-        self._send_sse_chunk(WARMUP_THINKING_SSE)
+        self._send_sse_chunk(_warmup_thinking_sse(backend))
         self._send_sse_chunk(WARMUP_THINKING_SSE_DONE)
         self._send_sse_chunk("data: [DONE]\n\n")
         self.wfile.flush()

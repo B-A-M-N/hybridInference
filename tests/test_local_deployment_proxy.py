@@ -686,7 +686,7 @@ def _gpu_query_result(stdout: str) -> Any:
 
 
 def test_detect_profile_selects_h200_for_four_h200s(monkeypatch: Any, tmp_path: Path) -> None:
-    # A box with 4x H200 must serve the DeepSeek-V4-Flash (PP=3 on 0,2,3) profile.
+    # A box with 4x H200 must serve the DeepSeek-V4-Flash-0731 (TP=2 on 2,3) profile.
     proxy = _load_proxy(monkeypatch, tmp_path)
     monkeypatch.setattr(
         proxy.subprocess,
@@ -696,25 +696,36 @@ def test_detect_profile_selects_h200_for_four_h200s(monkeypatch: Any, tmp_path: 
     assert proxy._detect_profile_config().name == "models.h200.json"
 
 
-def test_h200_profile_uses_pp3_and_skips_gpu1() -> None:
-    """Canonical H200 profile shards DeepSeek-V4-Flash with PP=3 on GPUs 0,2,3.
+def test_h200_profile_uses_tp2_on_gpus_2_and_3() -> None:
+    """Canonical H200 profile shards DeepSeek-V4-Flash-0731 with TP=2 on GPUs 2,3.
 
-    The 273 GiB of FP8 weights do not fit at TP=2 on two H200s, and TP=3 is
-    illegal (64 attention heads are not divisible by 3). Pipeline parallelism
-    splits by layer, so PP=3 fits on three GPUs while leaving GPU 1 free.
+    The earlier profile needed PP=3 across GPUs 0,2,3 because 273 GiB of FP8
+    weights do not fit at TP=2 (and TP=3 is illegal — 64 attention heads are not
+    divisible by 3). The 0731 release ships FP4 experts at ~156 GiB, so it fits on
+    two GPUs and frees a third. Must stay in step with the dedicated
+    ``ops/h200_idle_proxy`` profile, which is what actually runs on h200a/h200b.
     """
     import json
     from pathlib import Path
 
-    cfg_path = (
-        Path(__file__).resolve().parents[1] / "ops" / "local_deployment_proxy" / "models.h200.json"
-    )
-    cfg = json.loads(cfg_path.read_text())
-    model = cfg["deepseek-v4-flash"]
-    assert model["pipeline_parallel_size"] == 3
-    assert model["tensor_parallel_size"] == 1
-    assert model["gpu_index"] == "0,2,3"
-    assert "1" not in str(model["gpu_index"]).split(",")
+    root = Path(__file__).resolve().parents[1] / "ops"
+    profile = json.loads((root / "local_deployment_proxy" / "models.h200.json").read_text())
+    dedicated = json.loads((root / "h200_idle_proxy" / "models.json").read_text())
+
+    model = profile["deepseek-v4-flash"]
+    assert model["tensor_parallel_size"] == 2
+    assert "pipeline_parallel_size" not in model
+    assert model["gpu_index"] == "2,3"
+    # DSpark needs the official checkpoint: the NVFP4 conversion excludes mtp.*, so
+    # the draft-expert scales are dropped at load and accept length collapses to 1.0.
+    assert model["hf_repo"] == "deepseek-ai/DeepSeek-V4-Flash-0731"
+    assert model["speculative_algorithm"] == "DSPARK"
+    assert model["moe_runner_backend"] == "marlin"
+
+    for key in ("model_dir", "hf_repo", "gpu_index", "speculative_algorithm", "sglang_image"):
+        assert model[key] == dedicated["deepseek-v4-flash"][key], (
+            f"models.h200.json and h200_idle_proxy/models.json disagree on {key!r}"
+        )
 
 
 def test_h200_profiles_use_deepseek_v4_parsers() -> None:
@@ -968,6 +979,114 @@ def test_sglang_mtp_algorithm_override(monkeypatch: Any, tmp_path: Path) -> None
     assert cmd[cmd.index("--speculative-algorithm") + 1] == "EAGLE"
 
 
+def _dspark_base() -> dict[str, Any]:
+    return {
+        "container": "ds-sglang",
+        "engine": "sglang",
+        "gpu_index": "2,3",
+        "tensor_parallel_size": 2,
+        "backend_port": 18003,
+        "model_dir": "/tmp/ds",
+        "served_name": MODEL_NAME,
+        "max_model_len": 4096,
+        "mem_fraction": "0.90",
+        "mtp": True,
+        "speculative_algorithm": "DSPARK",
+    }
+
+
+def test_sglang_dspark_omits_single_mtp_layer_defaults(monkeypatch: Any, tmp_path: Path) -> None:
+    # DeepSeek-V4-Flash-0731's DSpark head carries its own block size (gamma) in the
+    # checkpoint. Sending the single-MTP-layer defaults would override it --
+    # --speculative-num-draft-tokens 2 collapses a 5-token block to 1 -- so none of
+    # the step/topk/draft-token flags may be emitted unless explicitly configured.
+    proxy = _load_proxy(monkeypatch, tmp_path)
+
+    cmd = proxy.BackendManager(MODEL_NAME, _dspark_base())._sglang_run_cmd("2,3")
+
+    assert cmd[cmd.index("--speculative-algorithm") + 1] == "DSPARK"
+    assert "--speculative-num-draft-tokens" not in cmd
+    assert "--speculative-num-steps" not in cmd
+    assert "--speculative-eagle-topk" not in cmd
+
+
+def test_sglang_dspark_passes_explicit_overrides(monkeypatch: Any, tmp_path: Path) -> None:
+    # Explicit tuning still wins over checkpoint inference when it is set.
+    proxy = _load_proxy(monkeypatch, tmp_path)
+
+    cmd = proxy.BackendManager(
+        MODEL_NAME,
+        {**_dspark_base(), "speculative_num_draft_tokens": 6, "speculative_dspark_block_size": 5},
+    )._sglang_run_cmd("2,3")
+
+    assert cmd[cmd.index("--speculative-num-draft-tokens") + 1] == "6"
+    assert cmd[cmd.index("--speculative-dspark-block-size") + 1] == "5"
+
+
+def test_sglang_non_dspark_mtp_keeps_defaults(monkeypatch: Any, tmp_path: Path) -> None:
+    # The DSPARK special case must not change behaviour for EAGLE/NEXTN models.
+    proxy = _load_proxy(monkeypatch, tmp_path)
+
+    cmd = proxy.BackendManager(
+        MODEL_NAME, {**_dspark_base(), "speculative_algorithm": "EAGLE"}
+    )._sglang_run_cmd("2,3")
+
+    assert cmd[cmd.index("--speculative-algorithm") + 1] == "EAGLE"
+    assert cmd[cmd.index("--speculative-num-steps") + 1] == "1"
+    assert cmd[cmd.index("--speculative-eagle-topk") + 1] == "1"
+    assert cmd[cmd.index("--speculative-num-draft-tokens") + 1] == "2"
+
+
+def test_sglang_cache_dir_and_image_pin(monkeypatch: Any, tmp_path: Path) -> None:
+    # A persistent JIT cache mount and a pinned image are both opt-in; DSpark needs
+    # sglang >= 0.5.16, so the deployment pins the tag rather than tracking :latest.
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    base = _dspark_base()
+
+    default = proxy.BackendManager(MODEL_NAME, dict(base))._sglang_run_cmd("2,3")
+    assert "lmsysorg/sglang:latest" in default
+    assert not any(arg.endswith(":/root/.cache") for arg in default)
+
+    pinned = proxy.BackendManager(
+        MODEL_NAME,
+        {
+            **base,
+            "cache_dir": "/var/tmp/sglang-cache/ds",
+            "sglang_image": "lmsysorg/sglang:v0.5.16",
+        },
+    )._sglang_run_cmd("2,3")
+    assert "lmsysorg/sglang:v0.5.16" in pinned
+    assert "lmsysorg/sglang:latest" not in pinned
+    assert "/var/tmp/sglang-cache/ds:/root/.cache" in pinned
+
+
+def test_sglang_blank_image_falls_back_to_default_tag(monkeypatch: Any, tmp_path: Path) -> None:
+    # A key that is present but blank/null must fall back to the default tag. A dict
+    # default only covers an absent key, so "" and None would otherwise reach docker
+    # as the literal image references "" and "None".
+    proxy = _load_proxy(monkeypatch, tmp_path)
+
+    for blank in ("", None):
+        cmd = proxy.BackendManager(
+            MODEL_NAME, {**_dspark_base(), "sglang_image": blank}
+        )._sglang_run_cmd("2,3")
+        assert "lmsysorg/sglang:latest" in cmd
+        assert "None" not in cmd
+        assert "" not in cmd
+
+
+def test_sglang_skip_server_warmup_opt_in(monkeypatch: Any, tmp_path: Path) -> None:
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    base = _dspark_base()
+
+    assert "--skip-server-warmup" not in proxy.BackendManager(
+        MODEL_NAME, dict(base)
+    )._sglang_run_cmd("2,3")
+    assert "--skip-server-warmup" in proxy.BackendManager(
+        MODEL_NAME, {**base, "skip_server_warmup": True}
+    )._sglang_run_cmd("2,3")
+
+
 def test_sglang_mamba_mtp_uses_extra_buffer_and_spec_v2(monkeypatch: Any, tmp_path: Path) -> None:
     # Hybrid Mamba MoE models (Qwen3.5/3.6) must keep the radix (prefix) cache while
     # running MTP spec decoding. sglang disables the radix cache for these unless the
@@ -1074,3 +1193,19 @@ def test_copy_stream_forwards_sse_chunks_as_they_arrive(monkeypatch: Any, tmp_pa
 
     assert len(wfile.writes) >= 2
     assert b"".join(wfile.writes) == b"".join(events)
+
+
+def test_warmup_banner_uses_per_model_startup_estimate(monkeypatch: Any, tmp_path: Path) -> None:
+    # A flat "about 120 seconds" understates a large MoE cold start by ~10x, which is
+    # what callers saw while DeepSeek-V4 was taking 9-14 minutes to reach ready.
+    proxy = _load_proxy(monkeypatch, tmp_path)
+
+    default = proxy.BackendManager(MODEL_NAME, {"container": "c", "model_dir": "/tmp/m"})
+    assert "about 120 seconds" in proxy._warmup_thinking_sse(default)
+
+    slow = proxy.BackendManager(
+        MODEL_NAME, {"container": "c", "model_dir": "/tmp/m", "startup_estimate_seconds": 840}
+    )
+    banner = proxy._warmup_thinking_sse(slow)
+    assert "about 14 minutes" in banner
+    assert "120 seconds" not in banner
