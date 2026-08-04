@@ -96,15 +96,32 @@ sudo ./ops/h200_idle_proxy/uninstall.sh
 
 Default tunnels: `spark2` and `jason@internal.freeinference.org`.
 
+The unit reads the repo's `.env` for `LOCAL_API_KEY` (see [Gateway
+configuration](#gateway-configuration)). Neither H200 node normally has one, so
+pass the key on the first install — `sudo LOCAL_API_KEY='…'
+./ops/h200_idle_proxy/install.sh` — and it lands in a mode-0600 drop-in. The
+port-only re-runs above keep whatever key is already installed; to remove it, pass
+`LOCAL_API_KEY=` explicitly or run `uninstall.sh`.
+
 ## Gateway configuration
 
-On **both** staging and production, set:
+On **both** staging and production, set the following in `.env` — the first is
+h200a, the second h200b, and the third must match the key the proxy checks
+against:
 
 ```bash
-H200_DEPLOYMENT_URL=http://host.docker.internal:8003/v1   # h200a
-H200B_DEPLOYMENT_URL=http://host.docker.internal:8004/v1  # h200b
-LOCAL_API_KEY=freeinference_api   # must match the proxy
+H200_DEPLOYMENT_URL=http://host.docker.internal:8003/v1
+H200B_DEPLOYMENT_URL=http://host.docker.internal:8004/v1
+LOCAL_API_KEY=freeinference_api
 ```
+
+Write those with no trailing `# …` comment and no `export ` prefix. Compose reads
+`.env` with a dotenv parser that strips both; the proxies' systemd units read the
+same file with systemd's parser, which per systemd.exec(5) ignores only lines
+*starting* with `#` and keeps "interior whitespace within the line … verbatim".
+So `LOCAL_API_KEY=freeinference_api   # must match the proxy` gives the gateway
+`freeinference_api` and the proxy `freeinference_api   # must match the proxy` —
+the same 401-on-every-request mismatch, arrived at from a file that looks right.
 
 `config/models.yaml` registers one optional `kind: sglang` route per node for
 `deepseek-v4-flash`; each is skipped when its own env var is blank, so a node that

@@ -79,9 +79,25 @@ sudo ./local_deployment_proxy/install.sh
 sudo SSH_HOST='user@internal.freeinference.org|user@spark2' REMOTE_PORT=8001 \
      ./local_deployment_proxy/install.sh
 
-# Remove everything (proxy + all tunnel instances + drop-ins):
+# Remove everything (proxy + all tunnel instances + drop-ins, including the key):
 sudo ./local_deployment_proxy/uninstall.sh
 ```
+
+The unit reads the repo's `.env` for `LOCAL_API_KEY` — the key the gateway signs
+its requests with — so on a box that also hosts the gateway a rotation there
+reaches both ends at once. A box that runs only this proxy and its tunnel has no
+`.env`; pass the key to the installer instead and it writes a mode-0600 drop-in:
+
+```bash
+sudo LOCAL_API_KEY='…' ./local_deployment_proxy/install.sh
+```
+
+A later run that does not pass `LOCAL_API_KEY` **keeps** the drop-in it finds, so
+re-installing to add a tunnel host or move a port does not take the key off a box
+that has no `.env` to fall back on. To remove the key, ask for it explicitly —
+`sudo LOCAL_API_KEY= ./local_deployment_proxy/install.sh` — or run `uninstall.sh`.
+Either way the installer restarts the unit, since systemd does not re-read a
+drop-in on its own and `enable --now` does nothing to an already-running one.
 
 Equivalent manual steps, if you'd rather not use the script. The proxy unit
 carries a `__REPO_ROOT__` placeholder, so render it (the tunnel unit has no
@@ -218,8 +234,50 @@ To add a new model, append an entry to `models.json` and restart the proxy.
 | `IDLE_TIMEOUT` | `1440` | Seconds of inactivity before stopping a container (24 min) |
 | `HEALTH_TIMEOUT` | `600` | Max seconds to wait for a container to become healthy |
 | `HEALTH_INTERVAL` | `10` | Seconds between health-check polls |
-| `MODELS_CONFIG` | auto-detected | Path to the models config JSON. When unset, selected by GPU hardware (see [Hardware profiles](#hardware-profiles)); set explicitly to override |
-| `LOCAL_API_KEY` | (none) | API key for request auth; accept `Authorization: Bearer` or `X-API-Key` header |
+| `MODELS_CONFIG` | auto-detected | Path to the models config JSON. When unset, selected by GPU hardware (see [Hardware profiles](#hardware-profiles)); set explicitly to override. **Not settable from the environment under systemd** — see below |
+| `LOCAL_API_KEY` | `freeinference_api` | API key for request auth; accepts an `Authorization: Bearer` or `X-API-Key` header. A blank value falls back to the default rather than disabling auth — there is no way to turn auth off |
+
+### `MODELS_CONFIG` under systemd
+
+`deploy/systemd/local_deployment_proxy.service` reads the gateway's `.env` (that is
+where `LOCAL_API_KEY` comes from), and `MODELS_CONFIG` is also a *gateway*
+variable — a legacy alias of `MODELS_CONFIG_PATH` naming a YAML registry, which
+this proxy would `json.load()` and find no backends in. An `EnvironmentFile=`
+outranks every `Environment=` line whatever the order, so the unit drops the
+variable with `UnsetEnvironment=MODELS_CONFIG`, which systemd applies last of all.
+Hardware auto-detection is therefore always in charge under systemd, and no
+ordinary route — `.env`, a drop-in `Environment=`, `systemctl set-environment` —
+can override it.
+
+To pin a config there, set it in the **child process** with a `/usr/bin/env`
+prefix on `ExecStart`, the way `h200_idle_proxy.service` pins
+`ops/h200_idle_proxy/models.json`. That is the one place that outranks
+`EnvironmentFile=` and `UnsetEnvironment=` both, because it runs after systemd has
+finished compiling the environment. The bare `ExecStart=` is what lets a drop-in
+replace the command instead of appending a second one; take the rest of the line
+from `systemctl cat local_deployment_proxy.service`:
+
+```ini
+# /etc/systemd/system/local_deployment_proxy.service.d/models-config.conf
+[Service]
+ExecStart=
+ExecStart=/usr/bin/env MODELS_CONFIG=/path/to/models.json /srv/hybridInference/.venv/bin/python3 /srv/hybridInference/ops/local_deployment_proxy/local_deployment_proxy.py
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart local_deployment_proxy
+```
+
+Resetting the unset list and setting the variable with an `Environment=` line
+instead does **not** work, and fails precisely when it is needed:
+`UnsetEnvironment=` only stops the final deletion, so a `.env` that does define
+`MODELS_CONFIG` goes back to outranking that `Environment=` line and the proxy
+loads the gateway's YAML after all.
+
+Keep this in its own `.conf`, separate from the `local-api-key.conf` the installer
+writes into the same `.d` directory, and re-check it if the unit's own `ExecStart`
+ever changes, since the drop-in restates it. Running the proxy by hand is
+unaffected: `MODELS_CONFIG` works normally there.
 
 ## GPU auto-selection
 
