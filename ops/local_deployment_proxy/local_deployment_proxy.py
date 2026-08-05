@@ -26,13 +26,16 @@ IDLE_TIMEOUT   : Seconds of inactivity before stopping    (default 1440 = 24 min
 HEALTH_TIMEOUT : Max seconds to wait for backend startup  (default 600)
 HEALTH_INTERVAL: Seconds between health-check polls       (default 10)
 MODELS_CONFIG  : Path to a JSON config file               (see below)
+PROXY_OWNER    : Identity stamped on containers this proxy starts, so it never
+                 destroys or adopts a sibling proxy's backend of the same name
+                 (default ``port-$LISTEN_PORT``; see "Container ownership")
 
 When ``MODELS_CONFIG`` is unset the proxy auto-selects a hardware profile from
-``nvidia-smi``: ``models.h200.json`` on a 4+ x H200 box (DeepSeek-V4-Flash-0731 at
-``tensor_parallel_size`` 2 on GPUs 2,3), ``models.rtx6000.json``
-on an RTX (PRO) 6000 (Qwen3.6-35B), else ``models.json``. See
-``_detect_profile_config``. For the dedicated H200 service (port 8003 +
-staging/prod tunnels) use ``ops/h200_idle_proxy`` instead.
+``nvidia-smi``: ``../h200_idle_proxy/models.json`` on a 4+ x H200 box
+(DeepSeek-V4-Flash-0731 at ``tensor_parallel_size`` 2 on GPUs 2,3),
+``models.rtx6000.json`` on an RTX (PRO) 6000 (Qwen3.6-35B), else
+``models.json``. See ``_detect_profile_config``. For the dedicated H200 service
+(port 8003 + staging/prod tunnels) use ``ops/h200_idle_proxy`` instead.
 
 Model configuration
 -------------------
@@ -129,15 +132,17 @@ flag adds ``--mamba-scheduler-strategy extra_buffer`` (override with
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json as _json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -152,6 +157,223 @@ LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8001"))
 IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", "1440"))
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "600"))
 HEALTH_INTERVAL = float(os.environ.get("HEALTH_INTERVAL", "10"))
+
+# ── Container ownership ────────────────────────────────────────────────────
+# A container *name* is not proof of ownership. Several units run this same
+# script with different MODELS_CONFIG values (deploy/systemd/*_idle_proxy.service),
+# an operator can hand-start a backend to benchmark it
+# (ops/h200_idle_proxy/bench_decode.sh), and every lifecycle call here used to
+# address the container by name alone: `docker rm -f <name>` before every start,
+# another on the idle path, and an adoption check that only asked "is something
+# running and answering on this port?". So two processes that happen to resolve
+# the same container name silently destroyed and re-adopted each other's backend,
+# mid model load or mid stream.
+#
+# Fix: stamp two labels at `docker run` and consult them before destroying or
+# adopting anything.
+#   owner   — who runs it. The listen port is the natural identity: only one
+#             process can hold it on a host, and it is stable across restarts of
+#             the same unit (so restart-and-adopt keeps working). Override with
+#             PROXY_OWNER to claim a distinct identity for a hand-run container.
+#   profile — sha256 of the *launch-affecting* part of the resolved per-model
+#             config. Same owner + different hash means "my own config changed on
+#             disk" → replace. A *different* owner means hands off, whatever the
+#             hash.
+#
+# The owner check is gated on the container being *unfinished*: an exited container
+# of the same name holds no GPU and serves nothing, so refusing to touch it would
+# only wedge the name forever (nothing on any path removes a foreign container).
+# "Unfinished" and not merely "running", because docker reports a container that has
+# been created and not yet started as not running too, and that is what a sibling's
+# own `docker run -d` looks like for the moment between its create and its start —
+# see `_RECLAIMABLE_STATUSES`.
+#
+# A label read is only worth as much as the gap between reading it and acting on
+# it, and on the cold-start path that gap is not microseconds: the first version
+# of this guard checked ownership once at the top of `_start_container` and then
+# ran an unconditional `docker rm -f <name>` minutes later, after `_resolve_gpu`
+# and an `_ensure_model_dir` that can be a several-hundred-GiB Hugging Face
+# download. Two proxies cold-starting the same name both saw "nothing there",
+# and the slower one destroyed the container the faster one had meanwhile
+# created — the very cross-kill the labels exist to stop, on the one path where
+# it is most likely (a node reboot brings both units up at once).
+#
+# So no removal is authorised by a stale reading, and no removal names the
+# container by name:
+#   * the ownership decision is re-taken immediately before the removal it
+#     authorises, one docker call earlier rather than a download earlier
+#     (`_clear_container_name`), and
+#   * `docker rm -f` is given the container *id* that decision was taken about.
+#     Ids are unique and never reused, so if the container we judged removable is
+#     gone by the time the removal lands, the removal misses instead of hitting
+#     whatever now holds the name.
+# What is left is the window between that inspect and the `docker run` after it,
+# and docker closes that one itself: container names are unique, so `docker run
+# --name X` fails outright when X exists. That failure is the only atomic claim
+# on a name available to us — it is detected (`_is_name_conflict`) and read as
+# contention, which sends the ownership decision round again rather than
+# destroying anything.
+#
+# All of that guards the moment a backend is *started*. The mirror-image gap is a
+# backend already running: `_proxy` forwards a request straight to
+# localhost:backend_port whenever the manager says "ready", with no ownership check
+# and no docker call, because a warm request must not pay for one. Nothing demoted
+# "ready" when the container died out of band — the idle watcher reads only local
+# state, and the reactive reconcile in `_forward_with_body` needs the port to stop
+# answering — so once a sibling reclaimed this backend's corpse and launched its own
+# container on the same name and port, that fast path forwarded to the sibling's
+# backend indefinitely: the wrong model, success-shaped, under two idle watchers that
+# each believed they owned it. The identity the manager is ready over is therefore
+# recorded (`_container_id`, free from `docker run -d`'s own output) and re-checked in
+# the loop the proxy already runs, not on the request path — see
+# `_disown_if_replaced`.
+OWNER_LABEL = "com.freeinference.proxy.owner"
+PROFILE_LABEL = "com.freeinference.proxy.profile"
+PROXY_OWNER = os.environ.get("PROXY_OWNER", "").strip() or f"port-{LISTEN_PORT}"
+# Identity, liveness and ownership are read with ONE `docker inspect`, formatted
+# as a JSON object so all three come back from a single daemon round trip. Two
+# inspects would double the daemon calls on the warmup path (where the contention
+# check runs on every streaming request until the backend is ready) and leave a
+# window in which the container can stop between the two answers — or, worse, be
+# replaced between "whose is it?" and "what is its id?", which would hand a
+# removal the id of a container nobody judged.
+_INSPECT_STATE_FORMAT = (
+    '{"id":{{json .Id}},"running":{{json .State.Running}},'
+    '"status":{{json .State.Status}},"labels":{{json .Config.Labels}}}'
+)
+# `.State.Status` is read because "not running" is NOT the same as "a corpse", and
+# only a corpse of another owner may be reclaimed. Docker derives the status from
+# the same struct as `.State.Running` (`container.State.StateString`), so the two
+# together say exactly which of docker's states this is:
+#
+#   running / paused / restarting  → Running true  (already refused: hands off)
+#   exited / dead / removing       → Running false, and genuinely finished
+#   created                        → Running false, and about to be started
+#
+# That last one is the one this set exists for. `docker run -d` is create-then-
+# start, the name is reserved and the `--label` stamp is written at *create*, so a
+# sibling's ordinary launch is observable as `created` for as long as its start
+# takes (nvidia-container hooks, device injection — not instantaneous). Reclaiming
+# on `Running == false` alone therefore destroys a stranger's brand-new container,
+# with no operator and no stale reading involved: the labels we read are current,
+# they just do not mean what "not running" was taken to mean.
+#
+# An empty status (a daemon that did not report one) falls back to the previous
+# rule rather than refusing, for the reason `_inspect_state` fails towards
+# "nothing to remove": a reading we cannot interpret must not be able to wedge a
+# name, and this whole set is a narrowing of an existing removal, not a new one.
+_RECLAIMABLE_STATUSES = frozenset({"exited", "dead", "removing"})
+# `docker run` refusing a name that is already taken. Matched on the message
+# rather than on exit status alone: the status is 125 for every daemon-side
+# rejection, so it cannot tell a name conflict from a missing GPU driver, and
+# `sudo` can rewrite it besides.
+#
+# Both halves of the pattern are needed. "already in use" alone also matches
+# `listen tcp 0.0.0.0:18099: bind: address already in use` — a port collision,
+# which is a real failure to report rather than contention to retry — so the
+# phrase only counts when docker attributes it to a container name. Neither
+# misreading is destructive: a hard failure misread as contention costs one
+# retry and then raises, and contention misread as a hard failure fails the
+# request that the next one retries. Nothing is removed on either path without
+# its own fresh ownership check.
+_NAME_CONFLICT_RE = re.compile(
+    r"container name\b.{0,200}?\balready in use|already in use by container",
+    re.IGNORECASE | re.DOTALL,
+)
+# Pause before the one retry a name conflict gets. Docker releases a name when the
+# removal finishes inside the daemon, which can be after `docker rm -f` returned, so
+# an instant re-run can collide with the release it is waiting for. Half a second is
+# nothing against a container start and covers that flake.
+_NAME_CONFLICT_RETRY_DELAY = 0.5
+
+
+def _is_name_conflict(stderr: str) -> bool:
+    """Return True if this ``docker run`` failure means "that name is taken"."""
+    return bool(_NAME_CONFLICT_RE.search(stderr or ""))
+
+
+# `docker rm` answering that the target is gone. Removals here are aimed at a
+# container *id* precisely so that a container replaced since its labels were read
+# is missed rather than destroyed, so this is the design working and not a failure
+# to report — see `_remove_container`.
+_MISSING_CONTAINER_RE = re.compile(r"no such container", re.IGNORECASE)
+
+
+def _is_missing_container(stderr: str) -> bool:
+    """Return True if this ``docker rm`` failure means "it was already gone"."""
+    return bool(_MISSING_CONTAINER_RE.search(stderr or ""))
+
+
+def _launched_container_id(stdout: str) -> str | None:
+    """Read the container id ``docker run -d`` printed, or None if it did not.
+
+    Both engines launch detached, and a detached run's whole stdout is the new
+    container's id — so the identity this proxy later re-checks
+    (``_disown_if_replaced``) is free: no second ``docker inspect``, on a path where
+    an extra daemon call would land during a cold-start storm.
+
+    The *last* non-empty line is taken, not the whole output: a sudo or docker
+    wrapper that prints a banner first would otherwise make the id unusable. A
+    single token is required for the same reason — anything else is a wrapper
+    talking, and the honest answer is then "no id", which downgrades the identity
+    check to the owner-label check rather than inventing a mismatch that would
+    demote a healthy backend on every poll.
+    """
+    lines = [line.strip() for line in (stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    candidate = lines[-1]
+    return candidate if len(candidate.split()) == 1 else None
+
+
+class _ContainerState(NamedTuple):
+    """What one ``docker inspect`` says about the container of a given name.
+
+    ``container_id`` is the load-bearing field: it is what ``docker rm -f`` is
+    given, so a removal can only ever land on the exact container whose labels
+    were just read. It falls back to the container *name* when the inspect
+    succeeded but reported no usable id — that is the pre-existing behaviour, and
+    degrading to it beats declining to remove anything and wedging the name.
+
+    ``status`` is docker's own state word (``created``, ``exited``, ``dead`` …).
+    ``running`` cannot stand in for it: it is false for a container that has not
+    started *yet* as well as for one that has finished, and only the second is a
+    corpse another owner has no further use for. See ``_RECLAIMABLE_STATUSES``.
+    """
+
+    exists: bool
+    container_id: str
+    running: bool
+    status: str
+    labels: dict[str, str]
+
+
+_ABSENT_CONTAINER = _ContainerState(
+    exists=False, container_id="", running=False, status="", labels={}
+)
+# The device request is read as raw JSON and joined in Python (see
+# `_running_container_gpu`). A Go template cannot do it: `range` emits its
+# elements with no separator, so DeviceIDs ["2","3"] — how docker stores the
+# single quoted request `--gpus '"device=2,3"'` — came back as the token "23".
+_INSPECT_DEVICES_FORMAT = "{{json .HostConfig.DeviceRequests}}"
+# Config keys deliberately left *out* of the profile hash: they never reach either
+# `docker run` command line, so a container launched before such an edit is not
+# stale after it. This matters because a hash mismatch destroys a healthy backend
+# and pays a full weight reload -- ~14 minutes on DeepSeek-V4-Flash, during which
+# the model fails over to its paid remote route. `startup_estimate_seconds` only
+# words the warmup SSE banner (see `_warmup_thinking_sse`) and exists precisely to
+# be re-tuned against measured cold-start times, so it is the key most likely to
+# be edited on a live node; the `hf_*` keys are read once by `_ensure_model_dir`
+# at download time. Everything else stays in -- including `colocate_group`, which
+# steers GPU auto-selection and therefore the `--gpus` request.
+NON_LAUNCH_CONFIG_KEYS = frozenset(
+    {
+        "startup_estimate_seconds",
+        "hf_repo",
+        "hf_revision",
+        "hf_ignore_patterns",
+    }
+)
 # LOCAL_API_KEY is the key the gateway signs its requests to this proxy with. (A
 # comment here used to name FREEINFERENCE_API_KEY as a compatibility fallback; no
 # such fallback is read, and that variable is the gateway's *own* client key --
@@ -170,6 +392,15 @@ LOCAL_API_KEY = os.environ.get("LOCAL_API_KEY", "").strip() or "freeinference_ap
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = _SCRIPT_DIR / "models.json"
+# The H200 profile is NOT a copy kept next to this script: it is the very file
+# the dedicated ops/h200_idle_proxy unit pins on its ExecStart line. A 4x-H200
+# box has one DeepSeek deployment, not two, and both entry points must resolve
+# to the same (container, backend_port, gpu_index) or they fight over the same
+# container name — see ``_container_owner`` for what happens when they do.
+# There used to be a local ``models.h200.json`` mirror of this file, kept in
+# step only by a partial 5-key test assertion; #1187 had to apply one
+# mem_fraction change to both by hand. One file, no drift.
+H200_CONFIG_PATH = _SCRIPT_DIR.parent / "h200_idle_proxy" / "models.json"
 
 
 def _detect_profile_config() -> Path:
@@ -177,9 +408,10 @@ def _detect_profile_config() -> Path:
 
     The same proxy code runs on machines with very different GPUs, and each
     machine should serve the model that fits it. We inspect ``nvidia-smi`` once
-    at import and map the hardware to a profile JSON next to this script:
+    at import and map the hardware to a profile JSON:
 
-      * **4+ x H200**       -> ``models.h200.json``     (DeepSeek-V4-Flash-0731, TP=2 on 2,3)
+      * **4+ x H200**       -> ``../h200_idle_proxy/models.json``
+                               (DeepSeek-V4-Flash-0731, TP=2 on 2,3)
       * **RTX (PRO) 6000**  -> ``models.rtx6000.json``  (Qwen3.6-35B)
       * anything else / no ``nvidia-smi`` → ``models.json`` (default fallback)
 
@@ -204,7 +436,7 @@ def _detect_profile_config() -> Path:
 
     chosen: Path | None = None
     if h200_count >= 4:
-        chosen = _SCRIPT_DIR / "models.h200.json"
+        chosen = H200_CONFIG_PATH
     elif has_rtx6000:
         chosen = _SCRIPT_DIR / "models.rtx6000.json"
 
@@ -332,6 +564,31 @@ def _docker_gpu_arg(gpu: str) -> str:
     return f'"device={gpu}"' if "," in gpu else f"device={gpu}"
 
 
+def _launch_profile(config: dict[str, Any]) -> str:
+    """Fingerprint the launch-affecting part of a per-model config.
+
+    Stamped on the container at ``docker run`` and compared on adoption, so it
+    must answer exactly one question: *would this container have been launched
+    differently?* Hashing the whole config answers a different and more
+    pessimistic question — "has anything in the file changed?" — which turns a
+    purely cosmetic edit into a ``docker rm -f`` of a healthy, serving backend.
+    See ``NON_LAUNCH_CONFIG_KEYS`` for what is excluded and why.
+    """
+    launch = {k: v for k, v in config.items() if k not in NON_LAUNCH_CONFIG_KEYS}
+    return hashlib.sha256(_json.dumps(launch, sort_keys=True).encode()).hexdigest()[:16]
+
+
+class ForeignContainerError(RuntimeError):
+    """Raised when a *running* container of this name belongs to another proxy.
+
+    Deliberately fails the request instead of taking the container over. The two
+    alternatives are both worse: destroying it kills a backend another process is
+    loading or streaming from, and adopting it puts a backend under two idle
+    watchers that cannot see each other's activity, so whichever fires first
+    stops it out from under the other's traffic.
+    """
+
+
 class BackendManager:
     """Manages the lifecycle of a single sglang Docker container."""
 
@@ -350,6 +607,29 @@ class BackendManager:
         # auto-selecting backends can exclude it (config gpu_index is empty for
         # auto-selected models). Cleared when the container stops.
         self._current_gpu: str | None = None
+        # Fingerprint of the config this manager was built from, stamped onto the
+        # container so a later process can tell "the backend I asked for" from
+        # "some other backend wearing the same name".
+        self._profile = _launch_profile(config)
+        # Id of the container this manager launched or adopted, so the identity it
+        # believes in can be re-checked without a per-request docker call. See
+        # `_disown_if_replaced`: the labels prove *who owns the name now*, and this
+        # proves *whether it is still the container we became ready over*.
+        self._container_id: str | None = None
+        # Identity of a container this manager positively established was *not* the
+        # one it became ready over, carried forward out of `_disown_if_replaced`.
+        # Needed because the demotion there clears `_container_id`, and every
+        # refusal on the start path is gated on a foreign owner *label*: a same-
+        # `PROXY_OWNER` sibling or an unlabelled hand-restart reads as this proxy's
+        # own, so without this the next request would `docker rm -f` — or silently
+        # re-adopt — the very container the re-check had just disowned. See
+        # `_disowned_container_error`.
+        self._disowned_container_id: str | None = None
+        self._disowned_reason: str | None = None
+        # Last unrunnable-`docker inspect` reason already reported, so the
+        # ownership check on the streaming warmup path says it once instead of on
+        # every request (see `_log_inspect_failure`).
+        self._inspect_failure: str | None = None
 
     @property
     def state(self) -> str:
@@ -379,6 +659,7 @@ class BackendManager:
             if self._state == "ready":
                 self._state = "stopped"
                 self._current_gpu = None
+                self._container_id = None
                 self._ready_event.clear()
 
     def ensure_running(self) -> None:
@@ -438,7 +719,14 @@ class BackendManager:
                 f"[{self.model_name}] Backend did not become healthy within {HEALTH_TIMEOUT}s"
             )
 
-    def _resolve_gpu(self) -> str:
+    def _resolve_gpu(self, replacing_gpu: str | None = None) -> str:
+        """Return the ``--gpus`` device list this backend should launch on.
+
+        ``replacing_gpu`` is the device list currently held by a still-running
+        container of this name that the caller is about to replace (see
+        ``_start_container``). It is used only where the choice would otherwise be
+        auto-selected, and only when it still fits the requested shape.
+        """
         # An explicit gpu_index pins the model to that device (lets several
         # models share one GPU); only auto-pick when it is unset.
         pinned = self.config.get("gpu_index")
@@ -470,6 +758,27 @@ class BackendManager:
                     )
                     self._current_gpu = mgr._current_gpu
                     return self._current_gpu
+        tp = int(self.config.get("tensor_parallel_size", 1))
+        pp = int(self.config.get("pipeline_parallel_size", 1))
+        # A model sharded by both tensor and pipeline parallelism needs one GPU
+        # per (tp rank x pp stage).
+        n_gpus = tp * pp
+        # Replacing our own still-running container: stay on the device it already
+        # holds instead of auto-picking, which would read that device as busy (by
+        # the container being replaced) and move the backend somewhere else. Ranked
+        # below the colocate group on purpose: a group anchor that has already
+        # resolved a device is the placement the whole group must share, so
+        # following it is right even when this backend's old container sat
+        # elsewhere. Skipped when the device count no longer matches — a
+        # tp/pp change needs a different number of GPUs, so re-select.
+        if replacing_gpu and len(replacing_gpu.split(",")) == n_gpus:
+            log.info(
+                "[%s] Reusing GPU %s from the container being replaced.",
+                self.model_name,
+                replacing_gpu,
+            )
+            self._current_gpu = replacing_gpu
+            return self._current_gpu
         # Exclude GPUs already claimed by other backends that are starting or
         # running. Auto-selected backends carry no gpu_index in their config, so
         # rely on the runtime GPU each one actually resolved to.
@@ -481,11 +790,6 @@ class BackendManager:
                 continue
             if mgr.state in ("starting", "ready") and mgr._current_gpu is not None:
                 used_gpus.update(str(mgr._current_gpu).split(","))
-        tp = int(self.config.get("tensor_parallel_size", 1))
-        pp = int(self.config.get("pipeline_parallel_size", 1))
-        # A model sharded by both tensor and pipeline parallelism needs one GPU
-        # per (tp rank x pp stage).
-        n_gpus = tp * pp
         log.info(
             "[%s] Auto-selecting %d GPU(s) (tp=%d, pp=%d, excluding %s)",
             self.model_name,
@@ -517,18 +821,329 @@ class BackendManager:
             args += ["-e", f"{key}={val}"]
         return args
 
+    def _ownership_label_args(self) -> list[str]:
+        """Build the ``--label`` flags that make this container's owner readable.
+
+        Stamped by both engines' run commands. Without them the container name is
+        the only ownership token there is, and it is not one — see the
+        "Container ownership" block near the top of this module.
+        """
+        return [
+            "--label",
+            f"{OWNER_LABEL}={PROXY_OWNER}",
+            "--label",
+            f"{PROFILE_LABEL}={self._profile}",
+        ]
+
     def _start_container(self) -> None:
-        gpu = self._resolve_gpu()
+        # Ownership first: everything below either destroys the container of this
+        # name or binds its host port, so a *live* foreign container must stop us
+        # before we touch the GPU or the filesystem. This is the early, cheap
+        # refusal — it saves a several-hundred-GiB download that was going to be
+        # thrown away — and NOT the one the removal below relies on. That one is
+        # re-taken immediately before the removal, in `_clear_container_name`,
+        # because a collision that appears while `_ensure_model_dir` runs would be
+        # invisible to a check made here.
+        #
+        # Only checked when the label says foreign, and only when that container has
+        # not finished, because nothing anywhere removes a foreign container:
+        # `_stop_container` declines one too. An exited container of this name holds
+        # no GPU, serves no traffic, and cannot be harmed by a `docker rm -f` —
+        # refusing it would wedge the name permanently and 502 the model until an
+        # operator removed the corpse by hand. That is reachable: `bench_decode.sh`
+        # has the operator hand-start this exact container with `owner=manual`, and a
+        # `docker stop` (rather than `docker rm`) afterwards leaves one behind. The
+        # edge this guard exists for — a foreign backend eight minutes into a
+        # fourteen-minute load, failing the health probe — is running, and is still
+        # refused; so is one that is only `created`, which is a sibling's launch
+        # between `docker run`'s create and its start (see `_RECLAIMABLE_STATUSES`).
+        state = self._inspect_state()
+        running = state.running
+        owner = self._container_owner(state.labels)
+        if owner is not None and (running or not self._is_reclaimable(state)):
+            raise self._foreign_container_error(
+                owner,
+                "replace",
+                state_note=(
+                    "and running"
+                    if running
+                    else f"and in docker state {state.status!r}, so it has not finished"
+                ),
+            )
+        # The label is not the only positive evidence available: a takeover the idle
+        # watcher caught by container id reads as *ours* here, and would otherwise be
+        # destroyed by the removal below. Refused early for the same reason the label
+        # is — before the GPU is claimed and before a several-hundred-GiB download
+        # that was going to be thrown away — and re-taken in
+        # `_clear_container_name`, which is the check the removal actually rests on.
+        disowned = self._disowned_container_error(state, "replace")
+        if disowned is not None:
+            raise disowned
+        # A *running* container of this name that is ours is about to be replaced
+        # — a changed profile hash, or one that never became healthy. Its device
+        # request is the only reliable record of where this backend lives, and it
+        # has to be read before the `docker rm -f` below: `_resolve_gpu`'s
+        # auto-selection asks nvidia-smi for the least-used device, and nvidia-smi
+        # reports the current one as busy *because this very container is still on
+        # it*. Auto-selection would therefore relocate the replacement — off its
+        # colocation partner, or onto a device an idle-stopped model is pinned to,
+        # to OOM when that model wakes. Both real auto-selecting profiles
+        # (models.json, models.rtx6000.json) omit `gpu_index` and share a
+        # `colocate_group`, so this is the ordinary case, not an exotic one.
+        #
+        # Reading the GPU rather than removing the container first is deliberate:
+        # `docker rm -f` sits immediately before `docker run` so the backend is
+        # down for one docker call, not for however long `_ensure_model_dir` takes
+        # to fetch a few hundred GiB — and destroying first would not even
+        # guarantee the same device, since nvidia-smi accounting lags process
+        # teardown. Relaunching onto the device just released is exactly what the
+        # pinned-`gpu_index` path already does on every profile change.
+        replacing_gpu = self._running_container_gpu() if running else None
+        gpu = self._resolve_gpu(replacing_gpu=replacing_gpu)
         self._ensure_model_dir()
-        subprocess.run(
-            ["sudo", "docker", "rm", "-f", self.container],
-            check=False,
-            capture_output=True,
-        )
         engine = str(self.config.get("engine", "sglang")).lower()
         cmd = self._vllm_run_cmd(gpu) if engine == "vllm" else self._sglang_run_cmd(gpu)
-        log.info("Running: %s", " ".join(cmd))
-        subprocess.run(cmd, check=True, capture_output=True)
+        self._claim_container_name(cmd)
+
+    def _claim_container_name(self, cmd: list[str]) -> None:
+        """Free the container name and launch under it, or refuse to.
+
+        The name is the one resource two proxies of the same config both need, and
+        `docker run --name` is the only atomic claim on it available: names are
+        unique, so a run that returns a name conflict proves someone else got
+        there first. Every removal is therefore authorised by an ownership check
+        one docker call old (``_clear_container_name``) and aimed at a container
+        *id*, and a lost race is answered by taking the decision again rather than
+        by insisting on the name.
+
+        Bounded at two attempts on purpose. One retry covers the real case — a
+        sibling that claimed the name during our download and has since exited —
+        and a name that is taken twice over is a persistent collision, not a race
+        to keep re-running weight downloads against.
+
+        The retry is not immediate. Docker frees a name as the removal completes in
+        the daemon, which can be after `docker rm -f` has already returned, so a
+        conflict answered by an instant re-run can hit the very name release it is
+        waiting for ("removal of container … is already in progress"). A short pause
+        costs nothing next to a container start and takes that flake out of the one
+        retry there is.
+
+        A successful launch records the new container's id. ``docker run -d`` prints
+        it on stdout, which is already captured, so the identity
+        ``_disown_if_replaced`` re-checks later costs no extra daemon round trip.
+        """
+        attempts = 2
+        removal_error: str | None = None
+        for attempt in range(1, attempts + 1):
+            if attempt > 1:
+                time.sleep(_NAME_CONFLICT_RETRY_DELAY)
+            removal_error = self._clear_container_name()
+            log.info("Running: %s", " ".join(cmd))
+            result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            if result.returncode == 0:
+                self._container_id = _launched_container_id(result.stdout)
+                self._forget_disowned_container()
+                return
+            stderr = (result.stderr or "").strip()
+            if not _is_name_conflict(stderr):
+                # Not contention: a missing driver, an unavailable device, a bad
+                # image tag. Logged because `check=True` used to swallow the
+                # captured output into a CalledProcessError whose str() carries
+                # only the exit status, leaving the operator with a bare number.
+                log.error(
+                    "[%s] docker run for %s failed (exit %s): %s",
+                    self.model_name,
+                    self.container,
+                    result.returncode,
+                    stderr or "(no output)",
+                )
+                # The same exception `check=True` used to raise, so callers see no
+                # change: `ensure_running` stores it as `_start_error` and the
+                # handler turns it into a 502.
+                raise subprocess.CalledProcessError(
+                    result.returncode, cmd, output=result.stdout, stderr=result.stderr
+                )
+            if removal_error:
+                # Not contention at all: this proxy tried to free the name, docker
+                # refused, and the container is still there holding it. Saying
+                # "another process" here would be a claim the code can see is false.
+                log.warning(
+                    "[%s] Container name %s is still held after a removal this proxy could "
+                    "not complete (attempt %d/%d). docker rm said: %s -- docker run said: %s",
+                    self.model_name,
+                    self.container,
+                    attempt,
+                    attempts,
+                    removal_error,
+                    stderr,
+                )
+            else:
+                log.warning(
+                    "[%s] Container name %s was claimed by another process while this "
+                    "backend was being prepared (attempt %d/%d): %s",
+                    self.model_name,
+                    self.container,
+                    attempt,
+                    attempts,
+                    stderr,
+                )
+        # Out of attempts. Name whoever holds it now, so the 502 the caller turns
+        # this into carries the same diagnosis a collision seen up front would.
+        state = self._inspect_state()
+        owner = self._container_owner(state.labels)
+        if owner is not None and state.running:
+            raise self._foreign_container_error(owner, "replace")
+        if state.exists and owner is None:
+            # The name is held by a container this proxy reads as its *own* — either
+            # one whose removal failed just now, or an unlabelled one (the upgrade
+            # rule). Either way there is no sibling to blame, and the diagnosis the
+            # operator needs is which container it is and what docker said about
+            # removing it, not a guess about a second unit.
+            raise ForeignContainerError(
+                f"[{self.model_name}] Gave up starting container {self.container}: the name is "
+                f"still held by container {state.container_id} (docker state "
+                f"{state.status or 'unknown'!r}), which carries no foreign owner label and so "
+                f"reads as this proxy's own ({PROXY_OWNER!r}), yet it is still there after "
+                f"{attempts} attempts to remove it and launch. "
+                + (
+                    f"docker rm -f reported: {removal_error}. "
+                    if removal_error
+                    else "The removal reported success, so something recreated the name. "
+                )
+                + f"Remove it by hand with 'sudo docker rm -f {self.container}'. If it belongs to "
+                f"another process after all, that process is running a build of this script from "
+                f"before ownership labelling, or started the container without a "
+                f"'--label {OWNER_LABEL}=<owner>' -- label it, or point one of the two at a "
+                f"config whose 'container' and 'backend_port' do not collide."
+            )
+        raise ForeignContainerError(
+            f"[{self.model_name}] Gave up starting container {self.container}: the name was "
+            f"taken by another process on each of {attempts} attempts, so this proxy "
+            f"({PROXY_OWNER!r}) never launched. Something else on this host is starting a "
+            f"container of that name in a loop -- most likely a second unit running "
+            f"ops/local_deployment_proxy/local_deployment_proxy.py with a different "
+            f"MODELS_CONFIG. Point one of them at a config whose 'container' and "
+            f"'backend_port' do not collide, or disable it."
+        )
+
+    def _clear_container_name(self) -> str | None:
+        """Make the container name free to launch under, or refuse to touch it.
+
+        Raises ``ForeignContainerError`` for a container of another owner that is
+        either *live* or not yet started; removes one that is ours, unlabelled (the
+        upgrade rule), or a *finished* container of any owner — nothing else in this
+        module removes a foreign corpse, so declining that would wedge the name
+        until an operator cleared it by hand.
+
+        "Finished" is decided by docker's own state word and not by
+        ``.State.Running``, which is also false for a container that is merely
+        `created`: `docker run -d` reserves the name and writes the labels at create
+        time and starts the container after, so a sibling's ordinary launch passes
+        through a state that a running-only test reads as a corpse (see
+        ``_RECLAIMABLE_STATUSES``). Our own container is removed whatever its state:
+        refusing there would wedge our own name, and there is no other owner to
+        take it from.
+
+        Returns the daemon's message if a removal was attempted and failed, so the
+        caller can say the name is still held by a container *this* proxy could not
+        remove instead of blaming a sibling that does not exist. ``None`` when
+        nothing needed removing or the removal succeeded.
+
+        The removal is by container id rather than by name, which is what keeps
+        this from being just a narrower version of the race it replaces: the
+        judgement and the `docker rm -f` are one docker call apart, and should the
+        container we judged be replaced even inside that window, the removal
+        misses (docker answers "no such container") instead of destroying a
+        stranger's brand-new backend.
+        """
+        state = self._inspect_state()
+        if not state.exists:
+            return None
+        owner = self._container_owner(state.labels)
+        if owner is not None and state.running:
+            raise self._foreign_container_error(owner, "replace")
+        if owner is not None and not self._is_reclaimable(state):
+            raise self._foreign_container_error(
+                owner,
+                "replace",
+                state_note=(
+                    f"and in docker state {state.status!r}, which is not a container that has "
+                    f"finished -- a foreign container is reclaimed only once it has exited, "
+                    f"since 'docker run -d' reserves a name and stamps its labels before it "
+                    f"starts, so removing this one would destroy a launch in progress"
+                ),
+            )
+        # The reading the owner label cannot take, re-taken here rather than trusted
+        # from `_start_container`: this is the check the `docker rm -f` below rests
+        # on, and a container the idle watcher disowned by id reads as this proxy's
+        # own at every one of the tests above. Removing it would destroy a running
+        # backend this proxy has established it did not launch.
+        disowned = self._disowned_container_error(state, "replace")
+        if disowned is not None:
+            raise disowned
+        if owner is not None:
+            log.warning(
+                "[%s] Reclaiming %s container %s owned by %s: it holds no GPU and "
+                "serves nothing, and nothing else here would ever remove it.",
+                self.model_name,
+                state.status or "exited",
+                self.container,
+                owner,
+            )
+        return self._remove_container(state, "clearing the name for a fresh launch")
+
+    @staticmethod
+    def _is_reclaimable(state: _ContainerState) -> bool:
+        """Return True if this *foreign* container has finished and may be removed."""
+        return not state.status or state.status in _RECLAIMABLE_STATUSES
+
+    def _remove_container(self, state: _ContainerState, why: str) -> str | None:
+        """``docker rm -f`` the container just judged removable; report a failure.
+
+        Returns the daemon's message on failure, ``None`` on success. The result
+        used to be discarded at both call sites, which made this the one error in
+        the ownership guard that was swallowed rather than surfaced: `docker rm -f`
+        failing while the container survives is an ordinary docker failure mode (an
+        overlay2 or cgroup mount that is busy, a removal already in progress, a
+        CUDA-wedged process in D state), and a wedged backend is exactly when this
+        proxy is trying to replace one. Unreported, the start path then read its own
+        undead container as contention and blamed a sibling unit, and the idle path
+        reported GPUs freed that were still held.
+
+        "No such container" is not a failure here, and is deliberately not reported
+        as one: aiming the removal at an *id* is what makes a container replaced
+        since the label read get missed instead of destroyed, so a miss is this
+        design working. Whatever holds the name now is then reported by the `docker
+        run` that finds it, on its own fresh ownership check.
+        """
+        result = subprocess.run(
+            ["sudo", "docker", "rm", "-f", state.container_id],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return None
+        stderr = (result.stderr or "").strip() or "(no output)"
+        if _is_missing_container(stderr):
+            log.info(
+                "[%s] Container %s (%s) was already gone when the removal landed while %s.",
+                self.model_name,
+                state.container_id,
+                self.container,
+                why,
+            )
+            return None
+        log.error(
+            "[%s] docker rm -f %s (%s) failed while %s (exit %s): %s",
+            self.model_name,
+            state.container_id,
+            self.container,
+            why,
+            result.returncode,
+            stderr,
+        )
+        return stderr
 
     def _vllm_run_cmd(self, gpu: str) -> list[str]:
         """Build the ``docker run`` command for a vLLM backend.
@@ -559,6 +1174,7 @@ class BackendManager:
             "-d",
             "--name",
             self.container,
+            *self._ownership_label_args(),
             "--gpus",
             _docker_gpu_arg(gpu),
             "--shm-size",
@@ -626,6 +1242,7 @@ class BackendManager:
             "-d",
             "--name",
             self.container,
+            *self._ownership_label_args(),
             "--gpus",
             _docker_gpu_arg(gpu),
             "--shm-size",
@@ -800,16 +1417,140 @@ class BackendManager:
         log.info("[%s] Downloaded %s.", self.model_name, repo_id)
 
     def _stop_container(self) -> None:
+        # The idle watcher measures *this* process's last activity, which says
+        # nothing about traffic another proxy is putting through a container of
+        # the same name. Dropping local state without removing the container is
+        # the safe outcome: the owner's own watcher will reclaim its GPUs.
+        #
+        # Unlike `_start_container` this is *not* gated on liveness, and does not
+        # need to be: this path only ever frees GPUs, an exited container holds
+        # none, and the start path now reclaims a foreign corpse of this name. So
+        # declining unconditionally here strands nothing.
+        #
+        # The removal is aimed at the id this inspect returned, for the same reason
+        # the start path does it: the idle timer can fire on a container that died
+        # minutes ago and has since been replaced by another proxy reclaiming the
+        # corpse, and `docker rm -f <name>` would then destroy that proxy's live
+        # backend on the strength of a label read that never saw it.
+        state = self._inspect_state()
+        owner = self._container_owner(state.labels)
+        if owner is not None:
+            log.warning(
+                "[%s] Not removing container %s: it is owned by %s, not by this proxy (%s). "
+                "Releasing local state only.",
+                self.model_name,
+                self.container,
+                owner,
+                PROXY_OWNER,
+            )
+            with self._lock:
+                self._state = "stopped"
+                self._current_gpu = None
+                self._container_id = None
+            return
         log.info("[%s] Stopping container %s …", self.model_name, self.container)
-        subprocess.run(
-            ["sudo", "docker", "rm", "-f", self.container],
-            check=False,
-            capture_output=True,
+        removal_error = (
+            self._remove_container(state, "releasing an idle backend") if state.exists else None
         )
         with self._lock:
             self._state = "stopped"
             self._current_gpu = None
+            # "Stopped" must mean "this manager holds no container", or a later
+            # identity check could compare against an id from a previous life.
+            self._container_id = None
+        if removal_error:
+            # Local state is released either way — the alternative is a backend this
+            # proxy believes is ready and cannot reach. But the GPUs are *not* back,
+            # so say so rather than logging "stopped" over a container that is still
+            # running: the next start of any model here will auto-select against a
+            # device that is still busy.
+            log.warning(
+                "[%s] Container %s was NOT removed, so its GPUs are still held; local state "
+                "released anyway. Remove it by hand with 'sudo docker rm -f %s'.",
+                self.model_name,
+                self.container,
+                self.container,
+            )
+            return
         log.info("[%s] Container %s stopped.", self.model_name, self.container)
+
+    def _inspect_state(self) -> _ContainerState:
+        """Return identity, liveness, state word and labels for this container name.
+
+        One ``docker inspect`` answers all of them because every decision here needs
+        more than one: a foreign container only matters while it is alive, a live
+        container's owner decides whether we may touch it, a container that is not
+        alive is only reclaimable if it has *finished* rather than not started yet
+        (``status``), and the id is what any removal is aimed at, so it has to
+        describe the same container the labels came from. Asking separately also
+        left a window in which the container could stop, or be replaced, between
+        two answers.
+
+        Fails towards ``_ABSENT_CONTAINER`` — absent container, unreadable daemon,
+        unparseable output. That reads as "nothing to remove, nobody to refuse":
+        an empty label map means "mine" (see ``_container_owner``), which is both
+        the pre-labelling behaviour and the safe direction, since a docker hiccup
+        cannot invent a collision that wedges a model. A parseable answer, though,
+        means the container exists, so an id that cannot be read falls back to the
+        name rather than to "absent" — otherwise a removal that is genuinely due
+        would be skipped and the name would stay taken.
+
+        Those failures are silent because ``docker inspect`` exits non-zero with
+        the same status for "no such object" as for "cannot connect to the daemon",
+        and the first is the ordinary cold-start case on every single start — so a
+        warning here would be noise on the happy path. Only a docker command that
+        cannot be executed at all raises, and ``contention_error`` reports that.
+        """
+        result = subprocess.run(
+            ["sudo", "docker", "inspect", "-f", _INSPECT_STATE_FORMAT, self.container],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        # Missing container (non-zero exit) or unparseable output.
+        if result.returncode != 0:
+            return _ABSENT_CONTAINER
+        try:
+            payload = _json.loads(result.stdout.strip() or "null")
+        except ValueError:
+            return _ABSENT_CONTAINER
+        if not isinstance(payload, dict):
+            return _ABSENT_CONTAINER
+        labels = payload.get("labels")
+        if not isinstance(labels, dict):
+            labels = {}
+        container_id = payload.get("id")
+        if not isinstance(container_id, str) or not container_id:
+            # A parseable answer means the container exists, so an unreadable id
+            # must not read as "absent" — that would skip a removal that is
+            # genuinely due and leave the name taken. Degrade to the name, which
+            # is what this code did before ids were read at all.
+            container_id = self.container
+        status = payload.get("status")
+        if not isinstance(status, str):
+            # Same direction as the id fallback: an unreadable status degrades to
+            # the empty string, which `_is_reclaimable` reads as the pre-narrowing
+            # rule rather than as grounds to refuse and wedge the name.
+            status = ""
+        return _ContainerState(
+            exists=True,
+            container_id=container_id,
+            running=payload.get("running") is True,
+            status=status.strip().lower(),
+            labels={str(k): str(v) for k, v in labels.items()},
+        )
+
+    def _inspect_container(self) -> tuple[bool, dict[str, str]]:
+        """Return ``(running, labels)`` for the container of this name.
+
+        The narrow view, for callers that need nothing else: a bare liveness probe
+        (``_container_running``) and an ownership question asked without a state to
+        hand (``_container_owner``). Anything that removes a container, or that has
+        to remember *which* container it decided about, goes through
+        ``_inspect_state`` for the id — the same one inspect either way.
+        """
+        state = self._inspect_state()
+        return state.running, state.labels
 
     def _container_running(self) -> bool:
         """Return True while the backend container is still up.
@@ -819,15 +1560,331 @@ class BackendManager:
         until ``HEALTH_TIMEOUT`` elapses, making the client request appear to
         hang forever.
         """
-        result = subprocess.run(
-            ["sudo", "docker", "inspect", "-f", "{{.State.Running}}", self.container],
-            capture_output=True,
-            text=True,
-            check=False,
+        return self._inspect_container()[0]
+
+    def _container_owner(self, labels: dict[str, str] | None = None) -> str | None:
+        """Return the owner of the container of this name, or None if it is ours.
+
+        Pass ``labels`` to reuse an inspect the caller has already paid for.
+
+        UPGRADE RULE — an *absent* owner label means "started by a build of this
+        script from before labelling, therefore mine". Do not invert this. Every
+        container running right now is unlabelled, so reading absent-label as
+        "foreign" would make the idle watcher refuse to stop any of them and the
+        GPUs would never be reclaimed after the idle timeout. With this rule an
+        already-running deployment behaves exactly as it does today until its
+        next cold start, which labels it.
+        """
+        if labels is None:
+            labels = self._inspect_container()[1]
+        owner = labels.get(OWNER_LABEL)
+        if owner is None or owner == PROXY_OWNER:
+            return None
+        return owner
+
+    def _foreign_container_error(
+        self, owner: str, action: str, state_note: str = "and running"
+    ) -> ForeignContainerError:
+        """Build the error raised when another proxy owns this container name.
+
+        ``state_note`` says *why* that container is untouchable, because "running"
+        is not the only reason: one that is merely `created` has not started yet and
+        is a launch in progress, not a corpse to reclaim. Getting this wrong in the
+        text would send an operator looking for a live backend that is not there.
+
+        Kept to plain ASCII on purpose. This message reaches clients through
+        ``BaseHTTPRequestHandler.send_error``, which puts it in the HTTP status
+        line and encodes that latin-1: one em dash there raises
+        ``UnicodeEncodeError`` mid-response and the client sees a dropped
+        connection instead of the diagnosis.
+        """
+        return ForeignContainerError(
+            f"[{self.model_name}] Refusing to {action} container {self.container}: it is "
+            f"owned by {owner!r} {state_note}, not by this proxy ({PROXY_OWNER!r}). Two "
+            f"proxies have resolved the same container name, most likely two units running "
+            f"ops/local_deployment_proxy/local_deployment_proxy.py with different "
+            f"MODELS_CONFIG files on one host. Point one of them at a config whose "
+            f"'container' and 'backend_port' do not collide, or disable it. If that owner "
+            f"is instead a hand-started identity (a benchmark container) or this same unit "
+            f"before a LISTEN_PORT change, remove the container with "
+            f"'sudo docker rm -f {self.container}' or set PROXY_OWNER to {owner!r}."
         )
-        # Missing container (non-zero exit) or any non-"true" status means it is
-        # no longer running.
-        return result.returncode == 0 and result.stdout.strip() == "true"
+
+    def _disowned_container_error(
+        self, state: _ContainerState, action: str
+    ) -> ForeignContainerError | None:
+        """Refuse to destroy or re-adopt the running container this manager disowned.
+
+        ``_disown_if_replaced`` establishes, from container ids, that the name no
+        longer resolves to the container this manager became ready over — and it
+        does so in the one case the owner label cannot see, where the replacement
+        reads as *ours* (an unlabelled hand-restart, or a second unit given the same
+        ``PROXY_OWNER``). That finding has to outlive the demotion, because nothing
+        downstream can re-derive it: ``mark_stopped`` clears ``_container_id``, and
+        every refusal on the start path is gated on ``owner is not None``. Left to
+        itself the next request would either ``docker rm -f`` a running container
+        this proxy has positively established it did not launch — which is worse
+        than the wrong-model forwarding the re-check exists to stop, and is what
+        ``_clear_container_name`` would do, since an absent owner label reads as ours
+        — or re-adopt it and go straight back to ``ready`` over it, at which point
+        the ids agree again and the re-check can never fire a second time. So the
+        evidence is kept, and it refuses both.
+
+        Gated on ``running`` on purpose. Once that container exits it holds no GPU
+        and serves nothing, and the start path's reclaim rule applies as usual —
+        otherwise this guard would wedge the name until an operator cleared it by
+        hand, which is the failure mode ``_clear_container_name`` already refuses to
+        create for a foreign corpse.
+
+        Plain ASCII, like ``_foreign_container_error`` and for the same reason: this
+        text reaches clients through ``send_error``, which puts it in the HTTP status
+        line and encodes that latin-1.
+        """
+        disowned = self._disowned_container_id
+        if not disowned or not state.running or state.container_id != disowned:
+            return None
+        return ForeignContainerError(
+            f"[{self.model_name}] Refusing to {action} container {self.container}: "
+            f"{self._disowned_reason or 'this proxy disowned the container of that name'}, and "
+            f"that container is still running. This proxy read the takeover itself, on the idle "
+            f"watcher's ownership re-check, and released its local state without touching the "
+            f"container; removing it now would destroy a backend this proxy has established it "
+            f"did not launch (possibly mid-load or mid-stream), and adopting it would resume "
+            f"serving whatever model it runs under this model's name. It carries no foreign "
+            f"owner label, so it was either started by hand or by a second unit given this "
+            f"proxy's own identity ({PROXY_OWNER!r}) -- 'sudo docker inspect {self.container}' "
+            f"says which. If it should not be there, 'sudo docker rm -f {self.container}' and "
+            f"the next request launches a fresh one. If it is the backend this host should "
+            f"serve, restart this proxy so it adopts that container deliberately. To keep two "
+            f"units apart for good, point one at a config whose 'container' and 'backend_port' "
+            f"do not collide, or give it its own PROXY_OWNER."
+        )
+
+    def _forget_disowned_container(self) -> None:
+        """Drop the disowned-container evidence once this manager holds a backend again.
+
+        Called on a successful launch and on a successful adoption, both of which
+        end with the name resolving to a container this manager owns — so the
+        finding is spent. Keeping it would be harmless (ids are unique and never
+        reused, and the check is gated on that id still running) but it would leave
+        the manager carrying a claim about a container that no longer holds its
+        name, which is the sort of stale state this whole guard exists to remove.
+        """
+        self._disowned_container_id = None
+        self._disowned_reason = None
+
+    def _log_inspect_failure(self, exc: BaseException) -> None:
+        """Report an ownership inspect that could not be run at all.
+
+        At ``warning`` because this module configures the root handler at ``INFO``
+        (see ``logging.basicConfig`` at the top) and exposes no level knob, so a
+        ``debug`` record here would be dropped before it reached the journal — the
+        operator this exists for would see exactly nothing.
+
+        Latched on the reason instead, because both callers repeat:
+        ``contention_error`` runs on *every* streaming request until the backend is
+        ready, and ``_disown_if_replaced`` on every idle-watcher tick while it is.
+        The causes are not all transient either — a proxy that cannot execute ``sudo
+        docker`` at all answers "no contention" for every request it will ever serve,
+        which at one line per request or per tick would bury the journal. Cleared by
+        the next ownership read whose inspect succeeds, so a genuinely intermittent
+        failure is reported each time it recurs.
+        """
+        reason = f"{type(exc).__name__}: {exc}"
+        if reason == self._inspect_failure:
+            return
+        self._inspect_failure = reason
+        log.warning(
+            "[%s] Ownership inspect of %s could not run (%s); assuming no contention. "
+            "A foreign container of this name would go unnoticed until this is fixed.",
+            self.model_name,
+            self.container,
+            reason,
+        )
+
+    def contention_error(self) -> ForeignContainerError | None:
+        """Return the diagnosis if an untouchable foreign container holds this name.
+
+        Exists for the streaming warmup path, which commits ``200`` plus a "the
+        model is starting up" banner *before* ``ensure_running`` runs, on a
+        background thread that can only log what it raises. A
+        ``ForeignContainerError`` there reaches the journal and nothing else, so a
+        contended proxy would answer every streaming request success-shaped
+        forever: the gateway sees 200s, never opens a circuit, and never fails
+        over — the exact silent failure the labels were added to end. Calling this
+        before the response line is written keeps the 502 available.
+
+        Never raises. A ``docker inspect`` that cannot even be executed answers
+        "no contention", so a transient docker hiccup cannot turn every streaming
+        request into a 502. The reason is logged (see
+        ``_log_inspect_failure``): the return value cannot distinguish "nobody
+        else owns this" from "the docker CLI is not installed" or "this user
+        cannot run sudo", and an operator chasing a proxy that never starts a
+        backend needs to see which it was.
+
+        Reports exactly what the start path will refuse, which is a foreign
+        container that has not finished — not only a running one. A foreign
+        container left in `created` (its launcher died between docker's create and
+        its start) is refused by ``_start_container`` on the background thread, so
+        answering "no contention" for it would restore the silent-success-forever
+        shape this method exists to prevent.
+        """
+        try:
+            state = self._inspect_state()
+        except Exception as exc:  # docker unreachable: not evidence of a collision
+            self._log_inspect_failure(exc)
+            return None
+        self._inspect_failure = None
+        owner = self._container_owner(state.labels)
+        if owner is None:
+            # No foreign label, but the start path has a second refusal that does not
+            # need one: a container the idle watcher disowned by id. Reporting it here
+            # too is what keeps this method's contract — "exactly what the start path
+            # will refuse" — from going stale, and without it a warmup stream would
+            # commit its 200 and banner and then discover the refusal on a background
+            # thread that can only log, which is the silent-success shape this exists
+            # to prevent.
+            return self._disowned_container_error(state, "adopt")
+        if not state.running and self._is_reclaimable(state):
+            # A foreign corpse is reclaimed rather than refused, so it is not a
+            # collision to report — the start path will remove it and launch.
+            return None
+        return self._foreign_container_error(
+            owner,
+            "adopt",
+            state_note=(
+                "and running"
+                if state.running
+                else f"and in docker state {state.status!r}, so it has not finished"
+            ),
+        )
+
+    def _stale_ownership_reason(self, state: _ContainerState) -> str | None:
+        """Say why the container of this name is no longer the one we became ready over.
+
+        Answers on *positive evidence only*. An inspect that reports no container —
+        which is also what an unreachable daemon and an unparseable answer degrade
+        to (see ``_inspect_state``) — returns None, so a docker hiccup can never
+        demote a warm backend. A container that has genuinely gone away is already
+        reconciled reactively, by the ``URLError`` branch of ``_forward_with_body``:
+        the port stops answering, ``alive()`` says the container is gone, and the
+        request path restarts it. What that branch cannot see is the case here,
+        because the port *does* answer — it is another proxy's backend answering.
+
+        Two disagreements count, and they catch different things:
+
+        * a **foreign owner label**. Container names are unique, so a foreign
+          container holding this name proves ours is no longer under it: whatever
+          this manager's ``ready`` state refers to, it is not this container. There
+          is no false positive to worry about — our own container cannot be wearing
+          a sibling's owner label.
+        * a **different container id**, when one was recorded. This is what catches
+          a replacement that reads as *ours*: an operator who hand-restarts the
+          backend leaves an unlabelled container, which the upgrade rule in
+          ``_container_owner`` deliberately reads as this proxy's own, and two units
+          can also be given the same ``PROXY_OWNER``. Same name, same port, possibly
+          a different profile — and nothing in the labels to say so.
+
+        The two do *not* end the same way, and the difference matters enough to
+        state. A foreign label is re-read by every guard on the start path, so the
+        next request is refused there and 502s naming both owners. An id mismatch is
+        not: it fires precisely when the label reads as ours, so there is no second
+        owner to name and nothing downstream would refuse anything — the finding is
+        instead carried out of ``_disown_if_replaced`` in
+        ``_disowned_container_id``, and the start path refuses on *that*. See
+        ``_disowned_container_error`` for what would happen otherwise.
+
+        Only compared when both ids are known, so a launch whose id could not be
+        read (``_launched_container_id``) degrades to the owner check instead of
+        mismatching against the empty string every poll.
+        """
+        if not state.exists:
+            return None
+        owner = self._container_owner(state.labels)
+        if owner is not None:
+            return (
+                f"the name is now held by container {state.container_id} owned by {owner!r}, "
+                f"not by this proxy ({PROXY_OWNER!r})"
+            )
+        launched = self._container_id
+        if launched and state.container_id and state.container_id != launched:
+            return (
+                f"the name is now held by container {state.container_id}, not by "
+                f"{launched}, the container this proxy became ready over"
+            )
+        return None
+
+    def _disown_if_replaced(self) -> bool:
+        """Drop a ``ready`` state that refers to a container someone else replaced.
+
+        The gap this closes. ``_proxy`` forwards a request straight to
+        ``localhost:backend_port`` whenever ``state == "ready"``, with no ownership
+        check and no docker call — that fast path is the whole point of being ready.
+        But nothing demoted ``ready`` when the container died *out of band*: the idle
+        watcher only reads local state, and the reactive ``URLError`` reconcile in
+        ``_forward_with_body`` needs the port to go quiet. So after a sibling proxy
+        reclaims this backend's corpse (which the start path now does, by design) and
+        launches its own container on the same name and host port, this manager keeps
+        answering "ready" and forwards to a port that is now the sibling's backend.
+        Two configs that collide on name and port but differ in profile then serve
+        each other's clients the wrong model, success-shaped, for as long as traffic
+        keeps the idle timer alive — and two idle watchers each believe they own it.
+
+        Checked here, in a loop the proxy already runs, rather than on the request
+        path: a warm request must still cost zero docker round trips, and the
+        cold-start storm this guard's earlier rounds were about must not gain a
+        ``docker inspect`` per request. The watcher only runs while a backend is
+        ``ready``, so a starting backend adds nothing either. The exposure is
+        therefore bounded by one watcher tick — ``min(10, IDLE_TIMEOUT / 2)`` seconds
+        — instead of being unbounded.
+
+        Removes nothing, ever. The container belongs to its new owner and may be
+        mid-load or mid-stream; local state is all this proxy has any claim on, which
+        is exactly what ``_stop_container`` concluded for the same situation arriving
+        through the idle door. Returns True when the backend was demoted.
+
+        And it makes sure the *next* request removes nothing either, which does not
+        follow from this method touching nothing. Demotion is what puts the manager
+        back on the start path, and every refusal there is gated on a foreign owner
+        *label*: an unlabelled hand-restart or a same-``PROXY_OWNER`` sibling reads as
+        this proxy's own, so ``_clear_container_name`` would ``docker rm -f`` the very
+        container just disowned — the running backend of whoever replaced ours. So the
+        id evidence is recorded in ``_disowned_container_id`` before ``mark_stopped``
+        discards ``_container_id``, and the start path refuses on it. What the next
+        request then does depends on which reading fired: a foreign label 502s naming
+        both owners, an id mismatch 502s naming the two containers.
+        """
+        try:
+            state = self._inspect_state()
+        except Exception as exc:  # docker unreachable: not evidence of a takeover
+            self._log_inspect_failure(exc)
+            return False
+        self._inspect_failure = None
+        reason = self._stale_ownership_reason(state)
+        if reason is None:
+            return False
+        log.warning(
+            "[%s] Backend %s was ready, but %s. Releasing local state without touching the "
+            "container: this proxy has been serving another owner's backend on port %d, and "
+            "the next request must re-decide ownership rather than forward to it.",
+            self.model_name,
+            self.container,
+            reason,
+            self.backend_port,
+        )
+        if state.container_id and self._container_owner(state.labels) is None:
+            # The id branch fired: the name resolves to a container that reads as
+            # *ours*. Every guard on the start path re-reads the owner label and
+            # would agree, so this reading is the only thing standing between that
+            # container and a `docker rm -f` (or a re-adoption) on the next request.
+            # `mark_stopped` clears `_container_id` immediately below, so carry it.
+            # A foreign owner label needs no help: it is re-read, and refused, by
+            # `_start_container`, `_clear_container_name` and
+            # `_adopt_running_container` alike.
+            self._disowned_container_id = state.container_id
+            self._disowned_reason = reason
+        self.mark_stopped()
+        return True
 
     def _adopt_running_container(self) -> bool:
         """Adopt an already-running, healthy container instead of reloading it.
@@ -836,9 +1893,52 @@ class BackendManager:
         containers keep running. Without adoption the next request would
         ``docker rm -f`` a perfectly healthy backend and pay the multi-minute
         model reload. Returns True if the existing container was adopted.
+
+        Raises ``ForeignContainerError`` when the container of this name belongs
+        to another proxy — including while it is still loading and therefore not
+        yet answering health checks. That case is the sharp one: a container
+        eight minutes into a fourteen-minute load fails ``_backend_healthy``, so
+        without this guard the caller would fall through to ``_start_container``
+        and ``docker rm -f`` it.
+
+        Reads the full state rather than ``(running, labels)`` so the adopted
+        container's *id* is recorded too — an adopted backend needs the same later
+        identity re-check as a launched one, and this inspect is already paid for.
         """
-        if self._container_running() and self._backend_healthy():
+        state = self._inspect_state()
+        running, labels = state.running, state.labels
+        if not running:
+            return False
+        owner = self._container_owner(labels)
+        if owner is not None:
+            raise self._foreign_container_error(owner, "adopt")
+        # A container the idle watcher disowned by id must not be taken back. It
+        # reads as ours (that is the whole point of the id check), it is unlabelled
+        # or same-owner so the profile test below cannot see it either, and a healthy
+        # one would otherwise be adopted straight back into `ready` — with
+        # `_container_id` overwritten by its id, so the ids agree from then on and
+        # the re-check can never fire again. That turns a mis-serve bounded at one
+        # watcher tick into a permanent one.
+        disowned = self._disowned_container_error(state, "adopt")
+        if disowned is not None:
+            raise disowned
+        stamped = labels.get(PROFILE_LABEL)
+        if stamped is not None and stamped != self._profile:
+            # My own container, but the config it was launched from has changed
+            # since (a mem_fraction bump, a new image tag). Replace it rather
+            # than adopt a backend running the previous config.
+            log.info(
+                "[%s] Container %s runs profile %s but the config is now %s — replacing it.",
+                self.model_name,
+                self.container,
+                stamped,
+                self._profile,
+            )
+            return False
+        if self._backend_healthy():
             self._current_gpu = self._running_container_gpu()
+            self._container_id = state.container_id or None
+            self._forget_disowned_container()
             return True
         return False
 
@@ -858,11 +1958,24 @@ class BackendManager:
             return False
 
     def _running_container_gpu(self) -> str | None:
-        """Return the GPU device id assigned to the running container, if any.
+        """Return the device list assigned to the running container, if any.
 
-        Read back from the container's ``--gpus device=N`` request so an
+        Read back from the container's ``--gpus device=…`` request so an
         adopted backend keeps the right device for colocation/GPU-exclusion
-        bookkeeping.
+        bookkeeping — and so a container being *replaced* hands its devices to the
+        replacement instead of letting auto-selection move the backend elsewhere
+        (see ``_start_container``).
+
+        Returned in the same comma-separated shape ``_docker_gpu_arg`` consumes
+        and ``_current_gpu`` records, because both round-trip it: the value is
+        counted against ``tensor_parallel_size x pipeline_parallel_size``, handed
+        to ``docker run``, and split on commas to exclude each device from other
+        backends' auto-selection. Docker stores ``--gpus '"device=2,3"'`` as *one*
+        request whose ``DeviceIDs`` is ``["2", "3"]`` — that single-request parse
+        is exactly what the quoting in ``_docker_gpu_arg`` buys — so the ids are
+        joined here rather than read through a Go template, whose ``range``
+        concatenates without a separator and turned a two-GPU container into the
+        one bogus token ``"23"``.
         """
         result = subprocess.run(
             [
@@ -870,15 +1983,33 @@ class BackendManager:
                 "docker",
                 "inspect",
                 "-f",
-                "{{range .HostConfig.DeviceRequests}}{{range .DeviceIDs}}{{.}}{{end}}{{end}}",
+                _INSPECT_DEVICES_FORMAT,
                 self.container,
             ],
             capture_output=True,
             text=True,
             check=False,
         )
-        gpu = result.stdout.strip()
-        return gpu or None
+        if result.returncode != 0:
+            return None
+        try:
+            requests = _json.loads(result.stdout.strip() or "null")
+        except ValueError:
+            return None
+        if not isinstance(requests, list):
+            return None
+        # Flattened across requests: this proxy always emits one, but a
+        # hand-started container can carry several (`--gpus device=0 --gpus
+        # device=1`), and every one of them holds a device this backend owns.
+        # A request that asks for a *count* rather than named devices
+        # (`--gpus all`) contributes nothing — there is no id to reuse.
+        devices = [
+            str(device)
+            for request in requests
+            if isinstance(request, dict)
+            for device in (request.get("DeviceIDs") or [])
+        ]
+        return ",".join(devices) or None
 
     def _container_logs_tail(self, lines: int = 20) -> str:
         """Return the last ``lines`` of the container log for error reporting."""
@@ -923,6 +2054,12 @@ class BackendManager:
                         return
                     continue
                 idle_for = time.monotonic() - self._last_activity
+            # Outside the lock: this issues a `docker inspect`, and holding the lock
+            # across it would stall every request thread reading `.state` for the
+            # length of a daemon round trip. Before the idle check, because a backend
+            # whose container someone else replaced has nothing left to idle-stop.
+            if self._disown_if_replaced():
+                return
             if idle_for >= IDLE_TIMEOUT:
                 with self._lock:
                     if self._state != "ready":
@@ -1047,6 +2184,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     is_stream = _json.loads(body).get("stream", False)
 
             if is_chat and is_stream:
+                # Diagnose a contended container name *before* committing the 200
+                # and the warmup banner: once the response line is written the
+                # background start has no way to reach the client, and a
+                # success-shaped answer keeps the gateway from failing over.
+                contention = backend.contention_error()
+                if contention is not None:
+                    self.send_error(502, str(contention))
+                    return
                 self._handle_warmup_stream(backend)
                 return
             try:

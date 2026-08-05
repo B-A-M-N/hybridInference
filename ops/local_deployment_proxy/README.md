@@ -236,6 +236,7 @@ To add a new model, append an entry to `models.json` and restart the proxy.
 | `HEALTH_INTERVAL` | `10` | Seconds between health-check polls |
 | `MODELS_CONFIG` | auto-detected | Path to the models config JSON. When unset, selected by GPU hardware (see [Hardware profiles](#hardware-profiles)); set explicitly to override. **Not settable from the environment under systemd** — see below |
 | `LOCAL_API_KEY` | `freeinference_api` | API key for request auth; accepts an `Authorization: Bearer` or `X-API-Key` header. A blank value falls back to the default rather than disabling auth — there is no way to turn auth off |
+| `PROXY_OWNER` | `port-$LISTEN_PORT` | Identity stamped on the containers this proxy starts, so it never destroys or adopts another proxy's backend of the same name (see [Container ownership](#container-ownership)). The default is unique per host and stable across restarts; override only to give a hand-run proxy an identity of its own |
 
 ### `MODELS_CONFIG` under systemd
 
@@ -287,19 +288,92 @@ To intentionally **colocate** models on one GPU, give them a shared `colocate_gr
 
 For **tensor-parallel** or **pipeline-parallel** backends (`tensor_parallel_size` > 1 and/or `pipeline_parallel_size` > 1), either pin the devices with a comma-list `gpu_index` (e.g. `"0,2,3"`) or omit `gpu_index` to auto-pick the `tensor_parallel_size × pipeline_parallel_size` least-used GPUs. A multi-GPU `gpu_index` is passed to Docker as a quoted `--gpus '"device=0,2,3"'` so the daemon does not split the comma list into separate GPU requests.
 
+Docker therefore stores the whole list as **one** device request, and the two places that read a container's devices back — adopting a running backend on restart, and replacing one whose config changed (see [Container ownership](#container-ownership)) — parse `HostConfig.DeviceRequests` as JSON and rejoin the ids with commas. A `docker inspect --format` template cannot do it: Go's `range` emits its elements with no separator, so a backend on GPUs 2,3 read back as the single bogus token `23`, which matches no `nvidia-smi` index, excludes neither device from another backend's auto-selection, and would be handed to the next `docker run` as `--gpus device=23`.
+
 ## Hardware profiles
 
-The same proxy runs on machines with different GPUs and serves the model set that fits the hardware. When `MODELS_CONFIG` is **unset**, the proxy inspects `nvidia-smi` once at startup and selects a profile JSON next to the script:
+The same proxy runs on machines with different GPUs and serves the model set that fits the hardware. When `MODELS_CONFIG` is **unset**, the proxy inspects `nvidia-smi` once at startup and selects a profile JSON:
 
 | Detected hardware | Profile | Serves |
 |---|---|---|
-| 4+ × H200 | `models.h200.json` | `deepseek-v4-flash` — sglang, `pipeline_parallel_size: 3` on GPUs **0,2,3** (GPU 1 free) |
+| 4+ × H200 | [`../h200_idle_proxy/models.json`](../h200_idle_proxy/models.json) | `deepseek-v4-flash` — sglang, `tensor_parallel_size: 2` on GPUs **2,3** (GPUs 0,1 free) |
 | RTX (PRO) 6000 | `models.rtx6000.json` | `Qwen/Qwen3.6-35B-A3B-FP8` + `BAAI/bge-m3` (single GPU) |
 | anything else / no `nvidia-smi` | `models.json` | default fallback |
 
 A matched-but-missing profile falls back to `models.json`; setting `MODELS_CONFIG` explicitly bypasses detection entirely.
 
+The H200 row points **out of this directory on purpose.** A 4×H200 box has one DeepSeek deployment, not two, and the file the dedicated `h200_idle_proxy` unit pins on its `ExecStart` line *is* that deployment's definition — so the auto-detected profile is that same file rather than a copy of it. There used to be a local `models.h200.json` mirror: it drifted (FP8 at PP=3 on GPUs 0,2,3 on one side, NVFP4 at TP=2 on the other) until #1185 reconverged the two, and only a partial five-key test assertion held them in step afterwards — #1187's `mem_fraction` change still had to be applied twice by hand. Two entry points that resolve the same `container` and `backend_port` must resolve the same config, or they fight over it; see [Container ownership](#container-ownership).
+
 The H200 profile serves `deepseek-ai/DeepSeek-V4-Flash-0731` on GPUs 2,3 (TP=2; GPUs 0,1 left free for other workloads), with DSpark speculative decoding and the `marlin` MoE runner that FP4 experts require on SM90. It previously needed PP=3 across GPUs 0,2,3, because ~274 GiB of FP8 weights do not fit at TP=2 on two H200s and TP=3 is illegal (64 attention heads are not divisible by 3); the 0731 release ships FP4 experts at ~156 GiB, so it fits on two GPUs and frees a third. For the dedicated service with reverse tunnels to staging and production (port 8003 on h200a, 8004 on h200b), prefer [`ops/h200_idle_proxy`](../h200_idle_proxy/README.md). Its `tool_call_parser` / `reasoning_parser` use the DeepSeek-V4 pairing (`deepseekv4` / `deepseek-v4`) that the [sglang DeepSeek-V4 cookbook](https://lmsysorg.mintlify.app/cookbook/autoregressive/DeepSeek/DeepSeek-V4) prescribes. Do **not** substitute the V3-era parsers: `deepseek-r1` treats the whole generation as reasoning until a `</think>` close tag — requests that do not enable thinking never produce that tag, so every reply comes back with empty `content` and the answer buried in `reasoning_content` — and `deepseekv3` does not recognize V4's DSML tool-call markup, so `tool_calls` stays null and agentic clients cannot run tools.
+
+## Container ownership
+
+Every lifecycle operation here used to address its backend by container *name*: a `docker rm -f <name>` before each start, another when the idle timer expires, and an adoption check that asked only "is something running under this name and answering on `backend_port`?". A name is not proof of ownership, so each container is stamped with two labels at `docker run` and they are consulted before anything is destroyed or adopted:
+
+| Label | Value | Meaning |
+|---|---|---|
+| `com.freeinference.proxy.owner` | `port-<LISTEN_PORT>`, or `$PROXY_OWNER` when set | Which proxy runs it. Only one process can hold a listen port on a host, and the value is stable across restarts of the same unit — so restart-and-adopt keeps working. |
+| `com.freeinference.proxy.profile` | first 16 hex of `sha256` over the **launch-affecting** config keys | Which config it was launched from. |
+
+The rules:
+
+- **Owner matches, or no owner label** → this proxy's container. Adopt it when healthy, replace it when not, stop it when idle. An *absent* label means "started before labelling existed, therefore mine" — that keeps the change a no-op for containers already running at upgrade time (see [Upgrading](#upgrading-from-an-unlabelled-deployment)).
+- **Owner matches, profile differs** → the config on disk changed since launch (a `mem_fraction` bump, a new `sglang_image`). Replace the container; do not adopt a backend running the previous config. The replacement lands on the **same GPUs the old container held**, unless the config pins `gpu_index`, a `colocate_group` partner has already resolved a device, or the requested device count changed (a `tensor_parallel_size` / `pipeline_parallel_size` edit). Auto-selection cannot be used here: the container being replaced is still running when the choice is made, so `nvidia-smi` reports its device as busy and the backend would migrate — away from its colocation partner, or onto a device an idle-stopped model is pinned to, which then OOMs when that model wakes.
+- **Owner differs, and that container is running** → hands off. The proxy neither adopts nor destroys it, and the request fails 502 with both owners named — for streaming chat requests too, which is the shape that matters: they are answered before the backend is up, so the diagnosis has to be produced before the `200` and the "starting up" banner are committed, or the gateway keeps seeing success and never fails over. Taking a live foreign container over would be worse either way: `docker rm -f` kills a backend another process may be eleven minutes into loading or actively streaming from, and adopting it puts one container under two idle watchers that cannot see each other's activity, so whichever fires first stops it out from under the other's traffic.
+- **Owner differs, and that container has finished** (docker state `exited`, `dead` or `removing`) → reclaimed: `docker rm -f` then a fresh launch. A finished container holds no GPU and serves no traffic, and *nothing* in this proxy removes a foreign container (the idle path declines one too), so refusing it would wedge the name permanently and 502 the model on that node until an operator removed the corpse by hand.
+- **Owner differs, and that container is `created`** → hands off, like a running one. "Not running" is not the same as "finished": `docker run -d` reserves the name and writes the owner label at *create* and starts the container afterwards (nvidia-container hooks, device injection), so an ordinary sibling launch is observable in this state — with current labels, no operator involved. Reclaiming on liveness alone destroyed that container at t≈0, which is why the state word is read rather than only `.State.Running`. A container of *ours* is cleared whatever state it is in: refusing there would wedge our own name with nobody to take it from. The remaining cost is a foreign container stuck in `created` — its own launcher died between create and start — which now needs `sudo docker rm -f <container>` by hand; the 502 says so, and names the state it saw.
+
+All four rules need the ownership labels, which means they need `sudo docker inspect` to run. When it cannot — the docker CLI is missing, `sudo` is refused — the proxy answers "no contention" rather than 502ing every request over a problem that may be transient, so a *real* collision would go unnoticed. That case is not silent: it logs `Ownership inspect of <container> could not run …` at `warning`, once per distinct reason rather than once per request, and again after any inspect that succeeds in between. If a proxy never starts a backend, `journalctl -u local_deployment_proxy` is where to look first.
+
+Which config keys force a replacement: all of them except `startup_estimate_seconds`, `hf_repo`, `hf_revision` and `hf_ignore_patterns`, which never reach a `docker run` command line — the first only words the warmup banner, the rest only steer the Hugging Face download. Re-tuning `startup_estimate_seconds` against a measured cold start is free, as it should be; editing anything else costs a reload on the next start.
+
+This only ever triggers when two processes resolve the *same* container name. Running this proxy pinned to `models.json` (Qwen + bge-m3 on GPUs 0,1) alongside `h200_idle_proxy` (DeepSeek on GPUs 2,3) on one 4-GPU box shares no container name or port and is unaffected.
+
+To protect a hand-started container from every proxy on the box — benchmarking with [`bench_decode.sh`](../h200_idle_proxy/bench_decode.sh), say — give it an owner of its own:
+
+```bash
+sudo docker run -d --name deepseek-v4-flash-sglang \
+  --label com.freeinference.proxy.owner=manual  …
+```
+
+The protection lasts only as long as the container runs: `docker stop` hands the name back, and the next proxy start reclaims it. When the benchmark is done, `sudo docker rm -f deepseek-v4-flash-sglang` and let the proxy launch its own.
+
+### When the rules are applied, and to what
+
+A label read is worth only as much as the gap between reading it and acting on it, and on the cold-start path that gap is not microseconds. The first version of this guard checked ownership once at the top of the start path and then ran its `docker rm -f <name>` minutes later — after GPU selection and after an `_ensure_model_dir` that can be a several-hundred-GiB `snapshot_download`. Two units brought up together by a reboot therefore *both* saw "no container", and the slower one destroyed the container the faster one had meanwhile created, without ever looking at its labels again.
+
+So:
+
+- The ownership decision is re-taken **immediately before** the removal it authorises, one `docker inspect` earlier rather than a download earlier. The check at the top of the start path remains, but only as an early refusal that saves a download which was going to be thrown away.
+- `docker rm -f` is given the container **id** that decision was taken about, never the name. Ids are unique and never reused, so if the container just judged removable has been replaced even inside that one-call window, the removal misses ("no such container") instead of landing on whatever now holds the name. The idle path removes by id for the same reason: its timer can fire on a backend that died minutes ago and has since been reclaimed by a sibling.
+- The remaining gap — between that inspect and the launch after it — is closed by docker itself. Container names are unique, so `docker run --name` fails outright when the name is taken; that refusal is the only atomic claim on a name available. It is detected by message (every daemon-side rejection shares exit status 125, and `sudo` can rewrite that besides) and read as contention, which sends the ownership decision round again: refuse if the winner is alive, reclaim if it has since exited. Bounded at one retry — a name taken twice over is a standing collision, not a race worth re-running a weight download against, and it is reported as `Gave up starting container …`.
+
+- The retry waits half a second first. Docker releases a name when the removal finishes *inside the daemon*, which can be after `docker rm -f` has already returned, so an instant re-run can collide with the very release it is waiting for ("removal of container … is already in progress") and spend the only retry there is on docker's own asynchrony.
+- A removal that docker **refuses** is reported, and is not read as contention. `docker rm -f` failing while the container survives is ordinary enough (a busy overlay2 or cgroup mount, a removal already in progress, a CUDA-wedged process in D state — and a wedged backend is exactly when a replacement is being attempted), and its result used to be discarded: the `docker run` that then hit this proxy's own undead container looked like a lost race, and the give-up blamed "a second unit running this script with a different `MODELS_CONFIG`" that did not exist. The failure now reaches the journal at `error` with the daemon's message, and the give-up names the container that still holds the name, quotes what `docker rm` said about it, and tells the operator to remove it by hand. A removal that *misses* — "no such container" — is not a failure at all but the id aiming working as intended, and stays at `info`.
+
+Any other `docker run` failure is reported as itself, at `error` with the daemon's message: a missing GPU driver, an unavailable device, a published port already bound. Only a name conflict counts as contention.
+
+The idle path reports a refused removal too, and says what it means: local state is released either way (the alternative is a backend this proxy believes is ready and cannot reach), but the GPUs are **not** back, so it logs that the container was not removed instead of "Container … stopped." — otherwise the next auto-selecting start picks against a device that is busy for a backend nothing here believes in.
+
+### A backend already `ready` over a container someone else replaced
+
+Everything above guards the moment a backend is *started*. The mirror image is a backend already running. A request whose model is `ready` is forwarded straight to `localhost:<backend_port>` with no ownership check and no `docker inspect` — that is the whole point of being ready, and a warm request must not pay for one. But nothing demoted `ready` when the container died **outside this proxy's control**: the idle watcher reads only local state, and the reactive reconcile in the forward path needs the port to stop answering. So once a sibling reclaimed *this* backend's corpse (the rule above, working as designed) and launched its own container on the same name and the same host port, the fast path kept forwarding — into the sibling's backend. Two configs that collide on name and port but differ in profile then answer each other's clients from the wrong model, `200` all the way, and two idle watchers each believe they own the container.
+
+The identity a manager is ready over is therefore recorded and re-checked:
+
+- **The container id is recorded at launch**, from the output `docker run -d` already prints, and on adoption from the inspect adoption already pays for. Neither adds a daemon round trip. If some wrapper prints over that output the id reads as unknown and the check falls back to the owner label alone, rather than mismatching against a bogus value and reloading a healthy backend every poll.
+- **The re-check runs in the idle watcher** — the loop the proxy already runs — and only while a backend is `ready`: never per request, and never while one is starting, so a cold-start storm gains nothing. The exposure is bounded by one watcher tick (`min(10, IDLE_TIMEOUT / 2)` seconds, so 10s at the defaults) instead of lasting as long as traffic keeps the idle timer alive.
+- **A foreign owner label, or a different container id, demotes the backend to `stopped`** and releases its GPU bookkeeping. The demotion removes nothing: the container is its new owner's and may be mid-load or mid-stream, which is the conclusion the idle path already reaches for the same situation. The id matters on its own because a takeover can read as *ours*: an operator hand-restarting a wedged backend leaves an unlabelled container, which the upgrade rule below deliberately reads as this proxy's own, and two units can be given the same `PROXY_OWNER`.
+- **What the next request then does depends on which reading fired**, and the two differ. A foreign owner label is re-read by every guard on the start path, so that request refuses and 502s naming both owners, and the gateway fails over. An id mismatch is not re-derivable: it fires *because* the label reads as ours, so there is no second owner to name and none of those guards would refuse — left to itself the request would `docker rm -f` the running container the watcher had just declined to touch, or re-adopt it and return to `ready` over it, at which point the ids agree and the re-check can never fire again. So the disowned container's id is carried out of the demotion, and the start path refuses on that instead: no removal, no adoption, and a 502 naming both containers. The refusal is gated on that container still **running** — once it exits it holds no GPU and serves nothing, and the ordinary reclaim rule applies, so the name is never wedged. To hand such a container back to this proxy deliberately, remove it (`sudo docker rm -f <container>`) and let the next request launch a fresh one, or restart the proxy so it adopts it.
+- **An inspect that reports no container demotes nothing.** An unreachable daemon and an unparseable reply degrade to the same reading as a name that genuinely does not exist, and a docker hiccup must not knock a warm backend out — with docker still down, the next request would 502 instead of forwarding. A container that has really gone away is already handled reactively: the port stops answering, and the forward path restarts the backend and retries the request once.
+
+### Upgrading from an unlabelled deployment
+
+Nothing to do, and nothing to restart. Containers running now carry no labels, are therefore read as this proxy's own, and keep being adopted and idle-stopped exactly as before. Each gets labelled at its next cold start, and is protected from then on. There is no window in which a running backend is orphaned or unreclaimable.
+
+### Changing `LISTEN_PORT` on a box with a labelled backend running
+
+The owner identity is derived from the listen port, so moving a node's port orphans the container it started: while that container keeps running the proxy reads it as another owner's and refuses to adopt or remove it. Either remove it once by hand (`sudo docker rm -f <container>`), or keep the old identity across the move by pinning `PROXY_OWNER` to what it used to be. Nothing is silently wrong in the meantime — requests fail 502 naming both owners, streaming ones included, and the 502 text carries both remediations.
 
 ## On-demand Hugging Face download
 
