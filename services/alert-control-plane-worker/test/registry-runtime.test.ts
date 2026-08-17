@@ -13,6 +13,7 @@ import type { StagingIngressConfig } from "../src/runtime-config";
 const NOW = Date.now();
 const deployment: TrustedDeploymentMetadata = {
   environment: "staging",
+  targetEnvironment: "staging",
   service: "synthetic-alert-producer",
   deploymentId: "run-123-attempt-1",
   artifactDigest: `sha256:${"a".repeat(64)}`,
@@ -87,6 +88,7 @@ function activateRequest(): Request {
           artifact_digest: deployment.artifactDigest,
         },
         deployment_sha: deployment.deploymentSha,
+        target_environment: "staging",
         activated_at: deployment.activatedAt,
         source: "gateway",
         principal: "staging-synthetic",
@@ -200,9 +202,10 @@ describe("deployment registry runtime", () => {
             artifact_digest: statusDeployment.artifactDigest,
           },
           deployment_sha: statusDeployment.deploymentSha,
+          target_environment: "staging",
           activated_at: statusDeployment.activatedAt,
           source: "status-monitor",
-          principal: "staging-monitor",
+          principal: "status-monitor-staging",
         }),
       }),
       config(registryNamespace),
@@ -212,6 +215,73 @@ describe("deployment registry runtime", () => {
     await expect(response.json()).resolves.toEqual({
       deployment: statusDeployment,
     });
+  });
+
+  function statusMonitorActivation(
+    overrides: Record<string, unknown> = {},
+  ): Request {
+    return new Request("https://alerts.example.test/v1/deployments/attest", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer github.oidc.token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        action: "activate",
+        deployment: {
+          environment: "staging",
+          service: "status-monitor",
+          deployment_id: deployment.deploymentId,
+          artifact_digest: deployment.artifactDigest,
+        },
+        deployment_sha: deployment.deploymentSha,
+        target_environment: "production",
+        activated_at: deployment.activatedAt,
+        source: "status-monitor",
+        principal: "status-monitor-production",
+        ...overrides,
+      }),
+    });
+  }
+
+  it("registers a monitor whose target differs from its trust domain", async () => {
+    const registryNamespace = namespace(async (request) => {
+      await expect(request.json()).resolves.toMatchObject({
+        command: {
+          action: "activate",
+          // The trust domain stays staging; only the subject is production.
+          deployment: { environment: "staging", targetEnvironment: "production" },
+        },
+      });
+      return new Response(JSON.stringify(deployment), {
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const response = await handleDeploymentAttestationRequest(
+      statusMonitorActivation(),
+      config(registryNamespace),
+    );
+
+    expect(response.status).toBe(200);
+  });
+
+  it.each([
+    ["a principal that disagrees with the target", { principal: "status-monitor-staging" }],
+    ["an unplaceable target", { target_environment: "unknown" }],
+    ["a local target", { target_environment: "local" }],
+    ["no target at all", { target_environment: undefined }],
+  ])("refuses an activation with %s", async (_label, overrides) => {
+    const registryNamespace = namespace(async () => {
+      throw new Error("registry must not be reached");
+    });
+
+    const response = await handleDeploymentAttestationRequest(
+      statusMonitorActivation(overrides),
+      config(registryNamespace),
+    );
+
+    expect(response.status).toBe(401);
   });
 
   it("looks up a version ID inside the status-monitor registry shard", async () => {

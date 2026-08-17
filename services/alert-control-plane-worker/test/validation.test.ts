@@ -35,6 +35,7 @@ function validEvent(): Record<string, unknown> {
 function validTrusted(): Record<string, unknown> {
   return {
     environment: "staging",
+    target_environment: "staging",
     source: "gateway",
     principal: "staging-gateway",
     deployment_id: "gateway-20260719-1",
@@ -297,6 +298,7 @@ describe("trusted envelope and canonical digest", () => {
 
     expect(trusted).toMatchObject({
       environment: "staging",
+      target_environment: "staging",
       source: "gateway",
       deployment_sha: "a".repeat(40),
       artifact_digest: `sha256:${"b".repeat(64)}`,
@@ -304,6 +306,28 @@ describe("trusted envelope and canonical digest", () => {
     });
     expect(envelope.event).not.toHaveProperty("environment");
     expect(envelope.trusted.environment).toBe("staging");
+  });
+
+  it("refuses a producer that names the environment its alert is about", () => {
+    // Rejected rather than ignored: silently dropping it would leave a producer
+    // believing it had set the label a responder reads.
+    expect(() =>
+      parseAlertEvent(
+        { ...validEvent(), target_environment: "production" },
+        { now: TEST_NOW },
+      ),
+    ).toThrow(/trusted or Slack-owned field: target_environment/);
+  });
+
+  it("requires trusted metadata to say what the alert is about", () => {
+    const { target_environment: _omitted, ...withoutTarget } = validTrusted();
+
+    expect(() => parseTrustedMetadata(withoutTarget)).toThrow(
+      /target_environment/,
+    );
+    expect(() =>
+      parseTrustedMetadata({ ...validTrusted(), target_environment: "local" }),
+    ).toThrow(/target_environment/);
   });
 
   it("rejects malformed or incomplete trusted metadata", () => {

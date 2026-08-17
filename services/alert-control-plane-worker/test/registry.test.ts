@@ -41,6 +41,7 @@ function activation(
       supersedes,
       deployment: {
         environment: "staging",
+        targetEnvironment: "staging",
         service: "gateway",
         deploymentId: "deploy-123",
         artifactDigest: DIGEST,
@@ -68,6 +69,7 @@ describe("DeploymentRegistry", () => {
     expect(calls).toHaveLength(1);
     expect(resolved).toEqual({
       environment: "staging",
+      targetEnvironment: "staging",
       service: "gateway",
       deploymentId: "deploy-123",
       artifactDigest: DIGEST,
@@ -407,6 +409,22 @@ describe("DeploymentRegistry", () => {
 
     await expect(
       registry.apply(activation({ deploymentSha: "c".repeat(40) })),
+    ).rejects.toEqual(
+      expect.objectContaining<Partial<DeploymentRegistryWriteError>>({
+        code: "deployment_conflict",
+      }),
+    );
+    expect(registry.version()).toBe(1);
+  });
+
+  it("refuses to re-point an existing record at a different target", async () => {
+    const registry = new InMemoryDeploymentRegistry(verifier([]));
+    await registry.apply(activation());
+
+    // Accepting this would silently relabel every alert the deployment has
+    // already sent and move its incidents to a different Durable Object.
+    await expect(
+      registry.apply(activation({ targetEnvironment: "production" })),
     ).rejects.toEqual(
       expect.objectContaining<Partial<DeploymentRegistryWriteError>>({
         code: "deployment_conflict",

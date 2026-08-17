@@ -38,9 +38,57 @@ export interface Env {
   ALERT_CYCLE_OWNER?: string;
 }
 
+/** Local/dev gateway hosts that never indicate a real deployment. */
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"]);
+
+/**
+ * Exact hosts, not patterns.
+ *
+ * This started as a display detail, where a loose suffix match cost nothing.
+ * It is now the proof a deploy submits for what a Worker probes, so the same
+ * looseness would let `notfreeinference.org` attest as production and any host
+ * containing "staging" attest as staging. An allowlist has the property the
+ * matching never did: a host nobody has vouched for is `unknown`, and the
+ * deploy refuses it.
+ */
+const DEPLOYMENT_HOSTS: ReadonlyMap<string, string> = new Map([
+  ["freeinference.org", "production"],
+  ["staging.freeinference.org", "staging"],
+]);
+
+/**
+ * The deployment this Worker probes, derived from the gateway it is configured
+ * to call.
+ *
+ * This lives beside {@link Config} rather than beside the alerting that first
+ * needed it because it is now the single answer to "which deployment is this
+ * Worker about" — used to label probe rows, to scope health reads, and to prove
+ * the target at deploy time. Deriving it from the configured URL is what keeps
+ * those from drifting apart when the URL moves.
+ */
+export function deriveEnvironment(gatewayBaseUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(gatewayBaseUrl);
+  } catch {
+    return "unknown";
+  }
+  // `.hostname` (not `.host`) excludes the port and keeps IPv6 brackets intact,
+  // so `freeinference.org:8443` still matches and `[::1]` isn't truncated.
+  const hostname = url.hostname.toLowerCase();
+  if (!hostname || LOCAL_HOSTS.has(hostname)) return "local";
+  // A deployment we page for is reached over TLS. Probing one over plaintext
+  // would be measuring something else, and attesting it as that deployment
+  // would put a name on the difference.
+  if (url.protocol !== "https:") return "unknown";
+  return DEPLOYMENT_HOSTS.get(hostname) ?? "unknown";
+}
+
 /** Normalized configuration derived from {@link Env}. */
 export interface Config {
   gatewayBaseUrl: string;
+  /** Which deployment this Worker's probes measure. Never assumed — derived. */
+  targetEnvironment: string;
   probePrompt: string;
   probeMaxTokens: number;
   maxConcurrency: number;
@@ -58,8 +106,13 @@ function intOr(value: string | undefined, fallback: number): number {
 
 /** Builds {@link Config} from raw environment bindings. */
 export function loadConfig(env: Env): Config {
+  const gatewayBaseUrl = (env.GATEWAY_BASE_URL || "https://freeinference.org").replace(
+    /\/+$/,
+    "",
+  );
   return {
-    gatewayBaseUrl: (env.GATEWAY_BASE_URL || "https://freeinference.org").replace(/\/+$/, ""),
+    gatewayBaseUrl,
+    targetEnvironment: deriveEnvironment(gatewayBaseUrl),
     probePrompt:
       env.PROBE_PROMPT ||
       "Write a Python function that implements binary search over a sorted list. " +

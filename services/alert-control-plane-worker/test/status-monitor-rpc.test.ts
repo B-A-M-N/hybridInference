@@ -10,6 +10,7 @@ import {
 const VERSION_ID = "0198a3d0-4c2f-7db4-8c55-1f6bc62ee908";
 const deployment: TrustedDeploymentMetadata = {
   environment: "staging",
+  targetEnvironment: "staging",
   service: "status-monitor",
   deploymentId: VERSION_ID,
   artifactDigest: `sha256:${"b".repeat(64)}`,
@@ -127,13 +128,82 @@ describe("status-monitor role RPC", () => {
     expect(digest).toMatch(/^sha256:[a-f0-9]{64}$/);
     expect(envelope.trusted).toEqual({
       environment: "staging",
+      target_environment: "staging",
       source: "status-monitor",
-      principal: "staging-monitor",
+      principal: "status-monitor-staging",
       deployment_id: VERSION_ID,
       deployment_sha: deployment.deploymentSha,
       artifact_digest: deployment.artifactDigest,
       registry_version: 7,
     });
+  });
+
+  async function trustedFor(
+    record: TrustedDeploymentMetadata,
+  ): Promise<{ trusted: Record<string, unknown>; incidentName: string }> {
+    const submit = vi.fn().mockResolvedValue(acknowledgement);
+    const registry = namespace(async () =>
+      new Response(JSON.stringify(record), {
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const result = await submitStatusMonitorRpcEvent(
+      env(registry),
+      body(),
+      VERSION_ID,
+      submit,
+    );
+    expect(result).toEqual({ accepted: true, acknowledgement });
+    const [, incidentName, envelope] = submit.mock.calls[0]!;
+    return { trusted: envelope.trusted, incidentName };
+  }
+
+  it("labels an alert by the gateway probed, not the domain that attested it", async () => {
+    const { trusted } = await trustedFor({
+      ...deployment,
+      targetEnvironment: "production",
+    });
+
+    // The monitor still ships from dev through the staging pipeline, so its
+    // trust domain is unchanged — only what it reports about has moved.
+    expect(trusted.environment).toBe("staging");
+    expect(trusted.target_environment).toBe("production");
+    expect(trusted.principal).toBe("status-monitor-production");
+  });
+
+  it("keeps one model's outage in two environments on separate incidents", async () => {
+    const staging = await trustedFor(deployment);
+    const production = await trustedFor({
+      ...deployment,
+      targetEnvironment: "production",
+    });
+
+    // Same fingerprint both times: `status-monitor:model:*` carries no
+    // environment, so nothing but the routed identity separates them. Were they
+    // to collide, either gateway's recovery would close the other's incident.
+    expect(production.incidentName).not.toBe(staging.incidentName);
+  });
+
+  it("reports a record written before the split exactly as it used to", async () => {
+    const legacy = await trustedFor({ ...deployment, targetEnvironment: null });
+
+    expect(legacy.trusted.target_environment).toBe("staging");
+    // Pinned, not derived. This record's open incidents are routed under the
+    // principal they were opened with, and the control plane can ship while one
+    // is in flight — the cutover gate is in the monitor's deploy, which is
+    // later. Deriving `status-monitor-staging` here would route their recovery
+    // to an object that holds nothing and leave them open forever.
+    expect(legacy.trusted.principal).toBe("staging-monitor");
+  });
+
+  it("leaves a pre-split incident's route material untouched", async () => {
+    // The compatibility guarantee in one assertion: upgrading the control plane
+    // must not move an in-flight incident, and the route is derived from
+    // (target ?? environment, principal, fingerprint).
+    const legacy = await trustedFor({ ...deployment, targetEnvironment: null });
+    const migrated = await trustedFor({ ...deployment, targetEnvironment: "staging" });
+
+    expect(legacy.incidentName).not.toBe(migrated.incidentName);
   });
 
   it.each(["version id with spaces", "opaque-but-not-a-worker-version"])(

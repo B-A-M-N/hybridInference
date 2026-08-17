@@ -25,7 +25,7 @@ import { hasAlertDestination } from "./oncall";
  * so it can never break the cycle.
  */
 async function finalizeCycle(env: Env, config: Config, status: CycleStatus): Promise<void> {
-  await setCycleStatus(env.DB, status);
+  await setCycleStatus(env.DB, status, config.targetEnvironment);
   try {
     await runCycleAlert(env, config, status);
   } catch (err) {
@@ -145,11 +145,12 @@ async function runProbeCycle(env: Env): Promise<void> {
       return;
     }
 
-    await recordResults(env.DB, results);
+    await recordResults(env.DB, results, config.targetEnvironment);
     await reconcileModels(
       env.DB,
       results.map((r) => r.modelId),
       Date.now(),
+      config.targetEnvironment,
     );
     await prune(env.DB, config.retentionDays);
     // finalizeCycle records health and, if the cycle was previously failing at
@@ -215,9 +216,12 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
+    // Every read below is scoped to the deployment this Worker probes; the
+    // retained history from before it was repointed belongs to a different one.
+    const config = loadConfig(env);
 
     if (path === "/api/health") {
-      const snap = await getSnapshot(env.DB);
+      const snap = await getSnapshot(env.DB, config.targetEnvironment);
       // Control Plane transitions awaiting acceptance. A probe cycle in flight
       // can legitimately show a transient nonzero (rows exist between creation
       // and the post-delivery batch), so this never flips `ok` — but a value
@@ -242,13 +246,13 @@ export default {
       );
     }
     if (path === "/api/status") {
-      return json(await getSnapshot(env.DB));
+      return json(await getSnapshot(env.DB, config.targetEnvironment));
     }
     if (path === "/") {
-      const snap = await getSnapshot(env.DB);
+      const snap = await getSnapshot(env.DB, config.targetEnvironment);
       let gatewayHost: string | undefined;
       try {
-        gatewayHost = new URL(loadConfig(env).gatewayBaseUrl).host;
+        gatewayHost = new URL(config.gatewayBaseUrl).host;
       } catch {
         gatewayHost = undefined;
       }

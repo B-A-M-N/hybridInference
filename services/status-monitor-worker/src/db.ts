@@ -40,12 +40,17 @@ export interface Snapshot {
 }
 
 /** Inserts the results of one probe cycle. */
-export async function recordResults(db: D1Database, results: ProbeResult[]): Promise<void> {
+export async function recordResults(
+  db: D1Database,
+  results: ProbeResult[],
+  targetEnvironment: string,
+): Promise<void> {
   if (results.length === 0) return;
   const stmt = db.prepare(
     `INSERT INTO probe_results
-       (model_id, ok, latency_ms, ttft_ms, completion_tokens, throughput_tps, error, checked_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       (model_id, ok, latency_ms, ttft_ms, completion_tokens, throughput_tps, error,
+        checked_at, target_environment)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   await db.batch(
     results.map((r) =>
@@ -58,6 +63,7 @@ export async function recordResults(db: D1Database, results: ProbeResult[]): Pro
         r.throughputTps,
         r.error,
         r.checkedAt,
+        targetEnvironment,
       ),
     ),
   );
@@ -77,13 +83,23 @@ export async function modelsFailingStreak(
   db: D1Database,
   modelIds: string[],
   threshold: number,
+  targetEnvironment: string,
 ): Promise<Set<string>> {
   const failing = new Set<string>();
   if (modelIds.length === 0 || threshold < 1) return failing;
+  // Scoped to one deployment: this decides whether to page, and a streak that
+  // reached back across the 2026-08-11 cutover would count staging failures
+  // toward a production outage. The window is short, so the mixing only shows
+  // up for a model absent from the catalog long enough for its newest rows to
+  // predate the switch — which is exactly when nobody would think to check.
   const stmt = db.prepare(
-    `SELECT ok FROM probe_results WHERE model_id = ? ORDER BY id DESC LIMIT ?`,
+    `SELECT ok FROM probe_results
+      WHERE model_id = ? AND target_environment = ?
+      ORDER BY id DESC LIMIT ?`,
   );
-  const batched = await db.batch<{ ok: number }>(modelIds.map((id) => stmt.bind(id, threshold)));
+  const batched = await db.batch<{ ok: number }>(
+    modelIds.map((id) => stmt.bind(id, targetEnvironment, threshold)),
+  );
   for (let i = 0; i < modelIds.length; i++) {
     const rows = batched[i].results ?? [];
     if (rows.length >= threshold && rows.every((r) => r.ok === 0)) {
@@ -257,6 +273,7 @@ export async function reconcileModels(
   db: D1Database,
   activeIds: string[],
   nowMs: number,
+  targetEnvironment: string,
 ): Promise<void> {
   // Persist the active model list in a single meta row so getSnapshot can read it
   // with an O(1) keyed lookup. Deriving it from probe_results (e.g. SELECT
@@ -273,8 +290,16 @@ export async function reconcileModels(
     .bind(MODEL_SWEEP_KEY, String(nowMs));
 
   if (sortedIds.length === 0) {
-    // Unfiltered DELETE, so there is no predicate to index in the first place.
-    await db.batch([db.prepare(`DELETE FROM probe_results`), setModelIds, markSwept]);
+    // Scoped, not unfiltered: an empty catalog says nothing about a deployment
+    // this instance does not probe, and the retained pre-cutover history sits in
+    // the same table.
+    await db.batch([
+      db
+        .prepare(`DELETE FROM probe_results WHERE target_environment = ?`)
+        .bind(targetEnvironment),
+      setModelIds,
+      markSwept,
+    ]);
     return;
   }
 
@@ -284,7 +309,12 @@ export async function reconcileModels(
   if (previous === null || sweepDue) {
     const placeholders = sortedIds.map(() => "?").join(",");
     await db.batch([
-      db.prepare(`DELETE FROM probe_results WHERE model_id NOT IN (${placeholders})`).bind(...sortedIds),
+      db
+        .prepare(
+          `DELETE FROM probe_results
+            WHERE target_environment = ? AND model_id NOT IN (${placeholders})`,
+        )
+        .bind(targetEnvironment, ...sortedIds),
       setModelIds,
       markSwept,
     ]);
@@ -297,7 +327,12 @@ export async function reconcileModels(
   if (departed.length > 0) {
     const placeholders = departed.map(() => "?").join(",");
     statements.push(
-      db.prepare(`DELETE FROM probe_results WHERE model_id IN (${placeholders})`).bind(...departed),
+      db
+        .prepare(
+          `DELETE FROM probe_results
+            WHERE target_environment = ? AND model_id IN (${placeholders})`,
+        )
+        .bind(targetEnvironment, ...departed),
     );
   }
   // Exact string comparison, so any drift in the stored representation (legacy
@@ -369,12 +404,22 @@ export async function releaseCycleLock(db: D1Database, token: string): Promise<v
 }
 
 /** Records whether the most recent cron cycle succeeded. */
-export async function setCycleStatus(db: D1Database, status: CycleStatus): Promise<void> {
+export async function setCycleStatus(
+  db: D1Database,
+  status: CycleStatus,
+  targetEnvironment: string,
+): Promise<void> {
   const stmt = db.prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`);
   await db.batch([
     stmt.bind("last_cycle_ok", status.ok ? "1" : "0"),
     stmt.bind("last_cycle_at", status.checkedAt ?? ""),
     stmt.bind("last_cycle_error", status.error ?? ""),
+    // Stamped so a reader can tell whether this result describes the deployment
+    // it is asking about. These three rows are a single latest-value slot, not
+    // history, so without it a repointed Worker keeps serving the previous
+    // gateway's verdict — a green `/api/health` for a deployment it has not yet
+    // probed once.
+    stmt.bind("last_cycle_target_environment", targetEnvironment),
   ]);
 }
 
@@ -382,12 +427,25 @@ export async function setCycleStatus(db: D1Database, status: CycleStatus): Promi
 // stopped/undeployed cron or a never-run monitor doesn't show stale green.
 const CYCLE_FRESHNESS_MS = 60 * 60 * 1000;
 
-async function getCycleStatus(db: D1Database): Promise<CycleStatus> {
+async function getCycleStatus(
+  db: D1Database,
+  targetEnvironment: string,
+): Promise<CycleStatus> {
   const result = await db.prepare(`SELECT key, value FROM meta`).all<{ key: string; value: string }>();
   const map = new Map((result.results ?? []).map((r) => [r.key, r.value]));
   const checkedAt = map.get("last_cycle_at") || null;
   if (!checkedAt) {
     return { ok: false, checkedAt: null, error: "no probe cycle has run yet" };
+  }
+  // A row left by the gateway this Worker used to probe says nothing about the
+  // one it probes now. Absent means it predates the stamp, which can only be
+  // the deployment before a repoint — so treat it the same way.
+  if (map.get("last_cycle_target_environment") !== targetEnvironment) {
+    return {
+      ok: false,
+      checkedAt: null,
+      error: "no probe cycle has run yet for this deployment",
+    };
   }
   const ageMs = Date.now() - Date.parse(checkedAt);
   if (Number.isFinite(ageMs) && ageMs > CYCLE_FRESHNESS_MS) {
@@ -437,7 +495,10 @@ function toRow(r: RawRow): ProbeRow {
  * bounded by table size but transient: the next successful cycle writes the keyed
  * list and reverts reads to O(1).
  */
-async function readModelIds(db: D1Database): Promise<string[]> {
+async function readModelIds(
+  db: D1Database,
+  targetEnvironment: string,
+): Promise<string[]> {
   const row = await db
     .prepare(`SELECT value FROM meta WHERE key = 'model_ids'`)
     .first<{ value: string }>();
@@ -451,8 +512,16 @@ async function readModelIds(db: D1Database): Promise<string[]> {
       // Corrupt value: fall through to the backfill scan.
     }
   }
+  // Scoped like every other read of this table: the retained pre-cutover rows
+  // name models of a deployment this Worker no longer probes, and listing them
+  // would put permanently blank cards on the dashboard.
   const scan = await db
-    .prepare(`SELECT DISTINCT model_id FROM probe_results ORDER BY model_id ASC`)
+    .prepare(
+      `SELECT DISTINCT model_id FROM probe_results
+        WHERE target_environment = ?
+        ORDER BY model_id ASC`,
+    )
+    .bind(targetEnvironment)
     .all<{ model_id: string }>();
   return (scan.results ?? []).map((r) => r.model_id);
 }
@@ -461,21 +530,30 @@ async function readModelIds(db: D1Database): Promise<string[]> {
  * Builds the dashboard snapshot: the most recent {@link HISTORY_LIMIT} rows per
  * model, with the latest result, a sparkline window, and an uptime ratio.
  */
-export async function getSnapshot(db: D1Database): Promise<Snapshot> {
-  const modelIds = await readModelIds(db);
+export async function getSnapshot(
+  db: D1Database,
+  targetEnvironment: string,
+): Promise<Snapshot> {
+  const modelIds = await readModelIds(db, targetEnvironment);
 
   const byModel = new Map<string, ProbeRow[]>();
   if (modelIds.length > 0) {
-    // Fetch each model's newest HISTORY_LIMIT rows via the (model_id, id DESC)
-    // index — at most HISTORY_LIMIT rows read per model regardless of retention.
+    // Fetch each model's newest HISTORY_LIMIT rows via the
+    // (model_id, target_environment, id DESC) index — at most HISTORY_LIMIT rows
+    // read per model regardless of retention. Scoping to one deployment is what
+    // stops the retained pre-cutover history, which outnumbers the current
+    // deployment's rows many times over, from dominating every chart and uptime
+    // ratio on a page that presents itself as production.
     const stmt = db.prepare(
       `SELECT model_id, ok, latency_ms, ttft_ms, completion_tokens, throughput_tps, error, checked_at
        FROM probe_results
-       WHERE model_id = ?
+       WHERE model_id = ? AND target_environment = ?
        ORDER BY id DESC
        LIMIT ?`,
     );
-    const batched = await db.batch<RawRow>(modelIds.map((id) => stmt.bind(id, HISTORY_LIMIT)));
+    const batched = await db.batch<RawRow>(
+      modelIds.map((id) => stmt.bind(id, targetEnvironment, HISTORY_LIMIT)),
+    );
     for (let i = 0; i < modelIds.length; i++) {
       const rows = batched[i].results ?? [];
       // A model can be listed but have no rows — pruned or reconciled away
@@ -501,6 +579,6 @@ export async function getSnapshot(db: D1Database): Promise<Snapshot> {
   }
 
   const healthy = models.filter((m) => m.latest.ok).length;
-  const cycle = await getCycleStatus(db);
+  const cycle = await getCycleStatus(db, targetEnvironment);
   return { models, total: models.length, healthy, unhealthy: models.length - healthy, cycle };
 }
