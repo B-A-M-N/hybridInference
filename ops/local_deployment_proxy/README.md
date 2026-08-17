@@ -211,6 +211,9 @@ Models are defined in `local_deployment_proxy/models.json`:
 | `served_name` | `--served-model-name` for sglang |
 | `max_model_len` | `--context-length` |
 | `mem_fraction` | `--mem-fraction-static` |
+| `chunked_prefill_size` | optional prefill tokens per forward pass — `--chunked-prefill-size` (sglang) / `--max-num-batched-tokens` (vLLM). Bounds how long a decode stalls behind a co-resident prefill; see [Chunked prefill size](#chunked-prefill-size). Unset → the engine's own default. Chat models only |
+| `priority_scheduling` | `true` → `--enable-priority-scheduling` (sglang), so the gateway's per-request priority orders the waiting queue and can retract a running mega-prefill. See [Prioritizing decode over prefill](#prioritizing-decode-over-prefill). Inert on an embedding backend (nothing stamps a priority there) |
+| `priority_preemption_threshold` | optional `--priority-scheduling-preemption-threshold` (sglang default `10`) — the priority gap an arriving request needs to retract a running one |
 | `tool_call_parser` | `--tool-call-parser` (omit to disable; chat models only) |
 | `is_embedding` | `true` → launch with `--is-embedding` (encode-only); serves `/v1/embeddings` |
 | `attention_backend` | optional `--attention-backend` (embedding models) |
@@ -233,6 +236,112 @@ Models are defined in `local_deployment_proxy/models.json`:
 | `vllm_extra_args` | List of strings appended verbatim to the serve command, after everything else (so they can override an emitted default). E.g. Ministral 3: `["--tokenizer-mode", "mistral", "--limit-mm-per-prompt", "{\"image\": 0}"]`; Qwen3 thinking off by default: `["--default-chat-template-kwargs", "{\"enable_thinking\": false}"]` |
 
 To add a new model, append an entry to `models.json` and restart the proxy.
+
+### Chunked prefill size
+
+`chunked_prefill_size` is the one knob here that trades one request's latency
+for another's. Both engines split a long prompt across several forward passes
+and run waiting decodes in between — vLLM spends each step's token budget on
+decode first and prefill with the remainder; sglang alternates prefill and
+decode batches — so the chunk size, not the prompt size, is what bounds how long
+a decode stalls behind a neighbour's prefill.
+
+On the H200 DeepSeek deployment prefill runs at ~14.6k tok/s
+([measured](../h200_idle_proxy/README.md#long-context)), so at the 8192-token
+default one chunk stalls a co-resident decode ~0.6 s — against a 1.9–3 ms
+baseline ITL — and a 1M-token prompt does that ~122 times. Halving the chunk
+halves the stall:
+
+| `chunked_prefill_size` | decode stall per chunk (~14.6k tok/s) |
+|---:|---:|
+| 8192 (default) | ~560 ms |
+| 4096 | ~280 ms |
+| 2048 | ~140 ms |
+
+What it does **not** do is make the big prompt cheaper: the same tokens still
+cost the same GPU seconds, and smaller chunks cost it a little more (smaller
+GEMMs, more kernel launches, the prefix re-read per chunk). It buys ITL with
+TTFT, so pick it per model from how the replica is used — a chat model sharing a
+GPU with long-context agent traffic wants a smaller chunk than a model that
+mostly serves one big prompt at a time.
+
+It is the per-replica half of a problem whose cross-replica half the gateway
+already handles: prefill-aware routing (#1267) keeps two mega-prefills off the
+same replica, but cannot help the requests already sharing one with an elephant.
+
+Leave it unset to keep each engine's own default (sglang resolves one from GPU
+memory at startup and prints it in the `server_args` line of the container log;
+vLLM uses 8192 for online serving). `-1` disables chunking entirely — sglang
+only, and it hands a long prompt the whole GPU until it finishes.
+
+### Prioritizing decode over prefill
+
+Chunk size bounds how long a single prefill holds the GPU. It says nothing about
+*which* prefill gets to hold it — a 700k-token cache miss that arrives first is
+still admitted first, and everything behind it waits. `priority_scheduling`
+closes that half.
+
+It takes both sides, and they are independent:
+
+1. **This proxy** starts sglang with `--enable-priority-scheduling`, so the
+   waiting queue is ordered by each request's `priority` field (higher first)
+   instead of by arrival, and an arriving request retracts a running one when it
+   outranks it by at least `priority_preemption_threshold` (sglang default 10).
+2. **The gateway** stamps that priority, for routes that set
+   `priority_scheduling: true` in `models.yaml`. The tiers come from the same
+   thresholds prefill-aware routing already uses
+   (`apps/backend/routing/prefill_load.py`), applied to the **un-cached**
+   prefill rather than the prompt size — the fleet runs above 90% prefix-cache
+   hit, so ranking a warm 500k-token continuation on its total would queue the
+   interactive case last:
+
+   Size counts everything the upstream will prefill, not just the visible turn:
+   tool definitions and a structured-output schema are serialized into the same
+   request body, so a large MCP tool catalog is priced as the prefill it is.
+
+   | Un-cached prefill | Priority | Effect |
+   |---|---:|---|
+   | < 50k tokens (interactive) | 20 | scheduled first; retracts a running elephant |
+   | ≥ 50k tokens (large) | 15 | queues behind interactive, never preempted by it |
+   | ≥ 200k tokens (elephant) | 0 | scheduled last, retractable |
+
+   The discount is per endpoint, and recomputed for each dispatch: a prefix
+   resident on the replica a caller has been talking to is not resident on a
+   fallback that has never seen the conversation, and that fallback really is
+   facing the cold prefill. It is also per *conversation*, not per caller — one
+   API key sends many, and without that check a caller's unrelated cold
+   mega-prefill would inherit the previous one's discount and be handed the
+   tier that retracts elephants. And the prefix has to be *resident*, not merely
+   requested: the discount comes from a turn that finished prefilling, so two
+   overlapping turns of one conversation cannot have the second preempt the
+   first while it is still building the cache the second is counting on.
+
+   The *spacing* is the policy, not the absolute values: interactive beats an
+   elephant by 20 (≥ the threshold, so it preempts) and beats a large prompt by
+   5 (< the threshold, so it merely queues ahead). Peers differ by 0 and never
+   retract each other, so ordinary traffic sees no churn.
+
+Priority is assigned from prompt size alone, by the gateway, and a client cannot
+set its own — the adapters forward a whitelist of sampling params that does not
+include `priority`.
+
+Both request surfaces stamp it: `/v1/chat/completions` through `FixedRouter`,
+and `/v1/messages` (Claude Code traffic) through its own accounting — that
+handler dispatches its own adapter and never enters the router, so it estimates,
+fingerprints and leases for itself, counting Anthropic's top-level `system`
+block as part of the prompt.
+
+The exception is a model configured with `router: routewise`, which dispatches
+through a router that has no prefill accounting of its own, so it cannot compute
+the un-cached estimate the tiers are defined on; rather than rank warm
+continuations wrongly, it publishes nothing and those models keep the upstream's
+own default priority.
+
+Roll out in either order: an sglang server without the flag ignores the field,
+and a flagged server with no gateway-side opt-in sees every request at sglang's
+own default priority. vLLM backends are unaffected — its priority policy reads
+the opposite way (lower value first), so it is deliberately not wired to the same
+config field; reach it with `vllm_extra_args` if you want it.
 
 ## Configuration
 

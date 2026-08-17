@@ -3096,6 +3096,214 @@ def test_vllm_cmd_unchanged_without_image_or_extra_args(monkeypatch: Any, tmp_pa
     assert cmd[-1] == "--enable-prompt-tokens-details"
 
 
+def _chunked_prefill_base(engine: str) -> dict[str, Any]:
+    return {
+        "container": f"qwen-{engine}",
+        "engine": engine,
+        "gpu_index": "0",
+        "backend_port": 18001,
+        "model_dir": "/tmp/qwen",
+        "served_name": MODEL_NAME,
+        "max_model_len": 131072,
+        "mem_fraction": "0.80",
+    }
+
+
+def _run_cmd(backend: Any, engine: str) -> list[str]:
+    return backend._sglang_run_cmd("0") if engine == "sglang" else backend._vllm_run_cmd("0")
+
+
+@pytest.mark.parametrize(
+    ("engine", "flag"),
+    [("sglang", "--chunked-prefill-size"), ("vllm", "--max-num-batched-tokens")],
+)
+def test_chunked_prefill_size_caps_the_prefill_batch(
+    monkeypatch: Any, tmp_path: Path, engine: str, flag: str
+) -> None:
+    """One config field, the flag each engine spells it with.
+
+    The chunk size is what bounds a decode's stall behind a co-resident prefill
+    -- one chunk, not one prompt -- so the two engines' differently-named knobs
+    are the same knob and are configured as one.
+    """
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    config = {**_chunked_prefill_base(engine), "chunked_prefill_size": 2048}
+
+    cmd = _run_cmd(proxy.BackendManager(MODEL_NAME, config), engine)
+
+    assert cmd[cmd.index(flag) + 1] == "2048"
+
+
+@pytest.mark.parametrize(
+    ("engine", "flag"),
+    [("sglang", "--chunked-prefill-size"), ("vllm", "--max-num-batched-tokens")],
+)
+@pytest.mark.parametrize("unset", [None, "", 0])
+def test_chunked_prefill_size_unset_leaves_the_engine_default(
+    monkeypatch: Any, tmp_path: Path, engine: str, flag: str, unset: Any
+) -> None:
+    """Absent, blank or 0 must emit nothing rather than a meaningless budget.
+
+    sglang picks its own size from GPU memory and vLLM defaults to 8192; a "0"
+    reaching either would be a prefill budget no request fits in.
+    """
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    config = _chunked_prefill_base(engine)
+    if unset is not None:
+        config["chunked_prefill_size"] = unset
+
+    cmd = _run_cmd(proxy.BackendManager(MODEL_NAME, config), engine)
+
+    assert flag not in cmd
+
+
+@pytest.mark.parametrize(
+    ("engine", "flag"),
+    [("sglang", "--chunked-prefill-size"), ("vllm", "--max-num-batched-tokens")],
+)
+def test_chunked_prefill_size_skipped_for_embedding_backends(
+    monkeypatch: Any, tmp_path: Path, engine: str, flag: str
+) -> None:
+    """Embedding backends must not inherit the knob from a shared config.
+
+    vLLM's pooling runner does not chunk prefill and refuses to start when the
+    batch budget is below --max-model-len, so an embedding model that took this
+    flag would fail its health check instead of serving.
+    """
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    config = {
+        **_chunked_prefill_base(engine),
+        "is_embedding": True,
+        "max_model_len": 8192,
+        "chunked_prefill_size": 2048,
+    }
+
+    cmd = _run_cmd(proxy.BackendManager(MODEL_NAME, config), engine)
+
+    assert flag not in cmd
+
+
+def test_sglang_chunked_prefill_size_passes_disable_sentinel(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    # -1 disables chunking in sglang, so it has to survive the falsy check that
+    # drops 0 and blanks.
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    config = {**_chunked_prefill_base("sglang"), "chunked_prefill_size": -1}
+
+    cmd = proxy.BackendManager(MODEL_NAME, config)._sglang_run_cmd("0")
+
+    assert cmd[cmd.index("--chunked-prefill-size") + 1] == "-1"
+
+
+def test_vllm_extra_args_still_override_chunked_prefill_size(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    # vllm_extra_args is appended last precisely so it can override an emitted
+    # default (vLLM keeps the final occurrence of a repeated flag). The new flag
+    # must be emitted before it, not after.
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    config = {
+        **_chunked_prefill_base("vllm"),
+        "chunked_prefill_size": 2048,
+        "vllm_extra_args": ["--max-num-batched-tokens", "4096"],
+    }
+
+    cmd = proxy.BackendManager(MODEL_NAME, config)._vllm_run_cmd("0")
+
+    assert cmd[cmd.index("--max-num-batched-tokens") + 1] == "2048"
+    assert cmd[-2:] == ["--max-num-batched-tokens", "4096"]
+
+
+def test_sglang_priority_scheduling_is_opt_in(monkeypatch: Any, tmp_path: Path) -> None:
+    """The flag is what makes the gateway's per-request priority mean anything.
+
+    Without it sglang ignores the ``priority`` field entirely and serves the
+    waiting queue in arrival order, so a mega-prefill that got there first keeps
+    being admitted ahead of the interactive traffic behind it.
+    """
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    base = _chunked_prefill_base("sglang")
+
+    default = proxy.BackendManager(MODEL_NAME, dict(base))._sglang_run_cmd("0")
+    enabled = proxy.BackendManager(
+        MODEL_NAME, {**base, "priority_scheduling": True}
+    )._sglang_run_cmd("0")
+
+    assert "--enable-priority-scheduling" not in default
+    assert "--enable-priority-scheduling" in enabled
+    # Threshold left to sglang's own default (10), which is what the gateway's
+    # tier spacing is chosen against.
+    assert "--priority-scheduling-preemption-threshold" not in enabled
+
+
+def test_sglang_priority_preemption_threshold_override(monkeypatch: Any, tmp_path: Path) -> None:
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    config = {
+        **_chunked_prefill_base("sglang"),
+        "priority_scheduling": True,
+        "priority_preemption_threshold": 5,
+    }
+
+    cmd = proxy.BackendManager(MODEL_NAME, config)._sglang_run_cmd("0")
+
+    assert cmd[cmd.index("--priority-scheduling-preemption-threshold") + 1] == "5"
+
+
+def test_priority_threshold_needs_priority_scheduling(monkeypatch: Any, tmp_path: Path) -> None:
+    # A threshold on its own is a no-op sglang would reject as an unrecognized
+    # combination rather than a hint that the flag was forgotten; emitting
+    # neither keeps the launch honest about what it configured.
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    config = {**_chunked_prefill_base("sglang"), "priority_preemption_threshold": 5}
+
+    cmd = proxy.BackendManager(MODEL_NAME, config)._sglang_run_cmd("0")
+
+    assert "--priority-scheduling-preemption-threshold" not in cmd
+    assert "--enable-priority-scheduling" not in cmd
+
+
+def test_priority_scheduling_is_emitted_for_embedding_backends_too(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Inert there, not withheld -- unlike ``chunked_prefill_size``.
+
+    sglang accepts the flag on an encode-only server and finds no priorities to
+    order, because the gateway never stamps one on an embedding request. Dropping
+    it would make the launch disagree with the config for no gain; the knob that
+    genuinely must not reach an embedding backend is the prefill chunk size,
+    which vLLM's pooling runner rejects outright.
+    """
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    config = {
+        **_chunked_prefill_base("sglang"),
+        "is_embedding": True,
+        "max_model_len": 8192,
+        "priority_scheduling": True,
+        "chunked_prefill_size": 2048,
+    }
+
+    cmd = proxy.BackendManager(MODEL_NAME, config)._sglang_run_cmd("0")
+
+    assert "--enable-priority-scheduling" in cmd
+    assert "--chunked-prefill-size" not in cmd
+
+
+def test_vllm_backends_ignore_priority_scheduling(monkeypatch: Any, tmp_path: Path) -> None:
+    """vLLM's priority policy reads the opposite way, so it is not wired here.
+
+    Its scheduler treats a *lower* value as earlier. Emitting the sglang flag or
+    silently reusing the gateway's higher-is-first values would invert the
+    intent and schedule elephants first.
+    """
+    proxy = _load_proxy(monkeypatch, tmp_path)
+    config = {**_chunked_prefill_base("vllm"), "priority_scheduling": True}
+
+    cmd = proxy.BackendManager(MODEL_NAME, config)._vllm_run_cmd("0")
+
+    assert not any("priority" in str(arg) for arg in cmd)
+
+
 def test_health_endpoint_returns_200_without_api_key(monkeypatch: Any, tmp_path: Path) -> None:
     """Both phases a lazy proxy spends most of its life in answer 200, unauthenticated.
 

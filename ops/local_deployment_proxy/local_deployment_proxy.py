@@ -145,6 +145,31 @@ instead (ignored when ``hicache_size`` is set); ``hicache_write_policy``,
 ``hicache_io_backend`` and ``hicache_mem_layout`` map to the matching flags.
 Ignored for embedding models, which run ``--disable-radix-cache``.
 
+Set ``"chunked_prefill_size"`` (tokens) to cap how much prefill either engine
+does in one forward pass -- ``--chunked-prefill-size`` on sglang,
+``--max-num-batched-tokens`` on vLLM. Both already interleave waiting decodes
+between the chunks of a long prompt, so this is what bounds the decode stall a
+co-resident mega-prefill can inflict: at the 8192 default and ~14.6k tok/s
+prefill, one chunk stalls a neighbour's decode ~0.6s against a 1.9-3ms baseline
+ITL; 2048 makes it ~0.14s and costs the big prompt some of its own TTFT. Left
+unset each engine keeps its own default. Ignored for embedding models (vLLM's
+pooling runner does not chunk prefill and refuses a budget below its context
+length).
+
+Set ``"priority_scheduling": true`` to start sglang with
+``--enable-priority-scheduling``, which orders the waiting queue by each
+request's ``priority`` field (higher first) rather than arrival, and retracts a
+running request for an arriving one that outranks it by at least
+``--priority-scheduling-preemption-threshold`` (sglang default 10; override with
+``"priority_preemption_threshold"``). The gateway supplies the priority for
+routes marked ``priority_scheduling: true`` in ``models.yaml`` -- interactive 20,
+large 15, elephant 0 -- so a mega-prefill queues behind interactive traffic
+instead of ahead of it, and can be retracted for it. Where
+``chunked_prefill_size`` bounds how long one prefill holds the GPU per step,
+this decides which prefill runs at all; they are complementary. Inert on an
+embedding backend -- sglang accepts the flag there and finds nothing to order,
+since the gateway never stamps a priority on an embedding request.
+
 Set ``"moe_runner_backend"`` (e.g. ``"marlin"``) to override the MoE runner.
 NVFP4 / FP4-expert checkpoints need ``"marlin"`` on pre-Blackwell (SM90, e.g.
 H200) GPUs; the default ``triton`` runner asserts on the packed FP4 shapes.
@@ -1526,6 +1551,9 @@ class BackendManager:
             # required: --enable-prompt-tokens-details alone reports nothing, and an
             # FP8 KV cache yields zero prefix-cache hits (so cached_tokens stays 0).
             cmd += ["--enable-prefix-caching", "--enable-prompt-tokens-details"]
+            # vLLM spends the same per-step token budget on decode first and
+            # prefill with what is left, so this is its prefill chunk size.
+            cmd += self._chunked_prefill_args("--max-num-batched-tokens")
             # Opt-in FP8 KV cache only; defaulting to it would disable cache hits.
             kv_dtype = self.config.get("kv_cache_dtype")
             if kv_dtype:
@@ -1550,6 +1578,77 @@ class BackendManager:
         # keeps the final occurrence of a repeated flag.
         cmd += [str(arg) for arg in self.config.get("vllm_extra_args") or []]
         return cmd
+
+    def _chunked_prefill_args(self, flag: str) -> list[str]:
+        """Build the prefill-chunk-size flag, or nothing when unconfigured.
+
+        Both engines already chunk a long prompt into several forward passes and
+        run waiting decodes between the chunks, so the chunk size is what bounds
+        how long a decode stalls behind someone else's prefill: one chunk, not
+        one prompt. On the H200 DeepSeek deployment prefill runs at ~14.6k tok/s
+        (see ops/h200_idle_proxy/README.md), so the 8192-token default costs a
+        co-resident decode ~0.6s per chunk against a 1.9-3ms baseline ITL, and a
+        1M-token prompt inflicts that ~122 times over. At 2048 the same stall is
+        ~0.14s. The prompt still costs the same total GPU time -- this trades the
+        big prefill's own TTFT (smaller GEMMs, more launches, the prefix re-read
+        per chunk) for the latency of everything sharing the replica.
+
+        Complements the gateway's prefill-aware routing (#1267), which spreads
+        mega-prefills *across* replicas but cannot help the requests already
+        sharing one with an elephant.
+
+        Off unless configured, so each engine keeps its own default: sglang
+        resolves ``--chunked-prefill-size`` from GPU memory at startup (the
+        server_args line in the container log reports the value it picked) and
+        vLLM defaults ``--max-num-batched-tokens`` to 8192 for online serving.
+        Only ``-1`` (sglang, disables chunking entirely) is meaningful as a
+        non-positive value; 0 and blanks read as "unset" and emit nothing.
+
+        Emitted for generative backends only. vLLM's pooling runner does not
+        chunk prefill at all and refuses to start when the budget is below
+        ``--max-model-len``, so an embedding backend that inherited this would
+        fail its health check instead of serving.
+        """
+        size = self.config.get("chunked_prefill_size")
+        if not size or self.config.get("is_embedding"):
+            return []
+        return [flag, str(size)]
+
+    def _priority_scheduling_args(self) -> list[str]:
+        """Build the sglang priority-scheduling flags, or nothing when off.
+
+        With ``--enable-priority-scheduling`` sglang orders its waiting queue by
+        each request's ``priority`` field (higher first) instead of arrival, and
+        will retract a running request for an arriving one whose priority
+        exceeds it by at least ``--priority-scheduling-preemption-threshold``
+        (sglang's default: 10). That is the half of "prioritize decode" this
+        process owns: chunk size bounds how long one prefill holds the GPU per
+        step, and this decides *which* prefill gets admitted -- so an elephant
+        stops being scheduled ahead of the interactive traffic behind it.
+
+        The gateway stamps the priority (see ``routing/prefill_load.py``:
+        interactive 20, large 15, elephant 0). Those values are chosen against
+        the default threshold: interactive outranks an elephant by 20 and can
+        retract it, while ordinary traffic differs by 5 or 0 and merely queues
+        ahead. Raising the threshold here without moving those apart turns
+        preemption off; lowering it lets ordinary prompts retract each other.
+
+        Off unless configured -- an unflagged server ignores the field, so the
+        two sides can be rolled out in either order.
+
+        Unlike ``chunked_prefill_size`` this is not withheld from embedding
+        backends. sglang accepts the flag on an encode-only server and simply
+        finds no priorities to order there -- the gateway never stamps one on an
+        embedding request -- so the flag is inert rather than wrong, and the
+        launch says what was configured instead of quietly dropping it.
+        """
+        if not self.config.get("priority_scheduling"):
+            return []
+        args = ["--enable-priority-scheduling"]
+        threshold = self.config.get("priority_preemption_threshold")
+        if threshold is not None:
+            args += ["--priority-scheduling-preemption-threshold", str(threshold)]
+        return args
 
     def _hicache_args(self) -> list[str]:
         """Build the HiCache (host-DRAM KV tier) flags for an sglang backend.
@@ -1662,6 +1761,10 @@ class BackendManager:
         # readiness, so skipping it keeps slow models inside HEALTH_TIMEOUT.
         if self.config.get("skip_server_warmup"):
             cmd += ["--skip-server-warmup"]
+        # Which prefill gets to make a decode wait. Emitted for either kind of
+        # backend: inert on an encode-only one rather than wrong, so the launch
+        # says what was configured.
+        cmd += self._priority_scheduling_args()
         if self.config.get("is_embedding"):
             # Embedding models run sglang in encode-only mode; tool-call parsing
             # and chat-completion endpoints are irrelevant for them.
@@ -1675,6 +1778,8 @@ class BackendManager:
             # Without this flag sglang omits prompt_tokens_details.cached_tokens
             # from the usage block, so prefix-cache hits never surface to clients.
             cmd += ["--enable-cache-report"]
+            # Bound how long a decode waits behind a co-resident prefill.
+            cmd += self._chunked_prefill_args("--chunked-prefill-size")
             cmd += self._hicache_args()
             tcp = self.config.get("tool_call_parser")
             if tcp:
