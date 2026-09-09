@@ -10,6 +10,7 @@ from starlette.datastructures import Headers
 
 from serving.utils.session_identity import (
     MAX_SESSION_ID_CHARS,
+    MAX_USER_ID_CHARS,
     SessionIdentity,
     consume_session_fields,
     normalize_session_id,
@@ -450,3 +451,31 @@ def test_claude_code_header_wins_over_the_body_it_duplicates() -> None:
         {"metadata": {"user_id": CLAUDE_CODE_USER_ID_JSON}},
     )
     assert identity == SessionIdentity(CLAUDE_CODE_SESSION, "x-claude-code-session-id")
+
+
+def test_claude_code_deeply_nested_user_id_does_not_raise() -> None:
+    # `metadata.user_id` is client-controlled and `json.loads` recurses per
+    # level of nesting. RecursionError is NOT a ValueError, so before the
+    # length bound a ~12KB nested value escaped session_identity and turned an
+    # otherwise valid request into a 500. Verified: this depth raised against
+    # the unguarded decode.
+    payload = '{"a":' * 2000 + "1" + "}" * 2000
+    assert len(payload) > MAX_USER_ID_CHARS
+    assert session_identity(_headers(), {"metadata": {"user_id": payload}}) is None
+
+
+def test_claude_code_user_id_over_the_container_bound_is_rejected() -> None:
+    # Rejected without decoding. Padding sits in a member the parser ignores,
+    # so this is a well-formed object that is simply too large to be anything
+    # Claude Code sends -- its own cap is 512 bytes.
+    payload = json.dumps({"pad": "p" * MAX_USER_ID_CHARS, "session_id": CLAUDE_CODE_SESSION})
+    assert len(payload) > MAX_USER_ID_CHARS
+    assert session_identity(_headers(), {"metadata": {"user_id": payload}}) is None
+
+
+def test_claude_code_real_shape_is_well_inside_the_container_bound() -> None:
+    # The bound must not be so tight that a real value trips it.
+    assert len(CLAUDE_CODE_USER_ID_JSON) < MAX_USER_ID_CHARS
+    assert session_identity(
+        _headers(), {"metadata": {"user_id": CLAUDE_CODE_USER_ID_JSON}}
+    ) == SessionIdentity(CLAUDE_CODE_SESSION, "metadata.user_id.session_id")

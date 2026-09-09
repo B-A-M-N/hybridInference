@@ -95,6 +95,17 @@ _BODY_SESSION_OBJECTS = ("metadata", "client_metadata")
 #: sessions that share a prefix, which is worse than recording neither.
 MAX_SESSION_ID_CHARS = 128
 
+#: Bound on Claude Code's ``metadata.user_id`` *container* before it is decoded
+#: -- distinct from :data:`MAX_SESSION_ID_CHARS`, which bounds the id read out
+#: of it. Claude Code caps its own serialized metadata at 512 bytes and a real
+#: value measures ~190, so this is generous for every shape it sends. It exists
+#: because the field is client-controlled and ``json.loads`` recurses per level
+#: of nesting: without a bound, a deeply nested value raises ``RecursionError``,
+#: which is not a ``ValueError`` and would escape as a 500. At this length the
+#: reachable depth is far under the interpreter's limit; the decode below also
+#: catches ``RecursionError`` directly, so neither guard stands alone.
+MAX_USER_ID_CHARS = 1024
+
 # Control characters break log rendering and JSON round-tripping, and no client
 # means to send them; a value carrying one is malformed rather than long.
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -178,9 +189,11 @@ def _claude_code_session_id(metadata: Mapping[str, Any]) -> SessionIdentity | No
     # rather than positioning it.
     candidate = user_id.strip()
     if candidate.startswith("{"):
+        if len(candidate) > MAX_USER_ID_CHARS:
+            return None
         try:
             parsed = json.loads(candidate)
-        except ValueError:
+        except (ValueError, RecursionError):
             return None
         if not isinstance(parsed, dict):
             return None
