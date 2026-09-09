@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -15,14 +16,29 @@ from serving.utils.session_identity import (
     session_identity,
 )
 
-# What Claude Code puts in ``metadata.user_id``: one string carrying the user,
-# the account and the run.
+# What Claude Code put in ``metadata.user_id`` BEFORE 2.1.78: one string
+# carrying the user, the account and the run. Retired upstream but still parsed,
+# so it keeps its coverage -- see CLAUDE_CODE_USER_ID_JSON below for the shape
+# current clients actually send.
 CLAUDE_CODE_USER_ID = (
     "user_9f1c2d3e4a5b6c7d8e9f0a1b2c3d4e5f"
     "_account_2f1a0b3c-4d5e-6f70-8192-a3b4c5d6e7f8"
     "_session_7c6b5a49-3827-1605-f4e3-d2c1b0a99887"
 )
 CLAUDE_CODE_SESSION = "7c6b5a49-3827-1605-f4e3-d2c1b0a99887"
+
+# What Claude Code puts there NOW (>= 2.1.78, 2026-03-17): a JSON object. The
+# ids are synthetic; only the shape is real. A regex anchored at ``^user_``
+# cannot match a value whose first character is ``{``, which is why every
+# current Claude Code request logged no session until this was handled.
+CLAUDE_CODE_USER_ID_JSON = json.dumps(
+    {
+        "device_id": "b" * 64,
+        "account_uuid": "2f1a0b3c-4d5e-6f70-8192-a3b4c5d6e7f8",
+        "session_id": CLAUDE_CODE_SESSION,
+    }
+)
+CLAUDE_CODE_PARENT_SESSION = "11111111-2222-3333-4444-555555555555"
 
 
 def _headers(**pairs: str) -> Headers:
@@ -63,10 +79,13 @@ def test_canonical_header_wins_over_every_other_source() -> None:
     # sends, hyphenated; the underscore spellings are accepted beside them
     # because header names carrying underscores are legal but commonly dropped
     # by intermediaries, so clients differ over which to send.
+    # `x-claude-code-session-id` is Claude Code's own, a bare UUID it sends on
+    # every request.
     # `x-session-affinity` and `x-opencode-session` are OpenCode and its Kilo
     # Code fork -- the first beside the canonical header on a provider they do
     # not recognise as their own, the second instead of it on one they do.
     [
+        "x-claude-code-session-id",
         "x-opencode-session",
         "x-session-affinity",
         "session-id",
@@ -343,3 +362,91 @@ def test_parent_session_header_is_not_read_as_the_session() -> None:
         ),
     )
     assert identity == SessionIdentity(OPENCODE_SESSION, "x-session-affinity")
+
+
+# --- Claude Code, current format --------------------------------------------
+#
+# Claude Code changed `metadata.user_id` from the underscore composite to a
+# JSON object in 2.1.78 (2026-03-17), and added its own
+# `x-claude-code-session-id` header. Both are read; a client on either side of
+# that change resolves, and the source says which parse answered.
+
+
+def test_claude_code_json_user_id() -> None:
+    identity = session_identity(_headers(), {"metadata": {"user_id": CLAUDE_CODE_USER_ID_JSON}})
+    assert identity == SessionIdentity(CLAUDE_CODE_SESSION, "metadata.user_id.session_id")
+
+
+def test_claude_code_json_is_longer_than_a_session_id_may_be() -> None:
+    # The whole value is far past MAX_SESSION_ID_CHARS; only the extracted
+    # member is measured, so the bound must not reject the request outright.
+    assert len(CLAUDE_CODE_USER_ID_JSON) > MAX_SESSION_ID_CHARS
+    assert session_identity(_headers(), {"metadata": {"user_id": CLAUDE_CODE_USER_ID_JSON}})
+
+
+def test_claude_code_json_is_read_by_name_not_position() -> None:
+    # An operator's CLAUDE_CODE_EXTRA_METADATA keys are serialized ahead of the
+    # canonical ones, so `session_id` sits at no fixed offset.
+    user_id = json.dumps(
+        {
+            "team": "platform",
+            "device_id": "b" * 64,
+            "account_uuid": "2f1a0b3c-4d5e-6f70-8192-a3b4c5d6e7f8",
+            "session_id": CLAUDE_CODE_SESSION,
+        }
+    )
+    assert session_identity(_headers(), {"metadata": {"user_id": user_id}}) == SessionIdentity(
+        CLAUDE_CODE_SESSION, "metadata.user_id.session_id"
+    )
+
+
+def test_claude_code_parent_session_is_not_read_as_the_session() -> None:
+    # A subagent run carries both. Reading the parent would merge every
+    # subagent into the session that spawned it -- the same trap as OpenCode's
+    # ``x-parent-session-id``.
+    user_id = json.dumps(
+        {
+            "device_id": "b" * 64,
+            "account_uuid": "",
+            "session_id": CLAUDE_CODE_SESSION,
+            "parent_session_id": CLAUDE_CODE_PARENT_SESSION,
+        }
+    )
+    assert session_identity(_headers(), {"metadata": {"user_id": user_id}}) == SessionIdentity(
+        CLAUDE_CODE_SESSION, "metadata.user_id.session_id"
+    )
+
+
+def test_claude_code_json_without_a_session_member_yields_none() -> None:
+    user_id = json.dumps({"device_id": "b" * 64, "account_uuid": ""})
+    assert session_identity(_headers(), {"metadata": {"user_id": user_id}}) is None
+
+
+@pytest.mark.parametrize("user_id", ["{not json", "{}", "[1, 2]", '{"session_id": null}'])
+def test_claude_code_unusable_json_yields_none(user_id: str) -> None:
+    # Malformed or non-object JSON must not raise, and must not fall through to
+    # the legacy regex and invent something from the braces.
+    assert session_identity(_headers(), {"metadata": {"user_id": user_id}}) is None
+
+
+def test_claude_code_legacy_composite_still_resolves() -> None:
+    # Pre-2.1.78 clients keep working, under the source they always had.
+    assert session_identity(
+        _headers(), {"metadata": {"user_id": CLAUDE_CODE_USER_ID}}
+    ) == SessionIdentity(CLAUDE_CODE_SESSION, "metadata.user_id")
+
+
+def test_claude_code_header_is_read() -> None:
+    identity = session_identity(_headers(**{"x-claude-code-session-id": CLAUDE_CODE_SESSION}))
+    assert identity == SessionIdentity(CLAUDE_CODE_SESSION, "x-claude-code-session-id")
+
+
+def test_claude_code_header_wins_over_the_body_it_duplicates() -> None:
+    # Both carry the same run, so the outcome is the same either way -- but the
+    # header is a stated value rather than one parsed out of a composite, and
+    # the recorded source should say so.
+    identity = session_identity(
+        _headers(**{"x-claude-code-session-id": CLAUDE_CODE_SESSION}),
+        {"metadata": {"user_id": CLAUDE_CODE_USER_ID_JSON}},
+    )
+    assert identity == SessionIdentity(CLAUDE_CODE_SESSION, "x-claude-code-session-id")
