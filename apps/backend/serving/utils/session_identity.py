@@ -197,6 +197,17 @@ def _claude_code_session_id(metadata: Mapping[str, Any]) -> SessionIdentity | No
             return None
         if not isinstance(parsed, dict):
             return None
+        # The Claude markers are required, not just a ``session_id`` key. This
+        # field is Anthropic's *user* identifier, and another client is free to
+        # use a JSON object as its user identity; one that happened to carry a
+        # ``session_id`` member -- ``{"session_id": "tenant-plan"}`` -- would
+        # otherwise collapse every request behind that value into one invented
+        # session. The legacy branch below insists on its whole composite shape
+        # for exactly this reason, and this branch has to hold the same line.
+        # Presence, not content: ``account_uuid`` is the empty string when the
+        # client authenticated with an API key rather than an account.
+        if "device_id" not in parsed or "account_uuid" not in parsed:
+            return None
         # ``session_id`` only. ``parent_session_id``, present on a subagent
         # run, names the session that spawned this one -- reading it would
         # merge every subagent into its parent, the same trap as OpenCode's

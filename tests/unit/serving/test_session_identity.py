@@ -479,3 +479,36 @@ def test_claude_code_real_shape_is_well_inside_the_container_bound() -> None:
     assert session_identity(
         _headers(), {"metadata": {"user_id": CLAUDE_CODE_USER_ID_JSON}}
     ) == SessionIdentity(CLAUDE_CODE_SESSION, "metadata.user_id.session_id")
+
+
+def test_claude_code_json_requires_the_claude_markers() -> None:
+    # `metadata.user_id` is Anthropic's USER identifier. Another client may
+    # legitimately use a JSON object as its user identity, and one that happens
+    # to carry a `session_id` member must not be read as a session -- every
+    # request behind that value would collapse into one invented group.
+    assert (
+        session_identity(_headers(), {"metadata": {"user_id": '{"session_id": "tenant-plan"}'}})
+        is None
+    )
+
+
+@pytest.mark.parametrize("missing", ["device_id", "account_uuid"])
+def test_claude_code_json_missing_either_marker_yields_none(missing: str) -> None:
+    payload = {
+        "device_id": "b" * 64,
+        "account_uuid": "2f1a0b3c-4d5e-6f70-8192-a3b4c5d6e7f8",
+        "session_id": CLAUDE_CODE_SESSION,
+    }
+    del payload[missing]
+    assert session_identity(_headers(), {"metadata": {"user_id": json.dumps(payload)}}) is None
+
+
+def test_claude_code_json_marker_check_is_presence_not_content() -> None:
+    # `account_uuid` is the empty string when the client authenticated with an
+    # API key rather than an account -- a real shape that must still resolve.
+    payload = json.dumps(
+        {"device_id": "b" * 64, "account_uuid": "", "session_id": CLAUDE_CODE_SESSION}
+    )
+    assert session_identity(_headers(), {"metadata": {"user_id": payload}}) == SessionIdentity(
+        CLAUDE_CODE_SESSION, "metadata.user_id.session_id"
+    )
