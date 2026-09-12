@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 
 from routing.endpoint_health import EndpointHealthRegistry
 from routing.endpoints import endpoint_id_for_adapter
+from routing.prefill_load import PrefillLoadTracker
 from routing.routers import AllCircuitsOpenError, adapter_supports_modalities
 from routing.streaming import has_non_empty_content
 from routing.telemetry import failed_attempt, routing_chunk
@@ -160,6 +161,8 @@ class FeasibleProviderCandidate:
     concurrency_pool: str | None = None
     quota_used_fraction: float | None = None
     quota_remaining: int | None = None
+    outstanding_prefill_tokens: int = 0
+    prefill_load_adjusted_ttft_sec: float | None = None
 
 
 @dataclass(frozen=True)
@@ -258,6 +261,7 @@ class RouteWiseRouter:
         health_registry: EndpointHealthRegistry | None = None,
         *,
         fixed_router: RouteTableView | None = None,
+        prefill_load: PrefillLoadTracker | None = None,
     ) -> None:
         if route_table is not None and fixed_router is not None:
             raise TypeError("route_table and deprecated fixed_router cannot both be provided")
@@ -294,6 +298,12 @@ class RouteWiseRouter:
         # that genuinely serves the whole table. The registry narrows this to
         # the one model it built the router for; see attach_route_table.
         self._model_scope: frozenset[str] | None = None
+
+        # Prefill-load tracker: an existing PrefillLoadTracker can be shared
+        # (e.g. from FixedRouter) so RouteWise reads the same per-endpoint
+        # outstanding prefill state. When None, RouteWise creates its own
+        # standalone tracker (backward-compatible behavior).
+        self._prefill_load = prefill_load if prefill_load is not None else PrefillLoadTracker()
 
         self.predictor = BucketMeanOutputPredictor(
             default_output=self.config.output_default_tokens,
@@ -1277,6 +1287,24 @@ class RouteWiseRouter:
     def _mean_ttft_sec(self, endpoint_id: str, now: float) -> float:
         return self._latency_estimate(endpoint_id, now)[0]
 
+    def _prefill_load_penalty_ms(self, outstanding_tokens: int) -> float:
+        """Compute a bounded additive TTFT penalty (ms) from prefill backlog.
+
+        The penalty is linear in outstanding tokens up to a configured cap:
+        penalty = min(scale * tokens / 1000, max_penalty).
+
+        Args:
+            outstanding_tokens: Outstanding uncached prefill tokens on the
+                endpoint, as reported by PrefillLoadTracker.backlog().
+
+        Returns:
+            Penalty in milliseconds (0 if no backlog or feature disabled).
+        """
+        if outstanding_tokens <= 0 or self.config.prefill_load_scale_ms_per_1k <= 0:
+            return 0.0
+        raw_ms = self.config.prefill_load_scale_ms_per_1k * outstanding_tokens / 1000.0
+        return min(raw_ms, self.config.prefill_load_max_penalty_ms)
+
     def _api_cost_for_adapter(
         self,
         adapter: BaseAdapter,
@@ -1476,6 +1504,19 @@ class RouteWiseRouter:
                 concurrency_pool_id = None
 
             mean_ttft_sec, mean_ttft_source = self._latency_estimate(endpoint_id, now)
+
+            # Prefill-load-aware adjustment: read the existing tracker's
+            # outstanding prefill tokens for this endpoint and compute a bounded
+            # additive TTFT penalty. This is a soft signal — it never makes an
+            # endpoint infeasible, only less attractive in the LP.
+            outstanding_prefill_tokens = 0
+            prefill_load_adjusted_ttft_sec: float | None = None
+            if self.config.prefill_load_routing_enabled:
+                outstanding_prefill_tokens = self._prefill_load.backlog(endpoint_id)
+                penalty_ms = self._prefill_load_penalty_ms(outstanding_prefill_tokens)
+                if penalty_ms > 0:
+                    prefill_load_adjusted_ttft_sec = mean_ttft_sec + penalty_ms / 1000.0
+
             candidates.append(
                 FeasibleProviderCandidate(
                     endpoint_id=endpoint_id,
@@ -1494,6 +1535,8 @@ class RouteWiseRouter:
                     concurrency_pool=concurrency_pool_id,
                     quota_used_fraction=used_fraction,
                     quota_remaining=quota_remaining,
+                    outstanding_prefill_tokens=outstanding_prefill_tokens,
+                    prefill_load_adjusted_ttft_sec=prefill_load_adjusted_ttft_sec,
                 )
             )
         if not has_modality_match:
@@ -1730,6 +1773,17 @@ class RouteWiseRouter:
             },
             "candidate_mean_ttft_sec": {c.endpoint_id: c.mean_ttft_sec for c in candidates},
             "candidate_mean_ttft_sources": {c.endpoint_id: c.mean_ttft_source for c in candidates},
+            "candidate_outstanding_prefill_tokens": {
+                c.endpoint_id: c.outstanding_prefill_tokens
+                for c in candidates
+                if c.outstanding_prefill_tokens > 0
+            },
+            "candidate_prefill_load_adjusted_ttft_sec": {
+                c.endpoint_id: c.prefill_load_adjusted_ttft_sec
+                for c in candidates
+                if c.prefill_load_adjusted_ttft_sec is not None
+            },
+            "prefill_load_routing_enabled": self.config.prefill_load_routing_enabled,
             "candidate_provider_types": {c.endpoint_id: c.provider_type for c in candidates},
             "candidate_quota_used_fraction": {
                 c.endpoint_id: c.quota_used_fraction
@@ -2125,7 +2179,13 @@ class RouteWiseRouter:
         # committing, remove it and re-solve with the remaining candidates.
         while candidates:
             lp_candidates = [
-                LPCandidate(c.endpoint_id, c.effective_cost_usd, c.mean_ttft_sec)
+                LPCandidate(
+                    c.endpoint_id,
+                    c.effective_cost_usd,
+                    c.prefill_load_adjusted_ttft_sec
+                    if c.prefill_load_adjusted_ttft_sec is not None
+                    else c.mean_ttft_sec,
+                )
                 for c in candidates
             ]
             solution = solve_cost_budgeted_mean_ttft(
