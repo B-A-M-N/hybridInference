@@ -38,7 +38,9 @@ def _networks(*cidrs: str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Networ
 
 
 @contextmanager
-def _settings_env(proxy_headers: bool, cf_headers: bool, proxy_nets: tuple = (), cf_nets: tuple = ()):
+def _settings_env(
+    proxy_headers: bool, cf_headers: bool, proxy_nets: tuple = (), cf_nets: tuple = ()
+):
     """Set up a test environment with proper Settings and env vars.
 
     This is NOT monkey-patching internal state - it creates real Settings

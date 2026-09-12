@@ -339,7 +339,9 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
     # Cloudflare trust requires BOTH the global proxy flag AND the Cloudflare flag.
     # This preserves the master kill-switch semantics: TRUST_PROXY_HEADERS=0 means
     # no forwarded headers can influence identity, regardless of other flags.
-    peer_is_cloudflare = global_trust_enabled and cf_trust_enabled and _is_in_networks(peer_ip, cf_networks)
+    peer_is_cloudflare = (
+        global_trust_enabled and cf_trust_enabled and _is_in_networks(peer_ip, cf_networks)
+    )
 
     # Request-level trust: headers are trusted only if the peer is authorized.
     headers_trusted = peer_is_trusted_proxy
