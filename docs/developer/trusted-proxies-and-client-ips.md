@@ -43,39 +43,54 @@ Two consequences of the server never interpreting forwarded headers:
 - `peer_ip` below is the genuine TCP peer again, which is what makes it usable
   as the un-forgeable anchor the rest of this page treats it as.
 
-## Trust configuration: the `trusted_proxies` list
+## Trust configuration
 
 Forwarding headers (`X-Forwarded-For`, `CF-Connecting-IP`, etc.) are
 **attacker-controlled on every request** that reaches the origin without passing
-through the proxy you trust. The gateway therefore requires **two independent
-facts** to be established before any header influences the result:
+through a trusted proxy. The gateway requires explicit authorization before any
+header influences the result.
 
-1. The `TRUST_PROXY_HEADERS` environment variable is set to `1`.
-2. The immediate socket peer falls inside a CIDR range listed in the
-   `trusted_proxies` setting.
+### Trusted proxies
 
-Both must be true. Setting `TRUST_PROXY_HEADERS=1` alone does nothing if
-`trusted_proxies` is empty — and it defaults to empty, so forwarding headers
-are **never trusted** unless the operator explicitly opts in.
+The `trusted_proxies` setting is a comma-separated list of CIDR ranges
+authorized to assert forwarding provenance via `X-Forwarded-For` / `X-Real-IP`:
 
-```python
-# settings.py (or via env var)
-trusted_proxies = ["172.17.0.0/16", "10.0.0.0/8"]  # Docker bridge, internal
+```bash
+TRUSTED_PROXIES=172.16.0.0/12,10.0.0.0/8  # Docker bridge, internal ranges
 ```
 
-Invalid CIDRs fail configuration at startup rather than silently weakening
-identity resolution. Parsed networks are cached in `trusted_proxies_parsed`
-and validated once at startup.
+Invalid CIDRs fail configuration at startup. Parsed networks are cached in
+`trusted_proxies_parsed` and validated once at startup.
 
-`TRUST_CLOUDFLARE_HEADERS` additionally gates `CF-Connecting-IP`: it is honored
-only when `TRUST_PROXY_HEADERS=1` **and** the peer is in `trusted_proxies` **and**
-`TRUST_CLOUDFLARE_HEADERS=1`. A non-Cloudflare proxy may rewrite
-`X-Forwarded-For` correctly while forwarding a client-supplied
-`CF-Connecting-IP` untouched, so the two facts are gated apart.
+### Cloudflare-authorized networks
+
+`CF-Connecting-IP` requires **separate** authorization. A generic trusted
+reverse proxy does NOT make a client-supplied `CF-Connecting-IP` safe — only
+operators who front this service with Cloudflare should populate this:
+
+```bash
+TRUSTED_CLOUDFLARE_NETWORKS=172.16.0.0/12
+```
+
+This separation ensures that a misconfigured generic proxy cannot accidentally
+authorize attacker-supplied Cloudflare headers.
+
+### Trust flags
+
+Two environment variables control header processing:
+
+- `TRUST_PROXY_HEADERS=1`: enables processing of `X-Forwarded-For` and
+  `X-Real-IP` headers, but **only** when the immediate peer is in
+  `trusted_proxies`.
+- `TRUST_CLOUDFLARE_HEADERS=1`: enables processing of `CF-Connecting-IP`,
+  but **only** when the immediate peer is in `trusted_cloudflare_networks`.
+
+Both flags default to `0` (disabled). Setting a flag alone does nothing if the
+corresponding network list is empty — this is the fail-closed default.
 
 ### Why this matters
 
-Without this gate, a client can send `X-Forwarded-For: <anything>` and the
+Without these gates, a client can send `X-Forwarded-For: <anything>` and the
 gateway logs and rate-limits on the attacker-chosen address. The old boolean
 flags (issue #1036) asserted only that *some* proxy exists; they did not
 restrict which peer may assert forwarding provenance. The new model makes
@@ -85,51 +100,54 @@ trust explicit and fail-closed.
 
 `get_client_ip_info()` returns a frozen `ClientIpInfo` with the resolved
 `client_ip`, the `peer_ip` it was resolved against, and a `source` label naming
-the rung that won. Resolution walks the trust boundary correctly:
+the rung that won. The `trusted_proxy_headers` field describes whether
+forwarding headers were **actually trusted** for this request — that is,
+whether `TRUST_PROXY_HEADERS=1` **and** the immediate peer is in
+`trusted_proxies`.
 
-1. **Peer is not in `trusted_proxies`** — forwarding headers are ignored
-   entirely. The socket peer is used if it is routable; otherwise
-   `"unknown"` is returned.
-2. **`CF-Connecting-IP`** — only when the peer is trusted **and**
-   `TRUST_CLOUDFLARE_HEADERS=1`. Cloudflare overwrites this header on every
-   request, so it cannot be forged by the client. A corroborated Pseudo IPv4
-   pair yields the real IPv6 address from `CF-Connecting-IPv6`.
-3. **`X-Forwarded-For`** — walked **right-to-left**. The rightmost entry is the
-   address the immediate proxy saw; each entry to the left was added by an
-   earlier hop. Trusted-proxy hops are skipped; the first untrusted **routable**
-   hop is the real client. Non-routable untrusted hops (RFC 1918, ULA, etc.)
-   are skipped because they cannot represent a remote client — this is what
-   prevented the internal-overlay leak (issue #1036).
-4. **`X-Real-IP`** — when it is routable.
+Resolution walks the trust boundary correctly:
+
+1. **Peer not authorized** — forwarding headers are ignored entirely. The
+   socket peer is used if routable; otherwise `"unknown"`.
+2. **`CF-Connecting-IP`** — only when the peer is in
+   `trusted_cloudflare_networks` **and** `TRUST_CLOUDFLARE_HEADERS=1`. The
+   operator must explicitly configure which networks are Cloudflare-authorized;
+   a generic reverse proxy does not make this header safe. A corroborated
+   Pseudo IPv4 pair yields the real IPv6 address from `CF-Connecting-IPv6`.
+3. **`X-Forwarded-For`** — only when the peer is in `trusted_proxies` **and**
+   `TRUST_PROXY_HEADERS=1`. Walked **right-to-left**: trusted-proxy hops are
+   skipped. The **first untrusted hop terminates provenance**:
+   * if routable → it is the client;
+   * if non-routable or malformed → return `"unknown"`.
+   **Never continue leftward** — that would cross the trust boundary and
+   consume attacker-controlled values.
+4. **`X-Real-IP`** — only when trusted and routable.
 5. **The socket peer** — a direct connection, or the last resort when no
    forwarded hop is usable. If the peer itself is non-routable, the result is
    `"unknown"`.
-
-When `trusted_proxies` is empty (the default), forwarding headers are never
-trusted, and the socket peer is the only network fact used. This is the
-fail-closed default.
 
 ### Example: multi-hop chain
 
 ```
 XFF: "1.2.3.4, fdbd:dc02::153, 10.0.0.1, 172.16.0.5"
-Peer (our proxy): 172.16.0.5  ← in trusted_proxies
+trusted_proxies: 172.16.0.5 (peer), 10.0.0.1
 ```
 
 Walking right-to-left:
 
 | Hop | Trusted? | Routable? | Action |
 |-----|----------|-----------|--------|
-| 172.16.0.5 | yes (our peer) | no | skip (trusted) |
+| 172.16.0.5 | yes (peer) | no | skip (trusted) |
 | 10.0.0.1 | yes | no | skip (trusted) |
-| fdbd:dc02::153 | no | no (ULA) | skip (unroutable) |
-| 1.2.3.4 | no | yes | **return as client** |
+| fdbd:dc02::153 | no | no (ULA) | **provenance terminates → unknown** |
+
+We do NOT continue to `1.2.3.4` — that would cross the trust boundary.
 
 ### Example: attacker prepends fake addresses
 
 ```
 XFF: "8.8.8.8, 1.2.3.4, 203.0.113.9, 172.16.0.5"
-Peer (our proxy): 172.16.0.5  ← in trusted_proxies
+trusted_proxies: 172.16.0.5 (peer)
 ```
 
 Walking right-to-left:
@@ -139,9 +157,8 @@ Walking right-to-left:
 | 172.16.0.5 | yes | no | skip (trusted) |
 | 203.0.113.9 | no | yes | **return as client** |
 
-The attacker's prepended `8.8.8.8` and `1.2.3.4` sit to the left of the first
-untrusted routable hop and are never reached. The old leftmost-trust model
-would have returned `8.8.8.8`.
+The attacker's prepended `8.8.8.8` and `1.2.3.4` are never reached. The old
+leftmost-trust model would have returned `8.8.8.8`.
 
 ### What counts as routable
 
