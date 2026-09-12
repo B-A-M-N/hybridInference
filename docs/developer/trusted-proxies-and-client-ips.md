@@ -43,69 +43,105 @@ Two consequences of the server never interpreting forwarded headers:
 - `peer_ip` below is the genuine TCP peer again, which is what makes it usable
   as the un-forgeable anchor the rest of this page treats it as.
 
-## The two trust flags
+## Trust configuration: the `trusted_proxies` list
 
-Nothing in a forwarding header is trusted unless you say so. Two independent
-environment variables gate that, and they assert two different facts.
+Forwarding headers (`X-Forwarded-For`, `CF-Connecting-IP`, etc.) are
+**attacker-controlled on every request** that reaches the origin without passing
+through the proxy you trust. The gateway therefore requires **two independent
+facts** to be established before any header influences the result:
 
-| Variable | What setting it to `1` asserts | Ships as |
-|---|---|---|
-| `TRUST_PROXY_HEADERS` | *Some* trusted proxy in front of the gateway overwrites `X-Forwarded-For` / `X-Real-IP`. | `0` in `.env.example`; `deploy/docker/docker-compose.yml` defaults the backend service to `1` |
-| `TRUST_CLOUDFLARE_HEADERS` | The **immediate** proxy is Cloudflare, so `CF-Connecting-IP` is edge-set and authoritative. | `0` in both — explicit opt-in |
+1. The `TRUST_PROXY_HEADERS` environment variable is set to `1`.
+2. The immediate socket peer falls inside a CIDR range listed in the
+   `trusted_proxies` setting.
 
-`TRUST_CLOUDFLARE_HEADERS` is read only when `TRUST_PROXY_HEADERS` is also `1`;
-on its own it does nothing.
+Both must be true. Setting `TRUST_PROXY_HEADERS=1` alone does nothing if
+`trusted_proxies` is empty — and it defaults to empty, so forwarding headers
+are **never trusted** unless the operator explicitly opts in.
 
-They are separate because they are separate facts. A non-Cloudflare proxy may
-rewrite `X-Forwarded-For` perfectly well while forwarding a client-supplied
-`CF-Connecting-IP` untouched — trusting the Cloudflare header on the strength
-of generic proxy trust would hand that caller the spoof it was denied via
-`X-Forwarded-For`. **If you front this service with anything other than
-Cloudflare, leave `TRUST_CLOUDFLARE_HEADERS=0`.**
+```python
+# settings.py (or via env var)
+trusted_proxies = ["172.17.0.0/16", "10.0.0.0/8"]  # Docker bridge, internal
+```
 
-:::{warning}
-Before enabling either flag, restrict the origin. Every one of these headers is
-attacker-controlled on any request that reaches the origin without passing
-through the proxy you are trusting. For Cloudflare specifically, "Full (strict)"
-TLS does **not** prevent that — it authenticates the origin to Cloudflare, not
-Cloudflare to the origin. Until the origin enforces
-[Authenticated Origin Pulls](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/)
-or an edge IP allowlist, anyone who learns the origin address can send a forged
-`CF-Connecting-IP` straight to it. The same caveat applies to
-`TRUST_PROXY_HEADERS` and `X-Forwarded-For`.
-:::
+Invalid CIDRs fail configuration at startup rather than silently weakening
+identity resolution. Parsed networks are cached in `trusted_proxies_parsed`
+and validated once at startup.
 
-With `TRUST_PROXY_HEADERS=0`, resolution short-circuits to the socket peer and
-no header influences the result — the correct behaviour for a gateway exposed
-directly. The raw header values are still captured on the returned
-`ClientIpInfo` and logged, so a misconfiguration is visible rather than silent.
+`TRUST_CLOUDFLARE_HEADERS` additionally gates `CF-Connecting-IP`: it is honored
+only when `TRUST_PROXY_HEADERS=1` **and** the peer is in `trusted_proxies` **and**
+`TRUST_CLOUDFLARE_HEADERS=1`. A non-Cloudflare proxy may rewrite
+`X-Forwarded-For` correctly while forwarding a client-supplied
+`CF-Connecting-IP` untouched, so the two facts are gated apart.
+
+### Why this matters
+
+Without this gate, a client can send `X-Forwarded-For: <anything>` and the
+gateway logs and rate-limits on the attacker-chosen address. The old boolean
+flags (issue #1036) asserted only that *some* proxy exists; they did not
+restrict which peer may assert forwarding provenance. The new model makes
+trust explicit and fail-closed.
 
 ## Resolution order
 
 `get_client_ip_info()` returns a frozen `ClientIpInfo` with the resolved
 `client_ip`, the `peer_ip` it was resolved against, and a `source` label naming
-the rung that won. First match wins:
+the rung that won. Resolution walks the trust boundary correctly:
 
-1. **`CF-Connecting-IP`** — only when `TRUST_CLOUDFLARE_HEADERS=1`. Source
-   `cf-connecting-ip`, or `cf-connecting-ipv6` for a corroborated Pseudo IPv4
-   pair (below). Note that this rung returns the header value as it stands: the
-   routability filter applied to the `X-Forwarded-For` rungs is not applied
-   here, because the edge is assumed to have written it.
-2. **The first *routable* `X-Forwarded-For` hop**, scanned left to right.
-   Source `x-forwarded-for`.
-3. **`X-Real-IP`**, when it is routable. Source `x-real-ip`.
-4. **The socket peer** (`request.client.host`, or the literal `"unknown"` when
-   Starlette reports no client). Source `socket`. This is both the direct-
-   connection case and the last resort when no forwarded hop was usable. Like
-   rung 1, it is *not* passed through the routability filter — so on the
-   ordinary Docker-behind-nginx deployment with `TRUST_PROXY_HEADERS` off, this
-   rung reports the bridge address. That is a separate, pre-existing pollution
-   class the filter deliberately leaves alone; only rungs 2 and 3 are filtered.
+1. **Peer is not in `trusted_proxies`** — forwarding headers are ignored
+   entirely. The socket peer is used if it is routable; otherwise
+   `"unknown"` is returned.
+2. **`CF-Connecting-IP`** — only when the peer is trusted **and**
+   `TRUST_CLOUDFLARE_HEADERS=1`. Cloudflare overwrites this header on every
+   request, so it cannot be forged by the client. A corroborated Pseudo IPv4
+   pair yields the real IPv6 address from `CF-Connecting-IPv6`.
+3. **`X-Forwarded-For`** — walked **right-to-left**. The rightmost entry is the
+   address the immediate proxy saw; each entry to the left was added by an
+   earlier hop. Trusted-proxy hops are skipped; the first untrusted **routable**
+   hop is the real client. Non-routable untrusted hops (RFC 1918, ULA, etc.)
+   are skipped because they cannot represent a remote client — this is what
+   prevented the internal-overlay leak (issue #1036).
+4. **`X-Real-IP`** — when it is routable.
+5. **The socket peer** — a direct connection, or the last resort when no
+   forwarded hop is usable. If the peer itself is non-routable, the result is
+   `"unknown"`.
 
-`CF-Connecting-IP` is checked before `X-Forwarded-For` deliberately: Cloudflare
-overwrites its own header on every request, but it *appends* to a client-supplied
-`X-Forwarded-For`, so reading the leftmost entry there would let any caller
-dictate the address the gateway logs and rate-limits on.
+When `trusted_proxies` is empty (the default), forwarding headers are never
+trusted, and the socket peer is the only network fact used. This is the
+fail-closed default.
+
+### Example: multi-hop chain
+
+```
+XFF: "1.2.3.4, fdbd:dc02::153, 10.0.0.1, 172.16.0.5"
+Peer (our proxy): 172.16.0.5  ← in trusted_proxies
+```
+
+Walking right-to-left:
+
+| Hop | Trusted? | Routable? | Action |
+|-----|----------|-----------|--------|
+| 172.16.0.5 | yes (our peer) | no | skip (trusted) |
+| 10.0.0.1 | yes | no | skip (trusted) |
+| fdbd:dc02::153 | no | no (ULA) | skip (unroutable) |
+| 1.2.3.4 | no | yes | **return as client** |
+
+### Example: attacker prepends fake addresses
+
+```
+XFF: "8.8.8.8, 1.2.3.4, 203.0.113.9, 172.16.0.5"
+Peer (our proxy): 172.16.0.5  ← in trusted_proxies
+```
+
+Walking right-to-left:
+
+| Hop | Trusted? | Routable? | Action |
+|-----|----------|-----------|--------|
+| 172.16.0.5 | yes | no | skip (trusted) |
+| 203.0.113.9 | no | yes | **return as client** |
+
+The attacker's prepended `8.8.8.8` and `1.2.3.4` sit to the left of the first
+untrusted routable hop and are never reached. The old leftmost-trust model
+would have returned `8.8.8.8`.
 
 ### What counts as routable
 
@@ -121,10 +157,6 @@ fc00::/7          (IPv6 unique local)
 An IPv4-mapped IPv6 literal is judged by its embedded IPv4 address, so a mapped
 private peer is still rejected.
 
-Skipping these hops is the point of the left-to-right scan: an intermediary that
-inserts its own internal address as the leftmost hop would otherwise have that
-internal address reported — and logged — as the client.
-
 The list is written out explicitly rather than delegating to
 `ipaddress.is_private` / `is_global`, because those reclassified the
 documentation (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) and
@@ -132,25 +164,23 @@ benchmark (`198.18.0.0/15`) ranges between CPython 3.12.4 and 3.13; hard-coding
 the stable RFC ranges keeps IP resolution from depending on the interpreter
 version.
 
-The consequence is worth stating, because it is what the explicit list buys: a
-documentation or benchmark address is **routable** under this filter and will be
-reported as a client. That is why `::ffff:192.0.2.1` works as the example below
-even though `is_private` would reject it.
+## The "unknown" outcome
 
-### Known limitation
+When the gateway cannot determine a trustworthy routable client address, it
+returns `"unknown"` rather than masquerading an internal address as a client.
+This is correct: if the socket peer is a Docker bridge and there is no
+trustworthy forwarding provenance, `"unknown"` is more useful than
+`172.19.0.1`.
 
-A spoofed *public* leftmost `X-Forwarded-For` entry is still taken at face
-value. Stripping it correctly requires a configured trusted-proxy CIDR set, so
-the gateway can tell its own proxies from client-supplied hops; taking the
-rightmost public hop instead would misattribute every client sitting behind a
-shared public intermediary. The module says so in its own docstring, and the
-hardening is not implemented. If you need it, either terminate `X-Forwarded-For`
-at your proxy (overwrite rather than append) or trust only an edge header your
-proxy is known to overwrite.
+Downstream consumers that key on `client_ip` (rate limits, auth-failure
+blocklist, routing affinity) must handle `"unknown"` safely — it is a
+legitimate outcome, not an error. `normalize_ip_bucket("unknown")` returns
+`"unknown"` unchanged, so such callers collapse onto one bucket rather than
+creating a per-internal-address bucket.
 
-### Cloudflare Pseudo IPv4
+## Cloudflare Pseudo IPv4
 
-Within rung 1, `CF-Connecting-IPv6` wins over `CF-Connecting-IP` — it is not a
+Within rung 2, `CF-Connecting-IPv6` wins over `CF-Connecting-IP` — it is not a
 rung of its own — but **only when the two corroborate each other**.
 
 Cloudflare emits `CF-Connecting-IPv6` solely when
@@ -263,7 +293,7 @@ default on your behalf.
 
 Two knobs that reduce what there is to retain in the first place:
 
-- Leaving both trust flags at `0` where no proxy is in front means only the
+- Leaving `trusted_proxies` empty where no proxy is in front means only the
   socket peer is ever recorded.
 - Prompt and response content is governed separately by
   `DB_STORE_FULL_CONTENT` (default `false`, which hashes content rather than
@@ -272,12 +302,15 @@ Two knobs that reduce what there is to retain in the first place:
 ## Testing your setup
 
 `tests/unit/utils/test_request_ip.py` covers the resolution table, the
-Pseudo IPv4 corroboration and the bucketing rules;
+Pseudo IPv4 corroboration, the bucketing rules, and adversarial cases (spoofed
+headers, multi-hop chains, malformed inputs, all-private chains, the two
+production pollution classes from issue #1036);
+`tests/unit/config/test_trusted_proxies.py` covers CIDR validation;
 `tests/unit/middleware/test_request_log.py` covers the log fields. Run them
 with:
 
 ```bash
-uv run pytest tests/unit/utils/test_request_ip.py tests/unit/middleware/test_request_log.py
+uv run pytest tests/unit/utils/test_request_ip.py tests/unit/config/test_trusted_proxies.py tests/unit/middleware/test_request_log.py
 ```
 
 To check a live gateway, send a request with a deliberately absurd forwarded

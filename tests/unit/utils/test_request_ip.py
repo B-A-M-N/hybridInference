@@ -499,3 +499,37 @@ def test_get_client_ip_bucket_normalizes(monkeypatch):
             peer_ip="172.19.0.1",
         )
         assert get_client_ip_bucket(request) == "2001:db8:abcd:1234::/64"
+
+
+# ---------------------------------------------------------------------------
+# Sabotage test: prove adversarial tests catch the vulnerability
+# ---------------------------------------------------------------------------
+
+
+def test_sabotage_pre_fix_spoofing_model():
+    """Prove adversarial tests catch the pre-fix spoofable model.
+
+    BEFORE: caller could prepend XFF to spoof any client IP.
+    AFTER: spoofed XFF is ignored when peer is not a trusted proxy.
+    """
+    from serving.config.settings import get_settings
+    import os as _os
+    _os.environ["TRUST_PROXY_HEADERS"] = "1"
+    original = get_settings().trusted_proxies
+    get_settings().trusted_proxies = []
+    get_settings()._parse_trusted_proxies()
+
+    try:
+        # Attacker sends XFF claiming to be a victim
+        request = _request(
+            {"x-forwarded-for": "198.51.100.42"},
+            peer_ip="1.2.3.4",  # attacker's real IP, not trusted
+        )
+        info = get_client_ip_info(request)
+        # POST-FIX: spoofed XFF ignored, peer is public so socket peer used
+        assert info.client_ip == "1.2.3.4"
+        assert info.source == "socket"
+    finally:
+        get_settings().trusted_proxies = original
+        get_settings()._parse_trusted_proxies()
+        _os.environ.pop("TRUST_PROXY_HEADERS", None)
