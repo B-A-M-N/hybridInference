@@ -75,8 +75,11 @@ reverse proxy does NOT make a client-supplied `CF-Connecting-IP` safe — only
 operators who front this service with Cloudflare should populate this:
 
 ```bash
-# Example: Cloudflare → application directly (Cloudflare origins)
-TRUSTED_CLOUDFLARE_NETWORKS=10.0.0.1/32  # actual edge-facing origin IP
+# Example: Cloudflare → application directly
+# These are Cloudflare's origin-facing IP ranges (the socket peer),
+# NOT the visitor addresses in CF-Connecting-IP.
+# See: https://developers.cloudflare.com/fundamentals/concepts/cloudflare-ip-addresses/
+TRUSTED_CLOUDFLARE_NETWORKS=10.0.0.1/32  # actual Cloudflare source IP
 ```
 
 If your topology is Cloudflare → nginx → HybridInference, then HybridInference
@@ -120,19 +123,21 @@ must **never** key on a shared `"unknown"` value — that would collapse all
 untrusted callers onto one key, allowing a single caller to exhaust a rate
 limit or trigger a block that affects everyone.
 
-The `get_client_bucket()` function returns the **enforcement identity**: when
-provenance fails, it falls back to the socket peer's bucket. This ensures:
+The correct approach depends on the operation:
 
-- Rate limits key on the actual network-level source.
-- Auth-failure blocks target the real peer.
-- Affinity keys on the peer when the client is unresolvable.
+- **Rate limiting**: When provenance is resolved, key on the client IP.
+  When unresolved, skip per-IP limiting entirely (don't use the proxy IP).
+- **Auth-failure blocking**: Only block on resolved client IPs. When
+  unresolved, don't record or block (would affect all clients behind proxy).
+- **Affinity routing**: When resolved, key on client IP bucket. When
+  unresolved, return `None` for non-sticky routing (don't collapse clients).
 
-| Use case | Function | Returns |
-|----------|----------|---------|
-| Logging, audit, display | `get_client_ip()` | Provenance identity (may be `"unknown"`) |
-| Rate limiting | `get_client_bucket()` | Enforcement identity (never shared) |
-| Auth-failure blocking | `get_client_bucket()` | Enforcement identity (never shared) |
-| Affinity routing | `get_client_bucket()` or `get_client_enforcement_id()` | Enforcement identity (never shared) |
+| Use case | Resolved | Unresolved |
+|----------|----------|------------|
+| Logging, audit, display | `get_client_ip()` | `"unknown"` |
+| Rate limiting | Key on client IP | Skip per-IP limiting |
+| Auth-failure blocking | Block on client IP | Don't record/block |
+| Affinity routing | `ip:<bucket>` | `None` (non-sticky) |
 
 ## Resolution order
 
