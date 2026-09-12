@@ -56,8 +56,14 @@ The `trusted_proxies` setting is a comma-separated list of CIDR ranges
 authorized to assert forwarding provenance via `X-Forwarded-For` / `X-Real-IP`:
 
 ```bash
-TRUSTED_PROXIES=172.16.0.0/12,10.0.0.0/8  # Docker bridge, internal ranges
+# Example: a single nginx reverse proxy at a known internal address
+TRUSTED_PROXIES=172.19.0.2/32
 ```
+
+Trust the narrowest possible addresses. Only the specific proxy IP(s) that
+terminate connections from the internet and forward to the gateway should be
+trusted. Do not trust broad internal subnets — that would allow any host
+within that subnet to assert client identity on any request.
 
 Invalid CIDRs fail configuration at startup. Parsed networks are cached in
 `trusted_proxies_parsed` and validated once at startup.
@@ -69,8 +75,15 @@ reverse proxy does NOT make a client-supplied `CF-Connecting-IP` safe — only
 operators who front this service with Cloudflare should populate this:
 
 ```bash
-TRUSTED_CLOUDFLARE_NETWORKS=172.16.0.0/12
+# Example: Cloudflare → application directly (Cloudflare origins)
+TRUSTED_CLOUDFLARE_NETWORKS=10.0.0.1/32  # actual edge-facing origin IP
 ```
+
+If your topology is Cloudflare → nginx → HybridInference, then HybridInference
+sees nginx as the socket peer. In that case, `CF-Connecting-IP` safety depends
+on nginx both being exclusively trusted AND correctly sanitizing/overwriting
+the header. Cloudflare itself recommends restricting origin access to
+Cloudflare addresses to prevent direct-origin header spoofing.
 
 This separation ensures that a misconfigured generic proxy cannot accidentally
 authorize attacker-supplied Cloudflare headers.

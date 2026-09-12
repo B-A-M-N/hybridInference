@@ -37,14 +37,15 @@ def _networks(*cidrs: str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Networ
     return tuple(ipaddress.ip_network(c) for c in cidrs)
 
 
-from contextlib import contextmanager
-
 @contextmanager
 def _patch_networks(proxy_nets, cf_nets):
     """Return a context manager that patches both trusted_networks and
     trusted_cloudflare_networks."""
     with patch("serving.utils.request_ip._trusted_networks", return_value=proxy_nets):
-        with patch("serving.utils.request_ip._trusted_cloudflare_networks", return_value=cf_nets):
+        with patch(
+            "serving.utils.request_ip._trusted_cloudflare_networks",
+            return_value=cf_nets,
+        ):
             yield
 
 
@@ -67,8 +68,17 @@ def test_parse_ip_rejects_garbage():
 
 def test_parse_forwarded_chain_splits_and_trims():
     assert _parse_forwarded_chain("1.2.3.4, 5.6.7.8") == ["1.2.3.4", "5.6.7.8"]
-    assert _parse_forwarded_chain("  1.2.3.4  ,  , 5.6.7.8  ") == ["1.2.3.4", "5.6.7.8"]
-    assert _parse_forwarded_chain("") == []
+
+
+def test_parse_forwarded_chain_preserves_empty():
+    """Empty/malformed entries are preserved — they terminate provenance."""
+    assert _parse_forwarded_chain("8.8.8.8, , 172.19.0.1") == ["8.8.8.8", "", "172.19.0.1"]
+    assert _parse_forwarded_chain("  1.2.3.4  ,  , 5.6.7.8  ") == ["1.2.3.4", "", "5.6.7.8"]
+
+
+def test_parse_forwarded_chain_empty_input():
+    """A chain of empty/whitespace yields a list with one empty string."""
+    assert _parse_forwarded_chain("") == [""]
 
 
 def test_is_reportable_ip_rejects_non_routable():
@@ -190,11 +200,7 @@ def test_trusted_proxy_all_trusted_hops_returns_unknown(monkeypatch):
 
 
 def test_trusted_proxy_first_untrusted_private_hop_returns_unknown(monkeypatch):
-    """First untrusted hop that is non-routable → "unknown".
-
-    The resolver does NOT skip non-routable untrusted hops and continue left.
-    Provenance terminates at the first untrusted hop.
-    """
+    """First untrusted hop that is non-routable → "unknown"."""
     monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
     nets = _networks("172.16.0.0/12")
     with _patch_networks(nets, ()):
@@ -205,7 +211,6 @@ def test_trusted_proxy_first_untrusted_private_hop_returns_unknown(monkeypatch):
         info = get_client_ip_info(request)
         # 172.19.0.1 is trusted → skip. 10.50.0.8 is first untrusted hop but
         # non-routable → provenance terminates, return "unknown".
-        # We do NOT continue left to 8.8.8.8.
         assert info.client_ip == "unknown"
         assert info.source == "x-forwarded-for"
 
@@ -236,6 +241,22 @@ def test_trusted_proxy_first_untrusted_malformed_hop_returns_unknown(monkeypatch
         )
         info = get_client_ip_info(request)
         # "garbage" is first untrusted hop and malformed → "unknown"
+        assert info.client_ip == "unknown"
+        assert info.source == "x-forwarded-for"
+
+
+def test_trusted_proxy_empty_hop_terminates_provenance(monkeypatch):
+    """Empty hop between trusted and client terminates provenance with unknown."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    nets = _networks("172.16.0.0/12")
+    with _patch_networks(nets, ()):
+        # 8.8.8.8, [empty], 172.19.0.1
+        # Walking right-to-left: 172.19.0.1 trusted, "" first untrusted → unknown
+        request = _request(
+            {"x-forwarded-for": "8.8.8.8, , 172.19.0.1"},
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
         assert info.source == "x-forwarded-for"
 
@@ -371,24 +392,114 @@ def test_forged_cf_connecting_ipv6_rejected(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Edge cases and adversarial inputs
+# Cloudflare adversarial tests (P0: validate CF-derived client)
 # ---------------------------------------------------------------------------
 
 
-def test_malformed_xff_entries_handled(monkeypatch):
-    """Malformed first untrusted hop causes unknown."""
+def test_cf_malformed_ip_returns_unknown(monkeypatch):
+    """Malformed CF-Connecting-IP returns unknown."""
     monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("172.16.0.0/12")
-    with _patch_networks(nets, ()):
-        # "garbage" is the first untrusted hop (rightmost after trusted peer)
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    cf_nets = _networks("172.16.0.0/12")
+    with _patch_networks((), cf_nets):
+        request = _request({"cf-connecting-ip": "garbage"}, peer_ip="172.19.0.1")
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        assert info.source == "cf-connecting-ip"
+
+
+def test_cf_rfc1918_returns_unknown(monkeypatch):
+    """RFC1918 CF-Connecting-IP returns unknown."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    cf_nets = _networks("172.16.0.0/12")
+    with _patch_networks((), cf_nets):
+        request = _request({"cf-connecting-ip": "10.0.0.1"}, peer_ip="172.19.0.1")
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        assert info.source == "cf-connecting-ip"
+
+
+def test_cf_loopback_returns_unknown(monkeypatch):
+    """Loopback CF-Connecting-IP returns unknown."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    cf_nets = _networks("172.16.0.0/12")
+    with _patch_networks((), cf_nets):
+        request = _request({"cf-connecting-ip": "127.0.0.1"}, peer_ip="172.19.0.1")
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        assert info.source == "cf-connecting-ip"
+
+
+def test_cf_ula_returns_unknown(monkeypatch):
+    """ULA CF-Connecting-IP returns unknown."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    cf_nets = _networks("172.16.0.0/12")
+    with _patch_networks((), cf_nets):
+        request = _request({"cf-connecting-ip": "fc00::1"}, peer_ip="172.19.0.1")
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        assert info.source == "cf-connecting-ip"
+
+
+def test_cf_bare_class_e_without_pair_returns_unknown(monkeypatch):
+    """Bare Class-E address without valid Pseudo IPv4 pair returns unknown."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    cf_nets = _networks("172.16.0.0/12")
+    with _patch_networks((), cf_nets):
+        # CF-Connecting-IP is 240.1.2.3 but no CF-Connecting-IPv6 to corroborate
+        request = _request({"cf-connecting-ip": "240.1.2.3"}, peer_ip="172.19.0.1")
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        assert info.source == "cf-connecting-ip"
+
+
+def test_cf_pseudo_ipv4_with_invalid_ipv6_returns_unknown(monkeypatch):
+    """Pseudo IPv4 pair with invalid/non-reportable IPv6 returns unknown."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    cf_nets = _networks("172.16.0.0/12")
+    with _patch_networks((), cf_nets):
+        # CF-Connecting-IP is Class-E, CF-Connecting-IPv6 is loopback (not IPv6)
         request = _request(
-            {"x-forwarded-for": "8.8.8.8, garbage, 172.19.0.1"},
+            {
+                "cf-connecting-ip": "240.1.2.3",
+                "cf-connecting-ipv6": "127.0.0.1",
+            },
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        # "garbage" is first untrusted hop and malformed → "unknown"
+        # 127.0.0.1 is not IPv6, so _pseudo_ipv4_origin returns None.
+        # Falls through to direct CF-Connecting-IP path which sees bare Class-E.
         assert info.client_ip == "unknown"
-        assert info.source == "x-forwarded-for"
+        assert info.source == "cf-connecting-ip"
+
+
+def test_cf_pseudo_ipv4_with_ula_ipv6_returns_unknown(monkeypatch):
+    """Pseudo IPv4 pair with ULA IPv6 returns unknown."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    cf_nets = _networks("172.16.0.0/12")
+    with _patch_networks((), cf_nets):
+        # CF-Connecting-IP is Class-E, CF-Connecting-IPv6 is ULA
+        request = _request(
+            {
+                "cf-connecting-ip": "240.1.2.3",
+                "cf-connecting-ipv6": "fc00::1",
+            },
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        assert info.source == "cf-connecting-ipv6"
+
+
+# ---------------------------------------------------------------------------
+# Edge cases and adversarial inputs
+# ---------------------------------------------------------------------------
 
 
 def test_mixed_ipv4_ipv6_chain(monkeypatch):
@@ -613,9 +724,7 @@ def test_sabotage_pre_fix_spoofing_model():
     BEFORE: caller could prepend XFF to spoof any client IP.
     AFTER: spoofed XFF is ignored when peer is not a trusted proxy.
     """
-    import os as _os
-
-    _os.environ["TRUST_PROXY_HEADERS"] = "1"
+    os.environ["TRUST_PROXY_HEADERS"] = "1"
     with _patch_networks((), ()):
         # Attacker sends XFF claiming to be a victim
         request = _request(
@@ -626,4 +735,4 @@ def test_sabotage_pre_fix_spoofing_model():
         # POST-FIX: spoofed XFF ignored, peer is public so socket peer used
         assert info.client_ip == "1.2.3.4"
         assert info.source == "socket"
-    _os.environ.pop("TRUST_PROXY_HEADERS", None)
+    os.environ.pop("TRUST_PROXY_HEADERS", None)

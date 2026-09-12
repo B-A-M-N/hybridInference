@@ -189,18 +189,20 @@ def _pseudo_ipv4_origin(cf_connecting_ip: str | None, cf_connecting_ipv6: str | 
 
 
 def _parse_forwarded_chain(raw: str) -> list[str]:
-    """Split and sanitize an X-Forwarded-For header value into ordered hops.
+    """Split an X-Forwarded-For header value into ordered hops.
 
     The leftmost entry is the originally-reported client; each subsequent entry
     is a proxy that appended its address. We trim whitespace around each hop
-    and drop empty entries (a malformed ``"1.2.3.4,, 5.6.7.8"`` chain still
-    yields two addresses).
+    but **preserve empty/malformed entries** — the caller treats them as a
+    provenance-terminating condition (returns "unknown"). Silently dropping
+    empty elements would be inconsistent with the fail-closed design: a
+    malformed empty hop must terminate the chain, not disappear.
 
-    Entries that do not parse as IP addresses are preserved in the returned
-    list as-is; the caller decides whether to skip or reject them. A chain of
-    ``""`` or pure whitespace yields an empty list.
+    A chain of ``""`` or pure whitespace yields a single empty string so the
+    caller can reject it.
     """
-    return [hop.strip() for hop in raw.split(",") if hop.strip()]
+    hops = [hop.strip() for hop in raw.split(",")]
+    return hops if hops else []
 
 
 def normalize_ip_bucket(ip: str) -> str:
@@ -331,11 +333,24 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
 
     if peer_is_cloudflare and cf_connecting_ip:
         # CF-Connecting-IP is authoritative only from a Cloudflare-authorized hop.
+        # Validate the derived client address before returning it — never return
+        # a private/loopback/ULA/multicast/unspecified address as the client.
         pseudo_origin = _pseudo_ipv4_origin(cf_connecting_ip, cf_connecting_ipv6)
-        return _info(
-            pseudo_origin or cf_connecting_ip,
-            "cf-connecting-ipv6" if pseudo_origin else "cf-connecting-ip",
-        )
+        if pseudo_origin is not None:
+            # Genuine Pseudo IPv4 pair: use the corroborated IPv6 address.
+            if _is_reportable_ip(pseudo_origin):
+                return _info(pseudo_origin, "cf-connecting-ipv6")
+            return _info("unknown", "cf-connecting-ipv6")
+        # No valid Pseudo IPv4 pair. Parse the CF-Connecting-IP directly.
+        parsed_cf = _parse_ip(cf_connecting_ip)
+        if parsed_cf is not None and parsed_cf in PSEUDO_IPV4_NETWORK:
+            # A bare Class-E value without a valid Pseudo IPv4 pair is not a
+            # real client address (Cloudflare puts the synthetic in
+            # CF-Connecting-IP and the real IPv6 in CF-Connecting-IPv6).
+            return _info("unknown", "cf-connecting-ip")
+        if _is_reportable_ip(cf_connecting_ip):
+            return _info(cf_connecting_ip, "cf-connecting-ip")
+        return _info("unknown", "cf-connecting-ip")
 
     if peer_is_trusted_proxy:
         # Walk the XFF chain right-to-left, skipping explicitly trusted hops.
