@@ -12,11 +12,11 @@ the effective limit multiplies by worker count, which is acceptable for
 this defense (the goal is throttling, not audit). Mirrors the design of
 ``serving.utils.signup_rate_limit``.
 
-Uses client enforcement identity for rate-limiting. When client provenance
-is resolved, rate-limits on the client IP. When unresolved (e.g., behind
-misconfigured proxy), there is no information to distinguish clients
-behind the shared proxy. In that case, per-IP rate limiting is skipped
-entirely rather than collapsing all clients onto one bucket.
+When client provenance is resolved, rate-limits on the client IP.
+When unresolved (e.g., behind misconfigured proxy), there is no information
+to distinguish clients behind the shared proxy. In that case, per-IP rate
+limiting is skipped entirely rather than collapsing all clients onto one
+bucket.
 """
 
 from __future__ import annotations

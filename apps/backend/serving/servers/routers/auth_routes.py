@@ -132,8 +132,8 @@ async def signup(
         )
 
     # Record on entry so probing with varied payloads cannot bypass the limit.
-    # Rate limiting uses client enforcement identity (resolved client IP or
-    # coarse peer-level for unresolved). No shared 'unknown' bucket.
+    # Per-IP rate limiting is applied only when client provenance is resolved.
+    # Unresolved clients skip per-IP limiting entirely (no shared proxy bucket).
     client_ip = get_client_ip(request)
     allowed, reason = await check_and_record_signup(request)
     if not allowed:
@@ -291,8 +291,8 @@ async def login(
         raise HTTPException(status_code=500, detail="Database not available")
 
     # Record on entry so probing varied passwords cannot bypass the limit.
-    # Rate limiting uses client enforcement identity (resolved client IP or
-    # coarse peer-level for unresolved). No shared 'unknown' bucket.
+    # Per-IP rate limiting is applied only when client provenance is resolved.
+    # Unresolved clients skip per-IP limiting entirely (no shared proxy bucket).
     client_ip = get_client_ip(request)
 
     async def _record(
