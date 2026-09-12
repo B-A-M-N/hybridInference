@@ -78,6 +78,7 @@ docs:  ## Build the publishable docs site (every language) into docs/build/html
 DOCS_LANG ?= zh_CN
 
 docs-verify: docs docs-gettext  ## Build the site and check every translation still applies
+	$(UV_RUN) python ops/ci/check_docs_links.py
 	@echo "$(YELLOW)Checking translations against the English build...$(RESET)"
 	@# A translation never fails loudly: Sphinx falls back to English for any
 	@# string it cannot translate, so a stale catalog builds clean under -W and
@@ -259,7 +260,7 @@ DISTRIBUTION_COMPOSE_FILE := $(if $(DISTRIBUTION_PATH),$(wildcard $(DISTRIBUTION
 ifneq ($(DISTRIBUTION_COMPOSE_FILE),)
 COMPOSE_FILE_ARGS += -f $(DISTRIBUTION_COMPOSE_FILE)
 endif
-# Standalone cloud agent on the same host (freeinference-cloud-agent). Opting
+# Standalone cloud agent on the same host (hybridInference-cloud-agent). Opting
 # in attaches the console to that stack's network so the `/agents` rewrites
 # from #1206 can resolve `web` and `control-plane`; without it they resolve
 # nothing and the console answers 500 for a page it is configured to serve.

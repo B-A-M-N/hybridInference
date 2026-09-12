@@ -79,12 +79,15 @@ Three containers start:
 | Service | Published on | Notes |
 |---|---|---|
 | `backend` | `127.0.0.1:8080` | FastAPI gateway; override the bind with `BACKEND_HOST` / `BACKEND_PORT` |
-| `frontend` | `0.0.0.0:3001` | Next.js console; override with `FRONTEND_HOST` / `FRONTEND_PORT` |
+| `frontend` | `127.0.0.1:3001` | Next.js console; override with `FRONTEND_HOST` / `FRONTEND_PORT` |
 | `postgres` | `127.0.0.1:5432` | override with `DB_PORT` |
 
-pgAdmin and the Codex on-call relay are in the Compose file too but are gated
-behind profiles, so nothing starts them unless you ask (see
-[Deployment Guide](deployment.md)).
+These ports are reachable from the host by default. A reverse proxy on the
+same host can use the loopback address; access from another machine requires
+an explicit host override. See [Deployment Guide](deployment.md) before
+exposing the console, which also forwards API requests.
+
+pgAdmin is in the Compose file too, behind the optional `admin` profile.
 
 ### Which models the fresh stack serves
 
@@ -133,7 +136,7 @@ Run the gateway from the repository root — the backend packages live under
 
 ```bash
 cp .env.example .env    # edit as above; a process started here reads it
-PYTHONPATH=apps/backend uv run uvicorn serving.servers.app:app \
+PYTHONPATH=apps/backend uv run uvicorn serving.servers.app:app --no-proxy-headers \
   --host 127.0.0.1 --port 8080
 ```
 
@@ -142,19 +145,28 @@ Run the console in a second terminal:
 ```bash
 cd apps/frontend
 npm ci
-npm run dev            # listens on :3001
+BACKEND_INTERNAL_URL=http://127.0.0.1:8080 npm run dev -- --hostname 127.0.0.1
 ```
+
+Open `http://localhost:3001`. The explicit backend URL makes the console's API
+proxy reach the gateway running on the host. Its default, `http://backend:8080`,
+is a Docker network address; the frontend process does not load the repository
+root's `.env`. Reuse the override whenever you start the console, and adjust
+the port if your backend uses a different one. Check the complete proxy path
+with `curl http://localhost:3001/health`.
 
 To develop against Postgres without running the whole stack, start just the
 database container:
 
 ```bash
+make docker-volumes
 docker compose -f deploy/docker/docker-compose.yml --env-file .env up -d postgres
 ```
 
-Or set `DB_ENABLED=false` in `.env` and run with no database at all: the gateway
-still routes requests, and `/health` reports `"database_configured": false`.
-Accounts, API keys and request history need the database.
+For a local gateway without accounts or a database, set both `DB_ENABLED=false`
+and `USER_AUTH_ENABLED=false` in `.env`. It still routes requests, and `/health`
+reports `"database_configured": false`. Accounts, API keys and request history
+need the database and both authentication secrets.
 
 ## Configuration
 
@@ -176,6 +188,7 @@ the default registry needs, everything in `.env.example` is optional. The ones y
 |---|---|
 | `USER_AUTH_ENABLED` | `1` (default) requires user API keys for inference requests; `0` allows anonymous inference but does not disable account login or admin authentication |
 | `ADMIN_TOKEN` | optional legacy bearer token for the `/admin/*` endpoints; blank disables only this access path |
+| `PROVIDER_ROUTE_TYPES` | route types the admin console may add per provider, as `provider=type[\|type]` entries separated by commas (e.g. `chutes=quota,openrouter=concurrency\|on_demand`); blank leaves every provider unrestricted |
 | `DB_ENABLED` | `false` runs the gateway with no database |
 | `DB_STORE_FULL_CONTENT` | `false` (default) hashes prompts and responses instead of storing them |
 | `FRONTEND_URL` | absolute URL your users click in verification and reset emails |
@@ -204,6 +217,11 @@ route:
 `.env.example` ships blank placeholders for the providers this project has
 adapters or examples for; add your own names freely. The bundled default
 registry needs only `OPENROUTER_API_KEY`.
+
+Once a database is configured, keys can also be added from the admin console
+(**Providers → Keys**) with no restart; they join the same pool as the keys the
+registry names. See
+[Runtime configuration from the admin console](configuration.md#runtime-configuration-from-the-admin-console).
 
 ### Where the config files live
 

@@ -91,6 +91,7 @@ def test_no_compose_default_names_a_deployment() -> None:
         ("SMTP_FROM_NAME", "HybridInference"),
         ("BASE_URL", ""),
         ("FRONTEND_URL", "http://localhost:3001"),
+        ("DISTRIBUTION_CONFIG_MODE", "dark"),
     ],
 )
 def test_compose_neutral_default_matches_the_code_default(
@@ -118,6 +119,7 @@ def test_compose_neutral_default_matches_the_code_default(
         "SMTP_FROM_NAME": settings.smtp_from_name,
         "BASE_URL": settings.base_url,
         "FRONTEND_URL": settings.frontend_url,
+        "DISTRIBUTION_CONFIG_MODE": settings.distribution_config_mode,
     }[var]
 
     assert _compose_defaults()[var] == expected
@@ -216,6 +218,12 @@ def test_the_bottom_of_the_precedence_names_files_that_exist() -> None:
         assert (REPO / default).is_file(), (
             f"the {kind} fallback is {default!r}, which this repository does not ship"
         )
+
+
+def test_compose_preserves_dark_mode_default_without_hiding_empty_mode() -> None:
+    """Unset mode must stay dark; explicitly empty mode must remain an error."""
+    environment = _compose()["services"]["backend"]["environment"]
+    assert environment["DISTRIBUTION_CONFIG_MODE"] == "${DISTRIBUTION_CONFIG_MODE-dark}"
 
 
 def test_compose_leaves_the_config_paths_to_the_precedence() -> None:

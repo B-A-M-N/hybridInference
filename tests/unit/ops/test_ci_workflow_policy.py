@@ -249,7 +249,7 @@ def test_w5c_retired_services_and_ci_wiring_are_absent() -> None:
 def test_w5d_retired_ops_assets_are_absent() -> None:
     """The distribution repository owns the db toolkit, proxies, and units.
 
-    Production cron and the spark2 proxy unit already execute the consuming
+    Production cron and the staging proxy unit already execute the consuming
     repository's copies, so these upstream copies must not come back. The
     backend-coupled analysis remnant under ops/db/ stays deliberately.
     """
@@ -305,7 +305,12 @@ def test_tutorial_e2e_builds_and_runs_the_exact_linear_transition() -> None:
     assert changes["outputs"]["tutorial_e2e"] == "${{ steps.validate.outputs.tutorial_e2e }}"
     assert "needs.changes.outputs.tutorial_e2e == 'true'" in job["if"]
     assert "github.event_name != 'pull_request'" not in job["if"]
-    assert job["runs-on"] == ["self-hosted", "Linux", "ARM64", "image-verify-arm64"]
+    # PR events (untrusted after the repo is public) run GitHub-hosted; every
+    # trusted event keeps the self-hosted image-verify pool.
+    assert job["runs-on"] == (
+        "${{ github.event_name == 'pull_request' && 'ubuntu-24.04-arm'"
+        ' || fromJSON(\'["self-hosted", "Linux", "ARM64", "image-verify-arm64"]\') }}'
+    )
 
     expected_names = {
         "EXAMPLE_BACKEND_CONTAINER_NAME",

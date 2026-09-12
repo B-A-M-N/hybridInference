@@ -1,5 +1,10 @@
 # Per-Provider Hourly Performance Tracking — Implementation Plan
 
+> Historical design/review record. Instructions, findings and line numbers
+> describe the version reviewed at the time. For current setup, use the
+> [developer guide](../../../developer/index.rst). Surviving code links point to current paths
+> for navigation; references to removed files are retained as text.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Aggregate `api_logs` into a new `provider_hourly_stats` rollup table once per hour grouped by `(provider, model_id, hour_bucket)`, and surface the resulting TTFT and throughput time series in a new "Provider Performance" tab on the admin dashboard.
@@ -8,7 +13,7 @@
 
 **Tech Stack:** Python 3.12 (asyncio/asyncpg/APScheduler/FastAPI/Pydantic), Postgres 14+ (`PERCENTILE_CONT`, advisory locks), pytest + pytest-asyncio integration tests against a real test DB, Prometheus client, Next.js + Recharts + Tailwind.
 
-**Spec:** [docs/agents/specs/2026-05-02-per-provider-hourly-performance-design.md](../specs/2026-05-02-per-provider-hourly-performance-design.md)
+**Spec:** [docs/agents/specs/2026-05-02-per-provider-hourly-performance-design.md](../../specs/archive/2026-05-02-per-provider-hourly-performance-design.md)
 
 ---
 
@@ -40,7 +45,7 @@
 - [ ] **Step 1: Pull origin/dev**
 
 ```bash
-cd /home/juncheng/hybridInference
+cd /home/dev/hybridInference
 git fetch origin
 git checkout dev
 git pull origin dev --no-rebase --ff-only || git pull origin dev
@@ -49,12 +54,12 @@ git pull origin dev --no-rebase --ff-only || git pull origin dev
 - [ ] **Step 2: Create worktree on a new branch**
 
 ```bash
-cd /home/juncheng/hybridInference
+cd /home/dev/hybridInference
 git worktree add .worktrees/provider-hourly-perf -b jason/claude/provider-hourly-perf origin/dev
 cd .worktrees/provider-hourly-perf
 ```
 
-All subsequent tasks run inside `/home/juncheng/hybridInference/.worktrees/provider-hourly-perf`.
+All subsequent tasks run inside `/home/dev/hybridInference/.worktrees/provider-hourly-perf`.
 
 - [ ] **Step 3: Verify the worktree**
 
@@ -192,7 +197,7 @@ async def test_provider_hourly_stats_primary_key(db_logger: DatabaseLogger):
 - [ ] **Step 2: Run the test, verify it fails**
 
 ```bash
-cd /home/juncheng/hybridInference/.worktrees/provider-hourly-perf
+cd /home/dev/hybridInference/.worktrees/provider-hourly-perf
 TEST_PG_DSN="postgresql://postgres:postgres@localhost:5432/freeinference_test_db" \
     uv run pytest test/integration/test_provider_stats_rollup.py -v
 ```
@@ -2033,7 +2038,7 @@ make dev-frontend  # or the project's standard frontend dev command (check Makef
 make dev-backend   # or equivalent
 ```
 
-Then open the admin dashboard, log in as `admin@admin.com / admin`, click the new "Provider Performance" tab, choose a provider+model, and confirm the two charts render with data (or "Loading…" then a chart). If `provider_hourly_stats` is empty in your local dev DB, run a manual rollup once:
+Then open the admin dashboard, log in as a deployment-managed admin test account, click the new "Provider Performance" tab, choose a provider+model, and confirm the two charts render with data (or "Loading…" then a chart). If `provider_hourly_stats` is empty in your local dev DB, run a manual rollup once:
 
 ```bash
 TEST_PG_DSN="$DB_DSN" uv run python -c "
@@ -2069,7 +2074,7 @@ EOF
 - [ ] **Step 1: Run ruff format check (per CLAUDE.md)**
 
 ```bash
-cd /home/juncheng/hybridInference/.worktrees/provider-hourly-perf
+cd /home/dev/hybridInference/.worktrees/provider-hourly-perf
 uv run ruff format --check .
 uv run ruff check .
 ```
@@ -2135,7 +2140,7 @@ Address any CI failures or review comments by adding new commits to the same bra
 - [ ] **Step 6: After merge, delete branch and worktree (per CLAUDE.md)**
 
 ```bash
-cd /home/juncheng/hybridInference
+cd /home/dev/hybridInference
 git worktree remove .worktrees/provider-hourly-perf
 git branch -D jason/claude/provider-hourly-perf
 git push origin --delete jason/claude/provider-hourly-perf

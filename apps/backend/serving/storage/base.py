@@ -236,6 +236,15 @@ class OperationalStore(ABC):
         """
 
     @abstractmethod
+    async def list_user_activity_providers(self, *, days: int = 30) -> list[str]:
+        """Return the distinct ``api_logs.provider`` values seen in the last *days*.
+
+        The same table and window ``list_users(provider=...)`` matches on, so
+        the Users tab can offer every provider that filter can select —
+        including one the routing table has since dropped or renamed.
+        """
+
+    @abstractmethod
     async def list_users(
         self,
         *,
@@ -1345,6 +1354,46 @@ class LogStore(ABC):
         """Return ``{user_id: cost_usd}`` for a batch of users within the period.
 
         Used by admin list endpoints to avoid N+1 queries.
+        """
+
+    @abstractmethod
+    async def get_agent_grant_usage(
+        self,
+        *,
+        agent_job_id: str,
+        grant_id: str,
+        since: datetime,
+        until: datetime,
+    ) -> dict[str, Any]:
+        """Sum one grant's rows whose request started in ``[since, until)``.
+
+        Rows are located by the indexed ``agent_job_id`` column and then
+        matched on the exact grant recorded in ``metadata``, so two grants
+        minted for one external job never read each other's spend. Each
+        metric is summed over the rows that reported it; the rows that did
+        not are counted separately rather than folded in as zero.
+
+        Returns ``{"calls", "rows", "estimated_calls", "metrics": {name:
+        {"value", "known_rows", "unknown_rows"}}}`` for the metrics
+        ``tokens_in``, ``tokens_out``, ``cache_read``, ``cache_write``,
+        ``reasoning`` and ``spent_usd``.
+        """
+
+    @abstractmethod
+    async def list_agent_grant_requests(
+        self,
+        *,
+        agent_job_id: str,
+        grant_id: str,
+        since: datetime,
+        until: datetime,
+        limit: int,
+        after: tuple[datetime, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Page through the same rows, ordered by start time then request id.
+
+        ``after`` is the ``(request_started_at, request_id)`` of the last row
+        already returned; rows sorting at or before it are skipped.
         """
 
     @abstractmethod

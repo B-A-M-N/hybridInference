@@ -261,8 +261,26 @@ any internal hostnames in a route's base URL. Put it behind your reverse proxy,
 or do not expose it.
 ```
 
-Runtime route and weight administration lives under `/admin/routing/...` and
-does require admin authentication.
+Runtime administration lives under `/admin/...`, requires admin
+authentication, and is backed by the operational store. The routing-related
+endpoints:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /admin/routing` | The weight distribution, including unpublished routes. |
+| `GET /admin/routing/provider-routes` | Every route the gateway serves, per model, tagged `source: yaml`, `override` or `runtime`; `.../{model_id}` for one model. |
+| `POST /admin/routing/provider-route-models` | Create a runtime model with its first route. |
+| `POST /admin/routing/provider-route-candidates/{model_id}` | Add a route to a model; `PATCH` and `DELETE` on `.../{model_id}/{route_id}` edit or remove it. |
+| `PUT /admin/routing/provider-routes/{model_id}/{route_id}` | Retarget a registry route; `DELETE` restores the YAML route. |
+| `PUT` / `DELETE /admin/routing/weights/{model_id}/{endpoint_id}` | Set or clear a weight override. |
+| `PATCH /admin/routing/provider-route-strategies/{model_id}` | Switch a model's router. |
+| `/admin/routewise/model-settings` | Per-model RouteWise tuning — see [RouteWise](#routewise). |
+
+Each `POST` or `PUT` that changes a route has a `...-verifications` twin that
+tries the upstream without saving anything. Which admin-console tab drives
+which endpoint, what each one stores, and how the stored state combines with
+the registry at boot is in
+[Runtime configuration from the admin console](configuration.md#runtime-configuration-from-the-admin-console).
 
 ## Adding a routing strategy
 
@@ -617,21 +635,25 @@ registry fails loudly rather than silently using defaults.
 
 **Quota sources.** `quota_source:` is a selector, not a fetcher. It names
 `provider` / `usage_label` / `unit`, and `_find_usage` matches all three
-exactly against the usage records a provider fetcher returns. RouteWise calls
-those fetchers itself through `ProviderQuotaSnapshotStore`
+exactly against the usage records a provider's quota fetcher returns. RouteWise
+calls those fetchers itself through `ProviderQuotaSnapshotStore`
 (`apps/backend/routing/routewise/quota.py`) rather than reading the admin
-poller's cache, and only two are registered: `chutes` and `minimax`.
-`usage_label` is the fetcher's own label string, not an operator-chosen name —
-the Chutes fetcher emits `Daily requests` with `unit: requests`.
+poller's cache, and resolves them through the registry the Providers tab uses:
+the gateway enables no fetchers by default, and a backend extension registers one per
+provider with `register_quota_fetcher` (see
+[Quota reporting](configuration.md#quota-reporting)). `usage_label` is
+the fetcher's own label string, not an operator-chosen name.
 
-The route's `kind:` and credential belong to the same contract. Each fetcher
-discovers its own keys by provider — `fetch_chutes` looks for `CHUTES_API_KEY`
-and for keys bound to `chutes` routes — so a quota route served through the
-generic `openai_compat` adapter under an unrelated key never joins that pool:
-inference authenticates, and the quota snapshot stays `not_configured`. Match
-`kind:` to the provider and use the provider's own key variable.
+The route's `kind:` chooses its inference protocol; its `provider:` identifies
+the deployment's service/account and can differ from the kind. The fetcher
+must measure the account used by the corresponding routes, whether it uses
+their inference key or a separate billing credential. The
+[local quota example](../../config/examples/models.routewise.quota.yaml) uses
+`kind: openai_compat` with `provider: example_quota` and a matching registered
+source. It runs without a real supplier account; the default two-provider
+example remains unchanged until this separate registry is selected.
 
-A `provider` outside the registered pair, or a mistyped label, simply never
+A `provider` with no registered fetcher, or a mistyped label, simply never
 resolves. Nothing warns about it — the only quota log lines are a refresh
 failure and a provider/route limit mismatch — so the route stays unready and is
 skipped in silence. Verify a new quota source against the fetcher before

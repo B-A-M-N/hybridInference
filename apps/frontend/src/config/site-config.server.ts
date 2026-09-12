@@ -1,11 +1,7 @@
 import * as React from 'react';
 
-import {
-  buildTimeSiteConfig,
-  resolveRuntimeSiteConfig,
-  withAgentsFeature,
-  type RuntimeSiteConfig,
-} from './site-config';
+import { resolveRuntimeSiteConfig, withAgentsUrl, type RuntimeSiteConfig } from './site-config';
+import { SiteConfigLoadError } from './site-config-error';
 
 const DEFAULT_BACKEND_INTERNAL_URL = 'http://backend:8080';
 const SITE_CONFIG_TIMEOUT_MS = 3_000;
@@ -18,43 +14,73 @@ type CacheFunction = <T extends (...args: never[]) => unknown>(fn: T) => T;
 const cachePerRender: CacheFunction =
   (React as typeof React & { cache?: CacheFunction }).cache ?? ((fn) => fn);
 
-function hasRuntimeAgentProxy(): boolean {
-  return Boolean(
-    process.env.AGENT_WEB_INTERNAL_URL?.trim() &&
-    process.env.AGENT_CONTROL_PLANE_INTERNAL_URL?.trim(),
-  );
+function runtimeAgentsUrl(): string {
+  const publicUrl = process.env.AGENT_PUBLIC_URL?.trim();
+  if (publicUrl) {
+    try {
+      const parsed = new URL(publicUrl);
+      if (
+        publicUrl.startsWith('https://') &&
+        !/[\\\s]/.test(publicUrl) &&
+        parsed.hostname &&
+        !parsed.username &&
+        !parsed.password
+      ) {
+        return publicUrl;
+      }
+    } catch {
+      // Fall back to the local proxy, if configured, without exposing input.
+    }
+    console.warn('Ignoring AGENT_PUBLIC_URL: expected an HTTPS URL without credentials.');
+  }
+
+  return process.env.AGENT_WEB_INTERNAL_URL?.trim() &&
+    process.env.AGENT_CONTROL_PLANE_INTERNAL_URL?.trim()
+    ? '/agents'
+    : '';
 }
 
 async function loadRuntimeSiteConfigUncached(): Promise<RuntimeSiteConfig> {
-  let siteConfig = buildTimeSiteConfig;
   const backendUrl = (
     process.env.BUILT_BACKEND_INTERNAL_URL || DEFAULT_BACKEND_INTERNAL_URL
   ).replace(/\/+$/, '');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SITE_CONFIG_TIMEOUT_MS);
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(
-      () => controller.abort(new Error('Runtime site config request timed out.')),
-      SITE_CONFIG_TIMEOUT_MS,
-    );
-    try {
-      const response = await fetch(`${backendUrl}/site-config`, {
-        cache: 'no-store',
-        headers: { accept: 'application/json' },
-        signal: controller.signal,
-      });
-      if (response.ok) {
-        // Keep body consumption under the same deadline as the headers.
-        siteConfig = resolveRuntimeSiteConfig(await response.json());
-      }
-    } finally {
-      clearTimeout(timeout);
+    const response = await fetch(`${backendUrl}/site-config`, {
+      cache: 'no-store',
+      headers: { accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new SiteConfigLoadError(
+        `Runtime site configuration request returned HTTP ${response.status}.`,
+      );
     }
-  } catch (error) {
-    console.warn('Unable to load runtime site config; using build-time defaults.', error);
-  }
 
-  return withAgentsFeature(siteConfig, hasRuntimeAgentProxy());
+    let document: unknown;
+    try {
+      // Keep body consumption under the same deadline as the headers.
+      document = await response.json();
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
+      throw new SiteConfigLoadError('Runtime site configuration response is not valid JSON.');
+    }
+
+    return withAgentsUrl(resolveRuntimeSiteConfig(document), runtimeAgentsUrl());
+  } catch (error) {
+    const reason = controller.signal.aborted
+      ? `Runtime site configuration request timed out after ${SITE_CONFIG_TIMEOUT_MS} ms.`
+      : 'Unable to connect to the runtime site configuration endpoint.';
+    const failure = error instanceof SiteConfigLoadError ? error : new SiteConfigLoadError(reason);
+    // Do not log response bodies, URLs, or raw fetch/JSON errors: they may
+    // contain operator-supplied values. The reason remains visible in logs.
+    console.error(failure.message);
+    throw failure;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // React cache is scoped to one server render. That lets metadata, layouts, and

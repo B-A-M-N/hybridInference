@@ -1,8 +1,15 @@
 # Admin Dashboard — Provider Quotas Tab
 
+> Historical design/review record. Instructions, findings and line numbers
+> describe the version reviewed at the time. For current setup, use the
+> [developer guide](../../../developer/index.rst). Surviving code links point to current paths
+> for navigation; references to removed files are retained as text.
+
 **Status:** Design
 **Date:** 2026-04-30
 **Author:** brainstorming session
+
+> This is a partial historical reference, with deployment-specific setup and implementation instructions omitted.
 
 ## Summary
 
@@ -13,7 +20,7 @@ Target providers: **Chutes**, **ZAI**, **MiniMax**, **Ollama Cloud**.
 ## Goals
 
 - Give admins a single place to verify which provider keys are configured and how much quota remains, without logging into each provider's web dashboard.
-- Surface auth/health problems with provider quota endpoints (e.g., expired session cookie) so they can be repaired before quota runs out.
+- Surface auth/health problems with provider quota endpoints so they can be repaired before quota runs out.
 
 ## Non-goals
 
@@ -25,9 +32,9 @@ Target providers: **Chutes**, **ZAI**, **MiniMax**, **Ollama Cloud**.
 
 ## Context
 
-The codebase already exposes an admin dashboard at [frontend/src/app/dashboard/admin/page.tsx](frontend/src/app/dashboard/admin/page.tsx) with three tabs: Users, Recent Requests, Audit Log. Backend admin routes live under `/admin/*` in [serving/servers/routers/admin.py](serving/servers/routers/admin.py); schemas in [serving/schemas_admin.py](serving/schemas_admin.py); frontend API client in [frontend/src/lib/api/admin.ts](frontend/src/lib/api/admin.ts).
+The codebase already exposes an admin dashboard at [frontend/src/app/dashboard/admin/page.tsx](../../../../apps/frontend/src/app/dashboard/admin/page.tsx) with three tabs: Users, Recent Requests, Audit Log. Backend admin routes live under `/admin/*` in `serving/servers/routers/admin.py`; schemas in [serving/schemas_admin.py](../../../../apps/backend/serving/schemas_admin.py); frontend API client in [frontend/src/lib/api/admin.ts](../../../../apps/frontend/src/lib/api/admin.ts).
 
-Provider keys today are read from environment variables in [serving/config.py](serving/config.py) and [serving/config/settings.py](serving/config/settings.py).
+Provider keys today are read from environment variables in `serving/config.py` and [serving/config/settings.py](../../../../apps/backend/serving/config/settings.py).
 
 ## Architecture
 
@@ -44,8 +51,8 @@ No DB writes, no caching. The endpoint is admin-only (reuses existing role check
 Browser ── GET /admin/provider-quotas ──► FastAPI handler
                                            ├─► chutes_fetcher(CHUTES_API_KEY)
                                            ├─► zai_fetcher(ZAI_API_KEY)
-                                           ├─► minimax_fetcher(MINIMAX_SESSION_COOKIE)
-                                           └─► ollama_fetcher(OLLAMA_SESSION_COOKIE)
+                                           ├─► minimax_fetcher()
+                                           └─► ollama_fetcher()
                                           gather results
                                           → AdminProviderQuotasResponse
 ```
@@ -54,14 +61,14 @@ Browser ── GET /admin/provider-quotas ──► FastAPI handler
 
 Each fetcher is a small async function in a new module `serving/admin/provider_quotas.py`. They all return a common `ProviderQuotaResult` shape so the handler can aggregate uniformly. Errors are converted to structured results — fetchers never raise out of the gather.
 
+API-key examples:
+
 | Provider | Auth source (env var) | Endpoint | Notes |
 |---|---|---|---|
 | **Chutes** | `CHUTES_API_KEY` | `GET https://api.chutes.ai/users/me/subscription_usage` with `Authorization: Bearer <key>` | Returns monthly + 4-hour window usage vs limits. Officially documented. |
 | **ZAI** | `ZAI_API_KEY` | `GET https://api.z.ai/api/monitor/usage/quota/limit` with `Authorization: Bearer <key>` | Endpoint discovered from ZAI's official `glm-plan-usage` plugin. The plugin uses the user's Anthropic auth token; we attempt with `ZAI_API_KEY` directly. If the API key auth fails, fetcher reports `auth_failed`. |
-| **MiniMax** | `MINIMAX_SESSION_COOKIE` | `GET https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains` with `Cookie: <cookie>` | Endpoint requires browser session cookies (API key auth returns `1004: cookie missing`). Admin pastes the cookie from browser DevTools; expires periodically and admin re-pastes. |
-| **Ollama Cloud** | `OLLAMA_SESSION_COOKIE` | `GET https://ollama.com/settings` with `Cookie: <cookie>`, parse HTML for usage figures | No quota API exists. Scrape the settings page. Same cookie-renewal pattern as MiniMax. |
 
-Two new env vars are added to [serving/config/settings.py](serving/config/settings.py): `minimax_session_cookie: str = ""` and `ollama_session_cookie: str = ""`. The existing `CHUTES_API_KEY` and `ZAI_API_KEY` (already in `.env`) are read directly via `os.getenv` to match how other provider keys are loaded in [serving/config.py](serving/config.py).
+The existing `CHUTES_API_KEY` and `ZAI_API_KEY` (already in `.env`) are read directly via `os.getenv` to match how other provider keys are loaded in `serving/config.py`.
 
 ### Common result shape
 
@@ -95,11 +102,9 @@ class AdminProviderQuotasResponse(BaseModel):
 - Else (short or weird key): return `***configured***`
 - If key is empty/None: caller sets `key_configured=False` and `key_masked=None` instead of calling this
 
-Cookies are also masked using the same helper for the UI representation (we store full cookie server-side; UI only sees the masked form).
-
 ## Backend endpoint
 
-New route in [serving/servers/routers/admin.py](serving/servers/routers/admin.py):
+New route in `serving/servers/routers/admin.py`:
 
 ```
 GET /admin/provider-quotas
@@ -126,7 +131,7 @@ async def get_provider_quotas(_: AdminUser = Depends(require_admin)) -> AdminPro
 
 ### API client
 
-New code in [frontend/src/lib/api/admin.ts](frontend/src/lib/api/admin.ts):
+New code in [frontend/src/lib/api/admin.ts](../../../../apps/frontend/src/lib/api/admin.ts):
 
 ```typescript
 export interface ProviderQuotaUsage {
@@ -158,7 +163,7 @@ export async function getProviderQuotas(): Promise<AdminProviderQuotasResponse>;
 
 ### UI
 
-Adds a fourth tab to [frontend/src/app/dashboard/admin/page.tsx](frontend/src/app/dashboard/admin/page.tsx). Tab order: `Users → Recent Requests → Providers → Audit Log`.
+Adds a fourth tab to [frontend/src/app/dashboard/admin/page.tsx](../../../../apps/frontend/src/app/dashboard/admin/page.tsx). Tab order: `Users → Recent Requests → Providers → Audit Log`.
 
 Layout: a responsive 2-column grid of provider cards (matches the existing `RequestMetricsCard` style — `rounded-xl border-gray-200 bg-white p-4 shadow-sm`).
 
@@ -187,22 +192,22 @@ Each fetcher catches `asyncio.TimeoutError`, `aiohttp.ClientError`, JSON decode 
 |---|---|
 | `not_configured` | env var missing/empty |
 | `timeout` | request exceeded 8s |
-| `auth_failed` | HTTP 3xx redirect / 401 / 403 / cookie-rejected JSON body |
-| `parse_error` | response body doesn't match expected shape (e.g. Ollama HTML scrape can't find usage rows) |
+| `auth_failed` | HTTP 3xx redirect / 401 / 403 / provider authentication error |
+| `parse_error` | response body doesn't match expected shape |
 | `unexpected` | anything else (caught and logged at backend with traceback) |
 
 The admin endpoint never returns HTTP 500 from a provider failure; one bad provider does not block the response. The frontend treats `ok: false` as a presentation state, not an error toast.
 
 ## Security
 
-- Provider keys and cookies stay server-side. Only `key_masked` ever crosses the wire.
+- Provider credentials stay server-side. Only `key_masked` ever crosses the wire.
 - Endpoint reuses the existing admin role check (`is_admin`); no new auth surface.
-- Cookie env vars (`MINIMAX_SESSION_COOKIE`, `OLLAMA_SESSION_COOKIE`) are never logged in plaintext — masked when included in any error log.
+- Provider credentials are never logged in plaintext — masked when included in any error log.
 - All outbound calls use an explicit 8-second timeout and follow at most one redirect, to avoid resource exhaustion if a provider hangs or redirects to an auth wall.
 
 ## Testing
 
-New test file: [test/servers/test_admin_provider_quotas.py](test/servers/test_admin_provider_quotas.py).
+New test file: [test/servers/test_admin_provider_quotas.py](../../../../tests/servers/test_admin_provider_quotas.py).
 
 - **Route auth:** request without admin credentials returns 401; with admin role returns the response shape.
 - **Per-fetcher unit tests** using `unittest.mock.AsyncMock` to patch `aiohttp.ClientSession`:
@@ -216,13 +221,6 @@ New test file: [test/servers/test_admin_provider_quotas.py](test/servers/test_ad
 
 No frontend unit tests (matches existing convention — admin tab has no `*.test.tsx` files).
 
-## Configuration changes
-
-- New env vars added to `.env.example` and [serving/config/settings.py](serving/config/settings.py):
-  - `MINIMAX_SESSION_COOKIE` (default `""`)
-  - `OLLAMA_SESSION_COOKIE` (default `""`)
-- `CHUTES_API_KEY` and `ZAI_API_KEY` already exist in `.env` — no settings change needed.
-
 ## File map
 
 **New files:**
@@ -232,7 +230,5 @@ No frontend unit tests (matches existing convention — admin tab has no `*.test
 **Modified files:**
 - `serving/schemas_admin.py` — add `ProviderQuotaUsage`, `ProviderQuotaResult`, `AdminProviderQuotasResponse`
 - `serving/servers/routers/admin.py` — add `GET /admin/provider-quotas` route
-- `serving/config/settings.py` — add `minimax_session_cookie`, `ollama_session_cookie`
 - `frontend/src/lib/api/admin.ts` — add types + `getProviderQuotas()`
 - `frontend/src/app/dashboard/admin/page.tsx` — add `providers` tab and UI
-- `.env.example` — document the two new cookie env vars

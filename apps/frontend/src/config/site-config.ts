@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { branding as buildTimeBranding, sponsorClassNameSchema, type Branding } from './branding';
+import { SiteConfigLoadError } from './site-config-error';
 
 function hasProtocol(value: string, protocols: readonly string[]): boolean {
   if (/\s/.test(value) || value.includes('\\')) return false;
@@ -175,6 +176,7 @@ const siteConfigDocumentSchema = z.union([
 
 export interface RuntimeSiteConfig {
   branding: Branding;
+  agentsUrl: string;
   distribution: {
     id: string;
     release: string;
@@ -188,6 +190,7 @@ export interface RuntimeSiteConfig {
 
 export const buildTimeSiteConfig: RuntimeSiteConfig = {
   branding: buildTimeBranding,
+  agentsUrl: '',
   distribution: { id: 'legacy', release: '' },
   features: { publicSignup: true, rag: true, agents: false },
 };
@@ -196,7 +199,9 @@ function resolveBranding(input: unknown, displayName: string, supportEmail: stri
   if (input === null) return buildTimeBranding;
 
   const parsed = runtimeBrandingSchema.safeParse(input);
-  if (!parsed.success) return buildTimeBranding;
+  if (!parsed.success) {
+    throw new SiteConfigLoadError('Runtime site configuration contains invalid branding.');
+  }
 
   const document = parsed.data;
   const githubUrl = document.links.github_url.replace(/\/+$/, '');
@@ -267,7 +272,11 @@ function resolveLegacyBranding(
 
 export function resolveRuntimeSiteConfig(input: unknown): RuntimeSiteConfig {
   const parsed = siteConfigDocumentSchema.safeParse(input);
-  if (!parsed.success) return buildTimeSiteConfig;
+  if (!parsed.success) {
+    throw new SiteConfigLoadError(
+      'Runtime site configuration is invalid or uses an unsupported schema.',
+    );
+  }
 
   const document = parsed.data;
   let branding: Branding;
@@ -287,6 +296,7 @@ export function resolveRuntimeSiteConfig(input: unknown): RuntimeSiteConfig {
 
   return {
     branding,
+    agentsUrl: '',
     distribution: {
       id: document.distribution.id,
       release: document.distribution.release,
@@ -294,19 +304,17 @@ export function resolveRuntimeSiteConfig(input: unknown): RuntimeSiteConfig {
     features: {
       publicSignup: document.features.public_signup ?? buildTimeSiteConfig.features.publicSignup,
       rag: document.features.rag ?? buildTimeSiteConfig.features.rag,
-      // Never trust or infer this from public JSON. Only the server-side
-      // loader may enable it after seeing both private proxy destinations.
+      // Only the server-side loader may enable the entry point, from an
+      // explicit public URL or a configured local proxy.
       agents: false,
     },
   };
 }
 
-export function withAgentsFeature(
-  siteConfig: RuntimeSiteConfig,
-  agents: boolean,
-): RuntimeSiteConfig {
+export function withAgentsUrl(siteConfig: RuntimeSiteConfig, agentsUrl: string): RuntimeSiteConfig {
   return {
     ...siteConfig,
-    features: { ...siteConfig.features, agents },
+    agentsUrl,
+    features: { ...siteConfig.features, agents: Boolean(agentsUrl) },
   };
 }

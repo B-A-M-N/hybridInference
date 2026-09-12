@@ -61,10 +61,16 @@ Where to start
    * - Publish a new model id, or wire up a provider the gateway has never
        talked to
      - :doc:`adding-models`
+   * - Add a provider, a key or a model from the admin console, without
+       editing YAML or restarting
+     - :doc:`configuration`, under *Runtime configuration from the admin
+       console*
    * - Change how an endpoint gets chosen, or write your own strategy
      - :doc:`routing`
    * - Send a patch
      - :doc:`contributing`
+   * - Identify a version or plan an upgrade
+     - :doc:`releases`
 
 Scope of this site
 ------------------
@@ -111,6 +117,7 @@ how those overlays resolve.
    :caption: Operations
 
    deployment
+   releases
    database
    staging
    trusted-proxies-and-client-ips
