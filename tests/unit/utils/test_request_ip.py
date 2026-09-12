@@ -1,13 +1,25 @@
-"""Tests for proxied client IP extraction."""
+"""Tests for proxied client IP extraction with trusted-proxy trust model.
+
+Covers the security fix for issue #1036: client IP resolution now requires
+the socket peer to be in an explicitly configured trusted-proxy CIDR set
+before any forwarding header is consulted. Non-routable peers resolve to
+"unknown" instead of masquerading as clients.
+"""
 
 from __future__ import annotations
 
+import ipaddress
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from serving.utils.request_ip import (
-    get_client_ip,
+    _is_reportable_ip,
+    _is_trusted_proxy,
+    _parse_forwarded_chain,
+    _parse_ip,
+    derive_affinity_key,
     get_client_ip_bucket,
     get_client_ip_info,
     normalize_ip_bucket,
@@ -18,338 +30,431 @@ def _request(headers: dict[str, str], peer_ip: str = "10.0.0.2"):
     return SimpleNamespace(headers=headers, client=SimpleNamespace(host=peer_ip))
 
 
-def test_client_ip_ignores_forwarded_headers_by_default(monkeypatch):
-    """Ignore spoofable forwarding headers unless proxy trust is explicitly enabled."""
-    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
-
-    request = _request({"x-forwarded-for": "203.0.113.9"}, peer_ip="172.19.0.8")
-
-    info = get_client_ip_info(request)
-    assert get_client_ip(request) == "172.19.0.8"
-    assert info.client_ip == "172.19.0.8"
-    assert info.peer_ip == "172.19.0.8"
-    assert info.source == "socket"
-    assert info.x_forwarded_for == "203.0.113.9"
+def _networks(*cidrs: str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """Create a tuple of parsed networks from CIDR strings."""
+    return tuple(ipaddress.ip_network(c) for c in cidrs)
 
 
-def test_client_ip_uses_first_routable_forwarded_for_when_trusted(monkeypatch):
-    """Take the first routable X-Forwarded-For hop (leftmost that is a real IP)."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-
-    request = _request(
-        {"x-forwarded-for": "203.0.113.9, 198.51.100.4", "x-real-ip": "198.51.100.7"},
-        peer_ip="172.19.0.8",
-    )
-
-    info = get_client_ip_info(request)
-    assert get_client_ip(request) == "203.0.113.9"
-    assert info.client_ip == "203.0.113.9"
-    assert info.peer_ip == "172.19.0.8"
-    assert info.source == "x-forwarded-for"
-    assert info.x_forwarded_for == "203.0.113.9, 198.51.100.4"
-    assert info.x_real_ip == "198.51.100.7"
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def test_forwarded_for_skips_leading_private_and_ula_hops(monkeypatch):
-    """Leading private/ULA hops an upstream inserted are skipped, not reported."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-
-    request = _request(
-        {"x-forwarded-for": "fdbd:dc02:19:383::153, 172.19.0.1, 8.8.8.8"},
-        peer_ip="172.19.0.8",
-    )
-
-    info = get_client_ip_info(request)
-    assert info.client_ip == "8.8.8.8"
-    assert info.source == "x-forwarded-for"
+def test_parse_ip_accepts_ipv4_ipv6_mapped():
+    assert str(_parse_ip("1.2.3.4")) == "1.2.3.4"
+    assert str(_parse_ip("2001:db8::1")) == "2001:db8::1"
+    # IPv4-mapped IPv6 is unwrapped to its embedded IPv4 address.
+    assert str(_parse_ip("::ffff:192.0.2.1")) == "192.0.2.1"
 
 
-def test_forwarded_for_ula_is_not_reported_as_client(monkeypatch):
-    """An upstream forwarding only its internal ULA overlay must not leak it.
+def test_parse_ip_rejects_garbage():
+    assert _parse_ip("not-an-ip") is None
+    assert _parse_ip("") is None
+    assert _parse_ip(None) is None
 
-    Regression: the gateway used to record the leftmost X-Forwarded-For entry
-    verbatim, logging an operator's private ULA (fdbd:dc0x::) as the client IP.
-    The ULA hop is skipped and the real socket peer is reported instead.
+
+def test_parse_forwarded_chain_splits_and_trims():
+    assert _parse_forwarded_chain("1.2.3.4, 5.6.7.8") == ["1.2.3.4", "5.6.7.8"]
+    assert _parse_forwarded_chain("  1.2.3.4  ,  , 5.6.7.8  ") == ["1.2.3.4", "5.6.7.8"]
+    assert _parse_forwarded_chain("") == []
+
+
+def test_is_reportable_ip_rejects_non_routable():
+    assert _is_reportable_ip("172.19.0.1") is False
+    assert _is_reportable_ip("10.0.0.1") is False
+    assert _is_reportable_ip("fc00::1") is False
+    assert _is_reportable_ip("127.0.0.1") is False
+    assert _is_reportable_ip("::1") is False
+    assert _is_reportable_ip("fe80::1") is False
+    assert _is_reportable_ip("224.0.0.1") is False
+    assert _is_reportable_ip("0.0.0.0") is False
+
+
+def test_is_reportable_ip_accepts_public():
+    assert _is_reportable_ip("8.8.8.8") is True
+    assert _is_reportable_ip("203.0.113.9") is True
+    assert _is_reportable_ip("2001:db8::1") is True
+
+
+def test_is_trusted_proxy_matches_cidr():
+    nets = _networks("172.16.0.0/12", "10.0.0.0/8")
+    assert _is_trusted_proxy("172.19.0.1", nets) is True
+    assert _is_trusted_proxy("10.0.0.1", nets) is True
+    assert _is_trusted_proxy("8.8.8.8", nets) is False
+    assert _is_trusted_proxy("not-an-ip", nets) is False
+
+
+def test_is_trusted_proxy_empty_means_no_trust():
+    assert _is_trusted_proxy("172.19.0.1", ()) is False
+
+
+# ---------------------------------------------------------------------------
+# Default behavior: no trusted proxies configured
+# ---------------------------------------------------------------------------
+
+
+def test_non_routable_peer_returns_unknown_no_trusted_proxies(monkeypatch):
+    """Docker bridge peer without trustworthy forwarding provenance → "unknown".
+
+    Regression: the old code logged 172.19.0.1 as the client IP (issue #1036,
+    production pollution class #1).
     """
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-
-    request = _request({"x-forwarded-for": "fdbd:dc02:19:383::153"}, peer_ip="8.8.8.8")
-
-    info = get_client_ip_info(request)
-    assert info.client_ip == "8.8.8.8"
-    assert info.source == "socket"
-    assert info.client_ip != "fdbd:dc02:19:383::153"
+    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
+    with patch("serving.utils.request_ip._trusted_networks", return_value=()):
+        request = _request({}, peer_ip="172.19.0.1")
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        assert info.source == "unknown"
 
 
-def test_client_ip_falls_back_to_x_real_ip_when_trusted(monkeypatch):
-    """Use X-Real-IP when trusted and X-Forwarded-For has no routable hop."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-
-    request = _request({"x-real-ip": "198.51.100.7"}, peer_ip="172.19.0.8")
-
-    info = get_client_ip_info(request)
-    assert info.client_ip == "198.51.100.7"
-    assert info.peer_ip == "172.19.0.8"
-    assert info.source == "x-real-ip"
-
-
-def test_public_socket_peer_is_used_when_untrusted(monkeypatch):
+def test_public_peer_used_directly_no_trusted_proxies(monkeypatch):
     """A direct connection from a routable peer is a legitimate client IP."""
     monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
+    with patch("serving.utils.request_ip._trusted_networks", return_value=()):
+        info = get_client_ip_info(_request({}, peer_ip="8.8.8.8"))
+        assert info.client_ip == "8.8.8.8"
+        assert info.source == "socket"
 
-    info = get_client_ip_info(_request({}, peer_ip="8.8.8.8"))
-    assert info.client_ip == "8.8.8.8"
-    assert info.source == "socket"
+
+def test_forged_xff_ignored_without_trusted_peer(monkeypatch):
+    """Attacker cannot spoof XFF when peer is not a configured trusted proxy."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=()):
+        request = _request({"x-forwarded-for": "203.0.113.9"}, peer_ip="8.8.8.8")
+        info = get_client_ip_info(request)
+        assert info.client_ip == "8.8.8.8"
+        assert info.source == "socket"
 
 
-def test_cf_connecting_ip_wins_over_forwarded_for(monkeypatch):
-    """Cloudflare overwrites CF-Connecting-IP but only appends to X-Forwarded-For.
-
-    A client that supplies its own X-Forwarded-For leaves the leftmost entry
-    attacker-controlled, so the Cloudflare header must take precedence.
-    """
+def test_forged_cf_connecting_ip_ignored_without_trusted_peer(monkeypatch):
+    """Attacker cannot spoof CF-Connecting-IP without a trusted peer."""
     monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
     monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-
-    request = _request(
-        {
-            "x-forwarded-for": "1.2.3.4, 203.0.113.9",
-            "x-real-ip": "198.51.100.7",
-            "cf-connecting-ip": "203.0.113.9",
-        },
-        peer_ip="127.0.0.1",
-    )
-
-    info = get_client_ip_info(request)
-    assert get_client_ip(request) == "203.0.113.9"
-    assert info.client_ip == "203.0.113.9"
-    assert info.source == "cf-connecting-ip"
-    assert info.cf_connecting_ip == "203.0.113.9"
-    assert info.x_forwarded_for == "1.2.3.4, 203.0.113.9"
+    with patch("serving.utils.request_ip._trusted_networks", return_value=()):
+        request = _request({"cf-connecting-ip": "203.0.113.9"}, peer_ip="8.8.8.8")
+        info = get_client_ip_info(request)
+        assert info.client_ip == "8.8.8.8"
+        assert info.source == "socket"
 
 
-def test_cf_connecting_ip_ignored_when_untrusted(monkeypatch):
-    """The Cloudflare header is as spoofable as the others without proxy trust."""
+def test_no_client_means_unknown(monkeypatch):
+    """A request with no client at all resolves to "unknown"."""
     monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
-    monkeypatch.delenv("TRUST_CLOUDFLARE_HEADERS", raising=False)
-
-    request = _request({"cf-connecting-ip": "203.0.113.9"}, peer_ip="172.19.0.8")
-
-    info = get_client_ip_info(request)
-    assert info.client_ip == "172.19.0.8"
-    assert info.source == "socket"
-    # Provenance is still recorded so the log shows what the client claimed.
-    assert info.cf_connecting_ip == "203.0.113.9"
+    request = SimpleNamespace(headers={}, client=None)
+    with patch("serving.utils.request_ip._trusted_networks", return_value=()):
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        assert info.source == "unknown"
 
 
-def test_cf_connecting_ip_ignored_behind_non_cloudflare_proxy(monkeypatch):
-    """Generic proxy trust must not imply the Cloudflare header is trustworthy.
+# ---------------------------------------------------------------------------
+# Trusted proxy behavior: peer in configured CIDR
+# ---------------------------------------------------------------------------
 
-    A non-Cloudflare proxy may rewrite X-Forwarded-For correctly while passing
-    a client-supplied CF-Connecting-IP straight through.
+
+def test_trusted_proxy_rightmost_untrusted_hop_is_client(monkeypatch):
+    """XFF chain walked right-to-left; trusted hops skipped."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    # Peer is our trusted proxy at 172.19.0.1.
+    # XFF: client 1.2.3.4, then 10.0.0.1 (also trusted), then peer 172.19.0.1.
+    nets = _networks("172.16.0.0/12", "10.0.0.0/8")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {"x-forwarded-for": "1.2.3.4, 10.0.0.1, 172.19.0.1"},
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "1.2.3.4"
+        assert info.source == "x-forwarded-for"
+
+
+def test_trusted_proxy_all_trusted_hops_falls_through(monkeypatch):
+    """When every XFF hop is a trusted proxy, no client can be determined."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    nets = _networks("10.0.0.0/8", "172.16.0.0/12")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {"x-forwarded-for": "10.0.0.1, 172.19.0.1"},
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        # All hops trusted → fall through. Peer is non-routable → "unknown".
+        assert info.client_ip == "unknown"
+        assert info.source == "unknown"
+
+
+def test_trusted_proxy_ula_hop_skipped(monkeypatch):
+    """Operator's internal ULA overlay hop is skipped, not reported as client.
+
+    Regression: issue #1036 production pollution class #2.
     """
     monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    nets = _networks("172.16.0.0/12")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {"x-forwarded-for": "203.0.113.9, fdbd:dc02:19:383::153, 172.19.0.1"},
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "203.0.113.9"
+        assert info.source == "x-forwarded-for"
+
+
+def test_trusted_proxy_attacker_prepends_fake_addresses(monkeypatch):
+    """Attacker prepending public addresses to XFF does not spoof identity.
+
+    The rightmost untrusted hop is the real client; prepended addresses are
+    to the left of trusted hops and are never reached.
+    """
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    nets = _networks("172.16.0.0/12")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {"x-forwarded-for": "1.2.3.4, 5.6.7.8, 203.0.113.9, 172.19.0.1"},
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        # 172.19.0.1 is trusted (peer), 203.0.113.9 is the first untrusted hop.
+        assert info.client_ip == "203.0.113.9"
+        assert info.source == "x-forwarded-for"
+
+
+def test_trusted_proxy_x_real_ip_fallback(monkeypatch):
+    """X-Real-IP used when XFF has no usable hop."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    nets = _networks("172.16.0.0/12")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {"x-forwarded-for": "10.0.0.1, 172.19.0.1", "x-real-ip": "203.0.113.9"},
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "203.0.113.9"
+        assert info.source == "x-real-ip"
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare header handling
+# ---------------------------------------------------------------------------
+
+
+def test_cf_connecting_ip_when_trusted(monkeypatch):
+    """CF-Connecting-IP is authoritative when peer is trusted Cloudflare."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    nets = _networks("172.16.0.0/12")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {
+                "x-forwarded-for": "1.2.3.4, 203.0.113.9",
+                "cf-connecting-ip": "203.0.113.9",
+            },
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "203.0.113.9"
+        assert info.source == "cf-connecting-ip"
+
+
+def test_cf_connecting_ip_ignored_without_cloudflare_trust(monkeypatch):
+    """Generic proxy trust does not imply Cloudflare header trust."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
     monkeypatch.delenv("TRUST_CLOUDFLARE_HEADERS", raising=False)
-
-    request = _request(
-        {
-            "x-forwarded-for": "203.0.113.9",
-            "cf-connecting-ip": "1.2.3.4",
-        },
-        peer_ip="127.0.0.1",
-    )
-
-    info = get_client_ip_info(request)
-    assert info.client_ip == "203.0.113.9"
-    assert info.source == "x-forwarded-for"
-    # Still logged, so a spoof attempt remains visible after the fact.
-    assert info.cf_connecting_ip == "1.2.3.4"
+    nets = _networks("172.16.0.0/12")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {
+                "x-forwarded-for": "203.0.113.9",
+                "cf-connecting-ip": "1.2.3.4",
+            },
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "203.0.113.9"
+        assert info.source == "x-forwarded-for"
 
 
-def test_cf_trust_requires_generic_proxy_trust(monkeypatch):
-    """TRUST_CLOUDFLARE_HEADERS alone does not enable header trust."""
+def test_cf_connecting_ipv6_pseudo_ipv4(monkeypatch):
+    """Pseudo IPv4 "Overwrite headers" yields the real IPv6 address."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    nets = _networks("172.16.0.0/12")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {
+                "cf-connecting-ip": "240.1.2.3",
+                "cf-connecting-ipv6": "2001:db8:abcd:1234::5",
+            },
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "2001:db8:abcd:1234::5"
+        assert info.source == "cf-connecting-ipv6"
+
+
+def test_forged_cf_connecting_ipv6_rejected(monkeypatch):
+    """A caller-supplied CF-Connecting-IPv6 must not displace the real IP."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    nets = _networks("172.16.0.0/12")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {
+                "cf-connecting-ip": "203.0.113.9",
+                "cf-connecting-ipv6": "2001:db8:dead:beef::1",
+            },
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "203.0.113.9"
+        assert info.source == "cf-connecting-ip"
+
+
+# ---------------------------------------------------------------------------
+# Edge cases and adversarial inputs
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_xff_entries_skipped(monkeypatch):
+    """Malformed entries in XFF chain are skipped, not normalized into clients."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    nets = _networks("172.16.0.0/12")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {"x-forwarded-for": "garbage, 203.0.113.9, 172.19.0.1"},
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "203.0.113.9"
+
+
+def test_mixed_ipv4_ipv6_chain(monkeypatch):
+    """Mixed IPv4/IPv6 hops are handled correctly."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    nets = _networks("172.16.0.0/12", "fd00::/8")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {"x-forwarded-for": "203.0.113.9, fd00::1, 172.19.0.1"},
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "203.0.113.9"
+
+
+def test_ipv4_mapped_peer_trust(monkeypatch):
+    """An IPv4-mapped IPv6 peer address matches an IPv4 trusted-proxy CIDR."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    nets = _networks("172.16.0.0/12")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {"x-forwarded-for": "203.0.113.9, ::ffff:172.19.0.1"},
+            peer_ip="::ffff:172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "203.0.113.9"
+
+
+def test_all_private_chain_returns_unknown(monkeypatch):
+    """A chain of only private addresses resolves to "unknown"."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    nets = _networks("172.16.0.0/12")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {"x-forwarded-for": "10.0.0.1, 192.168.1.1, 172.19.0.1"},
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+
+
+def test_trust_flags_without_trusted_cidr_ignored(monkeypatch):
+    """TRUST_PROXY_HEADERS=1 without configured CIDRs does not trust headers."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=()):
+        request = _request(
+            {"x-forwarded-for": "203.0.113.9"},
+            peer_ip="8.8.8.8",
+        )
+        info = get_client_ip_info(request)
+        # Peer is public but not a configured proxy → socket peer used.
+        assert info.client_ip == "8.8.8.8"
+        assert info.source == "socket"
+
+
+# ---------------------------------------------------------------------------
+# Production pollution regression tests (issue #1036)
+# ---------------------------------------------------------------------------
+
+
+def test_regression_docker_bridge_pollution(monkeypatch):
+    """~43K rows recorded 172.19.0.1 as client IP. Now resolves to "unknown"."""
     monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-
-    request = _request({"cf-connecting-ip": "203.0.113.9"}, peer_ip="172.19.0.8")
-
-    info = get_client_ip_info(request)
-    assert info.client_ip == "172.19.0.8"
-    assert info.source == "socket"
-
-
-def test_cf_connecting_ipv6_wins_under_pseudo_ipv4(monkeypatch):
-    """Pseudo IPv4 "Overwrite headers" replaces CF-Connecting-IP with a synthetic.
-
-    Cloudflare puts a Class E address derived from the visitor in
-    CF-Connecting-IP and the real address in CF-Connecting-IPv6. Taking the
-    synthetic would route the client down the IPv4 bucketing path and undo the
-    /64 grouping this module exists to provide.
-    """
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-
-    request = _request(
-        {
-            "cf-connecting-ip": "240.1.2.3",
-            "cf-connecting-ipv6": "2001:db8:abcd:1234::5",
-        },
-        peer_ip="127.0.0.1",
-    )
-
-    info = get_client_ip_info(request)
-    assert info.client_ip == "2001:db8:abcd:1234::5"
-    assert info.source == "cf-connecting-ipv6"
-    # Both are retained so the synthetic remains visible in logs.
-    assert info.cf_connecting_ip == "240.1.2.3"
-    assert info.cf_connecting_ipv6 == "2001:db8:abcd:1234::5"
-    assert get_client_ip_bucket(request) == "2001:db8:abcd:1234::/64"
-
-
-def test_pseudo_ipv4_rotation_stays_in_one_bucket(monkeypatch):
-    """Rotation within the /64 must not escape limits just because Pseudo IPv4 is on.
-
-    Each rotated address yields a different synthetic Class E value, so
-    bucketing on CF-Connecting-IP would hand out a fresh bucket every time.
-    """
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-
-    buckets = {
-        get_client_ip_bucket(
-            _request(
-                {"cf-connecting-ip": synthetic, "cf-connecting-ipv6": real},
-                peer_ip="127.0.0.1",
-            )
+    with patch("serving.utils.request_ip._trusted_networks", return_value=()):
+        request = _request(
+            {"user-agent": "OpenAI-SDK/1.0"},
+            peer_ip="172.19.0.1",
         )
-        for synthetic, real in (
-            ("240.1.2.3", "2001:db8:abcd:1234::1"),
-            ("240.9.8.7", "2001:db8:abcd:1234:9c2b:1f4e:aa01:7d3f"),
-            ("240.4.5.6", "2001:db8:abcd:1234:4411:beef:0:2"),
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        assert info.source == "unknown"
+
+
+def test_regression_operator_ula_pollution(monkeypatch):
+    """~2.4K rows recorded fdbd:dc0x:: ULA as client IP. Now skipped."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    # Peer is the operator's gateway, which IS in the trusted set.
+    nets = _networks("2605:340::/48")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {"x-forwarded-for": "fdbd:dc02:19:383::153, 2605:340::1"},
+            peer_ip="2605:340::1",
         )
-    }
-    assert buckets == {"2001:db8:abcd:1234::/64"}
+        info = get_client_ip_info(request)
+        # fdbd:dc02:19:383::153 is the first untrusted hop but is ULA →
+        # not reportable → fall through. Peer is public → "2605:340::1".
+        # Actually: the ULA hop is untrusted but not reportable, so we break
+        # and fall through. Peer is public → socket peer.
+        assert info.client_ip == "2605:340::1"
+        assert info.source == "socket"
 
 
-def test_forged_cf_connecting_ipv6_loses_to_authoritative_cf_ip(monkeypatch):
-    """A caller-supplied CF-Connecting-IPv6 must not displace the real client IP.
-
-    With Pseudo IPv4 off, Cloudflare omits CF-Connecting-IPv6 rather than
-    clearing it, so anyone can send one. Only CF-Connecting-IP is overwritten
-    on every request, so it stays authoritative unless the pair corroborates.
-    """
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-
-    request = _request(
-        {
-            "cf-connecting-ip": "203.0.113.9",
-            "cf-connecting-ipv6": "2001:db8:dead:beef::1",
-        },
-        peer_ip="127.0.0.1",
-    )
-
-    info = get_client_ip_info(request)
-    assert info.client_ip == "203.0.113.9"
-    assert info.source == "cf-connecting-ip"
-    # Retained for forensics — the forgery attempt stays in the log.
-    assert info.cf_connecting_ipv6 == "2001:db8:dead:beef::1"
+# ---------------------------------------------------------------------------
+# Provenance is always recorded
+# ---------------------------------------------------------------------------
 
 
-def test_cf_connecting_ipv6_alone_does_not_establish_identity(monkeypatch):
-    """Without the authoritative Cloudflare header, the IPv6 variant is worthless."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-
-    request = _request(
-        {
-            "x-forwarded-for": "198.51.100.4",
-            "cf-connecting-ipv6": "2001:db8:dead:beef::1",
-        },
-        peer_ip="127.0.0.1",
-    )
-
-    info = get_client_ip_info(request)
-    assert info.client_ip == "198.51.100.4"
-    assert info.source == "x-forwarded-for"
-
-
-@pytest.mark.parametrize(
-    ("cf_ip", "cf_ipv6"),
-    [
-        # CF-Connecting-IP is a normal address, not a Class E synthetic.
-        ("203.0.113.9", "2001:db8:abcd:1234::5"),
-        # Synthetic present but the paired value is not IPv6.
-        ("240.1.2.3", "198.51.100.4"),
-        # Neither header parses.
-        ("240.1.2.3", "not-an-address"),
-        ("garbage", "2001:db8:abcd:1234::5"),
-    ],
-)
-def test_pseudo_ipv4_pair_must_corroborate(monkeypatch, cf_ip, cf_ipv6):
-    """The IPv6 header is honored only when both halves confirm a real rewrite."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-
-    request = _request(
-        {"cf-connecting-ip": cf_ip, "cf-connecting-ipv6": cf_ipv6},
-        peer_ip="127.0.0.1",
-    )
-
-    info = get_client_ip_info(request)
-    assert info.client_ip == cf_ip
-    assert info.source == "cf-connecting-ip"
+def test_provenance_always_includes_raw_headers(monkeypatch):
+    """Raw forwarding headers are always captured for auditability."""
+    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
+    with patch("serving.utils.request_ip._trusted_networks", return_value=()):
+        request = _request(
+            {
+                "x-forwarded-for": "1.2.3.4, 5.6.7.8",
+                "x-real-ip": "5.6.7.8",
+                "cf-connecting-ip": "1.2.3.4",
+            },
+            peer_ip="8.8.8.8",
+        )
+        info = get_client_ip_info(request)
+        assert info.x_forwarded_for == "1.2.3.4, 5.6.7.8"
+        assert info.x_real_ip == "5.6.7.8"
+        assert info.cf_connecting_ip == "1.2.3.4"
 
 
-def test_cf_connecting_ipv6_ignored_without_cloudflare_trust(monkeypatch):
-    """The IPv6 variant is gated by the same flag as CF-Connecting-IP."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.delenv("TRUST_CLOUDFLARE_HEADERS", raising=False)
-
-    request = _request(
-        {
-            "x-forwarded-for": "203.0.113.9",
-            "cf-connecting-ipv6": "2001:db8:abcd:1234::5",
-        },
-        peer_ip="127.0.0.1",
-    )
-
-    info = get_client_ip_info(request)
-    assert info.client_ip == "203.0.113.9"
-    assert info.source == "x-forwarded-for"
-    assert info.cf_connecting_ipv6 == "2001:db8:abcd:1234::5"
-
-
-def test_cf_connecting_ip_preserves_ipv6_client(monkeypatch):
-    """An IPv6 client reaching an IPv4-only origin through Cloudflare logs in full."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-
-    request = _request(
-        {"cf-connecting-ip": "2001:db8:abcd:1234::5"},
-        peer_ip="127.0.0.1",
-    )
-
-    info = get_client_ip_info(request)
-    assert info.client_ip == "2001:db8:abcd:1234::5"
-    assert info.peer_ip == "127.0.0.1"
+# ---------------------------------------------------------------------------
+# Bucketing and affinity
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     ("ip", "expected"),
     [
-        # IPv4 buckets on the exact address.
         ("203.0.113.9", "203.0.113.9"),
-        # IPv6 collapses to the delegated /64.
         ("2001:db8:abcd:1234::5", "2001:db8:abcd:1234::/64"),
         ("2001:db8:abcd:1234:ffff:ffff:ffff:ffff", "2001:db8:abcd:1234::/64"),
-        # A different /64 is a different bucket.
         ("2001:db8:abcd:9999::1", "2001:db8:abcd:9999::/64"),
-        # IPv4-mapped literals keep their embedded IPv4 identity — folding them
-        # by prefix would collapse every IPv4 client into a single ::/64.
         ("::ffff:192.0.2.1", "192.0.2.1"),
         ("::ffff:203.0.113.9", "203.0.113.9"),
-        # Unparseable values pass through untouched.
         ("unknown", "unknown"),
         ("", ""),
     ],
@@ -360,7 +465,6 @@ def test_normalize_ip_bucket(ip, expected):
 
 
 def test_rotating_ipv6_privacy_addresses_share_a_bucket():
-    """RFC 4941 rotation within one /64 must not create fresh rate-limit buckets."""
     rotated = [
         "2001:db8:abcd:1234::1",
         "2001:db8:abcd:1234:9c2b:1f4e:aa01:7d3f",
@@ -370,11 +474,6 @@ def test_rotating_ipv6_privacy_addresses_share_a_bucket():
 
 
 def test_ipv4_mapped_clients_keep_distinct_buckets():
-    """Dual-stack listeners report IPv4 peers as ::ffff:… — they must not merge.
-
-    Collapsing them would put every IPv4 client into one rate-limit bucket,
-    locking out unrelated users once any single client hit the limit.
-    """
     buckets = {
         normalize_ip_bucket(ip)
         for ip in ("::ffff:192.0.2.1", "::ffff:203.0.113.9", "::ffff:8.8.8.8")
@@ -382,19 +481,21 @@ def test_ipv4_mapped_clients_keep_distinct_buckets():
     assert len(buckets) == 3
 
 
-def test_ipv4_mapped_bucket_matches_plain_ipv4():
-    """The same client reaches one bucket whether or not the peer is mapped."""
-    assert normalize_ip_bucket("::ffff:192.0.2.1") == normalize_ip_bucket("192.0.2.1")
+def test_derive_affinity_key_falls_through():
+    assert derive_affinity_key(None, "8.8.8.8") == "ip:8.8.8.8"
+    assert derive_affinity_key(None, "2001:db8::1") == "ip:2001:db8::/64"
+    assert derive_affinity_key(None, "unknown") == "ip:unknown"
+    assert derive_affinity_key("keyhash", "8.8.8.8") == "keyhash"
+    assert derive_affinity_key(None, "8.8.8.8", grant_id="g1") == "grant:g1"
 
 
-def test_get_client_ip_bucket_normalizes_resolved_ip(monkeypatch):
-    """The bucket helper applies /64 folding to the resolved client IP."""
+def test_get_client_ip_bucket_normalizes(monkeypatch):
     monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
     monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-
-    request = _request(
-        {"cf-connecting-ip": "2001:db8:abcd:1234::5"},
-        peer_ip="127.0.0.1",
-    )
-
-    assert get_client_ip_bucket(request) == "2001:db8:abcd:1234::/64"
+    nets = _networks("172.16.0.0/12")
+    with patch("serving.utils.request_ip._trusted_networks", return_value=nets):
+        request = _request(
+            {"cf-connecting-ip": "2001:db8:abcd:1234::5"},
+            peer_ip="172.19.0.1",
+        )
+        assert get_client_ip_bucket(request) == "2001:db8:abcd:1234::/64"

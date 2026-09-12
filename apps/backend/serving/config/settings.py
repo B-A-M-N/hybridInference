@@ -4,6 +4,7 @@ This module provides type-safe, validated configuration management.
 All environment variables are centralized here for easy tracking and testing.
 """
 
+import ipaddress
 from functools import lru_cache
 from typing import Annotated
 
@@ -176,8 +177,23 @@ class Settings(BaseSettings):
         "https://127.0.0.1:8443",
     ]
 
-    # Trusted proxies (for real IP detection)
+    # Trusted proxies (for real IP detection). Comma-separated CIDR ranges
+    # (e.g. "172.17.0.0/16,10.0.0.0/8,240.0.0.0/4") that are authorized to
+    # assert forwarding provenance via X-Forwarded-For / CF-Connecting-IP.
+    # When empty (the default), forwarding headers are never trusted — the
+    # socket peer is the only network fact used. Invalid CIDRs fail startup.
     trusted_proxies: list[str] = []
+    # Parsed form of ``trusted_proxies``, validated at startup. Consumers
+    # read this rather than re-parsing on every request.
+    trusted_proxies_parsed: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
+
+    @field_validator("trusted_proxies", mode="before")
+    @classmethod
+    def parse_trusted_proxies(cls, value):
+        """Accept either a list or a comma-separated env var for trusted proxies."""
+        if isinstance(value, str):
+            return [entry.strip() for entry in value.split(",") if entry.strip()]
+        return value
 
     # Route types the admin console may add per provider, as comma-separated
     # "provider=type[|type]" entries, e.g.
@@ -247,6 +263,29 @@ class Settings(BaseSettings):
         default="config/alerts.yaml",
         validation_alias=AliasChoices("ALERTS_CONFIG_PATH", "alerts_config_path"),
     )
+
+    @model_validator(mode="after")
+    def _parse_trusted_proxies(self) -> "Settings":
+        """Parse trusted_proxies CIDRs and fail startup on invalid entries.
+
+        An empty list is valid (means no proxies trusted). Each entry must be
+        a parseable CIDR range. Invalid entries raise ValueError so the
+        operator is notified at startup rather than silently weakening
+        identity resolution.
+        """
+        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for entry in self.trusted_proxies:
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                networks.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError as exc:
+                raise ValueError(
+                    f"trusted_proxies entry {entry!r} is not a valid CIDR range: {exc}"
+                ) from exc
+        object.__setattr__(self, "trusted_proxies_parsed", tuple(networks))
+        return self
 
     @model_validator(mode="after")
     def _alerts_webhook_fallback(self) -> "Settings":
