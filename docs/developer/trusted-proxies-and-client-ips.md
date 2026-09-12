@@ -126,27 +126,32 @@ limit or trigger a block that affects everyone.
 The correct approach depends on the operation:
 
 - **Rate limiting**: When provenance is resolved, key on the client IP.
-  When unresolved, skip per-IP limiting entirely (don't use the proxy IP).
+  When unresolved, never use the proxy IP: signup emits an
+  `unresolved_client_ip` warning and can fail closed with
+  `SIGNUP_REQUIRE_RESOLVED_CLIENT_IP=1`; login retains its per-email limit but
+  skips the per-IP bucket.
 - **Auth-failure blocking**: Only block on resolved client IPs. When
-  unresolved, don't record or block (would affect all clients behind proxy).
+  unresolved, emit an `unresolved_client_ip` warning but don't record or block
+  (would affect all clients behind the proxy).
 - **Affinity routing**: When resolved, key on client IP bucket. When
   unresolved, return `None` for non-sticky routing (don't collapse clients).
 
 | Use case | Resolved | Unresolved |
 |----------|----------|------------|
 | Logging, audit, display | `get_client_ip()` | `"unknown"` |
-| Rate limiting | Key on client IP | Skip per-IP limiting |
-| Auth-failure blocking | Block on client IP | Don't record/block |
+| Rate limiting | Key on client IP | Signup fails closed when configured; otherwise warning + no shared bucket. Login keeps per-email limiting and skips per-IP. |
+| Auth-failure blocking | Block on client IP | Warning; don't record/block |
 | Affinity routing | `ip:<bucket>` | `None` (non-sticky) |
 
 ## Resolution order
 
 `get_client_ip_info()` returns a frozen `ClientIpInfo` with the resolved
 `client_ip`, the `peer_ip` it was resolved against, and a `source` label naming
-the rung that won. The `trusted_proxy_headers` field describes whether
-forwarding headers were **actually trusted** for this request — that is,
-whether `TRUST_PROXY_HEADERS=1` **and** the immediate peer is in
-`trusted_proxies`.
+the rung that won. The `trusted_proxy_headers` field describes whether any
+forwarding identity header was **actually trusted** for this request — that
+is, whether `TRUST_PROXY_HEADERS=1` and the immediate peer is authorized by
+either the generic `trusted_proxies` set or the separately configured
+Cloudflare set with `TRUST_CLOUDFLARE_HEADERS=1`.
 
 Resolution walks the trust boundary correctly:
 
@@ -189,7 +194,7 @@ We do NOT continue to `1.2.3.4` — that would cross the trust boundary.
 ### Example: attacker prepends fake addresses
 
 ```
-XFF: "8.8.8.8, 1.2.3.4, 203.0.113.9, 172.16.0.5"
+XFF: "8.8.8.8, 1.2.3.4, 8.8.4.4, 172.16.0.5"
 trusted_proxies: 172.16.0.5 (peer)
 ```
 
@@ -198,7 +203,7 @@ Walking right-to-left:
 | Hop | Trusted? | Routable? | Action |
 |-----|----------|-----------|--------|
 | 172.16.0.5 | yes | no | skip (trusted) |
-| 203.0.113.9 | no | yes | **return as client** |
+| 8.8.4.4 | no | yes | **return as client** |
 
 The attacker's prepended `8.8.8.8` and `1.2.3.4` are never reached. The old
 leftmost-trust model would have returned `8.8.8.8`.
@@ -211,18 +216,20 @@ multicast and unspecified addresses, and these networks:
 ```text
 10.0.0.0/8        172.16.0.0/12     192.168.0.0/16    (RFC 1918)
 100.64.0.0/10     (CGNAT, RFC 6598)
+192.0.2.0/24      198.51.100.0/24  203.0.113.0/24    (TEST-NET)
+198.18.0.0/15     (benchmarking)   240.0.0.0/4       (reserved Class E)
 fc00::/7          (IPv6 unique local)
+2001:db8::/32     (IPv6 documentation)
 ```
 
 An IPv4-mapped IPv6 literal is judged by its embedded IPv4 address, so a mapped
 private peer is still rejected.
 
 The list is written out explicitly rather than delegating to
-`ipaddress.is_private` / `is_global`, because those reclassified the
-documentation (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) and
-benchmark (`198.18.0.0/15`) ranges between CPython 3.12.4 and 3.13; hard-coding
-the stable RFC ranges keeps IP resolution from depending on the interpreter
-version.
+`ipaddress.is_private` / `is_global`, because those reclassified special-use
+ranges between CPython releases. Hard-coding the stable internal,
+documentation, benchmarking, and reserved ranges keeps IP resolution from
+depending on the interpreter version.
 
 ## The "unknown" outcome
 
@@ -233,10 +240,12 @@ trustworthy forwarding provenance, `"unknown"` is more useful than
 `172.19.0.1`.
 
 Downstream consumers that key on `client_ip` (rate limits, auth-failure
-blocklist, routing affinity) must handle `"unknown"` safely — it is a
-legitimate outcome, not an error. `normalize_ip_bucket("unknown")` returns
-`"unknown"` unchanged, so such callers collapse onto one bucket rather than
-creating a per-internal-address bucket.
+blocklist, routing affinity) must inspect `ClientIpInfo.resolved` and handle
+`"unknown"` explicitly — it is a legitimate outcome, not an error. New
+callers never pass unresolved provenance to `normalize_ip_bucket()`, because
+that would collapse unrelated callers onto one shared key. The deprecated
+`get_client_ip_bucket()` helper retains its legacy behavior and must not be
+used for new enforcement or affinity code.
 
 ## Cloudflare Pseudo IPv4
 

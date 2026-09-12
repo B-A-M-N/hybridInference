@@ -13,10 +13,10 @@ this defense (the goal is throttling, not audit). Mirrors the design of
 ``serving.utils.signup_rate_limit``.
 
 When client provenance is resolved, rate-limits on the client IP.
-When unresolved (e.g., behind misconfigured proxy), there is no information
-to distinguish clients behind the shared proxy. In that case, per-IP rate
-limiting is skipped entirely rather than collapsing all clients onto one
-bucket.
+When unresolved (e.g., behind a misconfigured proxy), there is no information
+to distinguish clients behind the shared proxy. In that case, an alertable
+warning is emitted and per-IP rate limiting is skipped rather than collapsing
+all clients onto one bucket; per-email limiting still applies.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import time
 from collections import deque
 
 from serving.config.settings import settings
+from serving.utils.logging import get_logger
 from serving.utils.request_ip import get_client_ip_info, normalize_ip_bucket
 
 _FIFTEEN_MIN_SECONDS = 15 * 60
@@ -36,6 +37,7 @@ _email_attempts: dict[str, deque[float]] = {}
 _ip_attempts: dict[str, deque[float]] = {}
 _lock = asyncio.Lock()
 _sweep_counter = 0
+logger = get_logger(__name__)
 
 
 def _now() -> float:
@@ -60,25 +62,25 @@ async def check_and_record_login(email: str, request) -> tuple[bool, str | None]
     bypass the limit.
 
     When client provenance is resolved, the per-IP bucket is enforced on
-    the client IP. When unresolved (e.g., behind misconfigured proxy), there
+    the client IP. When unresolved (e.g., behind a misconfigured proxy), there
     is no information to distinguish clients behind the shared proxy. Per-IP
-    rate limiting is skipped entirely in that case rather than collapsing
+    rate limiting is skipped with an alertable warning rather than collapsing
     all clients onto one bucket. Per-email rate limiting still applies.
     """
     global _sweep_counter
 
     ip_info = get_client_ip_info(request)
+    if not ip_info.resolved:
+        logger.warning(
+            "unresolved_client_ip",
+            extra={"event": "unresolved_client_ip", "reason": "login"},
+        )
 
     # Normalize email so case variants share the same bucket.
     email_key = email.strip().lower()
 
-    # Use resolved client IP if available; otherwise skip per-IP limiting
-    if ip_info.resolved:
-        ip_key = f"client:{normalize_ip_bucket(ip_info.client_ip)}"
-    else:
-        # Unresolved: no per-IP rate limiting (would collapse all clients
-        # behind the proxy onto one bucket). Only per-email limiting applies.
-        ip_key = None
+    # Use resolved client IP if available; otherwise skip per-IP limiting.
+    ip_key = f"client:{normalize_ip_bucket(ip_info.client_ip)}" if ip_info.resolved else None
 
     now = _now()
     email_cutoff = now - _FIFTEEN_MIN_SECONDS

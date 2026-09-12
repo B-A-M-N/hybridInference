@@ -26,9 +26,21 @@ def test_trusted_proxies_invalid_cidr_fails():
         Settings(trusted_proxies="not-a-cidr")
 
 
+def test_trusted_proxies_unaligned_network_fails():
+    """A host address must not silently widen an authorized proxy range."""
+    with pytest.raises(ValueError, match="trusted_proxies entry"):
+        Settings(trusted_proxies="172.19.0.2/24")
+
+
 def test_trusted_cloudflare_invalid_cidr_fails():
     with pytest.raises(ValueError, match="trusted_cloudflare_networks entry"):
         Settings(trusted_cloudflare_networks="not-a-cidr")
+
+
+def test_trusted_cloudflare_unaligned_network_fails():
+    """A host address must not silently widen Cloudflare authorization."""
+    with pytest.raises(ValueError, match="trusted_cloudflare_networks entry"):
+        Settings(trusted_cloudflare_networks="172.19.0.2/24")
 
 
 def test_trusted_proxies_from_env_var(monkeypatch):

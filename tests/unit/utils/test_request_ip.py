@@ -16,11 +16,11 @@ import pytest
 
 from serving.config.settings import Settings
 from serving.utils.request_ip import (
+    ClientIpInfo,
     _is_in_networks,
     _is_reportable_ip,
     _parse_forwarded_chain,
     _parse_ip,
-    ClientIpInfo,
     derive_affinity_key,
     get_client_ip_bucket,
     get_client_ip_info,
@@ -57,9 +57,11 @@ def _settings_env(
         "TRUST_PROXY_HEADERS": "1" if proxy_headers else "0",
         "TRUST_CLOUDFLARE_HEADERS": "1" if cf_headers else "0",
     }
-    with patch.dict(os.environ, env):
-        with patch("serving.utils.request_ip.get_settings", return_value=settings):
-            yield settings
+    with (
+        patch.dict(os.environ, env),
+        patch("serving.utils.request_ip.get_settings", return_value=settings),
+    ):
+        yield settings
 
 
 # ---------------------------------------------------------------------------
@@ -103,12 +105,18 @@ def test_is_reportable_ip_rejects_non_routable():
     assert _is_reportable_ip("fe80::1") is False
     assert _is_reportable_ip("224.0.0.1") is False
     assert _is_reportable_ip("0.0.0.0") is False
+    assert _is_reportable_ip("192.0.2.1") is False
+    assert _is_reportable_ip("198.51.100.1") is False
+    assert _is_reportable_ip("203.0.113.1") is False
+    assert _is_reportable_ip("198.18.0.1") is False
+    assert _is_reportable_ip("240.1.2.3") is False
+    assert _is_reportable_ip("2001:db8::1") is False
 
 
 def test_is_reportable_ip_accepts_public():
     assert _is_reportable_ip("8.8.8.8") is True
-    assert _is_reportable_ip("203.0.113.9") is True
-    assert _is_reportable_ip("2001:db8::1") is True
+    assert _is_reportable_ip("1.1.1.1") is True
+    assert _is_reportable_ip("2001:4860:4860::8888") is True
 
 
 def test_is_in_networks_matches_cidr():
@@ -290,11 +298,11 @@ def test_trusted_proxy_attacker_prepends_fake_addresses():
         proxy_nets=_networks("172.16.0.0/12"),
     ):
         request = _request(
-            {"x-forwarded-for": "1.2.3.4, 5.6.7.8, 203.0.113.9, 172.19.0.1"},
+            {"x-forwarded-for": "1.2.3.4, 5.6.7.8, 8.8.8.8, 172.19.0.1"},
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        assert info.client_ip == "203.0.113.9"
+        assert info.client_ip == "8.8.8.8"
         assert info.source == "x-forwarded-for"
 
 
@@ -306,11 +314,11 @@ def test_trusted_proxy_x_real_ip_fallback():
         proxy_nets=_networks("172.16.0.0/12", "10.0.0.0/8"),
     ):
         request = _request(
-            {"x-forwarded-for": "10.0.0.1, 172.19.0.1", "x-real-ip": "203.0.113.9"},
+            {"x-forwarded-for": "10.0.0.1, 172.19.0.1", "x-real-ip": "8.8.8.8"},
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        assert info.client_ip == "203.0.113.9"
+        assert info.client_ip == "8.8.8.8"
         assert info.source == "x-real-ip"
 
 
@@ -328,14 +336,28 @@ def test_cf_connecting_ip_when_cloudflare_authorized():
     ):
         request = _request(
             {
-                "x-forwarded-for": "1.2.3.4, 203.0.113.9",
-                "cf-connecting-ip": "203.0.113.9",
+                "x-forwarded-for": "1.2.3.4, 8.8.8.8",
+                "cf-connecting-ip": "8.8.8.8",
             },
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        assert info.client_ip == "203.0.113.9"
+        assert info.client_ip == "8.8.8.8"
         assert info.source == "cf-connecting-ip"
+        assert info.trusted_proxy_headers is True
+
+
+def test_trusted_proxy_headers_true_for_cloudflare_only():
+    """CF-only authorization is reflected in forwarding-header provenance."""
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=True,
+        cf_nets=_networks("172.16.0.0/12"),
+    ):
+        info = get_client_ip_info(_request({"cf-connecting-ip": "8.8.8.8"}, peer_ip="172.19.0.1"))
+        assert info.client_ip == "8.8.8.8"
+        assert info.source == "cf-connecting-ip"
+        assert info.trusted_proxy_headers is True
 
 
 def test_cf_connecting_ip_ignored_with_generic_trust_only():
@@ -347,13 +369,13 @@ def test_cf_connecting_ip_ignored_with_generic_trust_only():
     ):
         request = _request(
             {
-                "x-forwarded-for": "203.0.113.9",
+                "x-forwarded-for": "8.8.8.8",
                 "cf-connecting-ip": "1.2.3.4",
             },
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        assert info.client_ip == "203.0.113.9"
+        assert info.client_ip == "8.8.8.8"
         assert info.source == "x-forwarded-for"
 
 
@@ -367,13 +389,13 @@ def test_cf_connecting_ip_ignored_without_cloudflare_trust_flag():
     ):
         request = _request(
             {
-                "x-forwarded-for": "203.0.113.9",
+                "x-forwarded-for": "8.8.8.8",
                 "cf-connecting-ip": "1.2.3.4",
             },
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        assert info.client_ip == "203.0.113.9"
+        assert info.client_ip == "8.8.8.8"
         assert info.source == "x-forwarded-for"
 
 
@@ -387,12 +409,12 @@ def test_cf_connecting_ipv6_pseudo_ipv4():
         request = _request(
             {
                 "cf-connecting-ip": "240.1.2.3",
-                "cf-connecting-ipv6": "2001:db8:abcd:1234::5",
+                "cf-connecting-ipv6": "2001:4860:4860:abcd:1234::5",
             },
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        assert info.client_ip == "2001:db8:abcd:1234::5"
+        assert info.client_ip == "2001:4860:4860:abcd:1234::5"
         assert info.source == "cf-connecting-ipv6"
 
 
@@ -405,13 +427,13 @@ def test_forged_cf_connecting_ipv6_rejected():
     ):
         request = _request(
             {
-                "cf-connecting-ip": "203.0.113.9",
+                "cf-connecting-ip": "8.8.8.8",
                 "cf-connecting-ipv6": "2001:db8:dead:beef::1",
             },
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        assert info.client_ip == "203.0.113.9"
+        assert info.client_ip == "8.8.8.8"
         assert info.source == "cf-connecting-ip"
 
 
@@ -425,7 +447,7 @@ def test_cf_requires_global_proxy_flag():
         cf_nets=_networks("172.16.0.0/12"),
     ):
         request = _request(
-            {"cf-connecting-ip": "203.0.113.9"},
+            {"cf-connecting-ip": "8.8.8.8"},
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
@@ -526,11 +548,11 @@ def test_mixed_ipv4_ipv6_chain():
         proxy_nets=_networks("172.16.0.0/12", "fd00::/8"),
     ):
         request = _request(
-            {"x-forwarded-for": "203.0.113.9, fd00::1, 172.19.0.1"},
+            {"x-forwarded-for": "8.8.8.8, fd00::1, 172.19.0.1"},
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        assert info.client_ip == "203.0.113.9"
+        assert info.client_ip == "8.8.8.8"
 
 
 def test_ipv4_mapped_peer_trust():
@@ -541,11 +563,11 @@ def test_ipv4_mapped_peer_trust():
         proxy_nets=_networks("172.16.0.0/12"),
     ):
         request = _request(
-            {"x-forwarded-for": "203.0.113.9, ::ffff:172.19.0.1"},
+            {"x-forwarded-for": "8.8.8.8, ::ffff:172.19.0.1"},
             peer_ip="::ffff:172.19.0.1",
         )
         info = get_client_ip_info(request)
-        assert info.client_ip == "203.0.113.9"
+        assert info.client_ip == "8.8.8.8"
 
 
 def test_all_trusted_chain_returns_unknown():
@@ -567,7 +589,7 @@ def test_trust_flags_without_trusted_cidr_ignored():
     """TRUST_PROXY_HEADERS=1 without configured CIDRs does not trust headers."""
     with _settings_env(proxy_headers=True, cf_headers=False):
         request = _request(
-            {"x-forwarded-for": "203.0.113.9"},
+            {"x-forwarded-for": "8.8.8.8"},
             peer_ip="8.8.8.8",
         )
         info = get_client_ip_info(request)
@@ -645,7 +667,7 @@ def test_trusted_proxy_headers_true_when_trusted():
         proxy_nets=_networks("172.16.0.0/12"),
     ):
         request = _request(
-            {"x-forwarded-for": "203.0.113.9, 172.19.0.1"},
+            {"x-forwarded-for": "8.8.8.8, 172.19.0.1"},
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
@@ -656,7 +678,7 @@ def test_trusted_proxy_headers_false_when_peer_untrusted():
     """trusted_proxy_headers is False when peer is not in trusted CIDRs."""
     with _settings_env(proxy_headers=True, cf_headers=False):
         request = _request(
-            {"x-forwarded-for": "203.0.113.9"},
+            {"x-forwarded-for": "8.8.8.8"},
             peer_ip="8.8.8.8",
         )
         info = get_client_ip_info(request)
@@ -667,7 +689,7 @@ def test_trusted_proxy_headers_false_when_global_disabled():
     """trusted_proxy_headers is False when TRUST_PROXY_HEADERS=0."""
     with _settings_env(proxy_headers=False, cf_headers=False):
         request = _request(
-            {"x-forwarded-for": "203.0.113.9, 172.19.0.1"},
+            {"x-forwarded-for": "8.8.8.8, 172.19.0.1"},
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
@@ -682,13 +704,13 @@ def test_trusted_proxy_headers_false_when_global_disabled():
 def test_affinity_key_resolved_ip():
     """Affinity key uses client IP when resolved."""
     ip_info = ClientIpInfo(
-        client_ip="203.0.113.9",
+        client_ip="8.8.8.8",
         peer_ip="172.19.0.1",
         source="socket",
         trusted_proxy_headers=False,
         resolved=True,
     )
-    assert derive_affinity_key(None, ip_info) == "ip:203.0.113.9"
+    assert derive_affinity_key(None, ip_info) == "ip:8.8.8.8"
 
 
 def test_affinity_key_unresolved():
@@ -706,7 +728,7 @@ def test_affinity_key_unresolved():
 def test_affinity_key_auth_preferred():
     """Auth key hash is preferred over IP."""
     ip_info = ClientIpInfo(
-        client_ip="203.0.113.9",
+        client_ip="8.8.8.8",
         peer_ip="172.19.0.1",
         source="socket",
         trusted_proxy_headers=False,
@@ -718,7 +740,7 @@ def test_affinity_key_auth_preferred():
 def test_affinity_key_grant_preferred():
     """Grant ID is preferred over IP."""
     ip_info = ClientIpInfo(
-        client_ip="203.0.113.9",
+        client_ip="8.8.8.8",
         peer_ip="172.19.0.1",
         source="socket",
         trusted_proxy_headers=False,
@@ -738,19 +760,19 @@ def test_affinity_key_shared_proxy_unresolved():
     with _settings_env(
         proxy_headers=True,
         cf_headers=False,
-        proxy_nets=_networks("203.0.113.1/32"),
+        proxy_nets=_networks("172.16.0.0/12"),
     ):
         request1 = _request(
-            {"x-forwarded-for": "garbage, 203.0.113.1"},
-            peer_ip="203.0.113.1",
+            {"x-forwarded-for": "garbage, 172.19.0.1"},
+            peer_ip="172.19.0.1",
         )
         request2 = _request(
-            {"x-forwarded-for": "garbage, 203.0.113.1"},
-            peer_ip="203.0.113.1",
+            {"x-forwarded-for": "garbage, 172.19.0.1"},
+            peer_ip="172.19.0.1",
         )
         request3 = _request(
-            {"x-forwarded-for": "garbage, 203.0.113.1"},
-            peer_ip="203.0.113.1",
+            {"x-forwarded-for": "garbage, 172.19.0.1"},
+            peer_ip="172.19.0.1",
         )
         info1 = get_client_ip_info(request1)
         info2 = get_client_ip_info(request2)
@@ -775,19 +797,19 @@ def test_resolved_clients_behind_same_proxy():
     with _settings_env(
         proxy_headers=True,
         cf_headers=False,
-        proxy_nets=_networks("203.0.113.1/32"),
+        proxy_nets=_networks("172.16.0.0/12"),
     ):
         request1 = _request(
-            {"x-forwarded-for": "1.2.3.4, 203.0.113.1"},
-            peer_ip="203.0.113.1",
+            {"x-forwarded-for": "1.2.3.4, 172.19.0.1"},
+            peer_ip="172.19.0.1",
         )
         request2 = _request(
-            {"x-forwarded-for": "5.6.7.8, 203.0.113.1"},
-            peer_ip="203.0.113.1",
+            {"x-forwarded-for": "5.6.7.8, 172.19.0.1"},
+            peer_ip="172.19.0.1",
         )
         request3 = _request(
-            {"x-forwarded-for": "9.10.11.12, 203.0.113.1"},
-            peer_ip="203.0.113.1",
+            {"x-forwarded-for": "9.10.11.12, 172.19.0.1"},
+            peer_ip="172.19.0.1",
         )
         info1 = get_client_ip_info(request1)
         info2 = get_client_ip_info(request2)
@@ -830,15 +852,15 @@ def test_cf_forged_by_generic_proxy():
     with _settings_env(
         proxy_headers=True,
         cf_headers=True,
-        proxy_nets=_networks("203.0.113.1/32"),
+        proxy_nets=_networks("172.16.0.0/12"),
     ):
         request = _request(
             {"cf-connecting-ip": "1.2.3.4"},
-            peer_ip="203.0.113.1",
+            peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        assert info.client_ip == "203.0.113.1"
-        assert info.source == "socket"
+        assert info.client_ip == "unknown"
+        assert info.source == "unknown"
 
 
 def test_cf_generic_proxy_no_xff():
@@ -846,12 +868,12 @@ def test_cf_generic_proxy_no_xff():
     with _settings_env(
         proxy_headers=True,
         cf_headers=True,
-        proxy_nets=_networks("203.0.113.1/32"),
+        proxy_nets=_networks("172.16.0.0/12"),
     ):
-        request = _request({}, peer_ip="203.0.113.1")
+        request = _request({}, peer_ip="172.19.0.1")
         info = get_client_ip_info(request)
-        assert info.client_ip == "203.0.113.1"
-        assert info.source == "socket"
+        assert info.client_ip == "unknown"
+        assert info.source == "unknown"
 
 
 def test_cf_requires_explicit_authorization():
@@ -862,11 +884,11 @@ def test_cf_requires_explicit_authorization():
         cf_nets=_networks("10.0.0.1/32"),
     ):
         request = _request(
-            {"cf-connecting-ip": "203.0.113.9"},
+            {"cf-connecting-ip": "8.8.8.8"},
             peer_ip="10.0.0.1",
         )
         info = get_client_ip_info(request)
-        assert info.client_ip == "203.0.113.9"
+        assert info.client_ip == "8.8.8.8"
         assert info.source == "cf-connecting-ip"
 
 
@@ -878,12 +900,15 @@ def test_cf_requires_explicit_authorization():
 @pytest.mark.parametrize(
     ("ip", "expected"),
     [
-        ("203.0.113.9", "203.0.113.9"),
-        ("2001:db8:abcd:1234::5", "2001:db8:abcd:1234::/64"),
-        ("2001:db8:abcd:1234:ffff:ffff:ffff:ffff", "2001:db8:abcd:1234::/64"),
-        ("2001:db8:abcd:9999::1", "2001:db8:abcd:9999::/64"),
+        ("8.8.8.8", "8.8.8.8"),
+        ("2001:4860:4860:abcd::5", "2001:4860:4860:abcd::/64"),
+        (
+            "2001:4860:4860:abcd:ffff:ffff:ffff:ffff",
+            "2001:4860:4860:abcd::/64",
+        ),
+        ("2001:4860:4860:beef::1", "2001:4860:4860:beef::/64"),
         ("::ffff:192.0.2.1", "192.0.2.1"),
-        ("::ffff:203.0.113.9", "203.0.113.9"),
+        ("::ffff:8.8.8.8", "8.8.8.8"),
         ("unknown", "unknown"),
         ("", ""),
     ],
@@ -895,17 +920,16 @@ def test_normalize_ip_bucket(ip, expected):
 
 def test_rotating_ipv6_privacy_addresses_share_a_bucket():
     rotated = [
-        "2001:db8:abcd:1234::1",
-        "2001:db8:abcd:1234:9c2b:1f4e:aa01:7d3f",
-        "2001:db8:abcd:1234:4411:beef:0:2",
+        "2001:4860:4860:abcd::1",
+        "2001:4860:4860:abcd:9c2b:1f4e:aa01:7d3f",
+        "2001:4860:4860:abcd:4411:beef:0:2",
     ]
     assert len({normalize_ip_bucket(ip) for ip in rotated}) == 1
 
 
 def test_ipv4_mapped_clients_keep_distinct_buckets():
     buckets = {
-        normalize_ip_bucket(ip)
-        for ip in ("::ffff:192.0.2.1", "::ffff:203.0.113.9", "::ffff:8.8.8.8")
+        normalize_ip_bucket(ip) for ip in ("::ffff:192.0.2.1", "::ffff:8.8.8.8", "::ffff:1.1.1.1")
     }
     assert len(buckets) == 3
 
@@ -922,13 +946,13 @@ def test_derive_affinity_key_falls_through():
     assert derive_affinity_key(None, resolved_info) == "ip:8.8.8.8"
 
     ipv6_info = ClientIpInfo(
-        client_ip="2001:db8::1",
+        client_ip="2001:4860:4860::8888",
         peer_ip="172.19.0.1",
         source="socket",
         trusted_proxy_headers=False,
         resolved=True,
     )
-    assert derive_affinity_key(None, ipv6_info) == "ip:2001:db8::/64"
+    assert derive_affinity_key(None, ipv6_info) == "ip:2001:4860:4860::/64"
 
     unresolved_info = ClientIpInfo(
         client_ip="unknown",
@@ -946,10 +970,10 @@ def test_derive_affinity_key_falls_through():
 def test_get_client_ip_bucket_normalizes():
     with _settings_env(proxy_headers=True, cf_headers=True, cf_nets=_networks("172.16.0.0/12")):
         request = _request(
-            {"cf-connecting-ip": "2001:db8:abcd:1234::5"},
+            {"cf-connecting-ip": "2001:4860:4860:abcd::5"},
             peer_ip="172.19.0.1",
         )
-        assert get_client_ip_bucket(request) == "2001:db8:abcd:1234::/64"
+        assert get_client_ip_bucket(request) == "2001:4860:4860:abcd::/64"
 
 
 # ---------------------------------------------------------------------------

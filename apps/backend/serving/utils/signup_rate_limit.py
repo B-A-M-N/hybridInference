@@ -6,11 +6,11 @@ the cost of disk I/O. With multiple uvicorn workers the effective limit
 multiplies by the worker count, which is acceptable.
 
 When client provenance is resolved, rate-limits on the client IP.
-When unresolved (e.g., behind misconfigured proxy), there is no information
-to distinguish clients behind the shared proxy. In that case, per-IP rate
-limiting is skipped entirely rather than collapsing all clients onto one
-bucket. This is a known limitation: without trustworthy client identity,
-the only safe option is to not key limits on the shared proxy address.
+When unresolved (e.g., behind a misconfigured proxy), there is no information
+to distinguish clients behind the shared proxy. In that case, the limiter
+emits an alertable warning and skips the per-IP bucket rather than collapsing
+all clients onto one bucket. Deployments that require trustworthy provenance
+can set ``SIGNUP_REQUIRE_RESOLVED_CLIENT_IP=1`` to fail closed.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import time
 from collections import deque
 
 from serving.config.settings import settings
+from serving.utils.logging import get_logger
 from serving.utils.request_ip import get_client_ip_info, normalize_ip_bucket
 
 _HOUR_SECONDS = 3600
@@ -29,6 +30,7 @@ _SWEEP_EVERY = 1024
 _attempts: dict[str, deque[float]] = {}
 _lock = asyncio.Lock()
 _sweep_counter = 0
+logger = get_logger(__name__)
 
 
 def _now() -> float:
@@ -51,20 +53,26 @@ async def check_and_record_signup(request) -> tuple[bool, str | None]:
     limits, or (False, "hour"|"day") indicating which window tripped.
 
     When client provenance is resolved, rate-limits on the client IP.
-    When unresolved (e.g., behind misconfigured proxy), there is no information
-    to distinguish clients behind the shared proxy. Per-IP rate limiting is
-    skipped entirely in that case rather than collapsing all clients onto one
-    bucket. This is a deployment/configuration issue that should be resolved
-    by fixing the proxy setup.
+    When unresolved (e.g., behind a misconfigured proxy), there is no
+    information to distinguish clients behind the shared proxy. The warning
+    signal is emitted and per-IP limiting is skipped rather than collapsing
+    all clients onto one bucket. A deployment can fail closed instead.
     """
     global _sweep_counter
 
     ip_info = get_client_ip_info(request)
 
     # When client provenance is unresolved, we cannot distinguish clients
-    # behind a shared proxy. Skip per-IP rate limiting entirely rather than
-    # collapsing all clients onto one bucket.
+    # behind a shared proxy. Never silently turn that into an unobserved abuse
+    # bypass: emit an alertable signal, and let deployments that require
+    # trustworthy proxy provenance fail closed for public signup.
     if not ip_info.resolved:
+        logger.warning(
+            "unresolved_client_ip",
+            extra={"event": "unresolved_client_ip", "reason": "signup"},
+        )
+        if settings.signup_require_resolved_client_ip:
+            return False, "unresolved"
         return True, None
 
     ip_key = f"client:{normalize_ip_bucket(ip_info.client_ip)}"

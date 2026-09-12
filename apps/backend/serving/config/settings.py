@@ -110,6 +110,11 @@ class Settings(BaseSettings):
     # entry so probing varied passwords cannot bypass the limit.
     login_rate_limit_per_15min: int = 5
     login_rate_limit_per_hour_per_ip: int = 20
+    # When enabled, public signup fails closed if the gateway cannot establish
+    # trustworthy client provenance. The default preserves availability for
+    # deployments that intentionally operate behind an unresolved relay; those
+    # deployments still receive an unresolved-provenance warning signal.
+    signup_require_resolved_client_ip: bool = False
     # Auto-block a source IP at the API-key auth layer after repeated auth
     # failures. Once an IP (IPv6 bucketed to /64) reaches
     # auth_failure_block_threshold failures within auth_failure_block_window_sec,
@@ -279,7 +284,7 @@ class Settings(BaseSettings):
             if not entry:
                 continue
             try:
-                proxy_networks.append(ipaddress.ip_network(entry, strict=False))
+                proxy_networks.append(ipaddress.ip_network(entry, strict=True))
             except ValueError as exc:
                 raise ValueError(
                     f"trusted_proxies entry {entry!r} is not a valid CIDR range: {exc}"
@@ -290,7 +295,7 @@ class Settings(BaseSettings):
             if not entry:
                 continue
             try:
-                cf_networks.append(ipaddress.ip_network(entry, strict=False))
+                cf_networks.append(ipaddress.ip_network(entry, strict=True))
             except ValueError as exc:
                 raise ValueError(
                     f"trusted_cloudflare_networks entry {entry!r} is not a valid CIDR range: {exc}"

@@ -18,8 +18,8 @@ from serving.utils.signup_rate_limit import (
 
 # Distinct /128 addresses inside one delegated /64 — what an attacker rotates
 # through, and what RFC 4941 privacy addressing produces on its own.
-_SAME_PREFIX = [f"2001:db8:abcd:1234::{n:x}" for n in range(1, 64)]
-_OTHER_PREFIX = "2001:db8:abcd:9999::1"
+_SAME_PREFIX = [f"2001:4860:4860:1234::{n:x}" for n in range(1, 64)]
+_OTHER_PREFIX = "2001:4860:4860:9999::1"
 
 
 def _request(ip: str) -> SimpleNamespace:
@@ -103,8 +103,8 @@ async def test_login_ipv4_buckets_remain_per_address(_live_settings):
     with patch("serving.utils.login_rate_limit.settings", _live_settings):
         email = "stable@example.com"
 
-        first = await check_and_record_login(email, _request("203.0.113.20"))
-        second = await check_and_record_login(email, _request("203.0.113.21"))
+        first = await check_and_record_login(email, _request("8.8.8.20"))
+        second = await check_and_record_login(email, _request("8.8.8.21"))
         # Each address is its own bucket, so both succeed independently.
         assert first[0] is True
         assert second[0] is True
@@ -112,8 +112,7 @@ async def test_login_ipv4_buckets_remain_per_address(_live_settings):
 
 @pytest.mark.asyncio
 async def test_signup_unresolved_skips_limit(_live_settings):
-    """When client provenance is unresolved (non-routable peer), signup
-    rate limiting is skipped entirely rather than using the proxy IP."""
+    """Default signup policy skips the per-IP bucket without using proxy IP."""
     request = SimpleNamespace(headers={}, client=SimpleNamespace(host="172.19.0.1"))
 
     from unittest.mock import patch
@@ -126,8 +125,20 @@ async def test_signup_unresolved_skips_limit(_live_settings):
 
 
 @pytest.mark.asyncio
+async def test_signup_unresolved_can_fail_closed(_live_settings):
+    """Deployments can reject signup when provenance is unresolved."""
+    _live_settings.signup_require_resolved_client_ip = True
+    request = SimpleNamespace(headers={}, client=SimpleNamespace(host="172.19.0.1"))
+
+    from unittest.mock import patch
+
+    with patch("serving.utils.signup_rate_limit.settings", _live_settings):
+        assert await check_and_record_signup(request) == (False, "unresolved")
+
+
+@pytest.mark.asyncio
 async def test_login_unresolved_skips_ip_limit(_live_settings):
-    """When client provenance is unresolved, login per-IP limit is skipped."""
+    """When client provenance is unresolved, login per-IP limit is skipped with a warning."""
     request = SimpleNamespace(headers={}, client=SimpleNamespace(host="172.19.0.1"))
 
     from unittest.mock import patch

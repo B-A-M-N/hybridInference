@@ -71,15 +71,22 @@ PSEUDO_IPV4_NETWORK = ipaddress.ip_network("240.0.0.0/4")
 
 # Non-routable ranges that can never identify a remote client. This is an
 # explicit list rather than ``ipaddress.is_private`` / ``is_global`` on purpose:
-# those reclassified the documentation and benchmark ranges across CPython
-# 3.12.4 / 3.13, so relying on them would make IP resolution depend on the
-# interpreter version. RFC 1918, CGNAT (RFC 6598) and IPv6 ULA are stable.
+# those reclassified special-use ranges across CPython releases, so relying on
+# them would make IP resolution depend on the interpreter version. Keep the
+# explicit deny set stable and include documentation, benchmarking, and
+# reserved ranges that must never be treated as real client addresses.
 _NON_ROUTABLE_NETWORKS = (
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("192.0.2.0/24"),
+    ipaddress.ip_network("198.51.100.0/24"),
+    ipaddress.ip_network("203.0.113.0/24"),
+    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("240.0.0.0/4"),
     ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("2001:db8::/32"),
 )
 
 
@@ -113,9 +120,9 @@ def _is_reportable_ip(value: str | None) -> bool:
     """True when *value* could plausibly identify a real remote client.
 
     Rejects anything unparseable plus loopback, link-local, multicast,
-    unspecified, RFC 1918 / CGNAT and IPv6 ULA addresses. IPv4-mapped IPv6
-    literals are judged by their embedded IPv4 address so a mapped private peer
-    is still rejected.
+    unspecified, RFC 1918 / CGNAT, IPv6 ULA, documentation, benchmarking,
+    and reserved ranges. IPv4-mapped IPv6 literals are judged by their
+    embedded IPv4 address so a mapped private peer is still rejected.
     """
     if not value:
         return False
@@ -131,11 +138,11 @@ def _is_reportable_ip(value: str | None) -> bool:
 class ClientIpInfo:
     """Client IP plus enough provenance to debug proxy hops.
 
-    ``trusted_proxy_headers`` describes whether forwarding headers were
-    actually trusted for this request — that is, whether the socket peer
-    was an authorized proxy for forwarding provenance. It is **True** only
-    when both the global ``TRUST_PROXY_HEADERS`` configuration flag is enabled
-    **and** the immediate peer falls inside a configured trusted-proxy CIDR.
+    ``trusted_proxy_headers`` describes whether any forwarding identity header
+    was actually trusted for this request. It is **True** only when the global
+    ``TRUST_PROXY_HEADERS`` configuration flag is enabled and the immediate
+    peer is authorized either by the generic trusted-proxy CIDRs or by the
+    separately configured Cloudflare CIDRs with ``TRUST_CLOUDFLARE_HEADERS``.
 
     ``client_ip`` is the best-effort originating client address, or the literal
     ``"unknown"`` when no trustworthy routable address could be determined. It
@@ -343,8 +350,10 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
         global_trust_enabled and cf_trust_enabled and _is_in_networks(peer_ip, cf_networks)
     )
 
-    # Request-level trust: headers are trusted only if the peer is authorized.
-    headers_trusted = peer_is_trusted_proxy
+    # Request-level trust: headers are trusted only if the peer is authorized
+    # by either forwarding trust model. CF-only requests must not be recorded
+    # as though their authoritative header was untrusted.
+    headers_trusted = peer_is_trusted_proxy or peer_is_cloudflare
 
     def _info(client_ip: str, source: str, resolved: bool) -> ClientIpInfo:
         return ClientIpInfo(

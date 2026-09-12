@@ -184,6 +184,13 @@ async def record_auth_failure(ip_info: ClientIpInfo) -> bool:
     if not ip_info.resolved:
         # Unresolved client provenance: do NOT record auth failures.
         # That would attribute all failures to the proxy address.
+        logger.warning(
+            "unresolved_client_ip",
+            extra={
+                "event": "unresolved_client_ip",
+                "reason": "auth_failure_blocklist",
+            },
+        )
         return False
     ip = ip_info.client_ip
     # An exempt source accrues no history at all: counting it would only

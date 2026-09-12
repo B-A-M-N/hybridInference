@@ -133,10 +133,19 @@ async def signup(
 
     # Record on entry so probing with varied payloads cannot bypass the limit.
     # Per-IP rate limiting is applied only when client provenance is resolved.
-    # Unresolved clients skip per-IP limiting entirely (no shared proxy bucket).
+    # Unresolved clients never share a proxy bucket; deployments may fail
+    # closed for public signup with SIGNUP_REQUIRE_RESOLVED_CLIENT_IP=1.
     client_ip = get_client_ip(request)
     allowed, reason = await check_and_record_signup(request)
     if not allowed:
+        if reason == "unresolved":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Signup is temporarily unavailable because client network "
+                    "provenance could not be verified."
+                ),
+            )
         retry_after = "3600" if reason == "hour" else "86400"
         raise HTTPException(
             status_code=429,
@@ -292,7 +301,8 @@ async def login(
 
     # Record on entry so probing varied passwords cannot bypass the limit.
     # Per-IP rate limiting is applied only when client provenance is resolved.
-    # Unresolved clients skip per-IP limiting entirely (no shared proxy bucket).
+    # Unresolved clients emit a warning and skip the per-IP bucket rather than
+    # sharing a proxy bucket; per-email limiting still applies.
     client_ip = get_client_ip(request)
 
     async def _record(
