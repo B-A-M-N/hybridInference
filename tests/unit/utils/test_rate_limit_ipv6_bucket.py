@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from serving.config.settings import settings
+from serving.config.settings import Settings
 from serving.utils.login_rate_limit import (
     check_and_record_login,
     reset_login_rate_limit_state,
@@ -35,58 +35,107 @@ def _clean_limiter_state():
     reset_login_rate_limit_state()
 
 
+@pytest.fixture
+def _live_settings():
+    """Use real Settings instance."""
+    return Settings()
+
+
 @pytest.mark.asyncio
-async def test_signup_limit_survives_ipv6_rotation():
+async def test_signup_limit_survives_ipv6_rotation(_live_settings):
     """Rotating the low 64 bits shares one signup bucket.
 
     Every attempt lands inside the same hour, so the hourly window trips
     first even though the daily cap is higher.
     """
-    per_hour = settings.signup_rate_limit_per_hour
+    per_hour = _live_settings.signup_rate_limit_per_hour
     addresses = _SAME_PREFIX[: per_hour + 1]
     assert len(addresses) == per_hour + 1
 
-    results = [await check_and_record_signup(_request(ip)) for ip in addresses]
+    from unittest.mock import patch
+
+    with patch("serving.utils.signup_rate_limit.settings", _live_settings):
+        results = [await check_and_record_signup(_request(ip)) for ip in addresses]
 
     assert all(allowed for allowed, _ in results[:per_hour])
     assert results[-1] == (False, "hour")
 
 
 @pytest.mark.asyncio
-async def test_signup_limit_isolates_distinct_ipv6_prefixes():
+async def test_signup_limit_isolates_distinct_ipv6_prefixes(_live_settings):
     """A different /64 is a separate bucket — no collateral throttling."""
-    # Fill the hourly window from the first prefix.
-    for _ in range(settings.signup_rate_limit_per_hour + 1):
-        await check_and_record_signup(_request(_SAME_PREFIX[0]))
-    assert (await check_and_record_signup(_request(_SAME_PREFIX[0])))[0] is False
+    from unittest.mock import patch
 
-    # A client from a separate /64 is unaffected.
-    assert (await check_and_record_signup(_request(_OTHER_PREFIX)))[0] is True
+    with patch("serving.utils.signup_rate_limit.settings", _live_settings):
+        # Fill the hourly window from the first prefix.
+        for _ in range(_live_settings.signup_rate_limit_per_hour + 1):
+            await check_and_record_signup(_request(_SAME_PREFIX[0]))
+        assert (await check_and_record_signup(_request(_SAME_PREFIX[0])))[0] is False
+
+        # A client from a separate /64 is unaffected.
+        assert (await check_and_record_signup(_request(_OTHER_PREFIX)))[0] is True
 
 
 @pytest.mark.asyncio
-async def test_login_per_ip_limit_survives_ipv6_rotation():
+async def test_login_per_ip_limit_survives_ipv6_rotation(_live_settings):
     """Per-IP login limit folds to /64 so rotation cannot dodge it."""
-    per_ip = settings.login_rate_limit_per_hour_per_ip
+    per_ip = _live_settings.login_rate_limit_per_hour_per_ip
 
-    # Use different emails so we're testing the per-IP limit, not per-email
-    for i, ip in enumerate(_SAME_PREFIX[: per_ip + 1]):
-        email = f"user{i}@example.com"
-        result = await check_and_record_login(email, _request(ip))
-        if not result[0]:
-            assert result == (False, "ip")
-            break
-    else:
-        pytest.fail("per_ip limit did not trip across a full /64")
+    from unittest.mock import patch
+
+    with patch("serving.utils.login_rate_limit.settings", _live_settings):
+        # Use different emails so we're testing the per-IP limit, not per-email
+        for i, ip in enumerate(_SAME_PREFIX[: per_ip + 1]):
+            email = f"user{i}@example.com"
+            result = await check_and_record_login(email, _request(ip))
+            if not result[0]:
+                assert result == (False, "ip")
+                break
+        else:
+            pytest.fail("per_ip limit did not trip across a full /64")
 
 
 @pytest.mark.asyncio
-async def test_login_ipv4_buckets_remain_per_address():
+async def test_login_ipv4_buckets_remain_per_address(_live_settings):
     """IPv4 clients keep per-address buckets — /64 folding does not apply."""
-    email = "stable@example.com"
+    from unittest.mock import patch
 
-    first = await check_and_record_login(email, _request("203.0.113.20"))
-    second = await check_and_record_login(email, _request("203.0.113.21"))
-    # Each address is its own bucket, so both succeed independently.
-    assert first[0] is True
-    assert second[0] is True
+    with patch("serving.utils.login_rate_limit.settings", _live_settings):
+        email = "stable@example.com"
+
+        first = await check_and_record_login(email, _request("203.0.113.20"))
+        second = await check_and_record_login(email, _request("203.0.113.21"))
+        # Each address is its own bucket, so both succeed independently.
+        assert first[0] is True
+        assert second[0] is True
+
+
+@pytest.mark.asyncio
+async def test_signup_unresolved_skips_limit(_live_settings):
+    """When client provenance is unresolved (non-routable peer), signup
+    rate limiting is skipped entirely rather than using the proxy IP."""
+    request = SimpleNamespace(headers={}, client=SimpleNamespace(host="172.19.0.1"))
+
+    from unittest.mock import patch
+
+    with patch("serving.utils.signup_rate_limit.settings", _live_settings):
+        # All attempts should be allowed (no per-IP limiting for unresolved)
+        for _ in range(100):
+            allowed, _ = await check_and_record_signup(request)
+            assert allowed is True
+
+
+@pytest.mark.asyncio
+async def test_login_unresolved_skips_ip_limit(_live_settings):
+    """When client provenance is unresolved, login per-IP limit is skipped."""
+    request = SimpleNamespace(headers={}, client=SimpleNamespace(host="172.19.0.1"))
+
+    from unittest.mock import patch
+
+    with patch("serving.utils.login_rate_limit.settings", _live_settings):
+        # All attempts should pass the IP check (but email limit still applies)
+        for i in range(100):
+            email = f"user{i}@example.com"
+            allowed, reason = await check_and_record_login(email, request)
+            assert allowed is True
+            assert reason is None

@@ -1,13 +1,16 @@
-"""In-memory IP-based sliding-window rate limiter for the signup endpoint.
+"""In-memory sliding-window rate limiter for the signup endpoint.
 
 State is a per-process dict and is intentionally lost on restart: signup
 abuse is a rate problem, not an audit problem, so durability is not worth
 the cost of disk I/O. With multiple uvicorn workers the effective limit
 multiplies by the worker count, which is acceptable.
 
-Uses client enforcement identity for rate-limiting. When client provenance
-is unresolved, uses a separate coarse peer-level key that doesn't masquerade
-as per-client protection.
+When client provenance is resolved, rate-limits on the client IP.
+When unresolved (e.g., behind misconfigured proxy), there is no information
+to distinguish clients behind the shared proxy. In that case, per-IP rate
+limiting is skipped entirely rather than collapsing all clients onto one
+bucket. This is a known limitation: without trustworthy client identity,
+the only safe option is to not key limits on the shared proxy address.
 """
 
 from __future__ import annotations
@@ -44,26 +47,27 @@ def _sweep_inactive(cutoff: float) -> None:
 async def check_and_record_signup(request) -> tuple[bool, str | None]:
     """Record a signup attempt and return whether it should be allowed.
 
-    Returns (True, None) if the request is under both the per-hour and per-day
+    Returns (True, None) if the IP is under both the per-hour and per-day
     limits, or (False, "hour"|"day") indicating which window tripped.
 
     When client provenance is resolved, rate-limits on the client IP.
-    When unresolved (e.g., behind misconfigured proxy), uses a separate
-    coarse peer-level key to avoid collapsing all clients behind one proxy
-    onto a single rate-limit bucket.
+    When unresolved (e.g., behind misconfigured proxy), there is no information
+    to distinguish clients behind the shared proxy. Per-IP rate limiting is
+    skipped entirely in that case rather than collapsing all clients onto one
+    bucket. This is a deployment/configuration issue that should be resolved
+    by fixing the proxy setup.
     """
     global _sweep_counter
 
     ip_info = get_client_ip_info(request)
 
-    # Use resolved client IP if available; otherwise use coarse peer-level key
-    if ip_info.resolved:
-        ip_key = f"client:{normalize_ip_bucket(ip_info.client_ip)}"
-    else:
-        # Unresolved: use a coarse peer-level key
-        # This prevents one proxy from exhausting the entire rate limit
-        ip_key = f"unresolved:{normalize_ip_bucket(ip_info.peer_ip)}"
+    # When client provenance is unresolved, we cannot distinguish clients
+    # behind a shared proxy. Skip per-IP rate limiting entirely rather than
+    # collapsing all clients onto one bucket.
+    if not ip_info.resolved:
+        return True, None
 
+    ip_key = f"client:{normalize_ip_bucket(ip_info.client_ip)}"
     now = _now()
     day_cutoff = now - _DAY_SECONDS
     hour_cutoff = now - _HOUR_SECONDS

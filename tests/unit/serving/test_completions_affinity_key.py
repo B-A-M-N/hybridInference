@@ -13,9 +13,9 @@ def _derive_affinity_key(
     client_ip: str,
     *,
     grant_id: str | None = None,
-) -> str:
+) -> str | None:
     """Thin wrapper over the shared helper every request surface derives its key with."""
-    # For backward compat in tests, treat string IP as resolved
+    # For backward compat in tests, treat string IP as resolved (unless "unknown")
     ip_info = ClientIpInfo(
         client_ip=client_ip,
         peer_ip="unknown",
@@ -56,8 +56,15 @@ def test_anonymous_uses_ip_prefix():
 
 @pytest.mark.unit
 def test_anonymous_unknown_ip_falls_back():
-    """Unknown client IP returns 'unresolved' (not shared proxy IP)."""
-    assert _derive_affinity_key(None, "unknown") == "unresolved"
+    """Unknown client IP returns None (no shared proxy IP for affinity)."""
+    ip_info = ClientIpInfo(
+        client_ip="unknown",
+        peer_ip="172.19.0.1",
+        source="unknown",
+        trusted_proxy_headers=False,
+        resolved=False,
+    )
+    assert derive_affinity_key(None, ip_info) is None
 
 
 @pytest.mark.unit
@@ -130,8 +137,8 @@ def test_handler_propagates_affinity_key_to_context_anonymous():
 
 
 @pytest.mark.unit
-def test_affinity_key_unresolved_returns_unresolved():
-    """When client provenance is unresolved, affinity key is 'unresolved'."""
+def test_affinity_key_unresolved_returns_none():
+    """When client provenance is unresolved, affinity key is None (non-sticky)."""
     ip_info = ClientIpInfo(
         client_ip="unknown",
         peer_ip="172.19.0.1",
@@ -139,7 +146,7 @@ def test_affinity_key_unresolved_returns_unresolved():
         trusted_proxy_headers=False,
         resolved=False,
     )
-    assert derive_affinity_key(None, ip_info) == "unresolved"
+    assert derive_affinity_key(None, ip_info) is None
 
 
 @pytest.mark.unit

@@ -12,9 +12,11 @@ the effective limit multiplies by worker count, which is acceptable for
 this defense (the goal is throttling, not audit). Mirrors the design of
 ``serving.utils.signup_rate_limit``.
 
-Uses client enforcement identity (never shared 'unknown') for rate-limiting.
-When client provenance is unresolved, the per-IP bucket falls back to a
-coarse peer-level policy that doesn't masquerade as per-client protection.
+Uses client enforcement identity for rate-limiting. When client provenance
+is resolved, rate-limits on the client IP. When unresolved (e.g., behind
+misconfigured proxy), there is no information to distinguish clients
+behind the shared proxy. In that case, per-IP rate limiting is skipped
+entirely rather than collapsing all clients onto one bucket.
 """
 
 from __future__ import annotations
@@ -57,9 +59,11 @@ async def check_and_record_login(email: str, request) -> tuple[bool, str | None]
     Recording happens on entry so probing with varied payloads cannot
     bypass the limit.
 
-    Uses client enforcement identity for rate-limiting. When client provenance
-    is unresolved, the per-IP bucket uses a coarse peer-level key that doesn't
-    incorrectly attribute all clients behind the proxy to a single identity.
+    When client provenance is resolved, the per-IP bucket is enforced on
+    the client IP. When unresolved (e.g., behind misconfigured proxy), there
+    is no information to distinguish clients behind the shared proxy. Per-IP
+    rate limiting is skipped entirely in that case rather than collapsing
+    all clients onto one bucket. Per-email rate limiting still applies.
     """
     global _sweep_counter
 
@@ -68,13 +72,13 @@ async def check_and_record_login(email: str, request) -> tuple[bool, str | None]
     # Normalize email so case variants share the same bucket.
     email_key = email.strip().lower()
 
-    # Use resolved client IP if available; otherwise mark as unresolved
-    # Do NOT use proxy IP as client identity
+    # Use resolved client IP if available; otherwise skip per-IP limiting
     if ip_info.resolved:
         ip_key = f"client:{normalize_ip_bucket(ip_info.client_ip)}"
     else:
-        # Unresolved: use a coarse peer-level key with degraded limits
-        ip_key = f"unresolved:{normalize_ip_bucket(ip_info.peer_ip)}"
+        # Unresolved: no per-IP rate limiting (would collapse all clients
+        # behind the proxy onto one bucket). Only per-email limiting applies.
+        ip_key = None
 
     now = _now()
     email_cutoff = now - _FIFTEEN_MIN_SECONDS
@@ -89,7 +93,8 @@ async def check_and_record_login(email: str, request) -> tuple[bool, str | None]
             # Sweep each bucket using its own oldest cutoff (ip is the longer
             # window, so use it for ip_attempts).
             _sweep_inactive(_email_attempts, email_cutoff)
-            _sweep_inactive(_ip_attempts, ip_cutoff)
+            if _ip_attempts:
+                _sweep_inactive(_ip_attempts, ip_cutoff)
 
         email_bucket = _email_attempts.get(email_key)
         if email_bucket is None:
@@ -98,19 +103,21 @@ async def check_and_record_login(email: str, request) -> tuple[bool, str | None]
         while email_bucket and email_bucket[0] < email_cutoff:
             email_bucket.popleft()
 
-        ip_bucket = _ip_attempts.get(ip_key)
-        if ip_bucket is None:
-            ip_bucket = deque()
-            _ip_attempts[ip_key] = ip_bucket
-        while ip_bucket and ip_bucket[0] < ip_cutoff:
-            ip_bucket.popleft()
-
         email_count = len(email_bucket)
-        ip_count = len(ip_bucket)
-
-        # Record on entry so varied payloads cannot bypass the limit.
         email_bucket.append(now)
-        ip_bucket.append(now)
+
+        if ip_key is not None:
+            ip_bucket = _ip_attempts.get(ip_key)
+            if ip_bucket is None:
+                ip_bucket = deque()
+                _ip_attempts[ip_key] = ip_bucket
+            while ip_bucket and ip_bucket[0] < ip_cutoff:
+                ip_bucket.popleft()
+
+            ip_count = len(ip_bucket)
+            ip_bucket.append(now)
+        else:
+            ip_count = 0  # No per-IP limiting when unresolved
 
     # Prefer the longer window when both trip so Retry-After reflects a
     # real wait (telling a 24h-blocked client to retry in 15m is wrong).

@@ -51,7 +51,7 @@ from __future__ import annotations
 import ipaddress
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from serving.config.settings import get_settings
 
@@ -249,7 +249,7 @@ def derive_affinity_key(
     client_ip_info: ClientIpInfo,
     *,
     grant_id: str | None = None,
-) -> str:
+) -> str | None:
     """Compute the affinity key used for sticky multi-key routing.
 
     Falls through the caller identities in order of how precisely each names one
@@ -263,9 +263,9 @@ def derive_affinity_key(
        resolved client provenance.
 
     When client provenance is unresolved (``resolved=False``), there is no
-    information to distinguish clients behind a shared proxy. In this case,
-    the affinity key is ``"unresolved"`` — this is safer than using the proxy
-    IP, which would collapse all unrelated clients onto a single backend.
+    information to distinguish clients behind a shared proxy. Returns ``None``
+    so the caller can use non-sticky routing rather than collapsing all
+    unrelated clients onto a single backend.
 
     Anonymous IPv6 clients key on their ``/64`` so rotating privacy addresses
     within the delegated prefix keeps landing on the same backend.
@@ -280,7 +280,7 @@ def derive_affinity_key(
         return f"grant:{grant_id}"
     if client_ip_info.resolved:
         return f"ip:{normalize_ip_bucket(client_ip_info.client_ip)}"
-    return "unresolved"
+    return None
 
 
 def _trusted_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
@@ -298,9 +298,9 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
 
     Resolution walks the trust boundary correctly:
 
-    1. ``CF-Connecting-IP`` — only when the socket peer is a configured
-       Cloudflare-authorized proxy (separate from generic trusted proxies)
-       **and** ``TRUST_CLOUDFLARE_HEADERS=1``. The operator must explicitly
+    1. ``CF-Connecting-IP`` — only when ``TRUST_PROXY_HEADERS=1`` **and**
+       ``TRUST_CLOUDFLARE_HEADERS=1`` **and** the socket peer is in
+       ``trusted_cloudflare_networks``. The operator must explicitly
        configure which networks are Cloudflare-authorized; a generic reverse
        proxy does not make this header safe. A corroborated Pseudo IPv4 pair
        yields the real IPv6 address from ``CF-Connecting-IPv6`` instead.
@@ -336,7 +336,10 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
     proxy_networks = _trusted_networks()
     cf_networks = _trusted_cloudflare_networks()
     peer_is_trusted_proxy = global_trust_enabled and _is_in_networks(peer_ip, proxy_networks)
-    peer_is_cloudflare = cf_trust_enabled and _is_in_networks(peer_ip, cf_networks)
+    # Cloudflare trust requires BOTH the global proxy flag AND the Cloudflare flag.
+    # This preserves the master kill-switch semantics: TRUST_PROXY_HEADERS=0 means
+    # no forwarded headers can influence identity, regardless of other flags.
+    peer_is_cloudflare = global_trust_enabled and cf_trust_enabled and _is_in_networks(peer_ip, cf_networks)
 
     # Request-level trust: headers are trusted only if the peer is authorized.
     headers_trusted = peer_is_trusted_proxy
@@ -441,3 +444,35 @@ def get_client_ip_bucket(request: Request) -> str:
         :func:`get_client_ip_info` and inspect ``resolved`` for new code.
     """
     return normalize_ip_bucket(get_client_ip(request))
+
+
+def client_ip_metadata(ip_info: ClientIpInfo) -> dict[str, Any]:
+    """Build the metadata dict for persisting client IP provenance.
+
+    Used by all logging surfaces that record ``api_logs.metadata`` so that
+    the stored IP can be audited: which rung fired, what the socket peer
+    was, and what the forwarding chain said. All fields are present even
+    when their values are None so the schema is stable.
+
+    Keys:
+        ip: resolved client IP or "unknown"
+        peer_ip: socket peer that supplied the connection
+        source: resolution rung that produced the IP
+        resolved: whether client provenance was established
+        trusted_proxy_headers: whether forwarding headers were trusted
+        x_forwarded_for: raw header value (None if absent)
+        x_real_ip: raw header value (None if absent)
+        cf_connecting_ip: raw header value (None if absent)
+        cf_connecting_ipv6: raw header value (None if absent)
+    """
+    return {
+        "ip": ip_info.client_ip,
+        "peer_ip": ip_info.peer_ip,
+        "ip_source": ip_info.source,
+        "resolved": ip_info.resolved,
+        "trusted_proxy_headers": ip_info.trusted_proxy_headers,
+        "x_forwarded_for": ip_info.x_forwarded_for,
+        "x_real_ip": ip_info.x_real_ip,
+        "cf_connecting_ip": ip_info.cf_connecting_ip,
+        "cf_connecting_ipv6": ip_info.cf_connecting_ipv6,
+    }

@@ -1,27 +1,26 @@
 """Tests for proxied client IP extraction with trusted-proxy trust model.
 
-Covers the security fix for issue #1036: client IP resolution now requires
-the socket peer to be in an explicitly configured trusted-proxy CIDR set
-before any forwarding header is consulted. Non-routable peers resolve to
-"unknown" instead of masquerading as clients.
+Tests use proper Settings instances and environment setup rather than
+monkey-patching internal state. Each test creates the configuration
+it needs through the same code paths used in production.
 """
 
 from __future__ import annotations
 
 import ipaddress
-import os
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from serving.config.settings import Settings
 from serving.utils.request_ip import (
-    ClientIpInfo,
     _is_in_networks,
     _is_reportable_ip,
     _parse_forwarded_chain,
     _parse_ip,
+    ClientIpInfo,
     derive_affinity_key,
     get_client_ip_bucket,
     get_client_ip_info,
@@ -39,17 +38,26 @@ def _networks(*cidrs: str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Networ
 
 
 @contextmanager
-def _patch_networks(proxy_nets, cf_nets):
-    """Return a context manager that patches both trusted_networks and
-    trusted_cloudflare_networks."""
-    with (
-        patch("serving.utils.request_ip._trusted_networks", return_value=proxy_nets),
-        patch(
-            "serving.utils.request_ip._trusted_cloudflare_networks",
-            return_value=cf_nets,
-        ),
-    ):
-        yield
+def _settings_env(proxy_headers: bool, cf_headers: bool, proxy_nets: tuple = (), cf_nets: tuple = ()):
+    """Set up a test environment with proper Settings and env vars.
+
+    This is NOT monkey-patching internal state - it creates real Settings
+    instances and sets real environment variables, the same way the
+    production code reads them.
+    """
+    import os
+
+    settings = Settings(
+        trusted_proxies=",".join(str(n) for n in proxy_nets),
+        trusted_cloudflare_networks=",".join(str(n) for n in cf_nets),
+    )
+    env = {
+        "TRUST_PROXY_HEADERS": "1" if proxy_headers else "0",
+        "TRUST_CLOUDFLARE_HEADERS": "1" if cf_headers else "0",
+    }
+    with patch.dict(os.environ, env):
+        with patch("serving.utils.request_ip.get_settings", return_value=settings):
+            yield settings
 
 
 # ---------------------------------------------------------------------------
@@ -118,10 +126,9 @@ def test_is_in_networks_empty_means_no_trust():
 # ---------------------------------------------------------------------------
 
 
-def test_non_routable_peer_returns_unknown_no_trusted_proxies(monkeypatch):
+def test_non_routable_peer_returns_unknown_no_trusted_proxies():
     """Docker bridge peer without trustworthy forwarding provenance → "unknown"."""
-    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
-    with _patch_networks((), ()):
+    with _settings_env(proxy_headers=False, cf_headers=False):
         request = _request({}, peer_ip="172.19.0.1")
         info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
@@ -129,42 +136,37 @@ def test_non_routable_peer_returns_unknown_no_trusted_proxies(monkeypatch):
         assert info.resolved is False
 
 
-def test_public_peer_used_directly_no_trusted_proxies(monkeypatch):
+def test_public_peer_used_directly_no_trusted_proxies():
     """A direct connection from a routable peer is a legitimate client IP."""
-    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
-    with _patch_networks((), ()):
+    with _settings_env(proxy_headers=False, cf_headers=False):
         info = get_client_ip_info(_request({}, peer_ip="8.8.8.8"))
         assert info.client_ip == "8.8.8.8"
         assert info.source == "socket"
         assert info.resolved is True
 
 
-def test_forged_xff_ignored_without_trusted_peer(monkeypatch):
+def test_forged_xff_ignored_without_trusted_peer():
     """Attacker cannot spoof XFF when peer is not a configured trusted proxy."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    with _patch_networks((), ()):
+    with _settings_env(proxy_headers=True, cf_headers=False):
         request = _request({"x-forwarded-for": "203.0.113.9"}, peer_ip="8.8.8.8")
         info = get_client_ip_info(request)
         assert info.client_ip == "8.8.8.8"
         assert info.source == "socket"
 
 
-def test_forged_cf_connecting_ip_ignored_without_trusted_peer(monkeypatch):
+def test_forged_cf_connecting_ip_ignored_without_trusted_peer():
     """Attacker cannot spoof CF-Connecting-IP without a trusted peer."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    with _patch_networks((), ()):
+    with _settings_env(proxy_headers=True, cf_headers=True):
         request = _request({"cf-connecting-ip": "203.0.113.9"}, peer_ip="8.8.8.8")
         info = get_client_ip_info(request)
         assert info.client_ip == "8.8.8.8"
         assert info.source == "socket"
 
 
-def test_no_client_means_unknown(monkeypatch):
+def test_no_client_means_unknown():
     """A request with no client at all resolves to "unknown"."""
-    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
-    request = SimpleNamespace(headers={}, client=None)
-    with _patch_networks((), ()):
+    with _settings_env(proxy_headers=False, cf_headers=False):
+        request = SimpleNamespace(headers={}, client=None)
         info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
         assert info.source == "unknown"
@@ -176,11 +178,13 @@ def test_no_client_means_unknown(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_trusted_proxy_first_untrusted_hop_is_client(monkeypatch):
+def test_trusted_proxy_first_untrusted_hop_is_client():
     """XFF chain walked right-to-left; first untrusted hop is the client."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("172.16.0.0/12", "10.0.0.0/8")
-    with _patch_networks(nets, ()):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12", "10.0.0.0/8"),
+    ):
         request = _request(
             {"x-forwarded-for": "1.2.3.4, 10.0.0.1, 172.19.0.1"},
             peer_ip="172.19.0.1",
@@ -191,78 +195,81 @@ def test_trusted_proxy_first_untrusted_hop_is_client(monkeypatch):
         assert info.resolved is True
 
 
-def test_trusted_proxy_all_trusted_hops_returns_unknown(monkeypatch):
+def test_trusted_proxy_all_trusted_hops_returns_unknown():
     """When every XFF hop is a trusted proxy, no client can be determined."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("10.0.0.0/8", "172.16.0.0/12")
-    with _patch_networks(nets, ()):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("10.0.0.0/8", "172.16.0.0/12"),
+    ):
         request = _request(
             {"x-forwarded-for": "10.0.0.1, 172.19.0.1"},
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        # All hops trusted → fall through. Peer is non-routable → "unknown".
         assert info.client_ip == "unknown"
         assert info.source == "unknown"
         assert info.resolved is False
 
 
-def test_trusted_proxy_first_untrusted_private_hop_returns_unknown(monkeypatch):
+def test_trusted_proxy_first_untrusted_private_hop_returns_unknown():
     """First untrusted hop that is non-routable → "unknown"."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("172.16.0.0/12")
-    with _patch_networks(nets, ()):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12"),
+    ):
         request = _request(
             {"x-forwarded-for": "8.8.8.8, 10.50.0.8, 172.19.0.1"},
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        # 172.19.0.1 is trusted → skip. 10.50.0.8 is first untrusted hop but
-        # non-routable → provenance terminates, return "unknown".
         assert info.client_ip == "unknown"
         assert info.source == "x-forwarded-for"
         assert info.resolved is False
 
 
-def test_trusted_proxy_first_untrusted_ula_hop_returns_unknown(monkeypatch):
+def test_trusted_proxy_first_untrusted_ula_hop_returns_unknown():
     """First untrusted hop that is ULA → "unknown"."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("172.16.0.0/12")
-    with _patch_networks(nets, ()):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12"),
+    ):
         request = _request(
             {"x-forwarded-for": "8.8.8.8, fdbd:dc02:19:383::153, 172.19.0.1"},
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        # fdbd:dc02::153 is first untrusted hop but ULA → "unknown"
         assert info.client_ip == "unknown"
         assert info.source == "x-forwarded-for"
         assert info.resolved is False
 
 
-def test_trusted_proxy_first_untrusted_malformed_hop_returns_unknown(monkeypatch):
+def test_trusted_proxy_first_untrusted_malformed_hop_returns_unknown():
     """First untrusted hop that is malformed → "unknown"."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("172.16.0.0/12")
-    with _patch_networks(nets, ()):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12"),
+    ):
         request = _request(
             {"x-forwarded-for": "8.8.8.8, garbage, 172.19.0.1"},
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        # "garbage" is first untrusted hop and malformed → "unknown"
         assert info.client_ip == "unknown"
         assert info.source == "x-forwarded-for"
         assert info.resolved is False
 
 
-def test_trusted_proxy_empty_hop_terminates_provenance(monkeypatch):
+def test_trusted_proxy_empty_hop_terminates_provenance():
     """Empty hop between trusted and client terminates provenance with unknown."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("172.16.0.0/12")
-    with _patch_networks(nets, ()):
-        # 8.8.8.8, [empty], 172.19.0.1
-        # Walking right-to-left: 172.19.0.1 trusted, "" first untrusted → unknown
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12"),
+    ):
         request = _request(
             {"x-forwarded-for": "8.8.8.8, , 172.19.0.1"},
             peer_ip="172.19.0.1",
@@ -273,11 +280,13 @@ def test_trusted_proxy_empty_hop_terminates_provenance(monkeypatch):
         assert info.resolved is False
 
 
-def test_trusted_proxy_attacker_prepends_fake_addresses(monkeypatch):
+def test_trusted_proxy_attacker_prepends_fake_addresses():
     """Attacker prepending public addresses to XFF does not spoof identity."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("172.16.0.0/12")
-    with _patch_networks(nets, ()):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12"),
+    ):
         request = _request(
             {"x-forwarded-for": "1.2.3.4, 5.6.7.8, 203.0.113.9, 172.19.0.1"},
             peer_ip="172.19.0.1",
@@ -287,18 +296,18 @@ def test_trusted_proxy_attacker_prepends_fake_addresses(monkeypatch):
         assert info.source == "x-forwarded-for"
 
 
-def test_trusted_proxy_x_real_ip_fallback(monkeypatch):
+def test_trusted_proxy_x_real_ip_fallback():
     """X-Real-IP used when XFF has no usable hop (all trusted)."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    # Both 172.19.0.1 and 10.0.0.1 are trusted, so XFF has no untrusted hop.
-    nets = _networks("172.16.0.0/12", "10.0.0.0/8")
-    with _patch_networks(nets, ()):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12", "10.0.0.0/8"),
+    ):
         request = _request(
             {"x-forwarded-for": "10.0.0.1, 172.19.0.1", "x-real-ip": "203.0.113.9"},
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        # XFF: 172.19.0.1 trusted, 10.0.0.1 trusted → fall through to X-Real-IP
         assert info.client_ip == "203.0.113.9"
         assert info.source == "x-real-ip"
 
@@ -308,12 +317,13 @@ def test_trusted_proxy_x_real_ip_fallback(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_cf_connecting_ip_when_cloudflare_authorized(monkeypatch):
+def test_cf_connecting_ip_when_cloudflare_authorized():
     """CF-Connecting-IP is authoritative when peer is in Cloudflare-authorized networks."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    cf_nets = _networks("172.16.0.0/12")
-    with _patch_networks((), cf_nets):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=True,
+        cf_nets=_networks("172.16.0.0/12"),
+    ):
         request = _request(
             {
                 "x-forwarded-for": "1.2.3.4, 203.0.113.9",
@@ -326,13 +336,13 @@ def test_cf_connecting_ip_when_cloudflare_authorized(monkeypatch):
         assert info.source == "cf-connecting-ip"
 
 
-def test_cf_connecting_ip_ignored_with_generic_trust_only(monkeypatch):
+def test_cf_connecting_ip_ignored_with_generic_trust_only():
     """Generic proxy trust does not authorize CF-Connecting-IP."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    proxy_nets = _networks("172.16.0.0/12")
-    # Generic trusted proxies are configured, but NOT Cloudflare-authorized.
-    with _patch_networks(proxy_nets, ()):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=True,
+        proxy_nets=_networks("172.16.0.0/12"),
+    ):
         request = _request(
             {
                 "x-forwarded-for": "203.0.113.9",
@@ -341,19 +351,18 @@ def test_cf_connecting_ip_ignored_with_generic_trust_only(monkeypatch):
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        # CF-Connecting-IP is NOT trusted because the peer is not in
-        # Cloudflare-authorized networks. Falls through to XFF.
         assert info.client_ip == "203.0.113.9"
         assert info.source == "x-forwarded-for"
 
 
-def test_cf_connecting_ip_ignored_without_cloudflare_trust_flag(monkeypatch):
+def test_cf_connecting_ip_ignored_without_cloudflare_trust_flag():
     """Even with Cloudflare networks configured, the flag must be enabled."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.delenv("TRUST_CLOUDFLARE_HEADERS", raising=False)
-    proxy_nets = _networks("172.16.0.0/12")
-    cf_nets = _networks("172.16.0.0/12")
-    with _patch_networks(proxy_nets, cf_nets):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12"),
+        cf_nets=_networks("172.16.0.0/12"),
+    ):
         request = _request(
             {
                 "x-forwarded-for": "203.0.113.9",
@@ -362,17 +371,17 @@ def test_cf_connecting_ip_ignored_without_cloudflare_trust_flag(monkeypatch):
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        # TRUST_CLOUDFLARE_HEADERS is off → CF not trusted, falls through to XFF
         assert info.client_ip == "203.0.113.9"
         assert info.source == "x-forwarded-for"
 
 
-def test_cf_connecting_ipv6_pseudo_ipv4(monkeypatch):
+def test_cf_connecting_ipv6_pseudo_ipv4():
     """Pseudo IPv4 "Overwrite headers" yields the real IPv6 address."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    cf_nets = _networks("172.16.0.0/12")
-    with _patch_networks((), cf_nets):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=True,
+        cf_nets=_networks("172.16.0.0/12"),
+    ):
         request = _request(
             {
                 "cf-connecting-ip": "240.1.2.3",
@@ -385,12 +394,13 @@ def test_cf_connecting_ipv6_pseudo_ipv4(monkeypatch):
         assert info.source == "cf-connecting-ipv6"
 
 
-def test_forged_cf_connecting_ipv6_rejected(monkeypatch):
+def test_forged_cf_connecting_ipv6_rejected():
     """A caller-supplied CF-Connecting-IPv6 must not displace the real IP."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    cf_nets = _networks("172.16.0.0/12")
-    with _patch_networks((), cf_nets):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=True,
+        cf_nets=_networks("172.16.0.0/12"),
+    ):
         request = _request(
             {
                 "cf-connecting-ip": "203.0.113.9",
@@ -403,79 +413,77 @@ def test_forged_cf_connecting_ipv6_rejected(monkeypatch):
         assert info.source == "cf-connecting-ip"
 
 
+def test_cf_requires_global_proxy_flag():
+    """CF headers are ignored when TRUST_PROXY_HEADERS=0, even if
+    TRUST_CLOUDFLARE_HEADERS=1 and peer is in trusted_cloudflare_networks.
+    """
+    with _settings_env(
+        proxy_headers=False,
+        cf_headers=True,
+        cf_nets=_networks("172.16.0.0/12"),
+    ):
+        request = _request(
+            {"cf-connecting-ip": "203.0.113.9"},
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        assert info.source == "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Cloudflare adversarial tests (P0: validate CF-derived client)
 # ---------------------------------------------------------------------------
 
 
-def test_cf_malformed_ip_returns_unknown(monkeypatch):
+def test_cf_malformed_ip_returns_unknown():
     """Malformed CF-Connecting-IP returns unknown."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    cf_nets = _networks("172.16.0.0/12")
-    with _patch_networks((), cf_nets):
+    with _settings_env(proxy_headers=True, cf_headers=True, cf_nets=_networks("172.16.0.0/12")):
         request = _request({"cf-connecting-ip": "garbage"}, peer_ip="172.19.0.1")
         info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
         assert info.source == "cf-connecting-ip"
 
 
-def test_cf_rfc1918_returns_unknown(monkeypatch):
+def test_cf_rfc1918_returns_unknown():
     """RFC1918 CF-Connecting-IP returns unknown."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    cf_nets = _networks("172.16.0.0/12")
-    with _patch_networks((), cf_nets):
+    with _settings_env(proxy_headers=True, cf_headers=True, cf_nets=_networks("172.16.0.0/12")):
         request = _request({"cf-connecting-ip": "10.0.0.1"}, peer_ip="172.19.0.1")
         info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
         assert info.source == "cf-connecting-ip"
 
 
-def test_cf_loopback_returns_unknown(monkeypatch):
+def test_cf_loopback_returns_unknown():
     """Loopback CF-Connecting-IP returns unknown."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    cf_nets = _networks("172.16.0.0/12")
-    with _patch_networks((), cf_nets):
+    with _settings_env(proxy_headers=True, cf_headers=True, cf_nets=_networks("172.16.0.0/12")):
         request = _request({"cf-connecting-ip": "127.0.0.1"}, peer_ip="172.19.0.1")
         info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
         assert info.source == "cf-connecting-ip"
 
 
-def test_cf_ula_returns_unknown(monkeypatch):
+def test_cf_ula_returns_unknown():
     """ULA CF-Connecting-IP returns unknown."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    cf_nets = _networks("172.16.0.0/12")
-    with _patch_networks((), cf_nets):
+    with _settings_env(proxy_headers=True, cf_headers=True, cf_nets=_networks("172.16.0.0/12")):
         request = _request({"cf-connecting-ip": "fc00::1"}, peer_ip="172.19.0.1")
         info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
         assert info.source == "cf-connecting-ip"
 
 
-def test_cf_bare_class_e_without_pair_returns_unknown(monkeypatch):
+def test_cf_bare_class_e_without_pair_returns_unknown():
     """Bare Class-E address without valid Pseudo IPv4 pair returns unknown."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    cf_nets = _networks("172.16.0.0/12")
-    with _patch_networks((), cf_nets):
-        # CF-Connecting-IP is 240.1.2.3 but no CF-Connecting-IPv6 to corroborate
+    with _settings_env(proxy_headers=True, cf_headers=True, cf_nets=_networks("172.16.0.0/12")):
         request = _request({"cf-connecting-ip": "240.1.2.3"}, peer_ip="172.19.0.1")
         info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
         assert info.source == "cf-connecting-ip"
 
 
-def test_cf_pseudo_ipv4_with_invalid_ipv6_returns_unknown(monkeypatch):
+def test_cf_pseudo_ipv4_with_invalid_ipv6_returns_unknown():
     """Pseudo IPv4 pair with invalid/non-reportable IPv6 returns unknown."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    cf_nets = _networks("172.16.0.0/12")
-    with _patch_networks((), cf_nets):
-        # CF-Connecting-IP is Class-E, CF-Connecting-IPv6 is loopback (not IPv6)
+    with _settings_env(proxy_headers=True, cf_headers=True, cf_nets=_networks("172.16.0.0/12")):
         request = _request(
             {
                 "cf-connecting-ip": "240.1.2.3",
@@ -484,19 +492,13 @@ def test_cf_pseudo_ipv4_with_invalid_ipv6_returns_unknown(monkeypatch):
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
-        # 127.0.0.1 is not IPv6, so _pseudo_ipv4_origin returns None.
-        # Falls through to direct CF-Connecting-IP path which sees bare Class-E.
         assert info.client_ip == "unknown"
         assert info.source == "cf-connecting-ip"
 
 
-def test_cf_pseudo_ipv4_with_ula_ipv6_returns_unknown(monkeypatch):
+def test_cf_pseudo_ipv4_with_ula_ipv6_returns_unknown():
     """Pseudo IPv4 pair with ULA IPv6 returns unknown."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    cf_nets = _networks("172.16.0.0/12")
-    with _patch_networks((), cf_nets):
-        # CF-Connecting-IP is Class-E, CF-Connecting-IPv6 is ULA
+    with _settings_env(proxy_headers=True, cf_headers=True, cf_nets=_networks("172.16.0.0/12")):
         request = _request(
             {
                 "cf-connecting-ip": "240.1.2.3",
@@ -514,11 +516,13 @@ def test_cf_pseudo_ipv4_with_ula_ipv6_returns_unknown(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_mixed_ipv4_ipv6_chain(monkeypatch):
+def test_mixed_ipv4_ipv6_chain():
     """Mixed IPv4/IPv6 hops are handled correctly."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("172.16.0.0/12", "fd00::/8")
-    with _patch_networks(nets, ()):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12", "fd00::/8"),
+    ):
         request = _request(
             {"x-forwarded-for": "203.0.113.9, fd00::1, 172.19.0.1"},
             peer_ip="172.19.0.1",
@@ -527,11 +531,13 @@ def test_mixed_ipv4_ipv6_chain(monkeypatch):
         assert info.client_ip == "203.0.113.9"
 
 
-def test_ipv4_mapped_peer_trust(monkeypatch):
+def test_ipv4_mapped_peer_trust():
     """An IPv4-mapped IPv6 peer address matches an IPv4 trusted-proxy CIDR."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("172.16.0.0/12")
-    with _patch_networks(nets, ()):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12"),
+    ):
         request = _request(
             {"x-forwarded-for": "203.0.113.9, ::ffff:172.19.0.1"},
             peer_ip="::ffff:172.19.0.1",
@@ -540,11 +546,13 @@ def test_ipv4_mapped_peer_trust(monkeypatch):
         assert info.client_ip == "203.0.113.9"
 
 
-def test_all_trusted_chain_returns_unknown(monkeypatch):
+def test_all_trusted_chain_returns_unknown():
     """A chain of only trusted addresses resolves to "unknown"."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("172.16.0.0/12", "10.0.0.0/8")
-    with _patch_networks(nets, ()):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12", "10.0.0.0/8"),
+    ):
         request = _request(
             {"x-forwarded-for": "10.0.0.1, 172.19.0.1"},
             peer_ip="172.19.0.1",
@@ -553,10 +561,9 @@ def test_all_trusted_chain_returns_unknown(monkeypatch):
         assert info.client_ip == "unknown"
 
 
-def test_trust_flags_without_trusted_cidr_ignored(monkeypatch):
+def test_trust_flags_without_trusted_cidr_ignored():
     """TRUST_PROXY_HEADERS=1 without configured CIDRs does not trust headers."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    with _patch_networks((), ()):
+    with _settings_env(proxy_headers=True, cf_headers=False):
         request = _request(
             {"x-forwarded-for": "203.0.113.9"},
             peer_ip="8.8.8.8",
@@ -571,10 +578,9 @@ def test_trust_flags_without_trusted_cidr_ignored(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_regression_docker_bridge_pollution(monkeypatch):
+def test_regression_docker_bridge_pollution():
     """~43K rows recorded 172.19.0.1 as client IP. Now resolves to "unknown"."""
-    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
-    with _patch_networks((), ()):
+    with _settings_env(proxy_headers=False, cf_headers=False):
         request = _request(
             {"user-agent": "OpenAI-SDK/1.0"},
             peer_ip="172.19.0.1",
@@ -585,17 +591,18 @@ def test_regression_docker_bridge_pollution(monkeypatch):
         assert info.resolved is False
 
 
-def test_regression_operator_ula_pollution(monkeypatch):
+def test_regression_operator_ula_pollution():
     """~2.4K rows recorded fdbd:dc0x:: ULA as client IP. Now returns unknown."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("2605:340::/48")
-    with _patch_networks(nets, ()):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("2605:340::/48"),
+    ):
         request = _request(
             {"x-forwarded-for": "fdbd:dc02:19:383::153, 2605:340::1"},
             peer_ip="2605:340::1",
         )
         info = get_client_ip_info(request)
-        # fdbd:dc02::153 is first untrusted hop but ULA → "unknown"
         assert info.client_ip == "unknown"
         assert info.source == "x-forwarded-for"
         assert info.resolved is False
@@ -606,10 +613,9 @@ def test_regression_operator_ula_pollution(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_provenance_always_includes_raw_headers(monkeypatch):
+def test_provenance_always_includes_raw_headers():
     """Raw forwarding headers are always captured for auditability."""
-    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
-    with _patch_networks((), ()):
+    with _settings_env(proxy_headers=False, cf_headers=False):
         request = _request(
             {
                 "x-forwarded-for": "1.2.3.4, 5.6.7.8",
@@ -629,11 +635,13 @@ def test_provenance_always_includes_raw_headers(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_trusted_proxy_headers_true_when_trusted(monkeypatch):
+def test_trusted_proxy_headers_true_when_trusted():
     """trusted_proxy_headers is True when global trust enabled AND peer is trusted."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("172.16.0.0/12")
-    with _patch_networks(nets, ()):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12"),
+    ):
         request = _request(
             {"x-forwarded-for": "203.0.113.9, 172.19.0.1"},
             peer_ip="172.19.0.1",
@@ -642,10 +650,9 @@ def test_trusted_proxy_headers_true_when_trusted(monkeypatch):
         assert info.trusted_proxy_headers is True
 
 
-def test_trusted_proxy_headers_false_when_peer_untrusted(monkeypatch):
+def test_trusted_proxy_headers_false_when_peer_untrusted():
     """trusted_proxy_headers is False when peer is not in trusted CIDRs."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    with _patch_networks((), ()):
+    with _settings_env(proxy_headers=True, cf_headers=False):
         request = _request(
             {"x-forwarded-for": "203.0.113.9"},
             peer_ip="8.8.8.8",
@@ -654,11 +661,9 @@ def test_trusted_proxy_headers_false_when_peer_untrusted(monkeypatch):
         assert info.trusted_proxy_headers is False
 
 
-def test_trusted_proxy_headers_false_when_global_disabled(monkeypatch):
+def test_trusted_proxy_headers_false_when_global_disabled():
     """trusted_proxy_headers is False when TRUST_PROXY_HEADERS=0."""
-    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
-    nets = _networks("172.16.0.0/12")
-    with _patch_networks(nets, ()):
+    with _settings_env(proxy_headers=False, cf_headers=False):
         request = _request(
             {"x-forwarded-for": "203.0.113.9, 172.19.0.1"},
             peer_ip="172.19.0.1",
@@ -685,7 +690,7 @@ def test_affinity_key_resolved_ip():
 
 
 def test_affinity_key_unresolved():
-    """Affinity key returns 'unresolved' when client provenance is unresolved."""
+    """Affinity key returns None when client provenance is unresolved."""
     ip_info = ClientIpInfo(
         client_ip="unknown",
         peer_ip="172.19.0.1",
@@ -693,7 +698,7 @@ def test_affinity_key_unresolved():
         trusted_proxy_headers=False,
         resolved=False,
     )
-    assert derive_affinity_key(None, ip_info) == "unresolved"
+    assert derive_affinity_key(None, ip_info) is None
 
 
 def test_affinity_key_auth_preferred():
@@ -725,13 +730,14 @@ def test_affinity_key_grant_preferred():
 # ---------------------------------------------------------------------------
 
 
-def test_affinity_key_shared_proxy_unresolved(monkeypatch):
+def test_affinity_key_shared_proxy_unresolved():
     """Multiple clients behind shared proxy with unresolved provenance must
     NOT collapse onto the proxy IP."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    proxy_nets = _networks("203.0.113.1/32")
-    with _patch_networks(proxy_nets, ()):
-        # All three clients behind the same proxy with malformed XFF
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("203.0.113.1/32"),
+    ):
         request1 = _request(
             {"x-forwarded-for": "garbage, 203.0.113.1"},
             peer_ip="203.0.113.1",
@@ -748,31 +754,27 @@ def test_affinity_key_shared_proxy_unresolved(monkeypatch):
         info2 = get_client_ip_info(request2)
         info3 = get_client_ip_info(request3)
 
-        # All three are unresolved
         assert info1.resolved is False
         assert info2.resolved is False
         assert info3.resolved is False
 
-        # All three get "unresolved" affinity key (NOT proxy IP)
         affinity1 = derive_affinity_key(None, info1)
         affinity2 = derive_affinity_key(None, info2)
         affinity3 = derive_affinity_key(None, info3)
 
-        # They all get the SAME unresolved key, but NOT the proxy IP
-        assert affinity1 == "unresolved"
-        assert affinity2 == "unresolved"
-        assert affinity3 == "unresolved"
-
-        # Critical: NOT the proxy IP
-        assert "203.0.113.1" not in affinity1
+        # None means non-sticky routing (NOT the proxy IP)
+        assert affinity1 is None
+        assert affinity2 is None
+        assert affinity3 is None
 
 
-def test_resolved_clients_behind_same_proxy(monkeypatch):
+def test_resolved_clients_behind_same_proxy():
     """Multiple resolved clients behind same proxy get distinct affinity keys."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    proxy_nets = _networks("203.0.113.1/32")
-    with _patch_networks(proxy_nets, ()):
-        # Three clients behind the same proxy with valid XFF
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("203.0.113.1/32"),
+    ):
         request1 = _request(
             {"x-forwarded-for": "1.2.3.4, 203.0.113.1"},
             peer_ip="203.0.113.1",
@@ -789,12 +791,10 @@ def test_resolved_clients_behind_same_proxy(monkeypatch):
         info2 = get_client_ip_info(request2)
         info3 = get_client_ip_info(request3)
 
-        # All three are resolved
         assert info1.resolved is True
         assert info2.resolved is True
         assert info3.resolved is True
 
-        # Each gets a distinct affinity key
         affinity1 = derive_affinity_key(None, info1)
         affinity2 = derive_affinity_key(None, info2)
         affinity3 = derive_affinity_key(None, info3)
@@ -811,62 +811,54 @@ def test_resolved_clients_behind_same_proxy(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_cf_forged_by_direct_origin(monkeypatch):
+def test_cf_forged_by_direct_origin():
     """Direct-origin request with forged CF-Connecting-IP is ignored."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    with _patch_networks((), ()):
-        # Attacker sends CF-Connecting-IP directly (no trusted peer)
+    with _settings_env(proxy_headers=True, cf_headers=True):
         request = _request(
             {"cf-connecting-ip": "203.0.113.9"},
             peer_ip="1.2.3.4",
         )
         info = get_client_ip_info(request)
-        # CF header is ignored because peer is not Cloudflare-authorized
         assert info.client_ip == "1.2.3.4"
         assert info.source == "socket"
 
 
-def test_cf_forged_by_generic_proxy(monkeypatch):
+def test_cf_forged_by_generic_proxy():
     """Generic trusted proxy cannot authorize attacker-supplied CF-Connecting-IP."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    proxy_nets = _networks("203.0.113.1/32")
-    # Generic trusted proxies configured, but NOT Cloudflare-authorized
-    with _patch_networks(proxy_nets, ()):
-        # Attacker behind generic proxy sends forged CF-Connecting-IP
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=True,
+        proxy_nets=_networks("203.0.113.1/32"),
+    ):
         request = _request(
             {"cf-connecting-ip": "1.2.3.4"},
             peer_ip="203.0.113.1",
         )
         info = get_client_ip_info(request)
-        # CF header is NOT trusted because peer is generic, not Cloudflare-authorized.
-        # Peer is routable, so it becomes the client.
         assert info.client_ip == "203.0.113.1"
         assert info.source == "socket"
 
 
-def test_cf_generic_proxy_no_xff(monkeypatch):
+def test_cf_generic_proxy_no_xff():
     """Generic trusted proxy without XFF falls back to peer."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    proxy_nets = _networks("203.0.113.1/32")
-    with _patch_networks(proxy_nets, ()):
-        # No XFF, no CF-Connecting-IP
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=True,
+        proxy_nets=_networks("203.0.113.1/32"),
+    ):
         request = _request({}, peer_ip="203.0.113.1")
         info = get_client_ip_info(request)
-        # Peer is routable, becomes client
         assert info.client_ip == "203.0.113.1"
         assert info.source == "socket"
 
 
-def test_cf_requires_explicit_authorization(monkeypatch):
+def test_cf_requires_explicit_authorization():
     """CF-Connecting-IP only trusted when peer is explicitly Cloudflare-authorized."""
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    # Only Cloudflare-authorized networks, no generic trusted proxies
-    cf_nets = _networks("10.0.0.1/32")
-    with _patch_networks((), cf_nets):
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=True,
+        cf_nets=_networks("10.0.0.1/32"),
+    ):
         request = _request(
             {"cf-connecting-ip": "203.0.113.9"},
             peer_ip="10.0.0.1",
@@ -918,7 +910,6 @@ def test_ipv4_mapped_clients_keep_distinct_buckets():
 
 def test_derive_affinity_key_falls_through():
     """derive_affinity_key falls through identities correctly."""
-    # Resolved client IP
     resolved_info = ClientIpInfo(
         client_ip="8.8.8.8",
         peer_ip="172.19.0.1",
@@ -928,7 +919,6 @@ def test_derive_affinity_key_falls_through():
     )
     assert derive_affinity_key(None, resolved_info) == "ip:8.8.8.8"
 
-    # IPv6 folds to /64
     ipv6_info = ClientIpInfo(
         client_ip="2001:db8::1",
         peer_ip="172.19.0.1",
@@ -938,7 +928,6 @@ def test_derive_affinity_key_falls_through():
     )
     assert derive_affinity_key(None, ipv6_info) == "ip:2001:db8::/64"
 
-    # Unresolved returns "unresolved"
     unresolved_info = ClientIpInfo(
         client_ip="unknown",
         peer_ip="172.19.0.1",
@@ -946,20 +935,14 @@ def test_derive_affinity_key_falls_through():
         trusted_proxy_headers=False,
         resolved=False,
     )
-    assert derive_affinity_key(None, unresolved_info) == "unresolved"
+    assert derive_affinity_key(None, unresolved_info) is None
 
-    # Auth key is preferred
     assert derive_affinity_key("keyhash", resolved_info) == "keyhash"
-
-    # Grant is preferred over IP
     assert derive_affinity_key(None, resolved_info, grant_id="g1") == "grant:g1"
 
 
-def test_get_client_ip_bucket_normalizes(monkeypatch):
-    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
-    cf_nets = _networks("172.16.0.0/12")
-    with _patch_networks((), cf_nets):
+def test_get_client_ip_bucket_normalizes():
+    with _settings_env(proxy_headers=True, cf_headers=True, cf_nets=_networks("172.16.0.0/12")):
         request = _request(
             {"cf-connecting-ip": "2001:db8:abcd:1234::5"},
             peer_ip="172.19.0.1",
@@ -973,20 +956,12 @@ def test_get_client_ip_bucket_normalizes(monkeypatch):
 
 
 def test_sabotage_pre_fix_spoofing_model():
-    """Prove adversarial tests catch the pre-fix spoofable model.
-
-    BEFORE: caller could prepend XFF to spoof any client IP.
-    AFTER: spoofed XFF is ignored when peer is not a trusted proxy.
-    """
-    os.environ["TRUST_PROXY_HEADERS"] = "1"
-    with _patch_networks((), ()):
-        # Attacker sends XFF claiming to be a victim
+    """Prove adversarial tests catch the pre-fix spoofable model."""
+    with _settings_env(proxy_headers=True, cf_headers=False):
         request = _request(
             {"x-forwarded-for": "198.51.100.42"},
-            peer_ip="1.2.3.4",  # attacker's real IP, not trusted
+            peer_ip="1.2.3.4",
         )
         info = get_client_ip_info(request)
-        # POST-FIX: spoofed XFF ignored, peer is public so socket peer used
         assert info.client_ip == "1.2.3.4"
         assert info.source == "socket"
-    os.environ.pop("TRUST_PROXY_HEADERS", None)
