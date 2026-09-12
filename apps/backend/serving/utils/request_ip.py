@@ -22,7 +22,7 @@ Security model
    right-to-left. Discard only hops explicitly in the trusted-proxy set. The
    first hop that is *not* a trusted proxy **is where provenance terminates**:
    * if it is routable, it is the real client;
-   * if it is non-routable or malformed, return ``"unknown"``.
+   * if it is non-routable or malformed, provenance is **unresolved**.
    Never continue farther left — that would cross the trust boundary and
    consume attacker-controlled values.
 
@@ -35,6 +35,12 @@ Security model
 5. **``"unknown"`` is a legitimate outcome.** If the socket peer is
    non-routable and there is no trustworthy forwarding provenance, the result
    is ``"unknown"`` rather than masquerading an internal address as a client.
+
+6. **Unresolved identity is not recoverable.** When client provenance fails,
+   there is no information to distinguish clients behind a shared proxy. The
+   proxy IP is useful for diagnosing *where a connection came from*, but it is
+   NOT a substitute for *who the client was*. Consumers must handle unresolved
+   identity explicitly rather than silently falling back to the proxy address.
 
 ``trusted_proxies`` and ``trusted_cloudflare_networks`` are validated at
 startup as comma-separated CIDR lists; invalid entries fail configuration.
@@ -136,12 +142,21 @@ class ClientIpInfo:
     is never an RFC 1918 / CGNAT / ULA / loopback / link-local / unspecified
     address — if the resolution lands on one of those, the result is
     ``"unknown"`` instead.
+
+    ``resolved`` is ``True`` when ``client_ip`` is a real routable address that
+    can be attributed to a specific client. It is ``False`` when the result is
+    ``"unknown"`` — meaning client provenance could not be established. This
+    distinction is critical for downstream consumers: when ``resolved`` is
+    ``False``, there is no information to distinguish clients behind a shared
+    proxy, and the proxy IP must NOT be used as a substitute for client
+    identity.
     """
 
     client_ip: str
     peer_ip: str
     source: str
     trusted_proxy_headers: bool
+    resolved: bool
     x_forwarded_for: str | None = None
     x_real_ip: str | None = None
     cf_connecting_ip: str | None = None
@@ -231,7 +246,7 @@ def normalize_ip_bucket(ip: str) -> str:
 
 def derive_affinity_key(
     auth_key_hash: str | None,
-    client_ip: str,
+    client_ip_info: ClientIpInfo,
     *,
     grant_id: str | None = None,
 ) -> str:
@@ -244,7 +259,13 @@ def derive_affinity_key(
     2. ``grant_id`` — an inference-grant token carries no key hash, so without
        this a sandbox would key on its IP and every sandbox behind one NAT or
        relay address would collapse onto a single binding.
-    3. The client IP bucket, for traffic with no credential at all.
+    3. The client IP bucket, for traffic with no credential at all **and**
+       resolved client provenance.
+
+    When client provenance is unresolved (``resolved=False``), there is no
+    information to distinguish clients behind a shared proxy. In this case,
+    the affinity key is ``"unresolved"`` — this is safer than using the proxy
+    IP, which would collapse all unrelated clients onto a single backend.
 
     Anonymous IPv6 clients key on their ``/64`` so rotating privacy addresses
     within the delegated prefix keeps landing on the same backend.
@@ -257,7 +278,9 @@ def derive_affinity_key(
         return auth_key_hash
     if grant_id:
         return f"grant:{grant_id}"
-    return f"ip:{normalize_ip_bucket(client_ip)}"
+    if client_ip_info.resolved:
+        return f"ip:{normalize_ip_bucket(client_ip_info.client_ip)}"
+    return "unresolved"
 
 
 def _trusted_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
@@ -287,12 +310,12 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
        (rightmost) toward the origin (leftmost); hops that fall inside the
        trusted-proxy set are skipped. The first hop that is *not* a trusted
        proxy terminates provenance: if it is routable, it is the client; if it
-       is non-routable or malformed, the result is ``"unknown"``. We never
+       is non-routable or malformed, provenance is **unresolved**. We never
        continue leftward past the first untrusted hop.
     3. ``X-Real-IP`` — only when trusted and routable.
     4. The socket peer — a direct connection, or the last resort when no
-       forwarded hop is usable. If the peer itself is non-routable, the result
-       is ``"unknown"``.
+       forwarded hop is usable. If the peer itself is non-routable, provenance
+       is **unresolved**.
 
     When ``trusted_proxies`` is empty (the default), forwarding headers are
     never trusted, and the socket peer is the only network fact used. This is
@@ -318,12 +341,13 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
     # Request-level trust: headers are trusted only if the peer is authorized.
     headers_trusted = peer_is_trusted_proxy
 
-    def _info(client_ip: str, source: str) -> ClientIpInfo:
+    def _info(client_ip: str, source: str, resolved: bool) -> ClientIpInfo:
         return ClientIpInfo(
             client_ip=client_ip,
             peer_ip=peer_ip,
             source=source,
             trusted_proxy_headers=headers_trusted,
+            resolved=resolved,
             x_forwarded_for=x_forwarded_for,
             x_real_ip=x_real_ip,
             cf_connecting_ip=cf_connecting_ip,
@@ -338,18 +362,18 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
         if pseudo_origin is not None:
             # Genuine Pseudo IPv4 pair: use the corroborated IPv6 address.
             if _is_reportable_ip(pseudo_origin):
-                return _info(pseudo_origin, "cf-connecting-ipv6")
-            return _info("unknown", "cf-connecting-ipv6")
+                return _info(pseudo_origin, "cf-connecting-ipv6", True)
+            return _info("unknown", "cf-connecting-ipv6", False)
         # No valid Pseudo IPv4 pair. Parse the CF-Connecting-IP directly.
         parsed_cf = _parse_ip(cf_connecting_ip)
         if parsed_cf is not None and parsed_cf in PSEUDO_IPV4_NETWORK:
             # A bare Class-E value without a valid Pseudo IPv4 pair is not a
             # real client address (Cloudflare puts the synthetic in
             # CF-Connecting-IP and the real IPv6 in CF-Connecting-IPv6).
-            return _info("unknown", "cf-connecting-ip")
+            return _info("unknown", "cf-connecting-ip", False)
         if _is_reportable_ip(cf_connecting_ip):
-            return _info(cf_connecting_ip, "cf-connecting-ip")
-        return _info("unknown", "cf-connecting-ip")
+            return _info(cf_connecting_ip, "cf-connecting-ip", True)
+        return _info("unknown", "cf-connecting-ip", False)
 
     if peer_is_trusted_proxy:
         # Walk the XFF chain right-to-left, skipping explicitly trusted hops.
@@ -364,7 +388,7 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
         #   10.0.0.1 is also trusted → skip
         #   1.2.3.4 is NOT trusted → provenance terminates here
         #     If routable: it is the client
-        #     If non-routable / malformed: return "unknown"
+        #     If non-routable / malformed: unresolved
         #     NEVER continue farther left
         if x_forwarded_for:
             hops = _parse_forwarded_chain(x_forwarded_for)
@@ -373,22 +397,22 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
                     continue
                 # First untrusted hop: provenance terminates here.
                 if _is_reportable_ip(hop):
-                    return _info(hop, "x-forwarded-for")
-                # Non-routable or malformed untrusted hop: return unknown.
+                    return _info(hop, "x-forwarded-for", True)
+                # Non-routable or malformed untrusted hop: unresolved.
                 # Do NOT continue leftward — that would cross the trust
                 # boundary and consume attacker-controlled values.
-                return _info("unknown", "x-forwarded-for")
+                return _info("unknown", "x-forwarded-for", False)
 
         if _is_reportable_ip(x_real_ip):
-            return _info(x_real_ip, "x-real-ip")  # type: ignore[arg-type]
+            return _info(x_real_ip, "x-real-ip", True)  # type: ignore[arg-type]
 
     # No trustworthy forwarded hop: fall back to the socket peer. A direct
     # public connection is a real client; an internal peer (docker bridge,
-    # etc.) is reported as "unknown" — it cannot represent a real remote
-    # client, and logging it as one is the pollution this fix eliminates.
+    # etc.) is unresolved — it cannot represent a real remote client, and
+    # logging it as one is the pollution this fix eliminates.
     if _is_reportable_ip(peer_ip):
-        return _info(peer_ip, "socket")
-    return _info("unknown", "unknown")
+        return _info(peer_ip, "socket", True)
+    return _info("unknown", "unknown", False)
 
 
 def get_client_ip(request: Request) -> str:
@@ -396,54 +420,24 @@ def get_client_ip(request: Request) -> str:
 
     This is the **provenance identity** — it may be ``"unknown"`` when no
     trustworthy client address could be determined. Use this for logging,
-    audit, and display. For rate-limiting, auth-blocking, and affinity, use
-    :func:`get_client_enforcement_id` instead, which never returns a shared
-    ``"unknown"`` value that could collapse unrelated callers onto one key.
+    audit, and display.
+
+    .. note::
+        For rate-limiting, auth-blocking, and affinity, do **not** use this
+        function directly. Use :func:`get_client_ip_info` and inspect
+        ``resolved`` to determine the appropriate identity for the operation.
+        When ``resolved`` is ``False``, there is no information to distinguish
+        clients behind a shared proxy.
     """
     return get_client_ip_info(request).client_ip
-
-
-def get_client_bucket(request: Request) -> str:
-    """Return the client bucket key for rate-limiting/blocking.
-
-    Unlike :func:`get_client_ip`, this **never returns a shared sentinel** like
-    ``"unknown"``. When client provenance fails, it falls back to the socket
-    peer's bucket, so unrelated callers don't collapse onto one key.
-
-    Returns the raw bucket (e.g. ``"172.19.0.1"`` or ``"2001:db8::/64"``)
-    without the ``"ip:"`` prefix.
-    """
-    info = get_client_ip_info(request)
-    if info.client_ip != "unknown":
-        return normalize_ip_bucket(info.client_ip)
-    return normalize_ip_bucket(info.peer_ip)
-
-
-def get_client_enforcement_id(request: Request) -> str:
-    """Return the enforcement identity for a request.
-
-    Unlike :func:`get_client_ip`, this **never returns a shared sentinel** like
-    ``"unknown"``. When client provenance fails, it falls back to the socket
-    peer's bucket, so that:
-
-    * Rate limits key on the actual network-level source, not a shared
-      ``"unknown"`` bucket that every untrusted caller collapses onto.
-    * Auth-failure blocks target the real peer, not a global ``"unknown"``
-      bucket that would block all direct-connection callers at once.
-    * Affinity keys on the peer when the client is unresolvable, preserving
-      per-source routing rather than merging everyone onto one backend.
-
-    Returns ``"ip:<bucket>"`` (e.g. ``"ip:172.19.0.1"``).
-    """
-    return f"ip:{get_client_bucket(request)}"
 
 
 def get_client_ip_bucket(request: Request) -> str:
     """Return the rate-limit/affinity bucket key for a request's client IP.
 
     .. deprecated::
-        Use :func:`get_client_enforcement_id` for new code. This function
-        preserves the old behavior for backward compatibility but will
-        collapse all ``"unknown"`` callers onto one bucket.
+        This function preserves the old behavior for backward compatibility but
+        will collapse all ``"unknown"`` callers onto one bucket. Use
+        :func:`get_client_ip_info` and inspect ``resolved`` for new code.
     """
     return normalize_ip_bucket(get_client_ip(request))

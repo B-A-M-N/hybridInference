@@ -38,7 +38,7 @@ from serving.servers.deps import (
 from serving.utils import context as req_ctx
 from serving.utils.auth_failure_blocklist import is_ip_blocked, record_auth_failure
 from serving.utils.logging import get_logger
-from serving.utils.request_ip import get_client_bucket, get_client_ip, get_client_ip_info
+from serving.utils.request_ip import get_client_ip, get_client_ip_info
 
 logger = get_logger(__name__)
 
@@ -237,11 +237,9 @@ async def _authenticate_by_api_key(
     # Refuse sources already blocked for repeated auth failures. The *decision*
     # costs no key extraction and no DB lookup, so a flood is shed cheaply.
     # ``ip_info`` is computed once here and reused by the failure logs below.
-    # Use enforcement ID for blocking (never "unknown") so unrelated callers
-    # don't share a single "unknown" block bucket.
+    # Block only on resolved client IPs (never on proxy address).
     ip_info = get_client_ip_info(request)
-    enforcement_id = get_client_bucket(request)
-    blocked, retry_after = await is_ip_blocked(enforcement_id)
+    blocked, retry_after = await is_ip_blocked(ip_info)
     if blocked:
         # Only once the refusal is settled — and only when the rejection log is
         # actually on — spend anything on making the row useful in the admin
@@ -316,7 +314,7 @@ async def _authenticate_by_api_key(
                 "reason": "missing_api_key",
             },
         )
-        await record_auth_failure(enforcement_id)
+        await record_auth_failure(ip_info)
         asyncio.create_task(  # noqa: RUF006 — fire-and-forget rejection log
             log_rejection(
                 request=request,
@@ -390,7 +388,7 @@ async def _authenticate_by_api_key(
                 "credential_state": (rejected_caller or {}).get("credential_state"),
             },
         )
-        await record_auth_failure(enforcement_id)
+        await record_auth_failure(ip_info)
         asyncio.create_task(  # noqa: RUF006 — fire-and-forget rejection log
             log_rejection(
                 request=request,

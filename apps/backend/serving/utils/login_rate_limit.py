@@ -11,6 +11,10 @@ State is per-process and lost on restart; with multiple uvicorn workers
 the effective limit multiplies by worker count, which is acceptable for
 this defense (the goal is throttling, not audit). Mirrors the design of
 ``serving.utils.signup_rate_limit``.
+
+Uses client enforcement identity (never shared 'unknown') for rate-limiting.
+When client provenance is unresolved, the per-IP bucket falls back to a
+coarse peer-level policy that doesn't masquerade as per-client protection.
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ import time
 from collections import deque
 
 from serving.config.settings import settings
-from serving.utils.request_ip import normalize_ip_bucket
+from serving.utils.request_ip import get_client_ip_info, normalize_ip_bucket
 
 _FIFTEEN_MIN_SECONDS = 15 * 60
 _HOUR_SECONDS = 3600
@@ -45,7 +49,7 @@ def _sweep_inactive(buckets: dict[str, deque[float]], cutoff: float) -> None:
             del buckets[key]
 
 
-async def check_and_record_login(email: str, client_ip: str) -> tuple[bool, str | None]:
+async def check_and_record_login(email: str, request) -> tuple[bool, str | None]:
     """Record a login attempt and return whether it should be allowed.
 
     Returns (True, None) if both the per-email and per-IP windows have
@@ -53,23 +57,30 @@ async def check_and_record_login(email: str, client_ip: str) -> tuple[bool, str 
     Recording happens on entry so probing with varied payloads cannot
     bypass the limit.
 
-    ``client_ip`` is the enforcement identity (never "unknown"); when
-    provenance fails, it falls back to the peer bucket so unrelated callers
-    don't share a single "unknown" rate-limit bucket.
+    Uses client enforcement identity for rate-limiting. When client provenance
+    is unresolved, the per-IP bucket uses a coarse peer-level key that doesn't
+    incorrectly attribute all clients behind the proxy to a single identity.
     """
     global _sweep_counter
+
+    ip_info = get_client_ip_info(request)
+
+    # Normalize email so case variants share the same bucket.
+    email_key = email.strip().lower()
+
+    # Use resolved client IP if available; otherwise mark as unresolved
+    # Do NOT use proxy IP as client identity
+    if ip_info.resolved:
+        ip_key = f"client:{normalize_ip_bucket(ip_info.client_ip)}"
+    else:
+        # Unresolved: use a coarse peer-level key with degraded limits
+        ip_key = f"unresolved:{normalize_ip_bucket(ip_info.peer_ip)}"
 
     now = _now()
     email_cutoff = now - _FIFTEEN_MIN_SECONDS
     ip_cutoff = now - _HOUR_SECONDS
     per_email = settings.login_rate_limit_per_15min
     per_ip = settings.login_rate_limit_per_hour_per_ip
-
-    # Normalize email so case variants share the same bucket.
-    email_key = email.strip().lower()
-    # Normalize IPv6 to its /64 so rotating within a delegated prefix cannot
-    # reset the per-IP window.
-    ip_key = normalize_ip_bucket(client_ip)
 
     async with _lock:
         _sweep_counter += 1
@@ -102,8 +113,7 @@ async def check_and_record_login(email: str, client_ip: str) -> tuple[bool, str 
         ip_bucket.append(now)
 
     # Prefer the longer window when both trip so Retry-After reflects a
-    # realistic wait (telling an hour-blocked client to retry in 15 min
-    # would be wrong).
+    # real wait (telling a 24h-blocked client to retry in 15m is wrong).
     if ip_count >= per_ip:
         return False, "ip"
     if email_count >= per_email:

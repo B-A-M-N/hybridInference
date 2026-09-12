@@ -47,7 +47,7 @@ from serving.utils.jwt import (
 )
 from serving.utils.logging import get_logger
 from serving.utils.login_rate_limit import check_and_record_login
-from serving.utils.request_ip import get_client_bucket, get_client_ip
+from serving.utils.request_ip import get_client_ip
 from serving.utils.signup_rate_limit import check_and_record_signup
 from serving.utils.turnstile import verify_turnstile_token
 
@@ -132,11 +132,10 @@ async def signup(
         )
 
     # Record on entry so probing with varied payloads cannot bypass the limit.
-    # Use enforcement ID for rate-limiting so unrelated callers don't share
-    # a single "unknown" rate-limit bucket.
+    # Rate limiting uses client enforcement identity (resolved client IP or
+    # coarse peer-level for unresolved). No shared 'unknown' bucket.
     client_ip = get_client_ip(request)
-    enforcement_id = get_client_bucket(request)
-    allowed, reason = await check_and_record_signup(enforcement_id)
+    allowed, reason = await check_and_record_signup(request)
     if not allowed:
         retry_after = "3600" if reason == "hour" else "86400"
         raise HTTPException(
@@ -292,10 +291,9 @@ async def login(
         raise HTTPException(status_code=500, detail="Database not available")
 
     # Record on entry so probing varied passwords cannot bypass the limit.
-    # Use enforcement ID for rate-limiting so unrelated callers don't share
-    # a single "unknown" rate-limit bucket.
+    # Rate limiting uses client enforcement identity (resolved client IP or
+    # coarse peer-level for unresolved). No shared 'unknown' bucket.
     client_ip = get_client_ip(request)
-    enforcement_id = get_client_bucket(request)
 
     async def _record(
         outcome: str,
@@ -324,7 +322,7 @@ async def login(
                 failure_reason or "-",
             )
 
-    allowed, reason = await check_and_record_login(body.email, enforcement_id)
+    allowed, reason = await check_and_record_login(body.email, request)
     if not allowed:
         retry_after = "3600" if reason == "ip" else "900"
         await _record("failure", failure_reason="rate_limited", user_id=None)

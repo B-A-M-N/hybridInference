@@ -43,7 +43,7 @@ from dataclasses import dataclass
 
 from serving.config.settings import settings
 from serving.utils.logging import get_logger
-from serving.utils.request_ip import normalize_ip_bucket
+from serving.utils.request_ip import ClientIpInfo, normalize_ip_bucket
 
 logger = get_logger(__name__)
 
@@ -128,15 +128,25 @@ def _sweep_inactive(now: float, window_sec: int) -> None:
             del _blocked_until[key]
 
 
-async def is_ip_blocked(ip: str) -> tuple[bool, int]:
-    """Return ``(blocked, retry_after_seconds)`` for *ip*.
+async def is_ip_blocked(ip_info: ClientIpInfo) -> tuple[bool, int]:
+    """Return ``(blocked, retry_after_seconds) for *ip_info*.
 
     ``(False, 0)`` when the feature is disabled or the IP is clear. A lapsed
     block is cleared lazily on read so an expired entry never lingers as a
     false positive.
+
+    Only blocks on **resolved** client IPs. When client provenance is
+    unresolved, there is no information to attribute auth failures to a
+    specific client, so blocking would incorrectly affect all clients
+    behind a shared proxy. Returns ``(False, 0)`` in that case.
     """
     if not settings.auth_failure_block_enabled:
         return False, 0
+    if not ip_info.resolved:
+        # Unresolved client provenance: do NOT block on the proxy address.
+        # That would block all clients behind the proxy when one misbehaves.
+        return False, 0
+    ip = ip_info.client_ip
     # Exemption outranks an existing block: an exempt address inside a blocked
     # /64 bucket must stay reachable, so this is checked before the bucket.
     if _is_exempt(ip):
@@ -154,18 +164,28 @@ async def is_ip_blocked(ip: str) -> tuple[bool, int]:
         return True, max(1, int(until - now + 0.999))
 
 
-async def record_auth_failure(ip: str) -> bool:
-    """Record one auth failure for *ip*; return True if this call blocked it.
+async def record_auth_failure(ip_info: ClientIpInfo) -> bool:
+    """Record one auth failure for *ip_info*; return True if this call blocked it.
 
     Blocks the source for ``auth_failure_block_duration_sec`` once its failure
     count within ``auth_failure_block_window_sec`` reaches
     ``auth_failure_block_threshold``. A no-op returning False when the feature
     is disabled or the source is already blocked (callers reject blocked IPs
     before reaching here, so a True return marks the blocking transition).
+
+    Only records failures for **resolved** client IPs. When client provenance
+    is unresolved, there is no information to attribute auth failures to a
+    specific client, so recording would incorrectly affect all clients
+    behind a shared proxy. Returns ``False`` in that case.
     """
     global _sweep_counter
     if not settings.auth_failure_block_enabled:
         return False
+    if not ip_info.resolved:
+        # Unresolved client provenance: do NOT record auth failures.
+        # That would attribute all failures to the proxy address.
+        return False
+    ip = ip_info.client_ip
     # An exempt source accrues no history at all: counting it would only
     # produce a block that is_ip_blocked then has to override on every read.
     if _is_exempt(ip):

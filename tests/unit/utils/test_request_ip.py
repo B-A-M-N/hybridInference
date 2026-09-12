@@ -17,13 +17,12 @@ from unittest.mock import patch
 import pytest
 
 from serving.utils.request_ip import (
+    ClientIpInfo,
     _is_in_networks,
     _is_reportable_ip,
     _parse_forwarded_chain,
     _parse_ip,
     derive_affinity_key,
-    get_client_bucket,
-    get_client_enforcement_id,
     get_client_ip_bucket,
     get_client_ip_info,
     normalize_ip_bucket,
@@ -43,9 +42,12 @@ def _networks(*cidrs: str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Networ
 def _patch_networks(proxy_nets, cf_nets):
     """Return a context manager that patches both trusted_networks and
     trusted_cloudflare_networks."""
-    with patch("serving.utils.request_ip._trusted_networks", return_value=proxy_nets), patch(
-        "serving.utils.request_ip._trusted_cloudflare_networks",
-        return_value=cf_nets,
+    with (
+        patch("serving.utils.request_ip._trusted_networks", return_value=proxy_nets),
+        patch(
+            "serving.utils.request_ip._trusted_cloudflare_networks",
+            return_value=cf_nets,
+        ),
     ):
         yield
 
@@ -124,6 +126,7 @@ def test_non_routable_peer_returns_unknown_no_trusted_proxies(monkeypatch):
         info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
         assert info.source == "unknown"
+        assert info.resolved is False
 
 
 def test_public_peer_used_directly_no_trusted_proxies(monkeypatch):
@@ -133,6 +136,7 @@ def test_public_peer_used_directly_no_trusted_proxies(monkeypatch):
         info = get_client_ip_info(_request({}, peer_ip="8.8.8.8"))
         assert info.client_ip == "8.8.8.8"
         assert info.source == "socket"
+        assert info.resolved is True
 
 
 def test_forged_xff_ignored_without_trusted_peer(monkeypatch):
@@ -164,6 +168,7 @@ def test_no_client_means_unknown(monkeypatch):
         info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
         assert info.source == "unknown"
+        assert info.resolved is False
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +188,7 @@ def test_trusted_proxy_first_untrusted_hop_is_client(monkeypatch):
         info = get_client_ip_info(request)
         assert info.client_ip == "1.2.3.4"
         assert info.source == "x-forwarded-for"
+        assert info.resolved is True
 
 
 def test_trusted_proxy_all_trusted_hops_returns_unknown(monkeypatch):
@@ -198,6 +204,7 @@ def test_trusted_proxy_all_trusted_hops_returns_unknown(monkeypatch):
         # All hops trusted → fall through. Peer is non-routable → "unknown".
         assert info.client_ip == "unknown"
         assert info.source == "unknown"
+        assert info.resolved is False
 
 
 def test_trusted_proxy_first_untrusted_private_hop_returns_unknown(monkeypatch):
@@ -214,6 +221,7 @@ def test_trusted_proxy_first_untrusted_private_hop_returns_unknown(monkeypatch):
         # non-routable → provenance terminates, return "unknown".
         assert info.client_ip == "unknown"
         assert info.source == "x-forwarded-for"
+        assert info.resolved is False
 
 
 def test_trusted_proxy_first_untrusted_ula_hop_returns_unknown(monkeypatch):
@@ -229,6 +237,7 @@ def test_trusted_proxy_first_untrusted_ula_hop_returns_unknown(monkeypatch):
         # fdbd:dc02::153 is first untrusted hop but ULA → "unknown"
         assert info.client_ip == "unknown"
         assert info.source == "x-forwarded-for"
+        assert info.resolved is False
 
 
 def test_trusted_proxy_first_untrusted_malformed_hop_returns_unknown(monkeypatch):
@@ -244,6 +253,7 @@ def test_trusted_proxy_first_untrusted_malformed_hop_returns_unknown(monkeypatch
         # "garbage" is first untrusted hop and malformed → "unknown"
         assert info.client_ip == "unknown"
         assert info.source == "x-forwarded-for"
+        assert info.resolved is False
 
 
 def test_trusted_proxy_empty_hop_terminates_provenance(monkeypatch):
@@ -260,6 +270,7 @@ def test_trusted_proxy_empty_hop_terminates_provenance(monkeypatch):
         info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
         assert info.source == "x-forwarded-for"
+        assert info.resolved is False
 
 
 def test_trusted_proxy_attacker_prepends_fake_addresses(monkeypatch):
@@ -571,6 +582,7 @@ def test_regression_docker_bridge_pollution(monkeypatch):
         info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
         assert info.source == "unknown"
+        assert info.resolved is False
 
 
 def test_regression_operator_ula_pollution(monkeypatch):
@@ -586,6 +598,7 @@ def test_regression_operator_ula_pollution(monkeypatch):
         # fdbd:dc02::153 is first untrusted hop but ULA → "unknown"
         assert info.client_ip == "unknown"
         assert info.source == "x-forwarded-for"
+        assert info.resolved is False
 
 
 # ---------------------------------------------------------------------------
@@ -655,64 +668,142 @@ def test_trusted_proxy_headers_false_when_global_disabled(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Adversarial tests: shared-unknown poisoning
+# Affinity key behavior with resolved/unresolved
 # ---------------------------------------------------------------------------
 
 
-def test_enforcement_id_never_shared_unknown(monkeypatch):
-    """Enforcement ID never returns a shared 'unknown' value."""
-    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
-    with _patch_networks((), ()):
-        # Direct connection from docker bridge (non-routable)
-        request = _request({}, peer_ip="172.19.0.1")
-        info = get_client_ip_info(request)
-        # Provenance identity is "unknown"
-        assert info.client_ip == "unknown"
-        # But enforcement ID falls back to peer bucket
-        enforcement_id = get_client_bucket(request)
-        assert enforcement_id != "unknown"
-        assert enforcement_id == "172.19.0.1"
+def test_affinity_key_resolved_ip():
+    """Affinity key uses client IP when resolved."""
+    ip_info = ClientIpInfo(
+        client_ip="203.0.113.9",
+        peer_ip="172.19.0.1",
+        source="socket",
+        trusted_proxy_headers=False,
+        resolved=True,
+    )
+    assert derive_affinity_key(None, ip_info) == "ip:203.0.113.9"
 
 
-def test_enforcement_id_different_peers_different_keys(monkeypatch):
-    """Different non-routable peers get different enforcement IDs."""
-    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
-    with _patch_networks((), ()):
-        request1 = _request({}, peer_ip="172.19.0.1")
-        request2 = _request({}, peer_ip="10.0.0.1")
-        id1 = get_client_bucket(request1)
-        id2 = get_client_bucket(request2)
-        assert id1 != id2
+def test_affinity_key_unresolved():
+    """Affinity key returns 'unresolved' when client provenance is unresolved."""
+    ip_info = ClientIpInfo(
+        client_ip="unknown",
+        peer_ip="172.19.0.1",
+        source="socket",
+        trusted_proxy_headers=False,
+        resolved=False,
+    )
+    assert derive_affinity_key(None, ip_info) == "unresolved"
 
 
-def test_enforcement_id_ipv6_peer_folds_to_64(monkeypatch):
-    """Enforcement ID for IPv6 folds to /64."""
-    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
-    with _patch_networks((), ()):
-        # Public IPv6 peer
-        request = _request({}, peer_ip="2001:db8:abcd:1234::1")
-        info = get_client_ip_info(request)
-        assert info.client_ip == "2001:db8:abcd:1234::1"
-        enforcement_id = get_client_bucket(request)
-        # IPv6 folds to /64 for bucketing
-        assert enforcement_id == "2001:db8:abcd:1234::/64"
+def test_affinity_key_auth_preferred():
+    """Auth key hash is preferred over IP."""
+    ip_info = ClientIpInfo(
+        client_ip="203.0.113.9",
+        peer_ip="172.19.0.1",
+        source="socket",
+        trusted_proxy_headers=False,
+        resolved=True,
+    )
+    assert derive_affinity_key("mykey", ip_info) == "mykey"
 
 
-def test_enforcement_id_xff_unknown_falls_to_peer(monkeypatch):
-    """When XFF provenance fails, enforcement ID falls back to peer."""
+def test_affinity_key_grant_preferred():
+    """Grant ID is preferred over IP."""
+    ip_info = ClientIpInfo(
+        client_ip="203.0.113.9",
+        peer_ip="172.19.0.1",
+        source="socket",
+        trusted_proxy_headers=False,
+        resolved=True,
+    )
+    assert derive_affinity_key(None, ip_info, grant_id="g1") == "grant:g1"
+
+
+# ---------------------------------------------------------------------------
+# Adversarial tests: shared-proxy poisoning topology
+# ---------------------------------------------------------------------------
+
+
+def test_affinity_key_shared_proxy_unresolved(monkeypatch):
+    """Multiple clients behind shared proxy with unresolved provenance must
+    NOT collapse onto the proxy IP."""
     monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
-    nets = _networks("172.16.0.0/12")
-    with _patch_networks(nets, ()):
-        # Trusted proxy, but XFF first untrusted hop is private → unknown
-        request = _request(
-            {"x-forwarded-for": "10.50.0.8, 172.19.0.1"},
-            peer_ip="172.19.0.1",
+    proxy_nets = _networks("203.0.113.1/32")
+    with _patch_networks(proxy_nets, ()):
+        # All three clients behind the same proxy with malformed XFF
+        request1 = _request(
+            {"x-forwarded-for": "garbage, 203.0.113.1"},
+            peer_ip="203.0.113.1",
         )
-        info = get_client_ip_info(request)
-        assert info.client_ip == "unknown"
-        # Enforcement ID falls back to peer bucket
-        enforcement_id = get_client_bucket(request)
-        assert enforcement_id == "172.19.0.1"
+        request2 = _request(
+            {"x-forwarded-for": "garbage, 203.0.113.1"},
+            peer_ip="203.0.113.1",
+        )
+        request3 = _request(
+            {"x-forwarded-for": "garbage, 203.0.113.1"},
+            peer_ip="203.0.113.1",
+        )
+        info1 = get_client_ip_info(request1)
+        info2 = get_client_ip_info(request2)
+        info3 = get_client_ip_info(request3)
+
+        # All three are unresolved
+        assert info1.resolved is False
+        assert info2.resolved is False
+        assert info3.resolved is False
+
+        # All three get "unresolved" affinity key (NOT proxy IP)
+        affinity1 = derive_affinity_key(None, info1)
+        affinity2 = derive_affinity_key(None, info2)
+        affinity3 = derive_affinity_key(None, info3)
+
+        # They all get the SAME unresolved key, but NOT the proxy IP
+        assert affinity1 == "unresolved"
+        assert affinity2 == "unresolved"
+        assert affinity3 == "unresolved"
+
+        # Critical: NOT the proxy IP
+        assert "203.0.113.1" not in affinity1
+
+
+def test_resolved_clients_behind_same_proxy(monkeypatch):
+    """Multiple resolved clients behind same proxy get distinct affinity keys."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    proxy_nets = _networks("203.0.113.1/32")
+    with _patch_networks(proxy_nets, ()):
+        # Three clients behind the same proxy with valid XFF
+        request1 = _request(
+            {"x-forwarded-for": "1.2.3.4, 203.0.113.1"},
+            peer_ip="203.0.113.1",
+        )
+        request2 = _request(
+            {"x-forwarded-for": "5.6.7.8, 203.0.113.1"},
+            peer_ip="203.0.113.1",
+        )
+        request3 = _request(
+            {"x-forwarded-for": "9.10.11.12, 203.0.113.1"},
+            peer_ip="203.0.113.1",
+        )
+        info1 = get_client_ip_info(request1)
+        info2 = get_client_ip_info(request2)
+        info3 = get_client_ip_info(request3)
+
+        # All three are resolved
+        assert info1.resolved is True
+        assert info2.resolved is True
+        assert info3.resolved is True
+
+        # Each gets a distinct affinity key
+        affinity1 = derive_affinity_key(None, info1)
+        affinity2 = derive_affinity_key(None, info2)
+        affinity3 = derive_affinity_key(None, info3)
+
+        assert affinity1 == "ip:1.2.3.4"
+        assert affinity2 == "ip:5.6.7.8"
+        assert affinity3 == "ip:9.10.11.12"
+        assert affinity1 != affinity2
+        assert affinity2 != affinity3
 
 
 # ---------------------------------------------------------------------------
@@ -737,11 +828,7 @@ def test_cf_forged_by_direct_origin(monkeypatch):
 
 
 def test_cf_forged_by_generic_proxy(monkeypatch):
-    """Generic trusted proxy cannot authorize attacker-supplied CF-Connecting-IP.
-
-    When a generic trusted proxy is not Cloudflare-authorized, the CF-Connecting-IP
-    header is ignored. The routable generic proxy peer becomes the client.
-    """
+    """Generic trusted proxy cannot authorize attacker-supplied CF-Connecting-IP."""
     monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
     monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
     proxy_nets = _networks("203.0.113.1/32")
@@ -830,11 +917,42 @@ def test_ipv4_mapped_clients_keep_distinct_buckets():
 
 
 def test_derive_affinity_key_falls_through():
-    assert derive_affinity_key(None, "8.8.8.8") == "ip:8.8.8.8"
-    assert derive_affinity_key(None, "2001:db8::1") == "ip:2001:db8::/64"
-    assert derive_affinity_key(None, "unknown") == "ip:unknown"
-    assert derive_affinity_key("keyhash", "8.8.8.8") == "keyhash"
-    assert derive_affinity_key(None, "8.8.8.8", grant_id="g1") == "grant:g1"
+    """derive_affinity_key falls through identities correctly."""
+    # Resolved client IP
+    resolved_info = ClientIpInfo(
+        client_ip="8.8.8.8",
+        peer_ip="172.19.0.1",
+        source="socket",
+        trusted_proxy_headers=False,
+        resolved=True,
+    )
+    assert derive_affinity_key(None, resolved_info) == "ip:8.8.8.8"
+
+    # IPv6 folds to /64
+    ipv6_info = ClientIpInfo(
+        client_ip="2001:db8::1",
+        peer_ip="172.19.0.1",
+        source="socket",
+        trusted_proxy_headers=False,
+        resolved=True,
+    )
+    assert derive_affinity_key(None, ipv6_info) == "ip:2001:db8::/64"
+
+    # Unresolved returns "unresolved"
+    unresolved_info = ClientIpInfo(
+        client_ip="unknown",
+        peer_ip="172.19.0.1",
+        source="socket",
+        trusted_proxy_headers=False,
+        resolved=False,
+    )
+    assert derive_affinity_key(None, unresolved_info) == "unresolved"
+
+    # Auth key is preferred
+    assert derive_affinity_key("keyhash", resolved_info) == "keyhash"
+
+    # Grant is preferred over IP
+    assert derive_affinity_key(None, resolved_info, grant_id="g1") == "grant:g1"
 
 
 def test_get_client_ip_bucket_normalizes(monkeypatch):
@@ -847,18 +965,6 @@ def test_get_client_ip_bucket_normalizes(monkeypatch):
             peer_ip="172.19.0.1",
         )
         assert get_client_ip_bucket(request) == "2001:db8:abcd:1234::/64"
-
-
-def test_get_client_enforcement_id_never_shared_unknown(monkeypatch):
-    """get_client_enforcement_id never returns a shared 'unknown' value."""
-    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
-    with _patch_networks((), ()):
-        # Direct connection from docker bridge (non-routable)
-        request = _request({}, peer_ip="172.19.0.1")
-        enforcement_id = get_client_enforcement_id(request)
-        assert enforcement_id != "unknown"
-        assert enforcement_id != "ip:unknown"
-        assert enforcement_id == "ip:172.19.0.1"
 
 
 # ---------------------------------------------------------------------------
