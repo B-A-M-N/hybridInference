@@ -66,7 +66,11 @@ from serving.servers.deps import (
 from serving.storage.utils import calculate_cost
 from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
-from serving.utils.request_ip import derive_affinity_key, get_client_ip_info
+from serving.utils.request_ip import (
+    derive_affinity_key,
+    get_client_enforcement_id,
+    get_client_ip_info,
+)
 from serving.utils.session_identity import consume_session_fields, session_identity
 from serving.utils.tokens import estimate_prompt_tokens, estimate_text_tokens
 
@@ -1341,7 +1345,7 @@ async def anthropic_messages(
             "auth_key_hash": auth_key_hash or "_anon",
             "affinity_key": derive_affinity_key(
                 auth_key_hash,
-                ip_info.client_ip,
+                get_client_enforcement_id(request),
                 grant_id=user_ctx.get("agent_grant_id"),
             ),
         }

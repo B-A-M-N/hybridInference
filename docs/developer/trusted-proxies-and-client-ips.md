@@ -109,6 +109,31 @@ flags (issue #1036) asserted only that *some* proxy exists; they did not
 restrict which peer may assert forwarding provenance. The new model makes
 trust explicit and fail-closed.
 
+### The "unknown" outcome and enforcement identity
+
+When the gateway cannot determine a trustworthy routable client address, the
+**provenance identity** (`get_client_ip()`) returns `"unknown"`. This is
+correct: it accurately reflects that we don't know the client.
+
+However, enforcement functions (rate limits, auth-failure blocks, affinity)
+must **never** key on a shared `"unknown"` value — that would collapse all
+untrusted callers onto one key, allowing a single caller to exhaust a rate
+limit or trigger a block that affects everyone.
+
+The `get_client_bucket()` function returns the **enforcement identity**: when
+provenance fails, it falls back to the socket peer's bucket. This ensures:
+
+- Rate limits key on the actual network-level source.
+- Auth-failure blocks target the real peer.
+- Affinity keys on the peer when the client is unresolvable.
+
+| Use case | Function | Returns |
+|----------|----------|---------|
+| Logging, audit, display | `get_client_ip()` | Provenance identity (may be `"unknown"`) |
+| Rate limiting | `get_client_bucket()` | Enforcement identity (never shared) |
+| Auth-failure blocking | `get_client_bucket()` | Enforcement identity (never shared) |
+| Affinity routing | `get_client_bucket()` or `get_client_enforcement_id()` | Enforcement identity (never shared) |
+
 ## Resolution order
 
 `get_client_ip_info()` returns a frozen `ClientIpInfo` with the resolved

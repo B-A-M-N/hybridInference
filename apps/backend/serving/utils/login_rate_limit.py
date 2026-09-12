@@ -45,13 +45,17 @@ def _sweep_inactive(buckets: dict[str, deque[float]], cutoff: float) -> None:
             del buckets[key]
 
 
-async def check_and_record_login(email: str, ip: str) -> tuple[bool, str | None]:
+async def check_and_record_login(email: str, client_ip: str) -> tuple[bool, str | None]:
     """Record a login attempt and return whether it should be allowed.
 
     Returns (True, None) if both the per-email and per-IP windows have
     capacity, or (False, "email"|"ip") indicating which bucket tripped.
     Recording happens on entry so probing with varied payloads cannot
     bypass the limit.
+
+    ``client_ip`` is the enforcement identity (never "unknown"); when
+    provenance fails, it falls back to the peer bucket so unrelated callers
+    don't share a single "unknown" rate-limit bucket.
     """
     global _sweep_counter
 
@@ -65,7 +69,7 @@ async def check_and_record_login(email: str, ip: str) -> tuple[bool, str | None]
     email_key = email.strip().lower()
     # Normalize IPv6 to its /64 so rotating within a delegated prefix cannot
     # reset the per-IP window.
-    ip_key = normalize_ip_bucket(ip)
+    ip_key = normalize_ip_bucket(client_ip)
 
     async with _lock:
         _sweep_counter += 1

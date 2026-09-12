@@ -55,7 +55,7 @@ from serving.storage.utils import billable_output_tokens, json_safe
 from serving.utils import context as req_ctx
 from serving.utils.errors import format_exception_for_db
 from serving.utils.logging import get_logger
-from serving.utils.request_ip import derive_affinity_key, get_client_ip
+from serving.utils.request_ip import derive_affinity_key, get_client_enforcement_id, get_client_ip
 from serving.utils.session_identity import session_identity
 from serving.utils.synthetic_probe import is_trusted_probe
 from serving.utils.token_utils import normalize_usage
@@ -754,7 +754,7 @@ async def chat_completions(
     auth_key_hash = user_ctx.get("auth_key_hash")
     affinity_key = derive_affinity_key(
         auth_key_hash,
-        get_client_ip(request),
+        get_client_enforcement_id(request),
         grant_id=user_ctx.get("agent_grant_id"),
     )
     req_ctx.update(

@@ -37,11 +37,15 @@ def _sweep_inactive(cutoff: float) -> None:
             del _attempts[ip]
 
 
-async def check_and_record_signup(ip: str) -> tuple[bool, str | None]:
+async def check_and_record_signup(client_ip: str) -> tuple[bool, str | None]:
     """Record a signup attempt and return whether it should be allowed.
 
     Returns (True, None) if the IP is under both the per-hour and per-day
     limits, or (False, "hour"|"day") indicating which window tripped.
+
+    ``client_ip`` is the enforcement identity (never "unknown"); when
+    provenance fails, it falls back to the peer bucket so unrelated callers
+    don't share a single "unknown" rate-limit bucket.
     """
     global _sweep_counter
 
@@ -52,7 +56,7 @@ async def check_and_record_signup(ip: str) -> tuple[bool, str | None]:
     per_day = settings.signup_rate_limit_per_day
     # Normalize IPv6 to its /64 so rotating within a delegated prefix cannot
     # reset the window.
-    ip_key = normalize_ip_bucket(ip)
+    ip_key = normalize_ip_bucket(client_ip)
 
     async with _lock:
         _sweep_counter += 1

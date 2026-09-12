@@ -193,16 +193,15 @@ def _parse_forwarded_chain(raw: str) -> list[str]:
 
     The leftmost entry is the originally-reported client; each subsequent entry
     is a proxy that appended its address. We trim whitespace around each hop
-    but **preserve empty/malformed entries** — the caller treats them as a
-    provenance-terminating condition (returns "unknown"). Silently dropping
-    empty elements would be inconsistent with the fail-closed design: a
-    malformed empty hop must terminate the chain, not disappear.
+    and preserve **all** entries including empty/malformed ones — the caller
+    treats them as a provenance-terminating condition (returns "unknown").
 
+    Silently dropping empty elements would be inconsistent with the fail-closed
+    design: a malformed empty hop must terminate the chain, not disappear.
     A chain of ``""`` or pure whitespace yields a single empty string so the
     caller can reject it.
     """
-    hops = [hop.strip() for hop in raw.split(",")]
-    return hops if hops else []
+    return [hop.strip() for hop in raw.split(",")] if raw else []
 
 
 def normalize_ip_bucket(ip: str) -> str:
@@ -393,10 +392,58 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
 
 
 def get_client_ip(request: Request) -> str:
-    """Return the best-effort originating client IP for a request."""
+    """Return the best-effort originating client IP for a request.
+
+    This is the **provenance identity** — it may be ``"unknown"`` when no
+    trustworthy client address could be determined. Use this for logging,
+    audit, and display. For rate-limiting, auth-blocking, and affinity, use
+    :func:`get_client_enforcement_id` instead, which never returns a shared
+    ``"unknown"`` value that could collapse unrelated callers onto one key.
+    """
     return get_client_ip_info(request).client_ip
 
 
+def get_client_bucket(request: Request) -> str:
+    """Return the client bucket key for rate-limiting/blocking.
+
+    Unlike :func:`get_client_ip`, this **never returns a shared sentinel** like
+    ``"unknown"``. When client provenance fails, it falls back to the socket
+    peer's bucket, so unrelated callers don't collapse onto one key.
+
+    Returns the raw bucket (e.g. ``"172.19.0.1"`` or ``"2001:db8::/64"``)
+    without the ``"ip:"`` prefix.
+    """
+    info = get_client_ip_info(request)
+    if info.client_ip != "unknown":
+        return normalize_ip_bucket(info.client_ip)
+    return normalize_ip_bucket(info.peer_ip)
+
+
+def get_client_enforcement_id(request: Request) -> str:
+    """Return the enforcement identity for a request.
+
+    Unlike :func:`get_client_ip`, this **never returns a shared sentinel** like
+    ``"unknown"``. When client provenance fails, it falls back to the socket
+    peer's bucket, so that:
+
+    * Rate limits key on the actual network-level source, not a shared
+      ``"unknown"`` bucket that every untrusted caller collapses onto.
+    * Auth-failure blocks target the real peer, not a global ``"unknown"``
+      bucket that would block all direct-connection callers at once.
+    * Affinity keys on the peer when the client is unresolvable, preserving
+      per-source routing rather than merging everyone onto one backend.
+
+    Returns ``"ip:<bucket>"`` (e.g. ``"ip:172.19.0.1"``).
+    """
+    return f"ip:{get_client_bucket(request)}"
+
+
 def get_client_ip_bucket(request: Request) -> str:
-    """Return the rate-limit/affinity bucket key for a request's client IP."""
+    """Return the rate-limit/affinity bucket key for a request's client IP.
+
+    .. deprecated::
+        Use :func:`get_client_enforcement_id` for new code. This function
+        preserves the old behavior for backward compatibility but will
+        collapse all ``"unknown"`` callers onto one bucket.
+    """
     return normalize_ip_bucket(get_client_ip(request))

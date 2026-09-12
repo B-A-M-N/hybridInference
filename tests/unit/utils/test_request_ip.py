@@ -22,6 +22,8 @@ from serving.utils.request_ip import (
     _parse_forwarded_chain,
     _parse_ip,
     derive_affinity_key,
+    get_client_bucket,
+    get_client_enforcement_id,
     get_client_ip_bucket,
     get_client_ip_info,
     normalize_ip_bucket,
@@ -41,12 +43,11 @@ def _networks(*cidrs: str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Networ
 def _patch_networks(proxy_nets, cf_nets):
     """Return a context manager that patches both trusted_networks and
     trusted_cloudflare_networks."""
-    with patch("serving.utils.request_ip._trusted_networks", return_value=proxy_nets):
-        with patch(
-            "serving.utils.request_ip._trusted_cloudflare_networks",
-            return_value=cf_nets,
-        ):
-            yield
+    with patch("serving.utils.request_ip._trusted_networks", return_value=proxy_nets), patch(
+        "serving.utils.request_ip._trusted_cloudflare_networks",
+        return_value=cf_nets,
+    ):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +78,8 @@ def test_parse_forwarded_chain_preserves_empty():
 
 
 def test_parse_forwarded_chain_empty_input():
-    """A chain of empty/whitespace yields a list with one empty string."""
-    assert _parse_forwarded_chain("") == [""]
+    """A chain of empty/whitespace yields a list with empty strings preserved."""
+    assert _parse_forwarded_chain(" , ") == ["", ""]
 
 
 def test_is_reportable_ip_rejects_non_routable():
@@ -654,6 +655,141 @@ def test_trusted_proxy_headers_false_when_global_disabled(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Adversarial tests: shared-unknown poisoning
+# ---------------------------------------------------------------------------
+
+
+def test_enforcement_id_never_shared_unknown(monkeypatch):
+    """Enforcement ID never returns a shared 'unknown' value."""
+    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
+    with _patch_networks((), ()):
+        # Direct connection from docker bridge (non-routable)
+        request = _request({}, peer_ip="172.19.0.1")
+        info = get_client_ip_info(request)
+        # Provenance identity is "unknown"
+        assert info.client_ip == "unknown"
+        # But enforcement ID falls back to peer bucket
+        enforcement_id = get_client_bucket(request)
+        assert enforcement_id != "unknown"
+        assert enforcement_id == "172.19.0.1"
+
+
+def test_enforcement_id_different_peers_different_keys(monkeypatch):
+    """Different non-routable peers get different enforcement IDs."""
+    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
+    with _patch_networks((), ()):
+        request1 = _request({}, peer_ip="172.19.0.1")
+        request2 = _request({}, peer_ip="10.0.0.1")
+        id1 = get_client_bucket(request1)
+        id2 = get_client_bucket(request2)
+        assert id1 != id2
+
+
+def test_enforcement_id_ipv6_peer_folds_to_64(monkeypatch):
+    """Enforcement ID for IPv6 folds to /64."""
+    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
+    with _patch_networks((), ()):
+        # Public IPv6 peer
+        request = _request({}, peer_ip="2001:db8:abcd:1234::1")
+        info = get_client_ip_info(request)
+        assert info.client_ip == "2001:db8:abcd:1234::1"
+        enforcement_id = get_client_bucket(request)
+        # IPv6 folds to /64 for bucketing
+        assert enforcement_id == "2001:db8:abcd:1234::/64"
+
+
+def test_enforcement_id_xff_unknown_falls_to_peer(monkeypatch):
+    """When XFF provenance fails, enforcement ID falls back to peer."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    nets = _networks("172.16.0.0/12")
+    with _patch_networks(nets, ()):
+        # Trusted proxy, but XFF first untrusted hop is private → unknown
+        request = _request(
+            {"x-forwarded-for": "10.50.0.8, 172.19.0.1"},
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        # Enforcement ID falls back to peer bucket
+        enforcement_id = get_client_bucket(request)
+        assert enforcement_id == "172.19.0.1"
+
+
+# ---------------------------------------------------------------------------
+# Adversarial tests: direct-origin / intermediary CF header forgery
+# ---------------------------------------------------------------------------
+
+
+def test_cf_forged_by_direct_origin(monkeypatch):
+    """Direct-origin request with forged CF-Connecting-IP is ignored."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    with _patch_networks((), ()):
+        # Attacker sends CF-Connecting-IP directly (no trusted peer)
+        request = _request(
+            {"cf-connecting-ip": "203.0.113.9"},
+            peer_ip="1.2.3.4",
+        )
+        info = get_client_ip_info(request)
+        # CF header is ignored because peer is not Cloudflare-authorized
+        assert info.client_ip == "1.2.3.4"
+        assert info.source == "socket"
+
+
+def test_cf_forged_by_generic_proxy(monkeypatch):
+    """Generic trusted proxy cannot authorize attacker-supplied CF-Connecting-IP.
+
+    When a generic trusted proxy is not Cloudflare-authorized, the CF-Connecting-IP
+    header is ignored. The routable generic proxy peer becomes the client.
+    """
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    proxy_nets = _networks("203.0.113.1/32")
+    # Generic trusted proxies configured, but NOT Cloudflare-authorized
+    with _patch_networks(proxy_nets, ()):
+        # Attacker behind generic proxy sends forged CF-Connecting-IP
+        request = _request(
+            {"cf-connecting-ip": "1.2.3.4"},
+            peer_ip="203.0.113.1",
+        )
+        info = get_client_ip_info(request)
+        # CF header is NOT trusted because peer is generic, not Cloudflare-authorized.
+        # Peer is routable, so it becomes the client.
+        assert info.client_ip == "203.0.113.1"
+        assert info.source == "socket"
+
+
+def test_cf_generic_proxy_no_xff(monkeypatch):
+    """Generic trusted proxy without XFF falls back to peer."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    proxy_nets = _networks("203.0.113.1/32")
+    with _patch_networks(proxy_nets, ()):
+        # No XFF, no CF-Connecting-IP
+        request = _request({}, peer_ip="203.0.113.1")
+        info = get_client_ip_info(request)
+        # Peer is routable, becomes client
+        assert info.client_ip == "203.0.113.1"
+        assert info.source == "socket"
+
+
+def test_cf_requires_explicit_authorization(monkeypatch):
+    """CF-Connecting-IP only trusted when peer is explicitly Cloudflare-authorized."""
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("TRUST_CLOUDFLARE_HEADERS", "1")
+    # Only Cloudflare-authorized networks, no generic trusted proxies
+    cf_nets = _networks("10.0.0.1/32")
+    with _patch_networks((), cf_nets):
+        request = _request(
+            {"cf-connecting-ip": "203.0.113.9"},
+            peer_ip="10.0.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "203.0.113.9"
+        assert info.source == "cf-connecting-ip"
+
+
+# ---------------------------------------------------------------------------
 # Bucketing and affinity
 # ---------------------------------------------------------------------------
 
@@ -711,6 +847,18 @@ def test_get_client_ip_bucket_normalizes(monkeypatch):
             peer_ip="172.19.0.1",
         )
         assert get_client_ip_bucket(request) == "2001:db8:abcd:1234::/64"
+
+
+def test_get_client_enforcement_id_never_shared_unknown(monkeypatch):
+    """get_client_enforcement_id never returns a shared 'unknown' value."""
+    monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
+    with _patch_networks((), ()):
+        # Direct connection from docker bridge (non-routable)
+        request = _request({}, peer_ip="172.19.0.1")
+        enforcement_id = get_client_enforcement_id(request)
+        assert enforcement_id != "unknown"
+        assert enforcement_id != "ip:unknown"
+        assert enforcement_id == "ip:172.19.0.1"
 
 
 # ---------------------------------------------------------------------------
