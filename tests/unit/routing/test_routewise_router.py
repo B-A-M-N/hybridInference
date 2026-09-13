@@ -34,6 +34,7 @@ from routing.routewise.router import (
     _ProbeConcurrencyGate,
 )
 from serving.schemas_admin import ProviderQuotaResult, ProviderQuotaUsage
+from serving.utils import context as req_ctx
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -4127,7 +4128,11 @@ class TestPrefillLoadPenalty:
 
         routing_chunk = await stream.__anext__()
         assert '"_routing"' in routing_chunk
-        assert router._prefill_load.backlog("test-model:stream") > 0
+        expected_tokens = router._tracked_prefill_tokens(
+            [{"role": "user", "content": "x" * 4000}],
+            {},
+        )
+        assert router._prefill_load.backlog("test-model:stream") == expected_tokens
 
         await stream.aclose()
         assert router._prefill_load.backlog("test-model:stream") == 0
@@ -4265,6 +4270,78 @@ class TestPrefillLoadCandidateFields:
 @pytest.mark.unit
 class TestPrefillLoadRoutingDecision:
     """Tests for prefill-load-aware routing decisions."""
+
+    def test_primary_lease_is_reserved_before_decision_returns(self):
+        """A serving decision publishes its load reservation atomically."""
+        adapter = _make_adapter(endpoint_id="test-model:primary")
+        route_table = _FakeRouteTable()
+        route_table.add("test-model", [(adapter, 1.0)])
+        router = RouteWiseRouter(
+            route_table=route_table,
+            config=RouteWiseConfig(prefill_load_routing_enabled=True),
+        )
+        context = {
+            "messages": [{"role": "user", "content": "x" * 4000}],
+            "params": {},
+            "request_id": "req-prefill-atomic",
+        }
+        expected_tokens = router._tracked_prefill_tokens(context["messages"], context["params"])
+
+        first = router._select_decision("test-model", context, reserve_prefill=True)
+        assert first is not None
+        assert router._prefill_load.backlog("test-model:primary") == expected_tokens
+
+        # The next selection observes the reservation that belongs to the
+        # first decision, rather than selecting against the stale pre-reserve
+        # snapshot that the old execution path exposed.
+        second = router._select_decision(
+            "test-model",
+            {**context, "request_id": "req-prefill-atomic-2"},
+            reserve_prefill=True,
+        )
+        assert second is not None
+        assert (
+            second.metadata["candidate_outstanding_prefill_tokens"]["test-model:primary"]
+            == expected_tokens
+        )
+
+        first.release()
+        second.release()
+        assert router._prefill_load.backlog("test-model:primary") == 0
+
+    def test_routewise_lease_does_not_consume_unverified_caller_hint(self):
+        """RouteWise charges cold work until verified cache evidence is wired in."""
+        adapter = _make_adapter(endpoint_id="test-model:primary")
+        route_table = _FakeRouteTable()
+        route_table.add("test-model", [(adapter, 1.0)])
+        router = RouteWiseRouter(
+            route_table=route_table,
+            config=RouteWiseConfig(prefill_load_routing_enabled=True),
+        )
+        affinity_key = "caller"
+        prior = router._prefill_load.acquire(
+            "test-model:primary",
+            100_000,
+            affinity_key=affinity_key,
+        )
+        router._prefill_load.release(prior, prefill_confirmed=True)
+
+        messages = [{"role": "user", "content": "unrelated" * 1000}]
+        with req_ctx.push(affinity_key=affinity_key):
+            decision = router._select_decision(
+                "test-model",
+                {
+                    "messages": messages,
+                    "params": {},
+                    "request_id": "req-routewise-cold",
+                },
+                reserve_prefill=True,
+            )
+
+        assert decision is not None
+        expected = router._tracked_prefill_tokens(messages, {})
+        assert router._prefill_load.backlog("test-model:primary") == expected
+        decision.release()
 
     def test_lower_load_preferred_when_otherwise_equivalent(self):
         """Endpoint with lower prefill load is preferred when cost/latency are equal."""

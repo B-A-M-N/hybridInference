@@ -2207,6 +2207,21 @@ class RouteWiseRouter:
     ) -> CheckpointBackupDispatch | None:
         """Select and reserve a backup at one in-flight checkpoint."""
         with self._route_commit_lock:
+            if self.config.prefill_load_routing_enabled:
+                with self._prefill_load.routing_transaction():
+                    return self._select_checkpoint_backup_locked(
+                        model_id=model_id,
+                        decision=decision,
+                        context=context,
+                        prompt_tokens=prompt_tokens,
+                        predicted_output_tokens=predicted_output_tokens,
+                        envelope=envelope,
+                        selected=selected,
+                        checkpoints_sec=checkpoints_sec,
+                        latency_slo_sec=latency_slo_sec,
+                        elapsed_sec=elapsed_sec,
+                        checkpoint_ts=checkpoint_ts,
+                    )
             return self._select_checkpoint_backup_locked(
                 model_id=model_id,
                 decision=decision,
@@ -2308,18 +2323,19 @@ class RouteWiseRouter:
                 context.get("messages") if isinstance(context, dict) else None,
                 request_params if isinstance(request_params, dict) else None,
             )
-            affinity_key = req_ctx.get().get("affinity_key")
             backup_lease = self._prefill_load.acquire(
                 backup.endpoint_id,
                 tracked_tokens,
-                affinity_key=affinity_key,
             )
 
         def _confirm_backup_prefill() -> None:
             self._prefill_load.release(backup_lease, prefill_confirmed=True)
 
-        def _release_backup_resources() -> None:
+        def _release_backup_prefill() -> None:
             self._prefill_load.release(backup_lease)
+
+        def _release_backup_resources() -> None:
+            _release_backup_prefill()
             reservation.release()
 
         try:
@@ -2334,7 +2350,10 @@ class RouteWiseRouter:
                 elapsed_sec=elapsed_sec,
                 success_probability=current.success_probability,
                 release=_release_backup_resources,
-                metadata={"prefill_confirm": _confirm_backup_prefill},
+                metadata={
+                    "prefill_confirm": _confirm_backup_prefill,
+                    "prefill_release": _release_backup_prefill,
+                },
             )
         except BaseException:
             # ``HedgedAdapter._start_backup_at`` swallows whatever this raises,
@@ -2560,6 +2579,8 @@ class RouteWiseRouter:
         model_id: str,
         context: dict[str, Any],
         trace: RoutingTrace | None = None,
+        *,
+        reserve_prefill: bool = False,
     ) -> RoutingDecision | None:
         model_id = self.canonical_model_id(model_id)
         if model_id not in self.classified:
@@ -2573,6 +2594,17 @@ class RouteWiseRouter:
             trace.request_id = str(request_id)
 
         with self._route_commit_lock:
+            if self.config.prefill_load_routing_enabled and reserve_prefill:
+                # The tracker lock makes the load snapshot used by
+                # _build_candidates and the primary lease reservation one
+                # linearizable operation.  No provider I/O occurs here.
+                with self._prefill_load.routing_transaction():
+                    return self._select_decision_locked(
+                        model_id,
+                        context,
+                        trace,
+                        reserve_prefill=True,
+                    )
             return self._select_decision_locked(model_id, context, trace)
 
     def _select_decision_locked(
@@ -2580,6 +2612,8 @@ class RouteWiseRouter:
         model_id: str,
         context: dict[str, Any],
         trace: RoutingTrace,
+        *,
+        reserve_prefill: bool = False,
     ) -> RoutingDecision | None:
         prompt_tokens = self._prompt_tokens_from_context(context)
         prediction = self._predict_output(model_id, prompt_tokens, context)
@@ -2663,7 +2697,10 @@ class RouteWiseRouter:
             leaf = self._leaf_for_adapter(execution, model_id)
             reservation = self._commit_candidate(selected)
             if reservation is not None:
+                prefill_lease = None
                 try:
+                    if reserve_prefill:
+                        prefill_lease = self._acquire_prefill_lease(selected, context)
                     hedge_plan = self._select_hedge_plan(
                         selected=selected,
                         now=now,
@@ -2685,6 +2722,12 @@ class RouteWiseRouter:
                         reservation=reservation,
                         metadata=metadata,
                         trace=trace,
+                        prefill_lease=prefill_lease,
+                        prefill_release=(
+                            None
+                            if prefill_lease is None
+                            else lambda lease=prefill_lease: self._prefill_load.release(lease)
+                        ),
                     )
                     if hedge_plan is not None:
 
@@ -2727,6 +2770,7 @@ class RouteWiseRouter:
                 except BaseException:
                     # Construction happens after a provider commit. Keep the
                     # ownership lexical even if metadata or hedge setup fails.
+                    self._prefill_load.release(prefill_lease)
                     reservation.release()
                     raise
             # Losing the commit race on a recovering endpoint is the same
@@ -2738,6 +2782,7 @@ class RouteWiseRouter:
                 return None
         return None
 
+<<<<<<< HEAD
     def _leaf_for_adapter(self, adapter: Any, model_id: str) -> LeafBackend:
         """Return the leaf that executes one already-chosen endpoint.
 
@@ -2747,6 +2792,31 @@ class RouteWiseRouter:
         reservation this router holds stays the one that gets released.
         """
         return LeafBackend.for_binding(binding_for_adapter(adapter, model_id=model_id))
+=======
+    def _acquire_prefill_lease(
+        self,
+        selected: FeasibleProviderCandidate,
+        context: dict[str, Any],
+    ) -> Any:
+        """Reserve the selected primary's prefill work before returning it.
+
+        This is called only from the tracker routing transaction.  The lease
+        is attached to the returned decision, so the attempt owns its release
+        even if dispatch fails before the execution helper starts.
+        """
+        params = context.get("params")
+        tracked_tokens = self._tracked_prefill_tokens(
+            context.get("messages"),
+            params if isinstance(params, dict) else None,
+        )
+        # RouteWise does not yet receive #1417's authoritative cache evidence
+        # on this branch. Do not consume FixedRouter's older caller-scoped
+        # warm hint as though it were verified locality.
+        return self._prefill_load.acquire(
+            selected.endpoint_id,
+            tracked_tokens,
+        )
+>>>>>>> f65094a2 (fix(routewise): enforce hedge lease lifecycle)
 
     def _stash_prefix_for_commit(
         self,
@@ -3057,22 +3127,19 @@ class RouteWiseRouter:
     ) -> dict[str, Any]:
         adapter = decision.adapter
         original_config = getattr(adapter, "config", None)
-        lease = None
+        lease = decision.prefill_lease
 
         try:
             endpoint_id = endpoint_id_for_adapter(adapter)
-            if self.config.prefill_load_routing_enabled:
+            if lease is None and self.config.prefill_load_routing_enabled:
                 # Use the prefill tracker's whole-request estimator to capture
                 # tools, response_format, tool_calls, etc. — not just message content.
                 tracked_tokens = self._tracked_prefill_tokens(messages, params)
-                affinity_key = req_ctx.get().get("affinity_key")
-
                 # Track this request's prefill pressure so subsequent RouteWise decisions
                 # see it in the LP. Mirrors FixedRouter's acquire/release pattern.
                 lease = self._prefill_load.acquire(
                     endpoint_id,
                     tracked_tokens,
-                    affinity_key=affinity_key,
                 )
             with req_ctx.push(model=model_id, provider=adapter.config.provider):
                 self._ensure_health(endpoint_id)
@@ -3139,14 +3206,11 @@ class RouteWiseRouter:
                 # Use the prefill tracker's whole-request estimator to capture
                 # tools, response_format, tool_calls, etc. — not just message content.
                 tracked_tokens = self._tracked_prefill_tokens(messages, params)
-                affinity_key = req_ctx.get().get("affinity_key")
-
                 # Track this request's prefill pressure so subsequent RouteWise decisions
                 # see it in the LP. Mirrors FixedRouter's acquire/release pattern.
                 lease = self._prefill_load.acquire(
                     endpoint_id,
                     tracked_tokens,
-                    affinity_key=affinity_key,
                 )
             with req_ctx.push(model=model_id, provider=adapter.config.provider):
                 self._ensure_health(endpoint_id)
@@ -3280,7 +3344,12 @@ class RouteWiseRouter:
 
         try:
             while True:
-                next_decision = self._select_decision(model_id, context, trace)
+                next_decision = self._select_decision(
+                    model_id,
+                    context,
+                    trace,
+                    reserve_prefill=True,
+                )
                 if next_decision is None:
                     if last_error is not None:
                         raise last_error
@@ -3401,11 +3470,15 @@ class RouteWiseRouter:
         last_error: BaseException | None = None
         chunks_yielded = False
         done_chunk: str | None = None
-        prefill_lease = None
 
         try:
             while True:
-                next_decision = self._select_decision(model_id, context, trace)
+                next_decision = self._select_decision(
+                    model_id,
+                    context,
+                    trace,
+                    reserve_prefill=True,
+                )
                 if next_decision is None:
                     if last_error is not None:
                         raise last_error
@@ -3418,15 +3491,6 @@ class RouteWiseRouter:
                 decision = next_decision
                 primary = decision.adapter
                 last_attempted = primary
-                if getattr(self.config, "prefill_load_routing_enabled", False):
-                    # Acquire before yielding the synthetic routing chunk. This
-                    # makes the lease visible to a concurrent request before that
-                    # request performs its own RouteWise selection.
-                    prefill_lease = self._prefill_load.acquire(
-                        endpoint_id_for_adapter(primary),
-                        self._tracked_prefill_tokens(messages, params),
-                        affinity_key=req_ctx.get().get("affinity_key"),
-                    )
                 try:
                     yield routing_chunk(
                         primary,
@@ -3438,7 +3502,7 @@ class RouteWiseRouter:
                         decision,
                         model_id,
                         messages,
-                        prefill_lease=prefill_lease,
+                        prefill_lease=decision.prefill_lease,
                         **params,
                     ):
                         self.pending_prefix_cache.touch(str(request_id))
@@ -3522,7 +3586,6 @@ class RouteWiseRouter:
                 self._attach_decision_info(routing, decision.metadata)
             raise
         finally:
-            self._prefill_load.release(prefill_lease)
             if decision is not None:
                 decision.release()
 
