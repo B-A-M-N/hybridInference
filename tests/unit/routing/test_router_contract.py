@@ -180,6 +180,71 @@ async def test_routing_options_are_consumed_before_adapter_dispatch(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_dispatch_admission_callback_runs_before_adapter_dispatch(
+    router_factory: _RouterFactory,
+) -> None:
+    primary = _adapter("primary")
+    router = router_factory.build([primary])
+    observed_calls: list[int] = []
+
+    await router.chat_completion(
+        _MODEL_ID,
+        _MESSAGES,
+        routing_options=RoutingRequestOptions(
+            on_dispatch_admitted=lambda: observed_calls.append(primary.chat_calls),
+        ),
+    )
+
+    assert observed_calls == [0]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_dispatch_admission_callback_runs_before_adapter_failure(
+    router_factory: _RouterFactory,
+) -> None:
+    primary = _adapter("primary", chat_error=RuntimeError("upstream failed"))
+    router = router_factory.build([primary])
+    admitted: list[bool] = []
+
+    with pytest.raises(RuntimeError, match="upstream failed"):
+        await router.chat_completion(
+            _MODEL_ID,
+            _MESSAGES,
+            routing_options=RoutingRequestOptions(
+                on_dispatch_admitted=lambda: admitted.append(True),
+            ),
+        )
+
+    assert admitted == [True]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_dispatch_admission_callback_runs_before_stream_dispatch(
+    router_factory: _RouterFactory,
+) -> None:
+    primary = _adapter(
+        "primary",
+        stream_chunks=('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',),
+    )
+    router = router_factory.build([primary])
+    observed_calls: list[int] = []
+
+    async for _chunk in router.stream_chat_completion(
+        _MODEL_ID,
+        _MESSAGES,
+        routing_options=RoutingRequestOptions(
+            on_dispatch_admitted=lambda: observed_calls.append(primary.stream_calls),
+        ),
+    ):
+        pass
+
+    assert observed_calls == [0]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_required_modalities_filter_chat_and_stream_routes(
     router_factory: _RouterFactory,
 ) -> None:
