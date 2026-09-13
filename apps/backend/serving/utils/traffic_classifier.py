@@ -120,6 +120,11 @@ HISTORY_OBSERVATION_TARGET = 5.0
 # Maximum contribution from any single signal (prevents single-signal domination)
 MAX_SINGLE_SIGNAL_SCORE = 0.35
 
+# In-flight concurrency is affected by downstream service time. Keep it as a
+# weak automation signal so scheduler-induced latency cannot by itself flip an
+# otherwise stable human-like arrival pattern out of the scheduling cohort.
+MAX_CONCURRENCY_SIGNAL_SCORE = 0.70
+
 # Signal weights (must sum to 1.0 for proper normalization)
 WEIGHT_CADENCE = 0.30
 WEIGHT_CONCURRENCY = 0.25
@@ -189,18 +194,20 @@ def _score_concurrency(concurrent_requests: int) -> float:
     """Score concurrency. Higher concurrency → higher automation score.
 
     Interactive users typically have 1-2 concurrent requests.
-    Automated systems often have 5+ concurrent requests.
+    Automated systems often have 5+ concurrent requests. The score is capped
+    because in-flight concurrency also reflects downstream service time.
     """
     if concurrent_requests >= 20:
-        return 0.90
+        score = 0.90
     elif concurrent_requests >= 10:
-        return 0.70
+        score = 0.70
     elif concurrent_requests >= 5:
-        return 0.50
+        score = 0.50
     elif concurrent_requests >= 3:
-        return 0.30
+        score = 0.30
     else:
-        return 0.10
+        score = 0.10
+    return min(score, MAX_CONCURRENCY_SIGNAL_SCORE)
 
 
 def _score_shape_repetition(shape_repeat_count: int) -> float:

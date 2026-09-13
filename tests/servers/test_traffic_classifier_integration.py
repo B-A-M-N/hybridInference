@@ -385,6 +385,35 @@ async def test_completions_rejected_pin_does_not_update_traffic_state(
 
 
 @pytest.mark.asyncio
+async def test_trusted_synthetic_probe_does_not_update_traffic_state(
+    traffic_completions_client,
+    traffic_completions_app,
+):
+    """Deployment probes must not become authenticated user history."""
+    from serving.servers.routers.completions import verify_api_key
+
+    async def fake_verify_api_key():
+        return {
+            "authenticated": True,
+            "user_id": "traffic-test-user",
+            "role": "internal",
+            "is_admin": True,
+        }
+
+    traffic_completions_app.dependency_overrides[verify_api_key] = fake_verify_api_key
+    state = get_traffic_observation_state()
+
+    response = await traffic_completions_client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4", "messages": [{"role": "user", "content": "probe"}]},
+        headers={"X-Probe": "synthetic"},
+    )
+
+    assert response.status_code == 200
+    assert state.get_identity_count() == 0
+
+
+@pytest.mark.asyncio
 async def test_completions_rejected_open_circuit_does_not_update_traffic_state(
     traffic_completions_client,
     traffic_completions_app,

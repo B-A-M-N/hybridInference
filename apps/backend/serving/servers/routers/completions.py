@@ -917,7 +917,12 @@ async def chat_completions(
     # Match FI's existing per-user automation/concurrency scope. In an
     # auth-disabled deployment, the shared ``anonymous`` sentinel must never
     # become a global behavioral bucket.
-    traffic_user_id = user_ctx.get("user_id") if is_authenticated else None
+    # Trusted synthetic probes are deployment-owned measurement traffic, not
+    # user behavior.  They must not advance the authenticated user's cadence,
+    # shape, session, or request-count history used by this classifier.
+    traffic_user_id = (
+        None if is_synthetic_probe else user_ctx.get("user_id") if is_authenticated else None
+    )
     traffic_state = get_traffic_observation_state()
     shape_hash = compute_request_shape_hash(
         model=model,

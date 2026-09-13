@@ -175,6 +175,31 @@ def test_five_observations_can_receive_human_scheduling_hint():
     assert is_high_confidence_human_hint(classification.class_hint.value, classification.confidence)
 
 
+def test_service_time_cannot_flip_human_hint_via_concurrency():
+    """Downstream latency cannot turn stable human traffic into automation."""
+    common_evidence = {
+        "inter_arrival_ms": 5000,
+        "shape_repeat_count": 2,
+        "session_continuity": True,
+        "is_authenticated": True,
+        "user_agent": "browser/1.0",
+        "request_count": 5,
+    }
+
+    classifications = [
+        classify_traffic(TrafficEvidence(concurrent_requests=concurrency, **common_evidence))
+        for concurrency in (1, 20)
+    ]
+
+    assert all(
+        classification.class_hint == TrafficClass.LIKELY_HUMAN for classification in classifications
+    )
+    assert all(
+        is_high_confidence_human_hint(classification.class_hint.value, classification.confidence)
+        for classification in classifications
+    )
+
+
 def test_conflicting_evidence_unknown():
     """Conflicting signals should result in UNKNOWN."""
     evidence = TrafficEvidence(
