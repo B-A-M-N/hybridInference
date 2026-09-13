@@ -95,6 +95,31 @@ async def test_record_signals_the_transition_only_once(small_limits, clock):
 
 
 @pytest.mark.asyncio
+async def test_unresolved_failures_use_a_global_guard_not_a_client_bucket(monkeypatch, clock):
+    """Unresolved abuse is shed without attributing it to the proxy address."""
+    monkeypatch.setattr(settings, "auth_failure_block_enabled", True)
+    monkeypatch.setattr(settings, "unresolved_auth_failure_block_threshold", 3)
+    monkeypatch.setattr(settings, "unresolved_auth_failure_block_window_sec", 100)
+    monkeypatch.setattr(settings, "unresolved_auth_failure_block_duration_sec", 1000)
+    unresolved = ClientIpInfo(
+        client_ip="unknown",
+        peer_ip="172.19.0.1",
+        source="unknown",
+        trusted_proxy_headers=False,
+        resolved=False,
+    )
+
+    assert await record_auth_failure(unresolved) is False
+    assert await record_auth_failure(unresolved) is False
+    assert await record_auth_failure(unresolved) is True
+    assert (await is_ip_blocked(unresolved))[0] is True
+    # A resolved client is not falsely attributed to the unresolved guard.
+    assert await is_ip_blocked(_resolved_ip("8.8.8.8")) == (False, 0)
+    blocks = await list_active_blocks()
+    assert [block.ip_bucket for block in blocks] == ["unresolved-global"]
+
+
+@pytest.mark.asyncio
 async def test_below_threshold_never_blocks(small_limits, clock):
     ip = _resolved_ip("203.0.113.9")
     await record_auth_failure(ip)
@@ -393,6 +418,35 @@ async def test_clear_block_lifts_an_active_block(small_limits, clock):
     assert await clear_block("203.0.113.40") is True
     assert await is_ip_blocked(ip) == (False, 0)
     assert await list_active_blocks() == []
+
+
+@pytest.mark.asyncio
+async def test_clear_block_lifts_the_unresolved_global_guard(monkeypatch, clock):
+    """The listed unresolved-global bucket can be cleared before its deadline."""
+    monkeypatch.setattr(settings, "auth_failure_block_enabled", True)
+    monkeypatch.setattr(settings, "unresolved_auth_failure_block_threshold", 3)
+    monkeypatch.setattr(settings, "unresolved_auth_failure_block_window_sec", 100)
+    monkeypatch.setattr(settings, "unresolved_auth_failure_block_duration_sec", 1000)
+    unresolved = ClientIpInfo(
+        client_ip="unknown",
+        peer_ip="172.19.0.1",
+        source="unknown",
+        trusted_proxy_headers=False,
+        resolved=False,
+    )
+
+    for _ in range(3):
+        await record_auth_failure(unresolved)
+    assert (await is_ip_blocked(unresolved))[0] is True
+    assert [block.ip_bucket for block in await list_active_blocks()] == ["unresolved-global"]
+
+    assert await clear_block("unresolved-global") is True
+    assert await is_ip_blocked(unresolved) == (False, 0)
+    assert await list_active_blocks() == []
+
+    # Clearing also drops the spent global history, so the next failure starts
+    # a fresh window rather than immediately re-blocking the traffic plane.
+    assert await record_auth_failure(unresolved) is False
 
 
 @pytest.mark.asyncio

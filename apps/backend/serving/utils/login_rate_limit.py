@@ -15,8 +15,9 @@ this defense (the goal is throttling, not audit). Mirrors the design of
 When client provenance is resolved, rate-limits on the client IP.
 When unresolved (e.g., behind a misconfigured proxy), there is no information
 to distinguish clients behind the shared proxy. In that case, an alertable
-warning is emitted and per-IP rate limiting is skipped rather than collapsing
-all clients onto one bucket; per-email limiting still applies.
+warning is emitted and a coarse global process-local budget applies rather
+than collapsing all clients onto one per-client bucket; per-email limiting
+still applies.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ _SWEEP_EVERY = 1024
 
 _email_attempts: dict[str, deque[float]] = {}
 _ip_attempts: dict[str, deque[float]] = {}
+_unresolved_attempts: deque[float] = deque()
 _lock = asyncio.Lock()
 _sweep_counter = 0
 logger = get_logger(__name__)
@@ -63,9 +65,9 @@ async def check_and_record_login(email: str, request) -> tuple[bool, str | None]
 
     When client provenance is resolved, the per-IP bucket is enforced on
     the client IP. When unresolved (e.g., behind a misconfigured proxy), there
-    is no information to distinguish clients behind the shared proxy. Per-IP
-    rate limiting is skipped with an alertable warning rather than collapsing
-    all clients onto one bucket. Per-email rate limiting still applies.
+    is no information to distinguish clients behind the shared proxy. A coarse
+    global budget applies with an alertable warning rather than collapsing all
+    clients onto one per-client bucket. Per-email rate limiting still applies.
     """
     global _sweep_counter
 
@@ -81,12 +83,14 @@ async def check_and_record_login(email: str, request) -> tuple[bool, str | None]
 
     # Use resolved client IP if available; otherwise skip per-IP limiting.
     ip_key = f"client:{normalize_ip_bucket(ip_info.client_ip)}" if ip_info.resolved else None
+    unresolved = not ip_info.resolved
 
     now = _now()
     email_cutoff = now - _FIFTEEN_MIN_SECONDS
     ip_cutoff = now - _HOUR_SECONDS
     per_email = settings.login_rate_limit_per_15min
     per_ip = settings.login_rate_limit_per_hour_per_ip
+    unresolved_count = 0
 
     async with _lock:
         _sweep_counter += 1
@@ -121,8 +125,16 @@ async def check_and_record_login(email: str, request) -> tuple[bool, str | None]
         else:
             ip_count = 0  # No per-IP limiting when unresolved
 
+        if unresolved:
+            while _unresolved_attempts and _unresolved_attempts[0] < ip_cutoff:
+                _unresolved_attempts.popleft()
+            unresolved_count = len(_unresolved_attempts)
+            _unresolved_attempts.append(now)
+
     # Prefer the longer window when both trip so Retry-After reflects a
     # real wait (telling a 24h-blocked client to retry in 15m is wrong).
+    if unresolved and unresolved_count >= settings.unresolved_login_rate_limit_per_hour:
+        return False, "unresolved"
     if ip_count >= per_ip:
         return False, "ip"
     if email_count >= per_email:
@@ -135,4 +147,5 @@ def reset_login_rate_limit_state() -> None:
     global _sweep_counter
     _email_attempts.clear()
     _ip_attempts.clear()
+    _unresolved_attempts.clear()
     _sweep_counter = 0

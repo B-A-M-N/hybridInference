@@ -292,9 +292,14 @@ async def _authenticate_by_api_key(
                 prompt=blocked_prompt,
             )
         )
+        detail = (
+            "Too many authentication failures from this IP. Temporarily blocked."
+            if ip_info.resolved
+            else "Too many unresolved authentication failures. Temporarily blocked."
+        )
         raise HTTPException(
             status_code=429,
-            detail="Too many authentication failures from this IP. Temporarily blocked.",
+            detail=detail,
             headers={"Retry-After": str(retry_after)},
         )
 

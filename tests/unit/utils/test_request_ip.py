@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from starlette.datastructures import Headers
 
 from serving.config.settings import Settings
 from serving.utils.request_ip import (
@@ -28,7 +29,7 @@ from serving.utils.request_ip import (
 )
 
 
-def _request(headers: dict[str, str], peer_ip: str = "10.0.0.2"):
+def _request(headers: object, peer_ip: str = "10.0.0.2"):
     return SimpleNamespace(headers=headers, client=SimpleNamespace(host=peer_ip))
 
 
@@ -39,7 +40,12 @@ def _networks(*cidrs: str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Networ
 
 @contextmanager
 def _settings_env(
-    proxy_headers: bool, cf_headers: bool, proxy_nets: tuple = (), cf_nets: tuple = ()
+    proxy_headers: bool,
+    cf_headers: bool,
+    proxy_nets: tuple = (),
+    direct_client_nets: tuple = (),
+    cf_nets: tuple = (),
+    x_real_ip: bool = False,
 ):
     """Set up a test environment with proper Settings and env vars.
 
@@ -47,20 +53,15 @@ def _settings_env(
     instances and sets real environment variables, the same way the
     production code reads them.
     """
-    import os
-
     settings = Settings(
         trusted_proxies=",".join(str(n) for n in proxy_nets),
+        trusted_direct_client_networks=",".join(str(n) for n in direct_client_nets),
         trusted_cloudflare_networks=",".join(str(n) for n in cf_nets),
+        trust_proxy_headers=proxy_headers,
+        trust_cloudflare_headers=cf_headers and proxy_headers,
+        trust_x_real_ip=x_real_ip,
     )
-    env = {
-        "TRUST_PROXY_HEADERS": "1" if proxy_headers else "0",
-        "TRUST_CLOUDFLARE_HEADERS": "1" if cf_headers else "0",
-    }
-    with (
-        patch.dict(os.environ, env),
-        patch("serving.utils.request_ip.get_settings", return_value=settings),
-    ):
+    with patch("serving.utils.request_ip.get_settings", return_value=settings):
         yield settings
 
 
@@ -108,6 +109,7 @@ def test_is_reportable_ip_rejects_non_routable():
     assert _is_reportable_ip("192.0.2.1") is False
     assert _is_reportable_ip("198.51.100.1") is False
     assert _is_reportable_ip("203.0.113.1") is False
+    assert _is_reportable_ip("192.0.0.1") is False
     assert _is_reportable_ip("198.18.0.1") is False
     assert _is_reportable_ip("240.1.2.3") is False
     assert _is_reportable_ip("2001:db8::1") is False
@@ -155,6 +157,32 @@ def test_public_peer_used_directly_no_trusted_proxies():
         assert info.resolved is True
 
 
+def test_direct_private_peer_requires_explicit_client_network():
+    """Private direct peers are usable only with explicit client authorization."""
+    with _settings_env(
+        proxy_headers=False,
+        cf_headers=False,
+        direct_client_nets=_networks("10.42.0.0/16"),
+    ):
+        info = get_client_ip_info(_request({}, peer_ip="10.42.1.7"))
+        assert info.client_ip == "10.42.1.7"
+        assert info.source == "socket"
+        assert info.resolved is True
+
+
+def test_direct_ula_peer_requires_explicit_client_network():
+    """ULA direct peers can be authorized without trusting forwarding headers."""
+    with _settings_env(
+        proxy_headers=False,
+        cf_headers=False,
+        direct_client_nets=_networks("fd00:42::/64"),
+    ):
+        info = get_client_ip_info(_request({}, peer_ip="fd00:42::7"))
+        assert info.client_ip == "fd00:42::7"
+        assert info.source == "socket"
+        assert info.resolved is True
+
+
 def test_forged_xff_ignored_without_trusted_peer():
     """Attacker cannot spoof XFF when peer is not a configured trusted proxy."""
     with _settings_env(proxy_headers=True, cf_headers=False):
@@ -166,7 +194,7 @@ def test_forged_xff_ignored_without_trusted_peer():
 
 def test_forged_cf_connecting_ip_ignored_without_trusted_peer():
     """Attacker cannot spoof CF-Connecting-IP without a trusted peer."""
-    with _settings_env(proxy_headers=True, cf_headers=True):
+    with _settings_env(proxy_headers=True, cf_headers=False):
         request = _request({"cf-connecting-ip": "203.0.113.9"}, peer_ip="8.8.8.8")
         info = get_client_ip_info(request)
         assert info.client_ip == "8.8.8.8"
@@ -181,6 +209,27 @@ def test_no_client_means_unknown():
         assert info.client_ip == "unknown"
         assert info.source == "unknown"
         assert info.resolved is False
+
+
+def test_unresolved_resolution_warns_once_per_request(caplog):
+    """Repeated consumers of one request share one cached resolution warning."""
+    request = SimpleNamespace(
+        headers={},
+        client=SimpleNamespace(host="172.19.0.1"),
+        state=SimpleNamespace(),
+    )
+    with (
+        _settings_env(proxy_headers=False, cf_headers=False),
+        caplog.at_level("WARNING", logger="serving.utils.request_ip"),
+    ):
+        first = get_client_ip_info(request)
+        second = get_client_ip_info(request)
+
+    assert first is second
+    assert (
+        sum(record.getMessage() == "client_ip_resolution_unresolved" for record in caplog.records)
+        == 1
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +267,7 @@ def test_trusted_proxy_all_trusted_hops_returns_unknown():
         )
         info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
-        assert info.source == "unknown"
+        assert info.source == "x-forwarded-for"
         assert info.resolved is False
 
 
@@ -307,19 +356,119 @@ def test_trusted_proxy_attacker_prepends_fake_addresses():
 
 
 def test_trusted_proxy_x_real_ip_fallback():
-    """X-Real-IP used when XFF has no usable hop (all trusted)."""
+    """X-Real-IP is used only when XFF is completely absent and opted in."""
     with _settings_env(
         proxy_headers=True,
         cf_headers=False,
         proxy_nets=_networks("172.16.0.0/12", "10.0.0.0/8"),
+        x_real_ip=True,
+    ):
+        request = _request({"x-real-ip": "8.8.8.8"}, peer_ip="172.19.0.1")
+        info = get_client_ip_info(request)
+        assert info.client_ip == "8.8.8.8"
+        assert info.source == "x-real-ip"
+
+
+def test_invalid_xff_does_not_fall_through_to_x_real_ip():
+    """An XFF assertion remains authoritative when its chain is unusable."""
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12"),
+        x_real_ip=True,
     ):
         request = _request(
-            {"x-forwarded-for": "10.0.0.1, 172.19.0.1", "x-real-ip": "8.8.8.8"},
+            {"x-forwarded-for": "garbage, 172.19.0.1", "x-real-ip": "8.8.8.8"},
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        assert info.source == "x-forwarded-for"
+
+
+def test_duplicate_xff_field_lines_are_combined_in_wire_order():
+    """All physical XFF fields participate in the same right-to-left walk."""
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12"),
+    ):
+        request = _request(
+            Headers(
+                raw=[
+                    (b"x-forwarded-for", b"1.2.3.4"),
+                    (b"X-FORWARDED-FOR", b"8.8.8.8, 172.19.0.1"),
+                ]
+            ),
             peer_ip="172.19.0.1",
         )
         info = get_client_ip_info(request)
         assert info.client_ip == "8.8.8.8"
-        assert info.source == "x-real-ip"
+        assert info.x_forwarded_for == "1.2.3.4, 8.8.8.8, 172.19.0.1"
+
+
+def test_duplicate_xff_empty_field_terminates_provenance():
+    """An empty physical XFF field is preserved and fails closed."""
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12"),
+    ):
+        request = _request(
+            Headers(
+                raw=[
+                    (b"x-forwarded-for", b"8.8.8.8"),
+                    (b"x-forwarded-for", b""),
+                    (b"x-forwarded-for", b"172.19.0.1"),
+                ]
+            ),
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        assert info.source == "x-forwarded-for"
+
+
+@pytest.mark.parametrize("header", ["x-real-ip", "cf-connecting-ip", "cf-connecting-ipv6"])
+def test_duplicate_singleton_forwarding_header_is_rejected(header):
+    """No singleton forwarding identity is selected from an ambiguous pair."""
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=True,
+        proxy_nets=_networks("172.16.0.0/12"),
+        cf_nets=_networks("172.16.0.0/12"),
+        x_real_ip=True,
+    ):
+        request = _request(
+            Headers(
+                raw=[
+                    (header.encode(), b"8.8.8.8"),
+                    (header.upper().encode(), b"1.1.1.1"),
+                ]
+            ),
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "unknown"
+        assert info.resolved is False
+
+
+def test_forwarded_hop_limit_fails_closed():
+    """A pathological forwarding chain cannot make parsing unbounded."""
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12"),
+    ):
+        chain = ", ".join(["8.8.8.8"] * 33)
+        info = get_client_ip_info(
+            _request(
+                {"x-forwarded-for": chain},
+                peer_ip="172.19.0.1",
+            )
+        )
+        assert info.client_ip == "unknown"
+        assert info.source == "x-forwarded-for"
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +513,7 @@ def test_cf_connecting_ip_ignored_with_generic_trust_only():
     """Generic proxy trust does not authorize CF-Connecting-IP."""
     with _settings_env(
         proxy_headers=True,
-        cf_headers=True,
+        cf_headers=False,
         proxy_nets=_networks("172.16.0.0/12"),
     ):
         request = _request(
@@ -837,7 +986,7 @@ def test_resolved_clients_behind_same_proxy():
 
 def test_cf_forged_by_direct_origin():
     """Direct-origin request with forged CF-Connecting-IP is ignored."""
-    with _settings_env(proxy_headers=True, cf_headers=True):
+    with _settings_env(proxy_headers=True, cf_headers=False):
         request = _request(
             {"cf-connecting-ip": "203.0.113.9"},
             peer_ip="1.2.3.4",
@@ -851,7 +1000,7 @@ def test_cf_forged_by_generic_proxy():
     """Generic trusted proxy cannot authorize attacker-supplied CF-Connecting-IP."""
     with _settings_env(
         proxy_headers=True,
-        cf_headers=True,
+        cf_headers=False,
         proxy_nets=_networks("172.16.0.0/12"),
     ):
         request = _request(
@@ -867,13 +1016,26 @@ def test_cf_generic_proxy_no_xff():
     """Generic trusted proxy without XFF falls back to peer."""
     with _settings_env(
         proxy_headers=True,
-        cf_headers=True,
+        cf_headers=False,
         proxy_nets=_networks("172.16.0.0/12"),
     ):
         request = _request({}, peer_ip="172.19.0.1")
         info = get_client_ip_info(request)
         assert info.client_ip == "unknown"
         assert info.source == "unknown"
+
+
+def test_public_trusted_proxy_without_identity_header_stays_unresolved():
+    """A public proxy address must not become the client without a header."""
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("8.8.8.0/24"),
+    ):
+        info = get_client_ip_info(_request({}, peer_ip="8.8.8.8"))
+        assert info.client_ip == "unknown"
+        assert info.source == "unknown"
+        assert info.resolved is False
 
 
 def test_cf_requires_explicit_authorization():

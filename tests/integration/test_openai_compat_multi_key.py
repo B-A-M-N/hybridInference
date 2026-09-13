@@ -98,6 +98,34 @@ async def test_multi_key_rotates_on_429():
     assert adapter._key_pool._affinity["_anon"].key_index == 1
 
 
+async def test_non_affine_failover_advances_without_shared_affinity():
+    """An unresolved caller remembers failover state without a shared binding."""
+    adapter = OpenAICompatAdapter(_make_config(["k1", "k2"]))
+    success_payload = {
+        "id": "x",
+        "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+        "usage": {},
+    }
+    used: list[str] = []
+
+    async def fake_json_post(url, json, headers, timeout):
+        key = headers["Authorization"].removeprefix("Bearer ")
+        used.append(key)
+        if key == "k1":
+            raise _make_response_error(503)
+        return success_payload
+
+    with patch.object(adapter.http, "json_post", side_effect=fake_json_post):
+        with req_ctx.push(affinity_key=None, auth_key_hash="_anon"):
+            await adapter.chat_completion([{"role": "user", "content": "hi"}])
+        with req_ctx.push(affinity_key=None, auth_key_hash="_anon"):
+            await adapter.chat_completion([{"role": "user", "content": "hi"}])
+
+    assert used == ["k1", "k2", "k2"]
+    assert adapter._key_pool is not None
+    assert adapter._key_pool.affinity_count() == 0
+
+
 async def test_multi_key_pool_exhausted_propagates():
     """All keys 429 in one call -> final exception is the last 429."""
     adapter = OpenAICompatAdapter(_make_config(["k1", "k2"]))

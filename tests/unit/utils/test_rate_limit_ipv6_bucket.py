@@ -112,16 +112,16 @@ async def test_login_ipv4_buckets_remain_per_address(_live_settings):
 
 @pytest.mark.asyncio
 async def test_signup_unresolved_skips_limit(_live_settings):
-    """Default signup policy skips the per-IP bucket without using proxy IP."""
+    """Unresolved signup uses a coarse budget without using the proxy IP."""
     request = SimpleNamespace(headers={}, client=SimpleNamespace(host="172.19.0.1"))
 
     from unittest.mock import patch
 
     with patch("serving.utils.signup_rate_limit.settings", _live_settings):
-        # All attempts should be allowed (no per-IP limiting for unresolved)
-        for _ in range(100):
-            allowed, _ = await check_and_record_signup(request)
-            assert allowed is True
+        _live_settings.unresolved_signup_rate_limit_per_hour = 3
+        for _ in range(3):
+            assert await check_and_record_signup(request) == (True, None)
+        assert await check_and_record_signup(request) == (False, "unresolved_hour")
 
 
 @pytest.mark.asyncio
@@ -138,15 +138,16 @@ async def test_signup_unresolved_can_fail_closed(_live_settings):
 
 @pytest.mark.asyncio
 async def test_login_unresolved_skips_ip_limit(_live_settings):
-    """When client provenance is unresolved, login per-IP limit is skipped with a warning."""
+    """Unresolved login uses a coarse budget, never a proxy-IP bucket."""
     request = SimpleNamespace(headers={}, client=SimpleNamespace(host="172.19.0.1"))
 
     from unittest.mock import patch
 
     with patch("serving.utils.login_rate_limit.settings", _live_settings):
-        # All attempts should pass the IP check (but email limit still applies)
-        for i in range(100):
+        _live_settings.unresolved_login_rate_limit_per_hour = 3
+        for i in range(3):
             email = f"user{i}@example.com"
             allowed, reason = await check_and_record_login(email, request)
             assert allowed is True
             assert reason is None
+        assert await check_and_record_login("user3@example.com", request) == (False, "unresolved")

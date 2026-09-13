@@ -68,41 +68,65 @@ within that subnet to assert client identity on any request.
 Invalid CIDRs fail configuration at startup. Parsed networks are cached in
 `trusted_proxies_parsed` and validated once at startup.
 
-### Cloudflare-authorized networks
+### Direct private client networks
+
+Private RFC1918 and ULA socket peers remain unresolved by default because a
+container bridge or shared internal proxy is not an individual client. If a
+deployment has clients connecting directly over a private network, authorize
+only those client CIDRs with `TRUSTED_DIRECT_CLIENT_NETWORKS`. This setting
+does not authorize forwarding headers and must not include shared proxy
+networks.
+
+```bash
+TRUSTED_DIRECT_CLIENT_NETWORKS=10.42.0.0/16,fd00:42::/64
+```
+
+### Cloudflare-header-authorized peers
 
 `CF-Connecting-IP` requires **separate** authorization. A generic trusted
 reverse proxy does NOT make a client-supplied `CF-Connecting-IP` safe — only
-operators who front this service with Cloudflare should populate this:
+operators who have verified a Cloudflare header-authority path should populate
+this:
 
 ```bash
 # Example: Cloudflare → application directly
 # These are Cloudflare's origin-facing IP ranges (the socket peer),
 # NOT the visitor addresses in CF-Connecting-IP.
 # See: https://developers.cloudflare.com/fundamentals/concepts/cloudflare-ip-addresses/
-TRUSTED_CLOUDFLARE_NETWORKS=10.0.0.1/32  # actual Cloudflare source IP
+TRUSTED_CLOUDFLARE_NETWORKS=173.245.48.0/20  # example Cloudflare origin range
 ```
 
-If your topology is Cloudflare → nginx → HybridInference, then HybridInference
-sees nginx as the socket peer. In that case, `CF-Connecting-IP` safety depends
-on nginx both being exclusively trusted AND correctly sanitizing/overwriting
-the header. Cloudflare itself recommends restricting origin access to
-Cloudflare addresses to prevent direct-origin header spoofing.
+`TRUSTED_CLOUDFLARE_NETWORKS` means the immediate socket peers authorized to
+assert Cloudflare semantics; it does not have to contain Cloudflare's public
+ranges. If your topology is Cloudflare → nginx → HybridInference, then
+HybridInference sees nginx as the socket peer. In that case, list only nginx's
+exact address when nginx is exclusively reachable from Cloudflare and correctly
+sanitizes/overwrites the header. Cloudflare itself recommends restricting
+origin access to Cloudflare addresses to prevent direct-origin spoofing.
 
 This separation ensures that a misconfigured generic proxy cannot accidentally
 authorize attacker-supplied Cloudflare headers.
 
 ### Trust flags
 
-Two environment variables control header processing:
+Three environment variables control header processing:
 
 - `TRUST_PROXY_HEADERS=1`: enables processing of `X-Forwarded-For` and
   `X-Real-IP` headers, but **only** when the immediate peer is in
   `trusted_proxies`.
 - `TRUST_CLOUDFLARE_HEADERS=1`: enables processing of `CF-Connecting-IP`,
   but **only** when the immediate peer is in `trusted_cloudflare_networks`.
+- `TRUST_X_REAL_IP=1`: separately opts in to the `X-Real-IP` assertion scheme.
+  It is ignored by default, and it is never consulted when XFF is present.
 
-Both flags default to `0` (disabled). Setting a flag alone does nothing if the
+All three flags default to `0` (disabled). Setting a flag alone does nothing if the
 corresponding network list is empty — this is the fail-closed default.
+`TRUST_CLOUDFLARE_HEADERS=1` additionally requires the master
+`TRUST_PROXY_HEADERS=1` flag and a non-empty Cloudflare-authorized network list;
+these combinations fail configuration at startup.
+`TRUST_X_REAL_IP=1` likewise requires `TRUST_PROXY_HEADERS=1` and uses the same
+trusted-proxy network list, but it is consulted only when XFF is completely
+absent.
 
 ### Why this matters
 
@@ -128,19 +152,22 @@ The correct approach depends on the operation:
 - **Rate limiting**: When provenance is resolved, key on the client IP.
   When unresolved, never use the proxy IP: signup emits an
   `unresolved_client_ip` warning and can fail closed with
-  `SIGNUP_REQUIRE_RESOLVED_CLIENT_IP=1`; login retains its per-email limit but
-  skips the per-IP bucket.
-- **Auth-failure blocking**: Only block on resolved client IPs. When
-  unresolved, emit an `unresolved_client_ip` warning but don't record or block
-  (would affect all clients behind the proxy).
+  `SIGNUP_REQUIRE_RESOLVED_CLIENT_IP=1`; otherwise signup and login use
+  separate coarse global process-local budgets while retaining their
+  per-email/per-request behavior. These budgets are traffic safeguards, not
+  client attribution, and their warning events can be counted by log/metrics
+  pipelines.
+- **Auth-failure blocking**: Resolved failures block on client IP. Unresolved
+  failures use a separate coarse global process-local circuit breaker and are
+  never stored under the proxy address, `"unknown"`, or any other client key.
 - **Affinity routing**: When resolved, key on client IP bucket. When
   unresolved, return `None` for non-sticky routing (don't collapse clients).
 
 | Use case | Resolved | Unresolved |
 |----------|----------|------------|
 | Logging, audit, display | `get_client_ip()` | `"unknown"` |
-| Rate limiting | Key on client IP | Signup fails closed when configured; otherwise warning + no shared bucket. Login keeps per-email limiting and skips per-IP. |
-| Auth-failure blocking | Block on client IP | Warning; don't record/block |
+| Rate limiting | Key on client IP | Coarse global budget; no proxy/client attribution. Signup may fail closed when configured. |
+| Auth-failure blocking | Block on client IP | Coarse global unresolved-traffic circuit breaker |
 | Affinity routing | `ip:<bucket>` | `None` (non-sticky) |
 
 ## Resolution order
@@ -148,10 +175,9 @@ The correct approach depends on the operation:
 `get_client_ip_info()` returns a frozen `ClientIpInfo` with the resolved
 `client_ip`, the `peer_ip` it was resolved against, and a `source` label naming
 the rung that won. The `trusted_proxy_headers` field describes whether any
-forwarding identity header was **actually trusted** for this request — that
-is, whether `TRUST_PROXY_HEADERS=1` and the immediate peer is authorized by
-either the generic `trusted_proxies` set or the separately configured
-Cloudflare set with `TRUST_CLOUDFLARE_HEADERS=1`.
+forwarding identity header was **actually authorized** for this request. The
+more specific `trusted_forwarded_headers` and `trusted_cloudflare_headers`
+fields identify which authority applied.
 
 Resolution walks the trust boundary correctly:
 
@@ -169,10 +195,20 @@ Resolution walks the trust boundary correctly:
    * if non-routable or malformed → return `"unknown"`.
    **Never continue leftward** — that would cross the trust boundary and
    consume attacker-controlled values.
-4. **`X-Real-IP`** — only when trusted and routable.
+4. **`X-Real-IP`** — only when `TRUST_X_REAL_IP=1`, trusted, and routable, and
+   only when XFF is completely absent. A present XFF chain that is malformed,
+   ambiguous, overlong, or contains only trusted hops terminates provenance;
+   it never falls through to this second assertion scheme.
 5. **The socket peer** — a direct connection, or the last resort when no
    forwarded hop is usable. If the peer itself is non-routable, the result is
    `"unknown"`.
+
+Every request log carries `ip_source`, `ip_resolved`, and the two explicit
+header-authority flags. Aggregating those fields gives operators a durable
+resolution counter such as `client_ip_resolution_total{result,source}` without
+ever turning an unresolved peer into a client identity. Structured
+`client_ip_resolution_unresolved` and `unresolved_client_ip` events additionally
+make malformed-header and degraded-enforcement spikes alertable.
 
 ### Example: multi-hop chain
 
@@ -208,6 +244,12 @@ Walking right-to-left:
 The attacker's prepended `8.8.8.8` and `1.2.3.4` are never reached. The old
 leftmost-trust model would have returned `8.8.8.8`.
 
+Duplicate field handling is fail closed. All physical `X-Forwarded-For` field
+lines are joined in wire order before parsing, preserving empty hops. The
+singleton `X-Real-IP` and `CF-Connecting-*` fields are rejected when repeated;
+the resolver never selects first or last based on framework ordering. Chains
+with more than 32 hops are rejected as unresolved.
+
 ### What counts as routable
 
 `_is_reportable_ip()` rejects anything unparseable, plus loopback, link-local,
@@ -222,8 +264,9 @@ fc00::/7          (IPv6 unique local)
 2001:db8::/32     (IPv6 documentation)
 ```
 
-An IPv4-mapped IPv6 literal is judged by its embedded IPv4 address, so a mapped
-private peer is still rejected.
+An IPv4-mapped IPv6 literal is judged by its embedded IPv4 address. A mapped
+private peer is accepted only when its embedded address falls inside
+`TRUSTED_DIRECT_CLIENT_NETWORKS`.
 
 The list is written out explicitly rather than delegating to
 `ipaddress.is_private` / `is_global`, because those reclassified special-use

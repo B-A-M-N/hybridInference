@@ -22,6 +22,8 @@ adapter's loop does.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from serving.adapters.key_pool import (
@@ -123,6 +125,84 @@ def test_concurrent_users_share_the_first_key():
     a, _ = pool.acquire("user-A")
     b, _ = pool.acquire("user-B")
     assert a == b == "k0"
+
+
+def test_non_affine_failure_advances_shared_start_without_binding():
+    """Unresolved callers skip a recently failing key without sharing affinity."""
+    pool = KeyPool(keys=["k0", "k1"], provider_label="test")
+
+    first_key, first_lease = pool.acquire(None)
+    assert first_key == "k0"
+    assert pool.release(first_lease, status_code=503, tried={0}) is ReleaseOutcome.ROTATED
+
+    second_key, second_lease = pool.acquire(None)
+    assert second_key == "k1"
+    pool.release(second_lease, status_code=200)
+
+    # The successful non-affine key remains the next starting point, but no
+    # caller-specific binding was created.
+    assert pool.acquire(None)[0] == "k1"
+    assert pool.affinity_count() == 0
+
+
+def test_non_affine_cursor_crosses_reservation_tiers_after_failure():
+    """A failed reserved key does not regain first position on every request."""
+    pool = KeyPool(
+        keys=["reserved", "shared"],
+        provider_label="test",
+        min_roles={"reserved": "pro"},
+    )
+
+    first_key, first_lease = pool.acquire(None, role="pro")
+    assert first_key == "reserved"
+    assert pool.release(first_lease, status_code=503, tried={0}) is ReleaseOutcome.ROTATED
+
+    second_key, second_lease = pool.acquire(None, role="pro")
+    assert second_key == "shared"
+    pool.release(second_lease, status_code=200)
+
+    # The cursor remains on the shared tier until another failure advances it;
+    # the failed reserved key must not be retried first for every caller.
+    third_key, third_lease = pool.acquire(None, role="pro")
+    assert third_key == "shared"
+    pool.release(third_lease, status_code=200)
+
+
+def test_non_affine_failover_reprobes_failed_preferred_key_on_bounded_cadence():
+    """A recovered preferred key is retried without a request-by-request storm."""
+    pool = KeyPool(keys=["preferred", "fallback"], provider_label="test")
+
+    first_key, first_lease = pool.acquire(None)
+    assert first_key == "preferred"
+    assert pool.release(first_lease, status_code=503, tried={0}) is ReleaseOutcome.ROTATED
+
+    fallback_key, fallback_lease = pool.acquire(None)
+    assert fallback_key == "fallback"
+    pool.release(fallback_lease, status_code=200)
+
+    # Keep using the successful fallback until the bounded recovery probe is due.
+    assert pool.acquire(None)[0] == "fallback"
+    pool._non_affine_reprobe_at[None] = time.monotonic()
+
+    recovered_key, recovered_lease = pool.acquire(None)
+    assert recovered_key == "preferred"
+    pool.release(recovered_lease, status_code=200)
+
+    # A successful probe restores the normal preferred-key order.
+    assert pool.acquire(None)[0] == "preferred"
+
+
+def test_non_affine_fresh_cursor_preserves_reservation_priority():
+    """A fresh non-affine caller starts in the highest eligible tier."""
+    pool = KeyPool(
+        keys=["shared", "reserved"],
+        provider_label="test",
+        min_roles={"reserved": "pro"},
+    )
+
+    key, _lease = pool.acquire(None, role="pro")
+
+    assert key == "reserved"
 
 
 @pytest.mark.parametrize("status_code", [429, 401, 402, 403, 408, 425, 500, 503, 599, 0])

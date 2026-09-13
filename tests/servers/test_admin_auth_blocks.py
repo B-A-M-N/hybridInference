@@ -147,6 +147,36 @@ async def test_clear_lifts_the_block_and_is_audited(admin_client, small_limits):
 
 
 @pytest.mark.asyncio
+async def test_clear_lifts_the_unresolved_global_block(admin_client, monkeypatch):
+    """The admin endpoint can clear the coarse unresolved-traffic guard."""
+    monkeypatch.setattr(settings, "auth_failure_block_enabled", True)
+    monkeypatch.setattr(settings, "unresolved_auth_failure_block_threshold", 2)
+    monkeypatch.setattr(settings, "unresolved_auth_failure_block_window_sec", 100)
+    monkeypatch.setattr(settings, "unresolved_auth_failure_block_duration_sec", 1000)
+    unresolved = ClientIpInfo(
+        client_ip="unknown",
+        peer_ip="172.19.0.1",
+        source="unknown",
+        trusted_proxy_headers=False,
+        resolved=False,
+    )
+    await record_auth_failure(unresolved)
+    await record_auth_failure(unresolved)
+    assert (await is_ip_blocked(unresolved))[0] is True
+
+    client, _audit = admin_client
+    response = await client.post(
+        "/admin/auth-blocks/clear",
+        json={"ip": "unresolved-global"},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ip_bucket": "unresolved-global", "cleared": True}
+    assert await is_ip_blocked(unresolved) == (False, 0)
+
+
+@pytest.mark.asyncio
 async def test_clear_of_an_unblocked_source_is_200_not_404(admin_client, small_limits):
     """Nothing to lift is a normal answer, and still audited."""
     client, audit = admin_client

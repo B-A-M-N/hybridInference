@@ -49,20 +49,28 @@ startup as comma-separated CIDR lists; invalid entries fail configuration.
 from __future__ import annotations
 
 import ipaddress
-import os
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from serving.config.settings import get_settings
+from serving.utils.logging import get_logger
 
 if TYPE_CHECKING:
     from fastapi import Request
+
+logger = get_logger(__name__)
 
 # IPv6 clients are routinely delegated a /64 (frequently a /56 or /48), and
 # RFC 4941 privacy addresses rotate within it, so a single client can present
 # effectively unlimited distinct addresses. Abuse-control and affinity buckets
 # therefore collapse IPv6 to its /64 network. IPv4 keeps full-address buckets.
 IPV6_BUCKET_PREFIXLEN = 64
+
+# Bound parsing work independently of the server's header-size settings. A
+# longer chain is not more trustworthy; it is more likely to contain malformed
+# or attacker-controlled history, so provenance fails closed.
+MAX_FORWARDED_HOPS = 32
 
 # Cloudflare's Pseudo IPv4 synthetics live in the reserved Class E space. A real
 # client address is never drawn from it, so its presence in CF-Connecting-IP is
@@ -76,9 +84,11 @@ PSEUDO_IPV4_NETWORK = ipaddress.ip_network("240.0.0.0/4")
 # explicit deny set stable and include documentation, benchmarking, and
 # reserved ranges that must never be treated as real client addresses.
 _NON_ROUTABLE_NETWORKS = (
+    ipaddress.ip_network("0.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("192.0.0.0/24"),
     ipaddress.ip_network("100.64.0.0/10"),
     ipaddress.ip_network("192.0.2.0/24"),
     ipaddress.ip_network("198.51.100.0/24"),
@@ -89,6 +99,14 @@ _NON_ROUTABLE_NETWORKS = (
     ipaddress.ip_network("2001:db8::/32"),
 )
 
+_PRIVATE_CLIENT_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("fc00::/7"),
+)
+_IP_INFO_STATE_KEY = "_hybrid_inference_client_ip_info"
+
 
 def _header_value(value: object) -> str | None:
     """Return a stripped header value when the request provides a real string."""
@@ -96,6 +114,52 @@ def _header_value(value: object) -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def _header_values(request: Request, name: str) -> list[str]:
+    """Return all physical field lines for *name*, preserving empty values.
+
+    Starlette's ``Headers`` is a multidict. Mapping-style ``get`` selects one
+    physical field line, which is not sufficient for list-valued forwarding
+    headers and makes duplicate singleton headers ambiguous. The fallback keeps
+    the resolver usable with the small request doubles used by older callers.
+    """
+    headers = request.headers
+    raw_headers = getattr(headers, "raw", None)
+    if raw_headers is not None:
+        wanted = name.lower().encode("latin-1")
+        values: list[object] = []
+        for raw_name, raw_value in raw_headers:
+            if (isinstance(raw_name, bytes) and raw_name.lower() == wanted) or (
+                isinstance(raw_name, str) and raw_name.lower() == name.lower()
+            ):
+                values.append(raw_value)
+        normalized: list[str] = []
+        for value in values:
+            if isinstance(value, bytes):
+                normalized.append(value.decode("latin-1").strip())
+            elif isinstance(value, str):
+                normalized.append(value.strip())
+        return normalized
+    getlist = getattr(headers, "getlist", None)
+    if callable(getlist):
+        values = getlist(name)
+    else:
+        value = headers.get(name)
+        values = [] if value is None else [value]
+    return [value.strip() for value in values if isinstance(value, str)]
+
+
+def _singleton_header(request: Request, name: str) -> tuple[bool, str | None]:
+    """Return ``(present, value)`` for a singleton header.
+
+    More than one physical field line is ambiguous, including when one line is
+    empty. Callers must not choose first/last based on framework ordering.
+    """
+    values = _header_values(request, name)
+    if len(values) != 1:
+        return bool(values), None
+    return True, _header_value(values[0])
 
 
 def _parse_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -145,10 +209,9 @@ class ClientIpInfo:
     separately configured Cloudflare CIDRs with ``TRUST_CLOUDFLARE_HEADERS``.
 
     ``client_ip`` is the best-effort originating client address, or the literal
-    ``"unknown"`` when no trustworthy routable address could be determined. It
-    is never an RFC 1918 / CGNAT / ULA / loopback / link-local / unspecified
-    address — if the resolution lands on one of those, the result is
-    ``"unknown"`` instead.
+    ``"unknown"`` when no trustworthy address could be determined. Forwarded
+    client addresses must be routable; explicitly authorized direct private
+    socket peers may be RFC 1918 or ULA addresses.
 
     ``resolved`` is ``True`` when ``client_ip`` is a real routable address that
     can be attributed to a specific client. It is ``False`` when the result is
@@ -168,6 +231,8 @@ class ClientIpInfo:
     x_real_ip: str | None = None
     cf_connecting_ip: str | None = None
     cf_connecting_ipv6: str | None = None
+    trusted_forwarded_headers: bool = False
+    trusted_cloudflare_headers: bool = False
 
 
 def _is_in_networks(
@@ -295,6 +360,11 @@ def _trusted_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, 
     return get_settings().trusted_proxies_parsed
 
 
+def _trusted_direct_client_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """Return private networks authorized to identify direct socket peers."""
+    return get_settings().trusted_direct_client_parsed
+
+
 def _trusted_cloudflare_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
     """Return parsed Cloudflare-authorized networks from settings."""
     return get_settings().trusted_cloudflare_parsed
@@ -319,23 +389,40 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
        proxy terminates provenance: if it is routable, it is the client; if it
        is non-routable or malformed, provenance is **unresolved**. We never
        continue leftward past the first untrusted hop.
-    3. ``X-Real-IP`` — only when trusted and routable.
-    4. The socket peer — a direct connection, or the last resort when no
-       forwarded hop is usable. If the peer itself is non-routable, provenance
-       is **unresolved**.
+    3. ``X-Real-IP`` — only when explicitly enabled, trusted, and routable;
+       it is considered only when XFF is completely absent.
+    4. The socket peer — a direct connection when no trusted proxy is
+       authorized. A trusted proxy without usable provenance is unresolved.
 
     When ``trusted_proxies`` is empty (the default), forwarding headers are
     never trusted, and the socket peer is the only network fact used. This is
     the fail-closed default — an operator must explicitly configure which CIDR
     ranges are allowed to assert forwarding provenance.
     """
+    settings = get_settings()
+    state = getattr(request, "state", None)
+    cached = getattr(state, _IP_INFO_STATE_KEY, None) if state is not None else None
+    if isinstance(cached, ClientIpInfo):
+        return cached
+
     peer_ip = request.client.host if request.client else "unknown"
-    global_trust_enabled = os.getenv("TRUST_PROXY_HEADERS", "0") == "1"
-    cf_trust_enabled = os.getenv("TRUST_CLOUDFLARE_HEADERS", "0") == "1"
-    x_forwarded_for = _header_value(request.headers.get("x-forwarded-for"))
-    x_real_ip = _header_value(request.headers.get("x-real-ip"))
-    cf_connecting_ip = _header_value(request.headers.get("cf-connecting-ip"))
-    cf_connecting_ipv6 = _header_value(request.headers.get("cf-connecting-ipv6"))
+    global_trust_enabled = settings.trust_proxy_headers
+    cf_trust_enabled = settings.trust_cloudflare_headers
+
+    # XFF is list-valued and must preserve every physical field line in wire
+    # order. The other forwarding identities are singleton assertions: a
+    # duplicate is ambiguous and cannot be made safe by choosing one value.
+    xff_values = _header_values(request, "x-forwarded-for")
+    xff_present = bool(xff_values)
+    x_forwarded_for = ", ".join(xff_values) if xff_present else None
+    x_real_ip_present, x_real_ip = _singleton_header(request, "x-real-ip")
+    cf_connecting_ip_present, cf_connecting_ip = _singleton_header(request, "cf-connecting-ip")
+    cf_connecting_ipv6_present, cf_connecting_ipv6 = _singleton_header(
+        request, "cf-connecting-ipv6"
+    )
+    cf_header_ambiguous = (cf_connecting_ip_present and cf_connecting_ip is None) or (
+        cf_connecting_ipv6_present and cf_connecting_ipv6 is None
+    )
 
     # Determine whether the immediate peer is a configured trusted proxy.
     # This is the gate for ALL forwarding-header trust. Without this, any
@@ -356,7 +443,17 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
     headers_trusted = peer_is_trusted_proxy or peer_is_cloudflare
 
     def _info(client_ip: str, source: str, resolved: bool) -> ClientIpInfo:
-        return ClientIpInfo(
+        if not resolved:
+            logger.warning(
+                "client_ip_resolution_unresolved",
+                extra={
+                    "event": "client_ip_resolution",
+                    "result": "unresolved",
+                    "source": source,
+                    "peer_ip": peer_ip,
+                },
+            )
+        info = ClientIpInfo(
             client_ip=client_ip,
             peer_ip=peer_ip,
             source=source,
@@ -366,7 +463,19 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
             x_real_ip=x_real_ip,
             cf_connecting_ip=cf_connecting_ip,
             cf_connecting_ipv6=cf_connecting_ipv6,
+            trusted_forwarded_headers=peer_is_trusted_proxy,
+            trusted_cloudflare_headers=peer_is_cloudflare,
         )
+        if state is not None:
+            with suppress(AttributeError, TypeError):
+                setattr(state, _IP_INFO_STATE_KEY, info)
+        return info
+
+    if peer_is_cloudflare and cf_header_ambiguous and not peer_is_trusted_proxy:
+        # An ambiguous Cloudflare assertion must not become a client identity.
+        # If this peer is also a generic trusted proxy, the independent XFF
+        # contract below may still be used; otherwise no other authority exists.
+        return _info("unknown", "cf-connecting-ip", False)
 
     if peer_is_cloudflare and cf_connecting_ip:
         # CF-Connecting-IP is authoritative only from a Cloudflare-authorized hop.
@@ -404,8 +513,10 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
         #     If routable: it is the client
         #     If non-routable / malformed: unresolved
         #     NEVER continue farther left
-        if x_forwarded_for:
+        if xff_present:
             hops = _parse_forwarded_chain(x_forwarded_for)
+            if len(hops) > MAX_FORWARDED_HOPS:
+                return _info("unknown", "x-forwarded-for", False)
             for hop in reversed(hops):
                 if _is_in_networks(hop, proxy_networks):
                     continue
@@ -417,14 +528,35 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
                 # boundary and consume attacker-controlled values.
                 return _info("unknown", "x-forwarded-for", False)
 
-        if _is_reportable_ip(x_real_ip):
+            # Every hop was trusted, or the chain was otherwise unusable. Do
+            # not fall through to a second assertion scheme: the presence of
+            # XFF makes its failure authoritative for this request.
+            return _info("unknown", "x-forwarded-for", False)
+
+        if settings.trust_x_real_ip and x_real_ip_present and _is_reportable_ip(x_real_ip):
             return _info(x_real_ip, "x-real-ip", True)  # type: ignore[arg-type]
+        if settings.trust_x_real_ip and x_real_ip_present:
+            return _info("unknown", "x-real-ip", False)
+
+    if peer_is_trusted_proxy or peer_is_cloudflare:
+        # A configured identity-bearing proxy is not itself the client. If it
+        # supplied no usable identity header, keep provenance unresolved rather
+        # than turning the shared proxy address into an enforcement identity.
+        return _info("unknown", "unknown", False)
 
     # No trustworthy forwarded hop: fall back to the socket peer. A direct
     # public connection is a real client; an internal peer (docker bridge,
     # etc.) is unresolved — it cannot represent a real remote client, and
     # logging it as one is the pollution this fix eliminates.
     if _is_reportable_ip(peer_ip):
+        return _info(peer_ip, "socket", True)
+    parsed_peer = _parse_ip(peer_ip)
+    direct_networks = _trusted_direct_client_networks()
+    if (
+        parsed_peer is not None
+        and any(parsed_peer in network for network in _PRIVATE_CLIENT_NETWORKS)
+        and _is_in_networks(peer_ip, direct_networks)
+    ):
         return _info(peer_ip, "socket", True)
     return _info("unknown", "unknown", False)
 
@@ -471,6 +603,8 @@ def client_ip_metadata(ip_info: ClientIpInfo) -> dict[str, Any]:
         source: resolution rung that produced the IP
         resolved: whether client provenance was established
         trusted_proxy_headers: whether forwarding headers were trusted
+        trusted_forwarded_headers: whether generic proxy headers were trusted
+        trusted_cloudflare_headers: whether Cloudflare headers were trusted
         x_forwarded_for: raw header value (None if absent)
         x_real_ip: raw header value (None if absent)
         cf_connecting_ip: raw header value (None if absent)
@@ -482,6 +616,8 @@ def client_ip_metadata(ip_info: ClientIpInfo) -> dict[str, Any]:
         "ip_source": ip_info.source,
         "resolved": ip_info.resolved,
         "trusted_proxy_headers": ip_info.trusted_proxy_headers,
+        "trusted_forwarded_headers": ip_info.trusted_forwarded_headers,
+        "trusted_cloudflare_headers": ip_info.trusted_cloudflare_headers,
         "x_forwarded_for": ip_info.x_forwarded_for,
         "x_real_ip": ip_info.x_real_ip,
         "cf_connecting_ip": ip_info.cf_connecting_ip,

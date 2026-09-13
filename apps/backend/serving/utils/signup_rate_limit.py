@@ -8,9 +8,10 @@ multiplies by the worker count, which is acceptable.
 When client provenance is resolved, rate-limits on the client IP.
 When unresolved (e.g., behind a misconfigured proxy), there is no information
 to distinguish clients behind the shared proxy. In that case, the limiter
-emits an alertable warning and skips the per-IP bucket rather than collapsing
-all clients onto one bucket. Deployments that require trustworthy provenance
-can set ``SIGNUP_REQUIRE_RESOLVED_CLIENT_IP=1`` to fail closed.
+emits an alertable warning and uses a coarse global process-local budget rather
+than collapsing all clients onto one per-client bucket. Deployments that require
+trustworthy provenance can set ``SIGNUP_REQUIRE_RESOLVED_CLIENT_IP=1`` to fail
+closed.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ _DAY_SECONDS = 86400
 _SWEEP_EVERY = 1024
 
 _attempts: dict[str, deque[float]] = {}
+_unresolved_attempts: deque[float] = deque()
 _lock = asyncio.Lock()
 _sweep_counter = 0
 logger = get_logger(__name__)
@@ -55,8 +57,9 @@ async def check_and_record_signup(request) -> tuple[bool, str | None]:
     When client provenance is resolved, rate-limits on the client IP.
     When unresolved (e.g., behind a misconfigured proxy), there is no
     information to distinguish clients behind the shared proxy. The warning
-    signal is emitted and per-IP limiting is skipped rather than collapsing
-    all clients onto one bucket. A deployment can fail closed instead.
+    signal is emitted and a coarse global budget limits the traffic without
+    pretending the proxy is a client identity. A deployment can fail closed
+    instead.
     """
     global _sweep_counter
 
@@ -73,6 +76,21 @@ async def check_and_record_signup(request) -> tuple[bool, str | None]:
         )
         if settings.signup_require_resolved_client_ip:
             return False, "unresolved"
+        now = _now()
+        hour_cutoff = now - _HOUR_SECONDS
+        day_cutoff = now - _DAY_SECONDS
+        hour_limit = settings.unresolved_signup_rate_limit_per_hour
+        day_limit = settings.unresolved_signup_rate_limit_per_day
+        async with _lock:
+            while _unresolved_attempts and _unresolved_attempts[0] < day_cutoff:
+                _unresolved_attempts.popleft()
+            day_count = len(_unresolved_attempts)
+            hour_count = sum(1 for t in _unresolved_attempts if t >= hour_cutoff)
+            _unresolved_attempts.append(now)
+        if day_count >= day_limit:
+            return False, "unresolved_day"
+        if hour_count >= hour_limit:
+            return False, "unresolved_hour"
         return True, None
 
     ip_key = f"client:{normalize_ip_bucket(ip_info.client_ip)}"
@@ -113,4 +131,5 @@ def reset_signup_rate_limit_state() -> None:
     """Wipe all recorded attempts. Test-only helper."""
     global _sweep_counter
     _attempts.clear()
+    _unresolved_attempts.clear()
     _sweep_counter = 0

@@ -250,6 +250,10 @@ class KeyPool:
     # the mute only paces a key that keeps failing.
     SOLE_KEY_BACKOFF_THRESHOLD: int = 2
     SOLE_KEY_BACKOFF_BASE_SECONDS: float = 15.0
+    # Do not starve a non-affine caller's preferred key after a transient
+    # failover.  Reprobe it periodically rather than on every request, which
+    # would turn a still-broken key into a retry storm.
+    NON_AFFINE_REPROBE_INTERVAL_SECONDS: float = 30.0
 
     def __init__(
         self,
@@ -275,6 +279,15 @@ class KeyPool:
             _KeyState(key=k, min_role=normalize_min_role(roles.get(k))) for k in deduped
         ]
         self._affinity: dict[str, _Affinity] = {}
+        # Non-affine callers have no identity-safe binding to persist. Keep a
+        # pool-level starting point only so a key that just failed does not
+        # become the first attempt for every unresolved caller forever.
+        self._non_affine_cursor: dict[str | None, int] = {}
+        # ``_non_affine_reprobe_index`` remembers the key that was skipped by a
+        # non-affine failover.  The deadline gives that key a bounded recovery
+        # probe without making every request pay the failed round trip.
+        self._non_affine_reprobe_index: dict[str | None, int] = {}
+        self._non_affine_reprobe_at: dict[str | None, float] = {}
         self._lock = threading.Lock()
         self._provider_label = provider_label
 
@@ -505,7 +518,10 @@ class KeyPool:
                 # Drop stale or unusable affinity; we'll re-pick below.
                 del self._affinity[affinity_key]
 
-            idx = self._pick_first_available_locked(now, role, exclude)
+            if affinity_key is None:
+                idx = self._pick_non_affine_locked(now, role, exclude)
+            else:
+                idx = self._pick_first_available_locked(now, role, exclude)
             if idx is None:
                 prefix = (
                     f"No usable API key for provider {self._provider_label!r} "
@@ -550,11 +566,11 @@ class KeyPool:
         earlier ones are muted or excluded. ``request_count`` is no longer a
         selection signal — it is retained purely for telemetry.
 
-        Reservation reorders that scan rather than replacing it: keys reserved
-        for the highest tier the caller still qualifies for come first, then
-        configuration order within a tier. An entitled caller therefore spends
-        the capacity set aside for it before falling back to the shared keys the
-        lower tiers depend on.
+        Reservation reorders that scan rather than replacing it for affine
+        callers: keys reserved for the highest tier the caller still qualifies
+        for come first, then configuration order within a tier. Non-affine
+        callers use the failure-aware cursor below so a failed reserved key does
+        not remain the first attempt on every request.
         """
         candidates = [
             (-ROLE_RANK.get(state.min_role, 0), i)
@@ -643,11 +659,27 @@ class KeyPool:
             if 200 <= status_code < 300:
                 with self._lock:
                     self._keys[lease.key_index].consecutive_failures = 0
+                    if (
+                        lease.affinity_key is None
+                        and self._non_affine_reprobe_index.get(lease.role) == lease.key_index
+                    ):
+                        # The skipped key recovered.  Return to the ordinary
+                        # preferred-key order for subsequent non-affine calls.
+                        self._non_affine_reprobe_index.pop(lease.role, None)
+                        self._non_affine_reprobe_at.pop(lease.role, None)
+                        self._non_affine_cursor.pop(lease.role, None)
             return ReleaseOutcome.PROPAGATE
         with self._lock:
             now = time.monotonic()
             state = self._keys[lease.key_index]
             state.consecutive_failures += 1
+
+            if lease.affinity_key is None:
+                self._non_affine_cursor[lease.role] = (lease.key_index + 1) % len(self._keys)
+                self._non_affine_reprobe_index[lease.role] = lease.key_index
+                self._non_affine_reprobe_at[lease.role] = (
+                    now + self.NON_AFFINE_REPROBE_INTERVAL_SECONDS
+                )
 
             # Rotate before muting: somewhere untried to go means this failure
             # costs the request one retry, not the key its place in the pool.
@@ -691,6 +723,52 @@ class KeyPool:
 
             state.cooldown_until = now + self.MUTE_SECONDS
             return ReleaseOutcome.MUTED
+
+    def _pick_non_affine_locked(
+        self, now: float, role: str | None, exclude: Collection[int]
+    ) -> int | None:
+        """Pick a non-affine key from a failure-aware, non-sticky cursor.
+
+        The cursor is deliberately pool-level rather than caller-keyed: an
+        unresolved caller has no safe identity to persist. It only changes the
+        starting point after a failed lease, preventing every such request from
+        paying the same failed-key round trip. It walks all keys the role may
+        use, including lower reservation tiers, so a failed reserved key does
+        not regain first position before the next non-affine request.
+        """
+        candidates = [
+            i
+            for i, state in enumerate(self._keys)
+            if not state.removed
+            and state.cooldown_until <= now
+            and i not in exclude
+            and _role_may_use(role, state)
+        ]
+        if not candidates:
+            return None
+
+        reprobe_index = self._non_affine_reprobe_index.get(role)
+        if (
+            reprobe_index is not None
+            and now >= self._non_affine_reprobe_at.get(role, float("inf"))
+            and reprobe_index in candidates
+        ):
+            return reprobe_index
+
+        cursor = self._non_affine_cursor.get(role)
+        if cursor is None:
+            # Preserve reservation preference for a fresh non-affine caller.
+            # Once a failure has advanced the pool cursor, the failure-aware
+            # walk may cross tiers so the failed reserved key is not retried
+            # first forever.
+            highest_rank = max(ROLE_RANK.get(self._keys[i].min_role, 0) for i in candidates)
+            candidates = [
+                i for i in candidates if ROLE_RANK.get(self._keys[i].min_role, 0) == highest_rank
+            ]
+            return min(candidates)
+
+        cursor %= len(self._keys)
+        return min(candidates, key=lambda i: (i - cursor) % len(self._keys))
 
     def _has_untried_usable_key_locked(
         self,

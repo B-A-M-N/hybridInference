@@ -27,6 +27,10 @@ async def _app(scope, receive, send):
             "peer_ip": info.peer_ip,
             "source": info.source,
             "trusted_proxy_headers": info.trusted_proxy_headers,
+            "ip_resolved": info.resolved,
+            "trusted_forwarded_headers": info.trusted_forwarded_headers,
+            "trusted_cloudflare_headers": info.trusted_cloudflare_headers,
+            "x_forwarded_for": info.x_forwarded_for,
         }
     ).encode()
     await send(
@@ -89,6 +93,50 @@ def test_uvicorn_no_proxy_headers_preserves_socket_peer():
 
         assert response.status == 200
         assert payload["peer_ip"] == "127.0.0.1"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+def test_uvicorn_preserves_duplicate_xff_field_lines():
+    """The ASGI boundary preserves all physical XFF fields for the resolver."""
+    port = _free_port()
+    server = uvicorn.Server(
+        uvicorn.Config(
+            _app,
+            host="127.0.0.1",
+            port=port,
+            log_level="error",
+            access_log=False,
+            lifespan="off",
+            proxy_headers=False,
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+
+    try:
+        for _ in range(500):
+            if server.started or not thread.is_alive():
+                break
+            time.sleep(0.01)
+        assert server.started
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            connection.putrequest("GET", "/")
+            connection.putheader("X-Forwarded-For", "8.8.8.8")
+            connection.putheader("x-forwarded-for", "1.1.1.1")
+            connection.endheaders()
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+        finally:
+            connection.close()
+
+        assert response.status == 200
+        assert payload["peer_ip"] == "127.0.0.1"
+        assert payload["x_forwarded_for"] == "8.8.8.8, 1.1.1.1"
     finally:
         server.should_exit = True
         thread.join(timeout=5)
