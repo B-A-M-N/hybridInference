@@ -83,6 +83,8 @@ class HedgedAdapter(BaseAdapter):
         stream_race_deadline_sec: Maximum time to wait for race-winning output.
         backup_release: Optional reservation release for fixed backup callers.
         event_sink: Registry that owns per-endpoint health and circuit state.
+        endpoint_failure_hook: Optional callback for invalidating endpoint-local
+            state after the health registry records a genuine leg failure.
     """
 
     # The registry receives every leg's outcome (including the winner's
@@ -97,6 +99,7 @@ class HedgedAdapter(BaseAdapter):
         backup: BaseAdapter | None = None,
         hedge_threshold_sec: float | None = None,
         event_sink: EndpointHealthRegistry | None = None,
+        endpoint_failure_hook: Callable[[str], None] | None = None,
         backup_start_hook: Callable[[], bool] | None = None,
         backup_release: Callable[[], None] | None = None,
         checkpoint_backup_selector: CheckpointBackupSelector[BaseAdapter] | None = None,
@@ -125,6 +128,7 @@ class HedgedAdapter(BaseAdapter):
             else _first_checkpoint(hedge_checkpoints_sec)
         )
         self.event_sink = event_sink
+        self.endpoint_failure_hook = endpoint_failure_hook
         self.backup_start_hook = backup_start_hook
         self.backup_release = backup_release
         self.checkpoint_backup_selector = checkpoint_backup_selector
@@ -141,6 +145,8 @@ class HedgedAdapter(BaseAdapter):
         self.leg_first_content_ttft_ms: dict[str, float] = {}
         self._stream_backup_dispatch: CheckpointBackupDispatch[BaseAdapter] | None = None
         self._stream_backup_gen: AsyncGenerator[str, None] | None = None
+        self._stream_backup_released = False
+        self._backup_prefill_confirmed = False
         self.stream_race_deadline_sec = (
             None if stream_race_deadline_sec is None else max(0.0, float(stream_race_deadline_sec))
         )
@@ -185,6 +191,44 @@ class HedgedAdapter(BaseAdapter):
         if dispatch is not None and dispatch.release is not None:
             dispatch.release()
 
+    def _finish_stream_backup(self) -> None:
+        """Release backup resources once the stream race no longer needs them."""
+        dispatch = self._stream_backup_dispatch
+        if dispatch is None or self._stream_backup_released:
+            return
+        self._stream_backup_released = True
+        self._finish_backup(dispatch)
+
+    def _record_leg_failure(
+        self,
+        endpoint_id: str,
+        *,
+        reason: str,
+        detail: str | None = None,
+        exc: BaseException | None = None,
+    ) -> None:
+        """Record one genuine leg failure and invalidate its endpoint state."""
+        self.event_sink.record_failure(
+            endpoint_id,
+            reason=reason,
+            detail=detail,
+            exc=exc,
+        )
+        if self.endpoint_failure_hook is not None:
+            self.endpoint_failure_hook(endpoint_id)
+
+    def _confirm_backup_prefill(
+        self,
+        dispatch: CheckpointBackupDispatch[BaseAdapter] | None,
+    ) -> None:
+        """Confirm a backup's prefill when its first response proves completion."""
+        if dispatch is None or self._backup_prefill_confirmed:
+            return
+        callback = dispatch.metadata.get("prefill_confirm")
+        if callable(callback):
+            callback()
+            self._backup_prefill_confirmed = True
+
     # ---------------------------------------------------------------
     # Non-streaming race
     # ---------------------------------------------------------------
@@ -192,6 +236,8 @@ class HedgedAdapter(BaseAdapter):
     async def chat_completion(
         self,
         messages: list[dict[str, Any]],
+        *,
+        primary_prefill_release: Callable[[], None] | None = None,
         **params: Any,
     ) -> dict[str, Any]:
         """Race primary against delayed backup for non-streaming completion.
@@ -199,8 +245,20 @@ class HedgedAdapter(BaseAdapter):
         When backup wins, ``self.config`` is swapped to the backup adapter's
         config so that RouteWise execution reads the real winner's provider/endpoint_id
         for ``_routing`` metadata and ``req_ctx``.
+
+        ``primary_prefill_release`` is invoked when the primary leg fails, so
+        the RouteWise wrapper stops charging an endpoint that is no longer
+        prefilling while an already-running backup continues.
         """
         primary_endpoint = _endpoint_id_from_adapter(self.primary)
+        primary_prefill_released = False
+
+        def _release_primary_prefill() -> None:
+            nonlocal primary_prefill_released
+            if primary_prefill_released or primary_prefill_release is None:
+                return
+            primary_prefill_released = True
+            primary_prefill_release()
 
         # Tracks whether the backup task has progressed past its initial
         # sleep(h*) delay.  When primary fails, we only cancel+relaunch the
@@ -224,7 +282,9 @@ class HedgedAdapter(BaseAdapter):
                     continue
                 backup_past_sleep = True
                 try:
-                    return await dispatch.backup.chat_completion(messages, **params)
+                    result = await dispatch.backup.chat_completion(messages, **params)
+                    self._confirm_backup_prefill(dispatch)
+                    return result
                 finally:
                     self._finish_backup(dispatch)
             raise HedgeBackupUnavailable("no checkpoint hedge backup selected")
@@ -240,7 +300,9 @@ class HedgedAdapter(BaseAdapter):
                 raise HedgeBackupUnavailable("no checkpoint hedge backup selected")
             backup_past_sleep = True
             try:
-                return await dispatch.backup.chat_completion(messages, **params)
+                result = await dispatch.backup.chat_completion(messages, **params)
+                self._confirm_backup_prefill(dispatch)
+                return result
             finally:
                 self._finish_backup(dispatch)
 
@@ -258,13 +320,14 @@ class HedgedAdapter(BaseAdapter):
                     exc = task.exception()
                     if exc is not None:
                         if task is primary_task:
-                            self.event_sink.record_failure(
+                            primary_error = exc
+                            _release_primary_prefill()
+                            self._record_leg_failure(
                                 primary_endpoint,
                                 reason=exc.__class__.__name__,
                                 exc=exc,
                             )
                             self.failed_attempts.append(failed_attempt(self.primary, exc))
-                            primary_error = exc
                             # Primary failed.  If the backup is still in its
                             # initial sleep(h*), cancel it and re-launch without
                             # the delay.  If the backup is already executing
@@ -278,7 +341,7 @@ class HedgedAdapter(BaseAdapter):
                                 pending.add(backup_task)
                         else:
                             if not isinstance(exc, HedgeBackupUnavailable):
-                                self.event_sink.record_failure(
+                                self._record_leg_failure(
                                     _endpoint_id_from_adapter(self.backup),
                                     reason=exc.__class__.__name__,
                                     exc=exc,
@@ -320,6 +383,8 @@ class HedgedAdapter(BaseAdapter):
     async def stream_chat_completion(
         self,
         messages: list[dict[str, Any]],
+        *,
+        primary_prefill_release: Callable[[], None] | None = None,
         **params: Any,
     ) -> AsyncGenerator[str, None]:
         """Race primary against delayed backup for streaming completion.
@@ -332,6 +397,11 @@ class HedgedAdapter(BaseAdapter):
         5. Buffer pre-content chunks (role deltas); yield winner's buffer + rest.
         6. Close loser via aclose().
         7. Primary tiebreaker: if both produce content in same await, primary wins.
+
+        ``primary_prefill_release`` is invoked as soon as a backup wins the
+        race. The RouteWise wrapper owns the primary lease, so releasing it at
+        race resolution avoids charging a cancelled primary while downstream
+        backpressure delays consumption of the winner's first content.
         """
         primary_provider = self.primary.config.provider
 
@@ -350,6 +420,7 @@ class HedgedAdapter(BaseAdapter):
                 primary_provider,
                 messages,
                 params,
+                primary_prefill_release=primary_prefill_release,
             )
 
             # After the race, self.config has been swapped to the winner's
@@ -374,6 +445,11 @@ class HedgedAdapter(BaseAdapter):
 
             # Phase 3: yield remaining chunks from winner.
             async for chunk in winner_gen:
+                if self.backup_won and has_non_empty_content(chunk):
+                    # A buffer-cap win may have selected the backup before any
+                    # model content arrived. Confirm its prefill at the first
+                    # actual content chunk, not when the cap-only buffer wins.
+                    self._confirm_backup_prefill(self._stream_backup_dispatch)
                 yield chunk
 
         finally:
@@ -383,7 +459,7 @@ class HedgedAdapter(BaseAdapter):
                 if gen is not None and id(gen) not in seen:
                     seen.add(id(gen))
                     await _safe_aclose(gen)
-            self._finish_backup(self._stream_backup_dispatch)
+            self._finish_stream_backup()
             self._stream_backup_dispatch = None
             self._stream_backup_gen = None
 
@@ -393,6 +469,8 @@ class HedgedAdapter(BaseAdapter):
         primary_provider: str,
         messages: list[dict[str, Any]],
         params: dict[str, Any],
+        *,
+        primary_prefill_release: Callable[[], None] | None = None,
     ) -> tuple[AsyncGenerator[str, None], AsyncGenerator[str, None] | None, list[str]]:
         """Race two streams, returning (winner_gen, loser_gen, winner_buffer).
 
@@ -417,6 +495,14 @@ class HedgedAdapter(BaseAdapter):
         schedule_start = asyncio.get_running_loop().time()
         backup_start: float | None = None
         race_deadline_sec = self.stream_race_deadline_sec
+        primary_prefill_released = False
+
+        def _release_primary_prefill() -> None:
+            nonlocal primary_prefill_released
+            if primary_prefill_released or primary_prefill_release is None:
+                return
+            primary_prefill_released = True
+            primary_prefill_release()
 
         def _record_first_content_ttft(
             adapter: BaseAdapter | None,
@@ -453,6 +539,7 @@ class HedgedAdapter(BaseAdapter):
             backup_started = True
             backup_start = asyncio.get_running_loop().time()
             self._stream_backup_dispatch = dispatch
+            self._stream_backup_released = False
             self._stream_backup_gen = dispatch.backup.stream_chat_completion(
                 messages,
                 **params,
@@ -527,7 +614,8 @@ class HedgedAdapter(BaseAdapter):
                         primary_error = e
                         primary_done = True
                         primary_next_task = None
-                        self.event_sink.record_failure(
+                        _release_primary_prefill()
+                        self._record_leg_failure(
                             primary_endpoint, reason=e.__class__.__name__, exc=e
                         )
                         self.failed_attempts.append(failed_attempt(self.primary, e))
@@ -559,13 +647,13 @@ class HedgedAdapter(BaseAdapter):
                         ):
                             backup_has_content = True
                     except StopAsyncIteration:
+                        self._finish_stream_backup()
                         backup_next_task = None
                     except Exception as e:
+                        self._finish_stream_backup()
                         if not isinstance(e, HedgeBackupUnavailable):
                             endpoint = backup_endpoint or _endpoint_id_from_adapter(self.backup)
-                            self.event_sink.record_failure(
-                                endpoint, reason=e.__class__.__name__, exc=e
-                            )
+                            self._record_leg_failure(endpoint, reason=e.__class__.__name__, exc=e)
                             self.failed_attempts.append(failed_attempt(self.backup, e))
                         backup_next_task = None
 
@@ -573,6 +661,7 @@ class HedgedAdapter(BaseAdapter):
                 if primary_has_content and backup_has_content:
                     # Tiebreaker: primary wins.
                     self.event_sink.record_success(primary_endpoint)
+                    self._finish_stream_backup()
                     # self.config stays as primary.config (already correct).
                     _cancel_task(backup_next_task)
                     _cancel_task(hedge_timer_task)
@@ -580,17 +669,21 @@ class HedgedAdapter(BaseAdapter):
                     return primary_gen, backup_gen, primary_buffer
                 elif primary_has_content:
                     self.event_sink.record_success(primary_endpoint)
+                    self._finish_stream_backup()
                     _cancel_task(backup_next_task)
                     _cancel_task(hedge_timer_task)
                     _cancel_task(race_deadline_task)
                     return primary_gen, backup_gen, primary_buffer
                 elif backup_has_content:
+                    if backup_content:
+                        self._confirm_backup_prefill(self._stream_backup_dispatch)
                     endpoint = backup_endpoint or _endpoint_id_from_adapter(self.backup)
                     self.event_sink.record_success(endpoint)
                     # Swap config so RouteWise attributes to the real winner.
                     assert self.backup is not None
                     self.config = self.backup.config
                     self.backup_won = True
+                    _release_primary_prefill()
                     _cancel_task(primary_next_task)
                     _cancel_task(hedge_timer_task)
                     _cancel_task(race_deadline_task)
@@ -614,15 +707,13 @@ class HedgedAdapter(BaseAdapter):
                         },
                     )
                     if not primary_done:
-                        self.event_sink.record_failure(
+                        self._record_leg_failure(
                             primary_endpoint, reason=exc.__class__.__name__, exc=exc
                         )
                         self.failed_attempts.append(failed_attempt(self.primary, exc))
                     if backup_started and backup_next_task is not None:
                         endpoint = backup_endpoint or _endpoint_id_from_adapter(self.backup)
-                        self.event_sink.record_failure(
-                            endpoint, reason=exc.__class__.__name__, exc=exc
-                        )
+                        self._record_leg_failure(endpoint, reason=exc.__class__.__name__, exc=exc)
                         self.failed_attempts.append(failed_attempt(self.backup, exc))
                     raise exc
 
@@ -643,6 +734,7 @@ class HedgedAdapter(BaseAdapter):
             return primary_gen, backup_gen, primary_buffer
 
         except BaseException:
+            self._finish_stream_backup()
             _cancel_task(primary_next_task)
             _cancel_task(backup_next_task)
             _cancel_task(hedge_timer_task)
