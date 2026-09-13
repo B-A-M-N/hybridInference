@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -15,10 +16,22 @@ __all__ = ["RouteTableRefreshable", "RouterProtocol", "RoutingRequestOptions"]
 
 @dataclass(frozen=True, slots=True)
 class RoutingRequestOptions:
-    """Router-owned request controls that must not reach provider adapters."""
+    """Router-owned request controls that must not reach provider adapters.
+
+    Traffic fields are server-generated online evidence. They are carried as a
+    typed routing hint so strategies can make an explicit, conservative
+    scheduling decision without reading arbitrary request-context keys. The
+    admission callback is consumed by typed routers at their dispatch boundary;
+    it is never forwarded to provider adapters.
+    """
 
     pin_provider: str | None = None
     required_modalities: frozenset[str] = frozenset()
+    traffic_classification: str | None = None
+    traffic_automation_score: float | None = None
+    traffic_confidence: float | None = None
+    traffic_reasons: tuple[str, ...] = ()
+    on_dispatch_admitted: Callable[[], None] | None = None
 
 
 @runtime_checkable

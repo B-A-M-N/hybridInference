@@ -7,6 +7,7 @@ import contextlib
 import json
 import time
 import uuid
+from inspect import Parameter, signature
 from typing import TYPE_CHECKING, Any
 
 import anyio
@@ -21,7 +22,10 @@ from serving.config.runtime_settings import RuntimeSettings, get_runtime_setting
 from serving.config.settings import has_role
 from serving.exceptions import scrub_error_for_user
 from serving.grant_auth import ledger_attribution
-from serving.model_access import is_model_disabled_for_user, is_model_outside_grant_scope
+from serving.model_access import (
+    is_model_disabled_for_user,
+    is_model_outside_grant_scope,
+)
 from serving.openai_chat_serializer import resolve_mode, sanitize_response
 from serving.schemas import (
     ChatCompletionRequest,
@@ -39,7 +43,10 @@ from serving.servers.deps import (
     get_pricing_lookup,
     get_router,
 )
-from serving.servers.routers.completions_stream import StreamSession, ToolCallAccumulator
+from serving.servers.routers.completions_stream import (
+    StreamSession,
+    ToolCallAccumulator,
+)
 from serving.servers.routers.routing_info import (
     RoutingInfo,
     _publish_error_provider,
@@ -59,6 +66,13 @@ from serving.utils.request_ip import derive_affinity_key, get_client_ip
 from serving.utils.session_identity import session_identity
 from serving.utils.synthetic_probe import is_trusted_probe
 from serving.utils.token_utils import normalize_usage
+from serving.utils.traffic_classifier import (
+    TrafficEvidence,
+    classification_to_metadata,
+    classify_traffic,
+    compute_request_shape_hash,
+)
+from serving.utils.traffic_state import get_traffic_observation_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -162,6 +176,27 @@ def _required_modalities(messages: list[dict[str, Any]]) -> frozenset[str]:
             if modality and modality != "text":
                 required.add(modality)
     return frozenset(required)
+
+
+def _router_supports_routing_options(router: Any) -> bool:
+    """Return whether ``router`` explicitly implements typed routing options.
+
+    The registry can also host legacy custom routers that accept arbitrary
+    ``**params`` and forward them to provider adapters. Passing the
+    router-owned ``routing_options`` keyword to those routers can therefore
+    break adapter calls. Require both serving methods to explicitly declare
+    the keyword-only option before opting a router into the typed contract.
+    """
+    for method_name in ("chat_completion", "stream_chat_completion"):
+        try:
+            parameter = signature(getattr(type(router), method_name)).parameters.get(
+                "routing_options"
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if parameter is None or parameter.kind is not Parameter.KEYWORD_ONLY:
+            return False
+    return True
 
 
 async def _should_force_chat_completions_streaming(
@@ -390,7 +425,10 @@ async def _streaming_response_with_keepalive(
             if isinstance(error, dict):
                 code = error.get("code")
                 status_code = code if isinstance(code, int) else 500
-                logger.error(f"Upstream error in stream: {error}", extra={"request_id": request_id})
+                logger.error(
+                    f"Upstream error in stream: {error}",
+                    extra={"request_id": request_id},
+                )
                 detail = scrub_error_for_user(None, request_id, status_code)
                 if yielded_any:
                     # A keepalive byte already committed a 200 response --
@@ -518,7 +556,7 @@ async def chat_completions(
     completions_logger: CompletionsLogger = Depends(get_completions_logger),
     pricing_lookup: PricingLookup = Depends(get_pricing_lookup),
     cost_tracker: CostTracker = Depends(get_cost_tracker),
-    _concurrency_slot=Depends(enforce_user_concurrency),
+    concurrency_observation: int | None = Depends(enforce_user_concurrency),
 ) -> dict[str, Any]:
     """Handle chat completion requests with routing and fallback.
 
@@ -657,7 +695,11 @@ async def chat_completions(
     if not has_role(user_role, required):
         logger.info(
             "Insufficient role for model",
-            extra={"model": model, "user_id": user_ctx.get("user_id"), "role": user_role},
+            extra={
+                "model": model,
+                "user_id": user_ctx.get("user_id"),
+                "role": user_role,
+            },
         )
         if log_store and not suppress_synthetic_logging:
             completions_logger.schedule_log(
@@ -868,30 +910,117 @@ async def chat_completions(
                 detail=f"Pinned provider '{pin_provider}' not found for model {model}",
             )
 
+    # Compute traffic classification only after all request-level preflight
+    # rejects have completed. Rejected modality or pin requests must not
+    # advance the authenticated user's cadence, shape, session, or count
+    # history used by the next valid request.
+    # Match FI's existing per-user automation/concurrency scope. In an
+    # auth-disabled deployment, the shared ``anonymous`` sentinel must never
+    # become a global behavioral bucket.
+    traffic_user_id = user_ctx.get("user_id") if is_authenticated else None
+    traffic_state = get_traffic_observation_state()
+    shape_hash = compute_request_shape_hash(
+        model=model,
+        messages_count=len(messages),
+        max_tokens=payload.max_tokens,
+        temperature=payload.temperature,
+    )
+    # Classification must be available before routing, but rejected requests
+    # must not become behavioral history. Preview the prospective evidence and
+    # commit it only after the router admits this dispatch below.
+    observations = traffic_state.preview_request(
+        user_id=traffic_user_id,
+        shape_hash=shape_hash,
+        session_id=session_id,
+    )
+    arrival_timestamp = float(observations["observed_at"])
+    traffic_evidence = TrafficEvidence(
+        inter_arrival_ms=observations.get("inter_arrival_ms"),
+        concurrent_requests=(concurrency_observation if is_authenticated else None),
+        shape_repeat_count=(
+            int(observations["shape_repeat_count"])
+            if observations.get("shape_repeat_count") is not None
+            else None
+        ),
+        session_continuity=observations.get("session_continuity"),
+        is_authenticated=is_authenticated,
+        user_agent=request.headers.get("user-agent"),
+        request_count=(
+            int(observations["request_count"])
+            if observations.get("request_count") is not None
+            else None
+        ),
+    )
+    traffic_classification = classify_traffic(traffic_evidence)
+    traffic_metadata = classification_to_metadata(traffic_classification)
+    req_ctx.update(traffic_metadata)
+    metadata.update(traffic_metadata)
+
+    traffic_observation_recorded = False
+
+    def _record_traffic_observation() -> None:
+        nonlocal traffic_observation_recorded
+        if traffic_observation_recorded:
+            return
+        traffic_state.record_request(
+            user_id=traffic_user_id,
+            shape_hash=shape_hash,
+            session_id=session_id,
+            observed_at=arrival_timestamp,
+        )
+        traffic_observation_recorded = True
+
     # Per-model routing strategy via ModelRouterRegistry. Pinned requests still
     # bypass RouteWise, but both selected routers now share one execution call
     # contract below.
+    active_router = router_exec
+    if model_router_registry is not None and pin_provider is None:
+        active_router = model_router_registry.get_router(model)
+    supports_typed_routing_options = _router_supports_routing_options(active_router)
     routing_options = (
         RoutingRequestOptions(
             pin_provider=pin_provider,
             required_modalities=required_modalities,
+            traffic_classification=traffic_classification.class_hint.value,
+            traffic_automation_score=traffic_classification.automation_score,
+            traffic_confidence=traffic_classification.confidence,
+            traffic_reasons=traffic_classification.reasons,
+            on_dispatch_admitted=(
+                _record_traffic_observation if traffic_user_id is not None else None
+            ),
         )
-        if pin_provider or required_modalities
+        if supports_typed_routing_options
+        and (
+            pin_provider
+            or required_modalities
+            or traffic_classification.confidence > 0.0
+            or traffic_user_id is not None
+        )
         else None
     )
-    active_router = router_exec
-    if model_router_registry is not None and pin_provider is None:
-        active_router = model_router_registry.get_router(model)
+    dispatch_admission_callback_enabled = bool(
+        routing_options is not None and routing_options.on_dispatch_admitted is not None
+    )
 
     # Thread the external request id into params so the router correlates its
     # routing metadata, prefix-cache stash, and observation under one id instead
     # of generating a divergent internal id.
     params["request_id"] = request_id
     router_params = dict(params)
-    if routing_options is not None:
-        # Keep router-owned controls out of provider adapter kwargs. Empty
-        # options are still omitted for one-release custom-router compatibility.
+    if routing_options is not None and supports_typed_routing_options:
+        # Keep router-owned controls out of provider adapter kwargs. Legacy
+        # custom routers are opted out unless both methods explicitly declare
+        # the typed keyword-only contract.
         router_params["routing_options"] = routing_options
+
+    async def _record_stream_admission(chunks: Any) -> Any:
+        """Fallback commit for legacy routers without an admission callback."""
+        recorded = False
+        async for chunk in chunks:
+            if not recorded:
+                _record_traffic_observation()
+                recorded = True
+            yield chunk
 
     # Streaming path
     if effective_stream:
@@ -900,6 +1029,8 @@ async def chat_completions(
             messages,
             **router_params,
         )
+        if not dispatch_admission_callback_enabled:
+            adapter_chunks = _record_stream_admission(adapter_chunks)
 
         session = StreamSession(
             routing=routing,
@@ -999,6 +1130,8 @@ async def chat_completions(
             messages,
             **router_params,
         )
+        if not dispatch_admission_callback_enabled:
+            _record_traffic_observation()
         serializer_mode = resolve_mode(request.headers)
 
         # Apply serializer: strip _routing metadata and enforce reasoning_content
