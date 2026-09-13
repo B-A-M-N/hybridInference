@@ -4,6 +4,7 @@ This module provides type-safe, validated configuration management.
 All environment variables are centralized here for easy tracking and testing.
 """
 
+import ipaddress
 from functools import lru_cache
 from typing import Annotated
 
@@ -109,6 +110,11 @@ class Settings(BaseSettings):
     # entry so probing varied passwords cannot bypass the limit.
     login_rate_limit_per_15min: int = 5
     login_rate_limit_per_hour_per_ip: int = 20
+    # When enabled, public signup fails closed if the gateway cannot establish
+    # trustworthy client provenance. The default preserves availability for
+    # deployments that intentionally operate behind an unresolved relay; those
+    # deployments still receive an unresolved-provenance warning signal.
+    signup_require_resolved_client_ip: bool = False
     # Auto-block a source IP at the API-key auth layer after repeated auth
     # failures. Once an IP (IPv6 bucketed to /64) reaches
     # auth_failure_block_threshold failures within auth_failure_block_window_sec,
@@ -176,8 +182,23 @@ class Settings(BaseSettings):
         "https://127.0.0.1:8443",
     ]
 
-    # Trusted proxies (for real IP detection)
-    trusted_proxies: list[str] = []
+    # Trusted proxies (for real IP detection). Comma-separated CIDR ranges
+    # (e.g. "172.16.0.0/12,10.0.0.0/8") authorized to assert forwarding
+    # provenance via X-Forwarded-For / X-Real-IP. When empty (the default),
+    # forwarding headers are never trusted. Invalid CIDRs fail startup.
+    # NoDecode ensures pydantic-settings does NOT JSON-decode this value,
+    # which would fail before our custom parser could split it.
+    trusted_proxies: Annotated[str, NoDecode] = ""
+    # Networks explicitly authorized to assert Cloudflare-derived provenance
+    # (CF-Connecting-IP). A generic trusted proxy does NOT automatically
+    # make a client-supplied CF-Connecting-IP safe — only operators who
+    # front this service with Cloudflare should populate this. When empty,
+    # CF-Connecting-IP is never trusted regardless of TRUST_CLOUDFLARE_HEADERS.
+    trusted_cloudflare_networks: Annotated[str, NoDecode] = ""
+    # Parsed forms of the above, validated at startup. Consumers read these
+    # rather than re-parsing on every request.
+    trusted_proxies_parsed: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
+    trusted_cloudflare_parsed: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
 
     # Route types the admin console may add per provider, as comma-separated
     # "provider=type[|type]" entries, e.g.
@@ -263,6 +284,41 @@ class Settings(BaseSettings):
         default="config/alerts.yaml",
         validation_alias=AliasChoices("ALERTS_CONFIG_PATH", "alerts_config_path"),
     )
+
+    @model_validator(mode="after")
+    def _parse_trusted_proxies(self) -> "Settings":
+        """Parse trusted_proxies and trusted_cloudflare_networks CIDRs.
+
+        Both fields accept comma-separated CIDR strings. An empty string is
+        valid (means no proxies trusted). Each entry must be a parseable CIDR
+        range. Invalid entries raise ValueError so the operator is notified
+        at startup rather than silently weakening identity resolution.
+        """
+        proxy_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for entry in self.trusted_proxies.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                proxy_networks.append(ipaddress.ip_network(entry, strict=True))
+            except ValueError as exc:
+                raise ValueError(
+                    f"trusted_proxies entry {entry!r} is not a valid CIDR range: {exc}"
+                ) from exc
+        cf_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for entry in self.trusted_cloudflare_networks.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                cf_networks.append(ipaddress.ip_network(entry, strict=True))
+            except ValueError as exc:
+                raise ValueError(
+                    f"trusted_cloudflare_networks entry {entry!r} is not a valid CIDR range: {exc}"
+                ) from exc
+        object.__setattr__(self, "trusted_proxies_parsed", tuple(proxy_networks))
+        object.__setattr__(self, "trusted_cloudflare_parsed", tuple(cf_networks))
+        return self
 
     @model_validator(mode="after")
     def _alerts_webhook_fallback(self) -> "Settings":
