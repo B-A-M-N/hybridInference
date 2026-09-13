@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
@@ -27,6 +27,7 @@ class PendingPrefixCacheEntry:
     scopes: Mapping[str, Any]
     created_at: float
     last_activity_at: float
+    generations: Mapping[str, int] = field(default_factory=dict)
 
 
 class PendingPrefixCacheStore:
@@ -45,7 +46,13 @@ class PendingPrefixCacheStore:
         self._entries: dict[str, PendingPrefixCacheEntry] = {}
         self._lock = RLock()
 
-    def put(self, request_id: str, blocks: Any, scopes: Mapping[str, Any]) -> None:
+    def put(
+        self,
+        request_id: str,
+        blocks: Any,
+        scopes: Mapping[str, Any],
+        generations: Mapping[str, int] | None = None,
+    ) -> None:
         """Store one request, evicting oldest entries when the cap is exceeded."""
         if not request_id or not scopes:
             return
@@ -69,6 +76,7 @@ class PendingPrefixCacheStore:
                 # warmed, but it must not renew the pending entry forever.
                 created_at=prior.created_at if prior is not None else now,
                 last_activity_at=prior.last_activity_at if prior is not None else now,
+                generations=dict(generations or {}),
             )
             while len(self._entries) > self._max_entries:
                 oldest_request_id = next(iter(self._entries))
@@ -104,6 +112,7 @@ class PendingPrefixCacheStore:
                     scopes=entry.scopes,
                     created_at=entry.created_at,
                     last_activity_at=now,
+                    generations=entry.generations,
                 )
         if expired is not None:
             self._emit_eviction(
