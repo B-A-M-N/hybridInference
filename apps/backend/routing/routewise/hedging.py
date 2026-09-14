@@ -819,12 +819,17 @@ async def _safe_aclose(gen: AsyncGenerator[Any, None]) -> None:
     must not abort the winning stream.  A cancellation delivered to this
     task, however, remains observable to the caller.
     """
+    close_task = asyncio.ensure_future(gen.aclose())
     try:
-        await gen.aclose()
+        await asyncio.shield(close_task)
     except asyncio.CancelledError:
-        task = asyncio.current_task()
-        if task is not None and task.cancelling():
-            raise
+        if close_task.done() and close_task.cancelled():
+            return
+
+        close_task.cancel()
+        with contextlib.suppress(BaseException):
+            await close_task
+        raise
     except Exception:
         pass
 
