@@ -213,13 +213,6 @@ async def record_auth_failure(ip_info: ClientIpInfo) -> bool:
                 )
                 _unresolved_failures.clear()
                 blocked_now = True
-        logger.warning(
-            "unresolved_client_ip",
-            extra={
-                "event": "unresolved_client_ip",
-                "reason": "auth_failure_blocklist",
-            },
-        )
         if blocked_now:
             logger.warning(
                 "unresolved_auth_traffic_blocked",

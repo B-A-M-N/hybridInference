@@ -857,6 +857,11 @@ class OpenAICompatAdapter(BaseAdapter):
                 self._key_pool.release(lease, status_code=None)
                 last_error = saturated
                 continue
+            except BaseException:
+                # Cancellation before the upstream request starts must not
+                # leave a non-affine recovery probe claimed.
+                self._key_pool.release(lease, status_code=None)
+                raise
 
             headers = self._build_headers(api_key_override=api_key)
             try:
@@ -866,6 +871,12 @@ class OpenAICompatAdapter(BaseAdapter):
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=_COMPLETION_TIMEOUT_S),
                 )
+            except asyncio.CancelledError:
+                # A cancelled request has no upstream outcome. Release the
+                # lease neutrally so cancellation cannot mute a key or leave a
+                # recovery probe permanently in flight.
+                self._key_pool.release(lease, status_code=None)
+                raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 status = e.status if isinstance(e, aiohttp.ClientResponseError) else 0
                 slot.release(status_code=status)
@@ -1030,6 +1041,11 @@ class OpenAICompatAdapter(BaseAdapter):
                 self._key_pool.release(lease, status_code=None)
                 last_error = saturated
                 continue
+            except BaseException:
+                # Cancellation before the stream is opened still owns the
+                # lease, even though no slot was acquired.
+                self._key_pool.release(lease, status_code=None)
+                raise
 
             headers = self._build_headers(api_key_override=api_key)
             stream_iter = self.http.stream_post(
@@ -1098,9 +1114,10 @@ class OpenAICompatAdapter(BaseAdapter):
             except BaseException:
                 # Cancellation before the first chunk: the slot is held for a
                 # request that no longer exists, so hand it back here — nothing
-                # downstream ever learns this attempt happened. The key pool
-                # needs nothing; a neutral release is its no-op.
+                # downstream ever learns this attempt happened. The neutral
+                # lease release also clears any claimed recovery probe.
                 slot.release()
+                self._key_pool.release(lease, status_code=None)
                 raise
 
             # First chunk read successfully — commit the lease and the slot
@@ -1471,6 +1488,7 @@ class OpenAICompatAdapter(BaseAdapter):
         # BaseExceptions that never mute either.
         stream_error = False
         stream_error_status: int | None = None
+        stream_cancelled = False
         try:
             async for chunk in _drain():
                 if not chunk.strip():
@@ -1550,7 +1568,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 float(sock_read) if sock_read else 0.0,
                 endpoint_id=stream_endpoint_id,
             ) from exc
-        except aiohttp.ClientError:
+        except aiohttp.ClientError as e:
             # Mid-stream upstream I/O failure (disconnect, ClientPayloadError):
             # mute the key, then propagate to the client as before.
             stream_error = True
@@ -1562,6 +1580,11 @@ class OpenAICompatAdapter(BaseAdapter):
             if isinstance(e, UpstreamStreamError):
                 stream_error_status = e.status
             raise
+        except (asyncio.CancelledError, GeneratorExit):
+            # Client-side termination is not evidence that the upstream key
+            # failed. Keep both the limiter slot and key-pool state neutral.
+            stream_cancelled = True
+            raise
         finally:
             # The outbound slot was held for the whole generation, not just the
             # response open, so it comes back here — on every exit path this
@@ -1569,9 +1592,13 @@ class OpenAICompatAdapter(BaseAdapter):
             # included. Released with the same outcome as the lease, and
             # unconditionally on the pool: a pool-less adapter still holds one.
             if active_slot is not None:
-                active_slot.release(status_code=0 if stream_error else 200)
+                active_slot.release(
+                    status_code=None if stream_cancelled else (0 if stream_error else 200)
+                )
             if active_lease is not None and self._key_pool is not None:
-                if stream_error:
+                if stream_cancelled:
+                    release_status = None
+                elif stream_error:
                     release_status = stream_error_status if stream_error_status else 0
                 else:
                     release_status = 200

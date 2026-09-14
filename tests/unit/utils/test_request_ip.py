@@ -216,7 +216,6 @@ def test_unresolved_resolution_warns_once_per_request(caplog):
     request = SimpleNamespace(
         headers={},
         client=SimpleNamespace(host="172.19.0.1"),
-        state=SimpleNamespace(),
     )
     with (
         _settings_env(proxy_headers=False, cf_headers=False),

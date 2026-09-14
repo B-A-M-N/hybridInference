@@ -401,7 +401,11 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
     """
     settings = get_settings()
     state = getattr(request, "state", None)
-    cached = getattr(state, _IP_INFO_STATE_KEY, None) if state is not None else None
+    # Starlette requests have ``state``; small request doubles and a few
+    # middleware-level callers do not. Keep the same per-request cache in both
+    # cases so every consumer observes one identity and one warning.
+    cache_owner = state if state is not None else request
+    cached = getattr(cache_owner, _IP_INFO_STATE_KEY, None)
     if isinstance(cached, ClientIpInfo):
         return cached
 
@@ -466,9 +470,8 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
             trusted_forwarded_headers=peer_is_trusted_proxy,
             trusted_cloudflare_headers=peer_is_cloudflare,
         )
-        if state is not None:
-            with suppress(AttributeError, TypeError):
-                setattr(state, _IP_INFO_STATE_KEY, info)
+        with suppress(AttributeError, TypeError):
+            setattr(cache_owner, _IP_INFO_STATE_KEY, info)
         return info
 
     if peer_is_cloudflare and cf_header_ambiguous and not peer_is_trusted_proxy:

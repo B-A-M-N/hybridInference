@@ -14,10 +14,10 @@ this defense (the goal is throttling, not audit). Mirrors the design of
 
 When client provenance is resolved, rate-limits on the client IP.
 When unresolved (e.g., behind a misconfigured proxy), there is no information
-to distinguish clients behind the shared proxy. In that case, an alertable
-warning is emitted and a coarse global process-local budget applies rather
-than collapsing all clients onto one per-client bucket; per-email limiting
-still applies.
+to distinguish clients behind the shared proxy. In that case, the canonical
+resolver emits the alertable warning and a coarse global process-local budget
+applies rather than collapsing all clients onto one per-client bucket;
+per-email limiting still applies.
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ import time
 from collections import deque
 
 from serving.config.settings import settings
-from serving.utils.logging import get_logger
 from serving.utils.request_ip import get_client_ip_info, normalize_ip_bucket
 
 _FIFTEEN_MIN_SECONDS = 15 * 60
@@ -39,7 +38,6 @@ _ip_attempts: dict[str, deque[float]] = {}
 _unresolved_attempts: deque[float] = deque()
 _lock = asyncio.Lock()
 _sweep_counter = 0
-logger = get_logger(__name__)
 
 
 def _now() -> float:
@@ -72,12 +70,6 @@ async def check_and_record_login(email: str, request) -> tuple[bool, str | None]
     global _sweep_counter
 
     ip_info = get_client_ip_info(request)
-    if not ip_info.resolved:
-        logger.warning(
-            "unresolved_client_ip",
-            extra={"event": "unresolved_client_ip", "reason": "login"},
-        )
-
     # Normalize email so case variants share the same bucket.
     email_key = email.strip().lower()
 

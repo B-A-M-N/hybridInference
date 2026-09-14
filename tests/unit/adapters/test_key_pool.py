@@ -240,6 +240,21 @@ def test_key_pool_change_resets_non_affine_priority_state():
     assert selected == "reserved"
 
 
+def test_stale_non_affine_release_cannot_restore_cleared_state():
+    """A lease acquired before a topology change cannot recreate its cursor."""
+    pool = KeyPool(keys=["preferred", "fallback"], provider_label="test")
+
+    _, stale_lease = pool.acquire(None, role="pro")
+    pool.add_key("reserved", min_role="pro")
+
+    assert pool.release(stale_lease, status_code=503, tried={0}) is ReleaseOutcome.PROPAGATE
+    assert pool._non_affine_cursor == {}
+    assert pool._non_affine_reprobe_index == {}
+    assert pool._non_affine_reprobe_at == {}
+    assert pool._non_affine_reprobe_in_flight == {}
+    assert pool.acquire(None, role="pro")[0] == "reserved"
+
+
 def test_non_affine_probe_success_only_resets_its_role():
     """A recovered role does not erase another role's recovery state."""
     pool = KeyPool(keys=["preferred", "fallback"], provider_label="test")

@@ -17,6 +17,7 @@ is configured. The legacy single-key path uses ``json_post_with_retry``.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import aiohttp
@@ -24,6 +25,7 @@ import pytest
 
 from serving.adapters.base import ModelConfig
 from serving.adapters.openai_compat import OpenAICompatAdapter
+from serving.adapters.upstream_limiter import UpstreamSlot
 from serving.utils import context as req_ctx
 
 
@@ -607,6 +609,81 @@ async def test_streaming_client_disconnect_does_not_mute_key():
     # A client-side cancellation is not an upstream error — k1 stays usable.
     assert adapter._key_pool is not None
     assert adapter._key_pool._keys[0].cooldown_until == 0
+
+
+async def test_cancelled_non_affine_post_releases_recovery_probe():
+    """Cancelling a pooled POST cannot leave its recovery probe claimed."""
+    adapter = OpenAICompatAdapter(_make_config(["k1", "k2"]))
+    assert adapter._key_pool is not None
+
+    _, failed = adapter._key_pool.acquire(None)
+    adapter._key_pool.release(failed, status_code=503, tried={0})
+    adapter._key_pool._non_affine_reprobe_at[None] = 0
+
+    started = asyncio.Event()
+    release_upstream = asyncio.Event()
+
+    async def blocked_json_post(*args, **kwargs):
+        started.set()
+        await release_upstream.wait()
+        return {}
+
+    with (
+        req_ctx.push(affinity_key=None, user_role=None),
+        patch.object(
+            adapter, "_acquire_upstream_slot", new=AsyncMock(return_value=UpstreamSlot(None))
+        ),
+        patch.object(adapter.http, "json_post", side_effect=blocked_json_post),
+    ):
+        task = asyncio.create_task(adapter._post_with_pool("https://example.test", {}))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert adapter._key_pool._non_affine_reprobe_in_flight.get(None) == 0
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert None not in adapter._key_pool._non_affine_reprobe_in_flight
+
+
+async def test_cancelled_non_affine_stream_releases_recovery_probe():
+    """Cancelling before the first stream chunk releases the probe lease."""
+    adapter = OpenAICompatAdapter(_make_config(["k1", "k2"]))
+    assert adapter._key_pool is not None
+
+    _, failed = adapter._key_pool.acquire(None)
+    adapter._key_pool.release(failed, status_code=503, tried={0})
+    adapter._key_pool._non_affine_reprobe_at[None] = 0
+
+    started = asyncio.Event()
+    release_upstream = asyncio.Event()
+
+    def blocked_stream(*args, **kwargs):
+        async def stream():
+            started.set()
+            await release_upstream.wait()
+            yield "data: {}\n\n"
+
+        return stream()
+
+    async def consume_stream():
+        async for _ in adapter._open_stream_with_pool("https://example.test", {}, timeout=None):
+            pass
+
+    with (
+        req_ctx.push(affinity_key=None, user_role=None),
+        patch.object(
+            adapter, "_acquire_upstream_slot", new=AsyncMock(return_value=UpstreamSlot(None))
+        ),
+        patch.object(adapter.http, "stream_post", side_effect=blocked_stream),
+    ):
+        task = asyncio.create_task(consume_stream())
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert adapter._key_pool._non_affine_reprobe_in_flight.get(None) == 0
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert None not in adapter._key_pool._non_affine_reprobe_in_flight
 
 
 async def test_reserved_key_is_spent_only_by_an_entitled_caller():

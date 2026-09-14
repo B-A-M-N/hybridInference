@@ -7,11 +7,11 @@ multiplies by the worker count, which is acceptable.
 
 When client provenance is resolved, rate-limits on the client IP.
 When unresolved (e.g., behind a misconfigured proxy), there is no information
-to distinguish clients behind the shared proxy. In that case, the limiter
-emits an alertable warning and uses a coarse global process-local budget rather
-than collapsing all clients onto one per-client bucket. Deployments that require
-trustworthy provenance can set ``SIGNUP_REQUIRE_RESOLVED_CLIENT_IP=1`` to fail
-closed.
+to distinguish clients behind the shared proxy. In that case, the canonical
+resolver emits the alertable warning and the limiter uses a coarse global
+process-local budget rather than collapsing all clients onto one per-client
+bucket. Deployments that require trustworthy provenance can set
+``SIGNUP_REQUIRE_RESOLVED_CLIENT_IP=1`` to fail closed.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import time
 from collections import deque
 
 from serving.config.settings import settings
-from serving.utils.logging import get_logger
 from serving.utils.request_ip import get_client_ip_info, normalize_ip_bucket
 
 _HOUR_SECONDS = 3600
@@ -32,7 +31,6 @@ _attempts: dict[str, deque[float]] = {}
 _unresolved_attempts: deque[float] = deque()
 _lock = asyncio.Lock()
 _sweep_counter = 0
-logger = get_logger(__name__)
 
 
 def _now() -> float:
@@ -66,14 +64,10 @@ async def check_and_record_signup(request) -> tuple[bool, str | None]:
     ip_info = get_client_ip_info(request)
 
     # When client provenance is unresolved, we cannot distinguish clients
-    # behind a shared proxy. Never silently turn that into an unobserved abuse
-    # bypass: emit an alertable signal, and let deployments that require
-    # trustworthy proxy provenance fail closed for public signup.
+    # behind a shared proxy. The canonical resolver already emitted the
+    # per-request alertable signal; let deployments that require trustworthy
+    # proxy provenance fail closed for public signup.
     if not ip_info.resolved:
-        logger.warning(
-            "unresolved_client_ip",
-            extra={"event": "unresolved_client_ip", "reason": "signup"},
-        )
         if settings.signup_require_resolved_client_ip:
             return False, "unresolved"
         now = _now()

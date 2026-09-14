@@ -229,6 +229,9 @@ class Lease:
     key_index: int
     affinity_key: str | None
     role: str | None = None
+    # Topology generation at acquire time. Releases from before a key add,
+    # removal, or re-tier must not repopulate state that the change cleared.
+    topology_generation: int = 0
 
 
 class KeyPool:
@@ -289,6 +292,7 @@ class KeyPool:
         self._non_affine_reprobe_index: dict[str | None, int] = {}
         self._non_affine_reprobe_at: dict[str | None, float] = {}
         self._non_affine_reprobe_in_flight: dict[str | None, int] = {}
+        self._topology_generation = 0
         self._lock = threading.Lock()
         self._provider_label = provider_label
 
@@ -353,12 +357,10 @@ class KeyPool:
                     retiered = state.min_role != normalized
                     state.min_role = normalized
                 if reactivated or retiered:
-                    self._clear_non_affine_state_locked()
-                    self._drop_repointed_affinities_locked(now)
+                    self._mark_topology_changed_locked(now)
                 return idx
             self._keys.append(_KeyState(key=key, min_role=normalize_min_role(min_role)))
-            self._clear_non_affine_state_locked()
-            self._drop_repointed_affinities_locked(now)
+            self._mark_topology_changed_locked(now)
             return len(self._keys) - 1
 
     def set_key_min_role(self, key: str, min_role: str | None) -> bool:
@@ -393,9 +395,14 @@ class KeyPool:
                 state.min_role = normalized
                 changed = True
             if changed:
-                self._clear_non_affine_state_locked()
-                self._drop_repointed_affinities_locked(now)
+                self._mark_topology_changed_locked(now)
         return found
+
+    def _mark_topology_changed_locked(self, now: float) -> None:
+        """Invalidate state whose key ordering or eligibility just changed."""
+        self._topology_generation += 1
+        self._clear_non_affine_state_locked()
+        self._drop_repointed_affinities_locked(now)
 
     def _clear_non_affine_state_locked(self) -> None:
         """Forget cursor and recovery-probe state after key-pool changes."""
@@ -458,8 +465,7 @@ class KeyPool:
             for _idx, state in enumerate(self._keys):
                 if state.key == key and not state.removed:
                     state.removed = True
-                    self._clear_non_affine_state_locked()
-                    self._drop_repointed_affinities_locked(now)
+                    self._mark_topology_changed_locked(now)
                     return True
             return False
 
@@ -533,7 +539,9 @@ class KeyPool:
                 ):
                     idx = existing.key_index
                     self._keys[idx].request_count += 1
-                    return self._keys[idx].key, Lease(idx, affinity_key, role)
+                    return self._keys[idx].key, Lease(
+                        idx, affinity_key, role, self._topology_generation
+                    )
                 # Drop stale or unusable affinity; we'll re-pick below.
                 del self._affinity[affinity_key]
 
@@ -573,7 +581,7 @@ class KeyPool:
                     role=role,
                 )
             self._keys[idx].request_count += 1
-            return self._keys[idx].key, Lease(idx, affinity_key, role)
+            return self._keys[idx].key, Lease(idx, affinity_key, role, self._topology_generation)
 
     def _pick_first_available_locked(
         self, now: float, role: str | None = None, exclude: Collection[int] = ()
@@ -675,12 +683,16 @@ class KeyPool:
         if status_code is None:
             if lease.affinity_key is None:
                 with self._lock:
+                    if lease.topology_generation != self._topology_generation:
+                        return ReleaseOutcome.PROPAGATE
                     if self._non_affine_reprobe_in_flight.get(lease.role) == lease.key_index:
                         self._non_affine_reprobe_in_flight.pop(lease.role, None)
             return ReleaseOutcome.PROPAGATE
         if not should_mute_status(status_code):
             if 200 <= status_code < 300:
                 with self._lock:
+                    if lease.topology_generation != self._topology_generation:
+                        return ReleaseOutcome.PROPAGATE
                     self._keys[lease.key_index].consecutive_failures = 0
                     if lease.affinity_key is None:
                         if self._non_affine_reprobe_in_flight.get(lease.role) == lease.key_index:
@@ -691,11 +703,15 @@ class KeyPool:
                             self._clear_non_affine_role_state_locked(lease.role)
             elif lease.affinity_key is None:
                 with self._lock:
+                    if lease.topology_generation != self._topology_generation:
+                        return ReleaseOutcome.PROPAGATE
                     if self._non_affine_reprobe_in_flight.get(lease.role) == lease.key_index:
                         self._non_affine_reprobe_in_flight.pop(lease.role, None)
             return ReleaseOutcome.PROPAGATE
         with self._lock:
             now = time.monotonic()
+            if lease.topology_generation != self._topology_generation:
+                return ReleaseOutcome.PROPAGATE
             state = self._keys[lease.key_index]
 
             if (
