@@ -832,6 +832,12 @@ async def test_stale_soft_delete_after_hard_delete_cannot_recreate_identity(fenc
 
     async with pool.acquire() as conn:
         await conn.execute(
+            "DELETE FROM admin_audit_log WHERE action IN "
+            "('stale_mutation_unverified', 'stale_mutation_unknown')"
+        )
+
+    async with pool.acquire() as conn:
+        await conn.execute(
             "UPDATE users SET status = 'active', hard_delete_pending = FALSE, "
             "hard_delete_claim_token = NULL WHERE id = $1",
             _OWNER,
@@ -1007,8 +1013,8 @@ async def test_stale_admin_update_after_hard_delete_cannot_recreate_identity(fen
 
 
 @pytest.mark.asyncio
-async def test_key_only_identity_lifecycle_and_audit_is_allowed_before_fence(fence_store):
-    """Legacy key-only identities remain manageable until an erasure fence exists."""
+async def test_key_only_identity_lifecycle_and_audit_redacts_missing_identity(fence_store):
+    """Legacy key-only credentials remain manageable while missing audit targets redact."""
     _store, pool = fence_store
     user_id = "u-fence-key-only-lifecycle"
     op_store = PostgresOperationalStore(pool)
@@ -1019,7 +1025,8 @@ async def test_key_only_identity_lifecycle_and_audit_is_allowed_before_fence(fen
             await conn.execute("DELETE FROM admin_audit_log WHERE target_user_id = $1", user_id)
             await conn.execute(
                 "DELETE FROM admin_audit_log WHERE action IN "
-                "('key_only_fenced_revoke', 'legacy_key_only_fenced_revoke')"
+                "('key_only_fenced_revoke', 'legacy_key_only_fenced_revoke', "
+                "'key_only_update', 'legacy_key_only_update')"
             )
 
         await op_store.create_key(
@@ -1076,8 +1083,17 @@ async def test_key_only_identity_lifecycle_and_audit_is_allowed_before_fence(fen
                 await conn.fetchval(
                     "SELECT COUNT(*) FROM admin_audit_log WHERE target_user_id = $1", user_id
                 )
-                == 2
+                == 0
             )
+            redacted = await conn.fetch(
+                "SELECT action, target_user_id, details->>'target_user_id_redacted' AS redaction "
+                "FROM admin_audit_log WHERE action IN "
+                "('key_only_update', 'legacy_key_only_update') ORDER BY action"
+            )
+        assert [(row["action"], row["target_user_id"], row["redaction"]) for row in redacted] == [
+            ("key_only_update", None, "missing_identity"),
+            ("legacy_key_only_update", None, "missing_identity"),
+        ]
     finally:
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM api_keys WHERE user_id = $1", user_id)

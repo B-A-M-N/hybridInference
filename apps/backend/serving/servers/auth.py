@@ -938,9 +938,17 @@ async def log_admin_action(
                 target_user_id,
             )
             if row is None:
-                if target_missing_identity_fenced:
-                    audit_target_user_id = None
-                    audit_details = {"target_user_id_redacted": "erasure_fence"}
+                # The row lookup is the transaction's authoritative view. A
+                # pre-transaction fence check can become stale while a hard
+                # delete commits, so every missing identity is redacted.
+                audit_target_user_id = None
+                audit_details = {
+                    "target_user_id_redacted": (
+                        "erasure_fence"
+                        if target_missing_identity_fenced
+                        else "missing_identity"
+                    )
+                }
             elif row.get("hard_delete_pending", False):
                 raise HardDeleteStateChanged(
                     f"Account {target_user_id} has a hard-delete in progress."
