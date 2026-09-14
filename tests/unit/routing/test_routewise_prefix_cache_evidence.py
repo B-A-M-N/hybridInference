@@ -818,10 +818,12 @@ class TestEvidenceLRURecency:
             (blocks_old, {"scopes": {"prov-a:h:1": scope}}),
             "old",
         )
+        router._reserve_prefix_generation_for_dispatch("old", "prov-a:h:1")
         router._stash_prefix_for_commit(
             (blocks_new, {"scopes": {"prov-a:h:1": scope}}),
             "new",
         )
+        router._reserve_prefix_generation_for_dispatch("new", "prov-a:h:1")
 
         router._commit_prefix_cache_observation(
             _obs(
@@ -1074,6 +1076,7 @@ class TestEvidenceAwareStreamedEmptyCompletion:
             (failed_blocks, {"scopes": {"prov-a:h:1": scope}}),
             "failed",
         )
+        router._reserve_prefix_generation_for_dispatch("failed", "prov-a:h:1")
         router._commit_prefix_cache_observation(
             _obs(
                 "prov-a:h:1",
