@@ -1786,7 +1786,17 @@ class PostgresOperationalStore(OperationalStore):
         reason: str,
     ) -> None:
         """Set status='rejected', record reviewer and reason."""
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            # The route's preliminary status read can race with a hard-delete
+            # claim. Lock and re-check the durable claim in the same
+            # transaction as the status update, just like approval and the
+            # generic status-update path.
+            row = await conn.fetchrow(
+                "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
+                user_id,
+            )
+            if row is not None and row["hard_delete_pending"]:
+                raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
             await conn.execute(
                 "UPDATE users SET status = 'rejected', approval_note = $1, "
                 "reviewed_at = NOW(), reviewed_by = $2 WHERE id = $3",

@@ -12,6 +12,7 @@ CacheBackend.
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import math
 import time
@@ -161,6 +162,7 @@ class CachedOperationalStore(OperationalStore):
     def __init__(self, store: OperationalStore, cache: CacheBackend) -> None:
         self._store = store
         self._cache = cache
+        self._background_cleanup_tasks: set[asyncio.Task[None]] = set()
 
     # -- cache key helpers ---------------------------------------------------
 
@@ -320,15 +322,55 @@ class CachedOperationalStore(OperationalStore):
         A caller may reuse an existing claim only after independently proving
         that the LogStore fence is already durable.
         """
-        claim_token = await self._store.begin_hard_delete_user(
-            user_id,
-            allow_existing_fence=allow_existing_fence,
-            recover_stale_claim=recover_stale_claim,
+        claim_task = asyncio.create_task(
+            self._store.begin_hard_delete_user(
+                user_id,
+                allow_existing_fence=allow_existing_fence,
+                recover_stale_claim=recover_stale_claim,
+            )
         )
-        await self._cache.delete(self._user_key(user_id))
-        await self._cache.delete_pattern("auth:*")
-        await self._cache.delete_pattern("auth_light:*")
+
+        def _release_completed_claim(task: asyncio.Task[str]) -> None:
+            if task.cancelled():
+                return
+            try:
+                completed_token = task.result()
+            except BaseException:
+                return
+            cleanup_task = asyncio.create_task(self._release_claim_safely(user_id, completed_token))
+            self._background_cleanup_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(self._background_cleanup_tasks.discard)
+
+        try:
+            # Shield the durable claim from cancellation while we obtain its
+            # token. If the caller is cancelled at this boundary, the done
+            # callback releases the claim if the underlying transaction won.
+            claim_token = await asyncio.shield(claim_task)
+        except BaseException:
+            claim_task.add_done_callback(_release_completed_claim)
+            raise
+
+        try:
+            await self._cache.delete(self._user_key(user_id))
+            await self._cache.delete_pattern("auth:*")
+            await self._cache.delete_pattern("auth_light:*")
+        except BaseException:
+            # The claim is committed before cache invalidation starts. Keep a
+            # cancelled or failed cache operation from stranding a pre-fence
+            # claim that the caller never received.
+            await self._release_claim_safely(user_id, claim_token)
+            raise
         return claim_token
+
+    async def _release_claim_safely(self, user_id: str, claim_token: str) -> None:
+        """Release a claim after a cancelled/failed claim wrapper operation."""
+        try:
+            await asyncio.shield(self._store.release_hard_delete_user_claim(user_id, claim_token))
+        except BaseException:
+            # Cleanup must not replace the original cancellation or cache
+            # failure. A retained claim remains fail-closed and is recoverable
+            # through the explicit stale-claim path.
+            return
 
     async def release_hard_delete_user_claim(self, user_id: str, claim_token: str) -> None:
         """Release a failed pre-fence claim and invalidate user caches."""

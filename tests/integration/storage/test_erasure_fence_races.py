@@ -860,6 +860,29 @@ async def test_approval_cannot_activate_claimed_account(fence_store):
     assert row["hard_delete_pending"] is True
 
 
+async def test_rejection_cannot_change_claimed_account(fence_store):
+    """Rejection cannot change status while hard-delete owns the claim."""
+    _store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET status = 'pending_approval', hard_delete_pending = TRUE, "
+            "hard_delete_claim_token = 'rejection-race' WHERE id = $1",
+            _OWNER,
+        )
+
+    with pytest.raises(HardDeleteStateChanged, match="hard-delete in progress"):
+        await op_store.reject_user(_OWNER, admin_id="admin", reason="not eligible")
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, hard_delete_pending FROM users WHERE id = $1", _OWNER
+        )
+    assert row["status"] == "pending_approval"
+    assert row["hard_delete_pending"] is True
+
+
 async def test_status_update_cannot_activate_claimed_account(fence_store):
     """Generic admin status updates cannot activate a claimed account."""
     _store, pool = fence_store
