@@ -759,7 +759,7 @@ async def test_resume_wrong_status_fails_without_target_audit(fence_store):
 async def test_stale_soft_delete_after_hard_delete_cannot_recreate_identity(fence_store):
     """A stale soft-delete cannot recreate a purged user or target audit row."""
     store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = PostgresOperationalStore(pool, fence_secret=_SECRET)
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -802,12 +802,11 @@ async def test_stale_soft_delete_after_hard_delete_cannot_recreate_identity(fenc
             email=snapshot["email"],
         )
 
-    with pytest.raises(HardDeleteStateChanged, match="no longer exists"):
-        await op_store.log_admin_action(
-            admin_ip="127.0.0.1",
-            action="stale_mutation",
-            target_user_id=_OWNER,
-        )
+    await op_store.log_admin_action(
+        admin_ip="127.0.0.1",
+        action="stale_mutation",
+        target_user_id=_OWNER,
+    )
 
     async with pool.acquire() as conn:
         user_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE id = $1", _OWNER)
@@ -837,7 +836,7 @@ async def test_stale_soft_delete_after_hard_delete_cannot_recreate_identity(fenc
 async def test_stale_admin_update_after_hard_delete_cannot_recreate_identity(fence_store):
     """Stale user/key/preference updates fail after permanent removal."""
     store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = PostgresOperationalStore(pool, fence_secret=_SECRET)
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -876,7 +875,6 @@ async def test_stale_admin_update_after_hard_delete_cannot_recreate_identity(fen
         lambda: op_store.update_user_preferences(_OWNER, {"theme": "dark"}),
         lambda: op_store.create_key(key_hash="hash", key_prefix="prefix", user_id=_OWNER),
         lambda: op_store.update_key(_OWNER, quota_daily_cost_usd=10),
-        lambda: op_store.revoke_key(_OWNER),
         lambda: op_store.regenerate_key(
             _OWNER,
             new_key_hash="new-hash",
@@ -887,12 +885,15 @@ async def test_stale_admin_update_after_hard_delete_cannot_recreate_identity(fen
         with pytest.raises(HardDeleteStateChanged, match="no longer exists"):
             await mutation()
 
-    with pytest.raises(HardDeleteStateChanged, match="no longer exists"):
-        await op_store.log_admin_action(
-            admin_ip="127.0.0.1",
-            action="stale_update",
-            target_user_id=_OWNER,
-        )
+    # Removing a stale credential is safe even after the identity's fence is
+    # durable. There are no keys left here, so this is intentionally a no-op.
+    await op_store.revoke_key(_OWNER)
+
+    await op_store.log_admin_action(
+        admin_ip="127.0.0.1",
+        action="stale_update",
+        target_user_id=_OWNER,
+    )
 
     async with pool.acquire() as conn:
         user_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE id = $1", _OWNER)
@@ -904,6 +905,229 @@ async def test_stale_admin_update_after_hard_delete_cannot_recreate_identity(fen
     assert user_count == 0
     assert key_count == 0
     assert audit_after == audit_before
+
+
+@pytest.mark.asyncio
+async def test_key_only_identity_lifecycle_and_audit_is_allowed_before_fence(fence_store):
+    """Legacy key-only identities remain manageable until an erasure fence exists."""
+    _store, pool = fence_store
+    user_id = "u-fence-key-only-lifecycle"
+    op_store = PostgresOperationalStore(pool, fence_secret=_SECRET)
+
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM api_keys WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM admin_audit_log WHERE target_user_id = $1", user_id)
+            await conn.execute(
+                "DELETE FROM admin_audit_log WHERE action IN "
+                "('key_only_fenced_revoke', 'legacy_key_only_fenced_revoke')"
+            )
+
+        await op_store.create_key(
+            key_hash="key-only-hash-1",
+            key_prefix="key-only-prefix-1",
+            user_id=user_id,
+        )
+        await op_store.update_key(user_id, notes="legacy key-only")
+        old_prefix = await op_store.regenerate_key(
+            user_id,
+            new_key_hash="key-only-hash-2",
+            new_key_prefix="key-only-prefix-2",
+        )
+        assert old_prefix == "key-only-prefix-1"
+
+        await op_store.log_admin_action(
+            admin_ip="127.0.0.1",
+            action="key_only_update",
+            target_user_id=user_id,
+        )
+        from serving.servers.auth import log_admin_action
+        from serving.storage.database import DatabaseLogger
+
+        legacy_logger = DatabaseLogger({}, fence_secret=_SECRET)
+        legacy_logger.pool = pool
+        await log_admin_action(
+            legacy_logger,
+            "127.0.0.1",
+            "legacy_key_only_update",
+            user_id,
+        )
+        await op_store.revoke_key(user_id)
+        async with pool.acquire() as conn:
+            assert (
+                await conn.fetchval("SELECT status FROM api_keys WHERE user_id = $1", user_id)
+                == "revoked"
+            )
+        await op_store.revoke_key(user_id, hard_delete=True)
+
+        async with pool.acquire() as conn:
+            assert (
+                await conn.fetchval("SELECT COUNT(*) FROM api_keys WHERE user_id = $1", user_id)
+                == 0
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM admin_audit_log WHERE target_user_id = $1", user_id
+                )
+                == 2
+            )
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM api_keys WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM admin_audit_log WHERE target_user_id = $1", user_id)
+
+
+@pytest.mark.asyncio
+async def test_fenced_key_only_identity_cannot_regain_credential_but_can_revoke(
+    fence_store,
+):
+    """A durable fence blocks credential creation/mutation without blocking removal."""
+    store, pool = fence_store
+    user_id = "u-fence-key-only-erased"
+    op_store = PostgresOperationalStore(pool, fence_secret=_SECRET)
+
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM api_keys WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM admin_audit_log WHERE target_user_id = $1", user_id)
+            await conn.execute(
+                "DELETE FROM admin_audit_log WHERE action IN "
+                "('key_only_fenced_revoke', 'legacy_key_only_fenced_revoke')"
+            )
+
+        await op_store.create_key(
+            key_hash="erased-key-hash",
+            key_prefix="erased-key-prefix",
+            user_id=user_id,
+        )
+        await store.hard_delete_user_data(user_id)
+        assert await store.account_has_erasure_fence(user_id) is True
+
+        with pytest.raises(HardDeleteStateChanged, match="erasure fence"):
+            await op_store.create_key(
+                key_hash="resurrection-hash",
+                key_prefix="resurrection-prefix",
+                user_id=user_id,
+            )
+        with pytest.raises(HardDeleteStateChanged, match="erasure fence"):
+            await op_store.update_key(user_id, notes="must not change")
+        with pytest.raises(HardDeleteStateChanged, match="erasure fence"):
+            await op_store.regenerate_key(
+                user_id,
+                new_key_hash="resurrection-hash-2",
+                new_key_prefix="resurrection-prefix-2",
+            )
+
+        await op_store.revoke_key(user_id)
+        from serving.servers.auth import log_admin_action
+        from serving.storage.database import DatabaseLogger
+
+        await op_store.log_admin_action(
+            admin_ip="127.0.0.1",
+            action="key_only_fenced_revoke",
+            target_user_id=user_id,
+            details={"key_prefix": "erased-key-prefix"},
+        )
+        legacy_logger = DatabaseLogger({}, fence_secret=_SECRET)
+        legacy_logger.pool = pool
+        await log_admin_action(
+            legacy_logger,
+            "127.0.0.1",
+            "legacy_key_only_fenced_revoke",
+            user_id,
+            {"key_prefix": "erased-key-prefix"},
+        )
+        await op_store.revoke_key(user_id, hard_delete=True)
+
+        async with pool.acquire() as conn:
+            assert (
+                await conn.fetchval("SELECT COUNT(*) FROM api_keys WHERE user_id = $1", user_id)
+                == 0
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM admin_audit_log WHERE target_user_id = $1", user_id
+                )
+                == 0
+            )
+            redacted = await conn.fetchval(
+                "SELECT COUNT(*) FROM admin_audit_log "
+                "WHERE details->>'target_user_id_redacted' = 'erasure_fence' "
+                "AND action IN ('key_only_fenced_revoke', 'legacy_key_only_fenced_revoke')"
+            )
+        assert redacted == 2
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM api_keys WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM admin_audit_log WHERE target_user_id = $1", user_id)
+            await conn.execute(
+                "DELETE FROM admin_audit_log WHERE action IN "
+                "('key_only_fenced_revoke', 'legacy_key_only_fenced_revoke')"
+            )
+            await conn.execute(
+                "DELETE FROM erasure_fence WHERE account_digest = $1",
+                fence_account_digest(user_id, _SECRET),
+            )
+
+
+@pytest.mark.asyncio
+async def test_key_only_mutation_waits_for_inflight_erasure_fence(fence_store, monkeypatch):
+    """A key mutation cannot observe a false negative during fence commit."""
+    _store, pool = fence_store
+    user_id = "u-fence-key-only-inflight"
+    op_store = PostgresOperationalStore(pool, fence_secret=_SECRET)
+    fence_key = fence_account_digest(user_id, _SECRET)
+    advisory_key = fence_account_advisory_key(fence_key)
+    writer_ready = asyncio.Event()
+    release_writer = asyncio.Event()
+    check_started = asyncio.Event()
+
+    from serving.storage import postgres_operational
+
+    original_check = postgres_operational.check_erasure_fence
+
+    async def _check_with_barrier(conn, *, fence_keys):
+        check_started.set()
+        return await original_check(conn, fence_keys=fence_keys)
+
+    monkeypatch.setattr(postgres_operational, "check_erasure_fence", _check_with_barrier)
+
+    async def _writer() -> None:
+        async with pool.acquire() as conn, conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", advisory_key)
+            await conn.execute(
+                "INSERT INTO erasure_fence (account_digest) VALUES ($1) "
+                "ON CONFLICT (account_digest) DO NOTHING",
+                fence_key,
+            )
+            writer_ready.set()
+            await release_writer.wait()
+
+    try:
+        writer_task = asyncio.create_task(_writer())
+        await writer_ready.wait()
+        key_task = asyncio.create_task(
+            op_store.create_key(
+                key_hash="inflight-hash",
+                key_prefix="inflight-prefix",
+                user_id=user_id,
+            )
+        )
+        await check_started.wait()
+        assert not key_task.done()
+
+        release_writer.set()
+        await writer_task
+        with pytest.raises(HardDeleteStateChanged, match="erasure fence"):
+            await key_task
+    finally:
+        release_writer.set()
+        if "writer_task" in locals() and not writer_task.done():
+            await writer_task
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM api_keys WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM admin_audit_log WHERE target_user_id = $1", user_id)
+            await conn.execute("DELETE FROM erasure_fence WHERE account_digest = $1", fence_key)
 
 
 async def test_account_has_erasure_fence_waits_for_inflight_writer(fence_store, monkeypatch):

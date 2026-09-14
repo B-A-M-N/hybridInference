@@ -36,6 +36,7 @@ from serving.servers.deps import (
     get_log_store,
     get_operational_store,
 )
+from serving.storage.log_schema import check_erasure_fence, fence_account_digest
 from serving.utils import context as req_ctx
 from serving.utils.auth_failure_blocklist import is_ip_blocked, record_auth_failure
 from serving.utils.logging import get_logger
@@ -924,14 +925,25 @@ async def log_admin_action(
     import json
 
     async with db_logger.pool.acquire() as conn, conn.transaction():
+        audit_target_user_id = target_user_id
+        audit_details = dict(details) if details else None
         if target_user_id is not None:
             row = await conn.fetchrow(
                 "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
                 target_user_id,
             )
             if row is None:
-                raise HardDeleteStateChanged(f"Account {target_user_id} no longer exists.")
-            if row.get("hard_delete_pending", False):
+                fence_secret = getattr(db_logger, "fence_secret", None)
+                if not fence_secret:
+                    raise HardDeleteStateChanged(
+                        f"Account {target_user_id} no longer exists and its erasure "
+                        "fence cannot be validated."
+                    )
+                fence_key = fence_account_digest(target_user_id, fence_secret)
+                if await check_erasure_fence(conn, fence_keys=[fence_key]):
+                    audit_target_user_id = None
+                    audit_details = {"target_user_id_redacted": "erasure_fence"}
+            elif row.get("hard_delete_pending", False):
                 raise HardDeleteStateChanged(
                     f"Account {target_user_id} has a hard-delete in progress."
                 )
@@ -942,7 +954,7 @@ async def log_admin_action(
             """,
             admin_ip,
             action,
-            target_user_id,
-            json.dumps(details) if details else None,
+            audit_target_user_id,
+            json.dumps(audit_details) if audit_details else None,
             success,
         )

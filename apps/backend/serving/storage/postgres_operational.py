@@ -28,11 +28,13 @@ from serving.storage.log_schema import (
     SchemaLockUnavailable,
     apply_column_migrations,
     bounded_ddl,
+    check_erasure_fence,
     column_metadata,
     constraint_admitted_values,
     constraint_definition,
     drop_columns_if_present,
     execute_ddl,
+    fence_account_digest,
 )
 from serving.utils.logging import get_logger
 
@@ -83,6 +85,43 @@ async def _lock_user_for_mutation(
             f"Account {user_id} cannot be mutated from status '{row['status']}'."
         )
     return dict(row)
+
+
+async def _validate_key_identity(
+    conn: Any,
+    user_id: str,
+    *,
+    fence_secret: str | None,
+    allow_fenced_missing: bool = False,
+) -> None:
+    """Validate a key identity without treating it as a user identity.
+
+    ``api_keys.user_id`` intentionally has no foreign key to ``users``: legacy
+    deployments can retain credentials after their user row is gone. A missing
+    row is therefore allowed only after the erasure fence is checked under its
+    shared advisory lock. Creation/update/regeneration reject a fenced identity;
+    destructive revocation may remove an existing stale credential safely.
+    """
+    row = await conn.fetchrow(
+        "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
+        user_id,
+    )
+    if row is not None:
+        if row["hard_delete_pending"]:
+            raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
+        return
+
+    if not fence_secret:
+        raise HardDeleteStateChanged(
+            f"Account {user_id} no longer exists and its erasure fence cannot be validated."
+        )
+
+    fence_key = fence_account_digest(user_id, fence_secret)
+    fenced = await check_erasure_fence(conn, fence_keys=[fence_key])
+    if fenced and not allow_fenced_missing:
+        raise HardDeleteStateChanged(
+            f"Account {user_id} no longer exists and is protected by an erasure fence."
+        )
 
 
 def _parse_command_tag_count(command_tag: str) -> int:
@@ -1945,7 +1984,11 @@ class PostgresOperationalStore(OperationalStore):
             metadata = json.dumps(metadata)
 
         async with self._pool.acquire() as conn, conn.transaction():
-            await _lock_user_for_mutation(conn, user_id)
+            await _validate_key_identity(
+                conn,
+                user_id,
+                fence_secret=self.fence_secret,
+            )
             try:
                 row = await conn.fetchrow(
                     "INSERT INTO api_keys "
@@ -2088,13 +2131,22 @@ class PostgresOperationalStore(OperationalStore):
             f"UPDATE api_keys SET {', '.join(set_parts)} WHERE user_id = $1 AND status <> 'revoked'"
         )
         async with self._pool.acquire() as conn, conn.transaction():
-            await _lock_user_for_mutation(conn, user_id)
+            await _validate_key_identity(
+                conn,
+                user_id,
+                fence_secret=self.fence_secret,
+            )
             await conn.execute(sql, *params)
 
     async def revoke_key(self, user_id: str, *, hard_delete: bool = False) -> None:
         """Soft-revoke (status='revoked') or hard-delete the key."""
         async with self._pool.acquire() as conn, conn.transaction():
-            await _lock_user_for_mutation(conn, user_id)
+            await _validate_key_identity(
+                conn,
+                user_id,
+                fence_secret=self.fence_secret,
+                allow_fenced_missing=True,
+            )
             if hard_delete:
                 await conn.execute("DELETE FROM api_keys WHERE user_id = $1", user_id)
             else:
@@ -2117,7 +2169,11 @@ class PostgresOperationalStore(OperationalStore):
         constraint (and resurrect revoked credentials).
         """
         async with self._pool.acquire() as conn, conn.transaction():
-            await _lock_user_for_mutation(conn, user_id)
+            await _validate_key_identity(
+                conn,
+                user_id,
+                fence_secret=self.fence_secret,
+            )
             old_row = await conn.fetchrow(
                 "SELECT key_prefix FROM api_keys WHERE user_id = $1 AND status = 'active'",
                 user_id,
@@ -2531,18 +2587,43 @@ class PostgresOperationalStore(OperationalStore):
         details: dict[str, Any] | None = None,
         success: bool = True,
     ) -> None:
-        """Insert an audit row, validating concrete targets transactionally."""
+        """Insert an audit row, validating concrete targets transactionally.
+
+        A missing, unfenced target can be a legacy key-only identity. A missing
+        fenced target is an erased identity, so retain the event but redact the
+        target column rather than recreating identifying state after deletion.
+        """
         async with self._pool.acquire() as conn, conn.transaction():
+            audit_target_user_id = target_user_id
+            audit_details = dict(details) if details else None
             if target_user_id is not None:
-                await _lock_user_for_mutation(conn, target_user_id)
+                row = await conn.fetchrow(
+                    "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
+                    target_user_id,
+                )
+                if row is not None:
+                    if row["hard_delete_pending"]:
+                        raise HardDeleteStateChanged(
+                            f"Account {target_user_id} has a hard-delete in progress."
+                        )
+                else:
+                    if not self.fence_secret:
+                        raise HardDeleteStateChanged(
+                            f"Account {target_user_id} no longer exists and its erasure "
+                            "fence cannot be validated."
+                        )
+                    fence_key = fence_account_digest(target_user_id, self.fence_secret)
+                    if await check_erasure_fence(conn, fence_keys=[fence_key]):
+                        audit_target_user_id = None
+                        audit_details = {"target_user_id_redacted": "erasure_fence"}
             await conn.execute(
                 "INSERT INTO admin_audit_log "
                 "(admin_ip, action, target_user_id, details, success) "
                 "VALUES ($1, $2, $3, $4::jsonb, $5)",
                 admin_ip,
                 action,
-                target_user_id,
-                json.dumps(details) if details else None,
+                audit_target_user_id,
+                json.dumps(audit_details) if audit_details else None,
                 success,
             )
 
