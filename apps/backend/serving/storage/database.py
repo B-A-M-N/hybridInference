@@ -15,6 +15,7 @@ from typing import Any
 import asyncpg
 
 from serving.storage.log_schema import (
+    ErasureFenceUnavailable,
     apply_column_migrations,
     bounded_ddl,
     column_metadata,
@@ -90,7 +91,14 @@ class DatabaseLogger:
         self.pool = await asyncpg.create_pool(
             **self.db_config, min_size=2, max_size=10, command_timeout=60
         )
-        await self._create_tables()
+        try:
+            await self._create_tables()
+        except ErasureFenceUnavailable:
+            # A fingerprint mismatch is a durable privacy boundary, not a
+            # transient database startup error. Do not let bootstrap retry and
+            # eventually disable logging while retaining an open pool.
+            await self.cleanup()
+            raise
 
     async def ensure_schema(self) -> None:
         """Re-run schema creation/migration against the existing pool.

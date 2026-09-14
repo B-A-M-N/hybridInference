@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
 from serving import grants, quota
@@ -47,6 +48,12 @@ class RequiredOperationalSchemaUnavailable(SchemaLockUnavailable):
     startup rather than defer the migration while serving against an unsafe
     schema.
     """
+
+
+# A takeover is deliberately not available immediately after a claim is made.
+# The endpoint requires an explicit operator opt-in as well, and this grace
+# period prevents an ordinary retry from racing a slow but healthy worker.
+_HARD_DELETE_CLAIM_RECOVERY_GRACE = timedelta(hours=1)
 
 
 def _parse_command_tag_count(command_tag: str) -> int:
@@ -154,6 +161,8 @@ class PostgresOperationalStore(OperationalStore):
                                       'pending_approval', 'rejected')),
                 hard_delete_pending BOOLEAN NOT NULL DEFAULT FALSE,
                 hard_delete_claim_token TEXT,
+                hard_delete_claimed_at TIMESTAMPTZ,
+                hard_delete_claim_recovered BOOLEAN NOT NULL DEFAULT FALSE,
                 approval_note TEXT,
                 reviewed_at TIMESTAMPTZ,
                 reviewed_by TEXT,
@@ -188,6 +197,16 @@ class PostgresOperationalStore(OperationalStore):
                     (
                         "hard_delete_claim_token",
                         "ALTER TABLE users ADD COLUMN IF NOT EXISTS hard_delete_claim_token TEXT",
+                    ),
+                    (
+                        "hard_delete_claimed_at",
+                        "ALTER TABLE users ADD COLUMN IF NOT EXISTS hard_delete_claimed_at "
+                        "TIMESTAMPTZ",
+                    ),
+                    (
+                        "hard_delete_claim_recovered",
+                        "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                        "hard_delete_claim_recovered BOOLEAN NOT NULL DEFAULT FALSE",
                     ),
                 ],
             )
@@ -1002,7 +1021,20 @@ class PostgresOperationalStore(OperationalStore):
             set_parts.append(f"{col} = ${idx}")
             params.append(val)
         sql = f"UPDATE users SET {', '.join(set_parts)} WHERE id = $1"
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            if "status" in fields:
+                # The route's preliminary read can race with a hard-delete
+                # claim. Lock and re-check the claim in the same transaction
+                # as the status update so no activation path can invalidate
+                # an in-flight erasure operation.
+                row = await conn.fetchrow(
+                    "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
+                    user_id,
+                )
+                if row is not None and row["hard_delete_pending"]:
+                    raise HardDeleteStateChanged(
+                        f"Account {user_id} has a hard-delete in progress."
+                    )
             await conn.execute(sql, *params)
 
     async def update_user_last_login(self, user_id: str) -> None:
@@ -1044,25 +1076,63 @@ class PostgresOperationalStore(OperationalStore):
                 True,
             )
 
-    async def begin_hard_delete_user(self, user_id: str) -> str:
-        """Claim a soft-deleted user before purging rows in another store."""
+    async def begin_hard_delete_user(
+        self,
+        user_id: str,
+        *,
+        allow_existing_fence: bool = False,
+        recover_stale_claim: bool = False,
+    ) -> str:
+        """Claim a soft-deleted user before purging rows in another store.
 
-        claim_token = secrets.token_urlsafe(32)
+        A pending claim normally belongs exclusively to the worker that made
+        it. An explicit stale-claim recovery may replace it only after the
+        grace period. Recovered claims are sticky: a pre-fence failure cannot
+        clear them, because the original worker may still be unwinding after a
+        process-level timeout or transient connection failure.
+        """
+
         async with self._pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
-                "SELECT status FROM users WHERE id = $1 FOR UPDATE",
+                "SELECT status, hard_delete_pending, hard_delete_claim_token, "
+                "hard_delete_claimed_at "
+                "FROM users WHERE id = $1 FOR UPDATE",
                 user_id,
             )
             if row is None or row["status"] != "deleted":
                 raise HardDeleteStateChanged(
                     f"Account {user_id} is no longer eligible for hard-delete."
                 )
-            # A retry takes ownership with a fresh token. This prevents an
-            # older in-flight attempt from releasing or completing the claim
-            # after a newer attempt has taken over.
+            if row["hard_delete_pending"]:
+                if allow_existing_fence and row["hard_delete_claim_token"]:
+                    return row["hard_delete_claim_token"]
+                if recover_stale_claim:
+                    stale = await conn.fetchval(
+                        "SELECT $1::TIMESTAMPTZ IS NOT NULL "
+                        "AND $1::TIMESTAMPTZ <= NOW() - $2::INTERVAL",
+                        row["hard_delete_claimed_at"],
+                        _HARD_DELETE_CLAIM_RECOVERY_GRACE,
+                    )
+                    if stale:
+                        claim_token = secrets.token_urlsafe(32)
+                        await conn.execute(
+                            "UPDATE users SET hard_delete_claim_token = $2, "
+                            "hard_delete_claimed_at = NOW(), "
+                            "hard_delete_claim_recovered = TRUE WHERE id = $1",
+                            user_id,
+                            claim_token,
+                        )
+                        return claim_token
+                raise HardDeleteStateChanged(
+                    f"Account {user_id} already has a hard-delete in progress or its "
+                    "claim is not yet eligible for recovery."
+                )
+
+            claim_token = secrets.token_urlsafe(32)
             await conn.execute(
                 "UPDATE users SET hard_delete_pending = TRUE, "
-                "hard_delete_claim_token = $2 WHERE id = $1",
+                "hard_delete_claim_token = $2, hard_delete_claimed_at = NOW(), "
+                "hard_delete_claim_recovered = FALSE WHERE id = $1",
                 user_id,
                 claim_token,
             )
@@ -1084,6 +1154,7 @@ class PostgresOperationalStore(OperationalStore):
                   AND status = 'deleted'
                   AND hard_delete_pending = TRUE
                   AND hard_delete_claim_token = $2
+                  AND hard_delete_claim_recovered = FALSE
                 """,
                 user_id,
                 claim_token,
@@ -1689,7 +1760,16 @@ class PostgresOperationalStore(OperationalStore):
         note: str | None = None,
     ) -> None:
         """Set status='active', record reviewer and note."""
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            # The route's preliminary status check can race with a hard-delete
+            # claim. Lock the row and re-check the durable claim before any
+            # approval path can activate an account under erasure.
+            row = await conn.fetchrow(
+                "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
+                user_id,
+            )
+            if row is not None and row["hard_delete_pending"]:
+                raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
             await conn.execute(
                 "UPDATE users SET status = 'active', approval_note = $1, "
                 "reviewed_at = NOW(), reviewed_by = $2 WHERE id = $3",

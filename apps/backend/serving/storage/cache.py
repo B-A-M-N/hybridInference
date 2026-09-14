@@ -308,9 +308,23 @@ class CachedOperationalStore(OperationalStore):
         await self._cache.delete_pattern("auth:*")
         await self._cache.delete_pattern("auth_light:*")
 
-    async def begin_hard_delete_user(self, user_id: str) -> str:
-        """Claim a hard-delete in the wrapped store and invalidate caches."""
-        claim_token = await self._store.begin_hard_delete_user(user_id)
+    async def begin_hard_delete_user(
+        self,
+        user_id: str,
+        *,
+        allow_existing_fence: bool = False,
+        recover_stale_claim: bool = False,
+    ) -> str:
+        """Claim a hard-delete and invalidate caches.
+
+        A caller may reuse an existing claim only after independently proving
+        that the LogStore fence is already durable.
+        """
+        claim_token = await self._store.begin_hard_delete_user(
+            user_id,
+            allow_existing_fence=allow_existing_fence,
+            recover_stale_claim=recover_stale_claim,
+        )
         await self._cache.delete(self._user_key(user_id))
         await self._cache.delete_pattern("auth:*")
         await self._cache.delete_pattern("auth_light:*")

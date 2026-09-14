@@ -37,6 +37,7 @@ the process environment.
 | `DB_USER` | `postgres` | Required by Compose. |
 | `DB_PASSWORD` | *(empty)* | Required by Compose. |
 | `DB_STORE_FULL_CONTENT` | `false` | Whether prompts and responses are stored verbatim. See [Request logging and privacy](#request-logging-and-privacy). |
+| `ERASURE_FENCE_PROTOCOL_READY` | `false` | Enables hard-delete only after every `api_logs` writer has been upgraded to use the erasure-fence protocol. |
 
 The bundled stack (`deploy/docker/docker-compose.yml`) runs `postgres:16`,
 initialised with `-E UTF8 --locale=C.UTF-8`, and publishes it on

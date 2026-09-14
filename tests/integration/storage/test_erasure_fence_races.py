@@ -21,6 +21,7 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from serving.exceptions import HardDeleteStateChanged
 from serving.storage.log_schema import (
     ErasureFenceUnavailable,
     check_erasure_fence,
@@ -719,8 +720,6 @@ async def test_resume_race_resume_wins(fence_store):
 
     # The operational claim refuses to start once resume has activated the
     # user; the LogStore is not responsible for querying operational state.
-    from serving.exceptions import HardDeleteStateChanged
-
     with pytest.raises(HardDeleteStateChanged):
         await op_store.begin_hard_delete_user(_OWNER)
 
@@ -748,8 +747,6 @@ async def test_resume_race_hard_delete_wins(fence_store):
     await store.hard_delete_user_data(_OWNER)
     assert await store.account_has_erasure_fence(_OWNER) is True
 
-    from serving.exceptions import HardDeleteStateChanged
-
     with pytest.raises(HardDeleteStateChanged):
         await op_store.resume_user(
             _OWNER, admin_ip="127.0.0.1", admin_id="admin", reason="test", email="a@b.com"
@@ -765,17 +762,30 @@ async def test_resume_race_hard_delete_wins(fence_store):
 
 
 async def test_failed_hard_delete_claim_can_be_released(fence_store):
-    """Only the current hard-delete attempt can clear a pre-fence claim."""
+    """Concurrent claims are rejected and released claims can be retried."""
     _store, pool = fence_store
     op_store = PostgresOperationalStore(pool)
 
     first_token = await op_store.begin_hard_delete_user(_OWNER)
+    with pytest.raises(HardDeleteStateChanged, match="already has a hard-delete"):
+        await op_store.begin_hard_delete_user(_OWNER)
+
+    # A concurrent attempt cannot take ownership while the first operation is
+    # still in flight.
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, hard_delete_pending, hard_delete_claim_token FROM users WHERE id = $1",
+            _OWNER,
+        )
+    assert row["status"] == "deleted"
+    assert row["hard_delete_pending"] is True
+    assert row["hard_delete_claim_token"] == first_token
+
+    # Once the failed attempt releases its claim, a later retry may establish
+    # a new token. The old token cannot clear that new claim.
+    await op_store.release_hard_delete_user_claim(_OWNER, first_token)
     second_token = await op_store.begin_hard_delete_user(_OWNER)
     assert first_token != second_token
-
-    # The first attempt is stale after the retry takes ownership, so it must
-    # not clear the second attempt's claim.
-    await op_store.release_hard_delete_user_claim(_OWNER, first_token)
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -785,8 +795,6 @@ async def test_failed_hard_delete_claim_can_be_released(fence_store):
     assert row["status"] == "deleted"
     assert row["hard_delete_pending"] is True
     assert row["hard_delete_claim_token"] == second_token
-
-    from serving.exceptions import HardDeleteStateChanged
 
     with pytest.raises(HardDeleteStateChanged):
         await op_store.hard_delete_user(
@@ -826,6 +834,108 @@ async def test_failed_hard_delete_claim_can_be_released(fence_store):
             _OWNER,
         )
     assert pending is True
+
+
+async def test_approval_cannot_activate_claimed_account(fence_store):
+    """Approval cannot activate an account claimed by hard-delete."""
+    _store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET status = 'pending_approval', hard_delete_pending = TRUE, "
+            "hard_delete_claim_token = 'approval-race' WHERE id = $1",
+            _OWNER,
+        )
+
+    with pytest.raises(HardDeleteStateChanged, match="hard-delete in progress"):
+        await op_store.approve_user(_OWNER, admin_id="admin", note="approve")
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, hard_delete_pending FROM users WHERE id = $1",
+            _OWNER,
+        )
+    assert row["status"] == "pending_approval"
+    assert row["hard_delete_pending"] is True
+
+
+async def test_status_update_cannot_activate_claimed_account(fence_store):
+    """Generic admin status updates cannot activate a claimed account."""
+    _store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET status = 'suspended', hard_delete_pending = TRUE, "
+            "hard_delete_claim_token = 'status-race' WHERE id = $1",
+            _OWNER,
+        )
+
+    with pytest.raises(HardDeleteStateChanged, match="hard-delete in progress"):
+        await op_store.update_user_fields(_OWNER, status="active")
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, hard_delete_pending FROM users WHERE id = $1", _OWNER
+        )
+    assert row["status"] == "suspended"
+    assert row["hard_delete_pending"] is True
+
+
+async def test_stale_claim_can_be_explicitly_recovered_without_releasing_safety(fence_store):
+    """A crashed pre-fence owner can be taken over without opening resume."""
+    _store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+
+    first_token = await op_store.begin_hard_delete_user(_OWNER)
+    with pytest.raises(HardDeleteStateChanged, match="already has a hard-delete"):
+        await op_store.begin_hard_delete_user(_OWNER, recover_stale_claim=True)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET hard_delete_claimed_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
+            _OWNER,
+        )
+
+    recovered_token = await op_store.begin_hard_delete_user(
+        _OWNER,
+        recover_stale_claim=True,
+    )
+    assert recovered_token != first_token
+
+    # A reclaimed claim is intentionally sticky. If the old worker was merely
+    # delayed rather than dead, releasing the new token must not make resume
+    # possible before either worker establishes the fence.
+    await op_store.release_hard_delete_user_claim(_OWNER, recovered_token)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT hard_delete_pending, hard_delete_claim_token, "
+            "hard_delete_claim_recovered FROM users WHERE id = $1",
+            _OWNER,
+        )
+    assert row["hard_delete_pending"] is True
+    assert row["hard_delete_claim_token"] == recovered_token
+    assert row["hard_delete_claim_recovered"] is True
+
+
+async def test_post_fence_retry_reuses_claim_without_stealing(fence_store):
+    """A durable fence permits completion retries with the original token."""
+    store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+
+    first_token = await op_store.begin_hard_delete_user(_OWNER)
+    await store.hard_delete_user_data(_OWNER)
+    assert await store.account_has_erasure_fence(_OWNER) is True
+
+    retry_token = await op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True)
+    assert retry_token == first_token
+
+    with pytest.raises(HardDeleteStateChanged, match="already has a hard-delete"):
+        await op_store.begin_hard_delete_user(_OWNER)
+
+    await op_store.release_hard_delete_user_claim(_OWNER, first_token)
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -899,7 +1009,7 @@ async def test_fingerprint_pins_during_startup_and_rejects_mixed_secret(fence_st
             "SELECT config_value FROM erasure_fence_metadata WHERE config_key = 'secret_fingerprint'"
         ) == fingerprint_secret(first_secret)
 
-        with pytest.raises(ErasureFenceUnavailable, match="restore the original"):
+        with pytest.raises(ErasureFenceUnavailable, match="Restore the original"):
             await validate_or_init_fingerprint(conn, secret=second_secret)
 
         assert await conn.fetchval(

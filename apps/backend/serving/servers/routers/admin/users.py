@@ -10,6 +10,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from serving.config.provider_labels import resolve_display_names
+from serving.config.settings import get_settings
 from serving.exceptions import HardDeleteStateChanged
 from serving.model_access import (
     DISABLED_MODELS_PREFERENCE_KEY,
@@ -485,7 +486,13 @@ async def approve_user(
 
     note = payload.note if payload else None
 
-    await op_store.approve_user(user_id, admin_id=admin_id, note=note)
+    try:
+        await op_store.approve_user(user_id, admin_id=admin_id, note=note)
+    except HardDeleteStateChanged:
+        raise HTTPException(
+            409,
+            "This account has a hard-delete in progress and cannot be approved.",
+        ) from None
 
     await log_admin_action(
         op_store,
@@ -779,7 +786,13 @@ async def update_user(
         payload_dict["suspension_message"] = msg
         updated.append("suspension_message")
     if user_table_updates:
-        await op_store.update_user_fields(user_id, **user_table_updates)
+        try:
+            await op_store.update_user_fields(user_id, **user_table_updates)
+        except HardDeleteStateChanged:
+            raise HTTPException(
+                409,
+                "This account has a hard-delete in progress and cannot change status.",
+            ) from None
 
     # Post-write side-effects that depend on the new status
     if new_status == "suspended":
@@ -1036,9 +1049,9 @@ async def hard_delete_user(
       user remains soft-deleted (``status='deleted'``), and the admin can
       retry the hard-delete. The fence is NOT established (the whole
       LogStore transaction is rolled back), so a retry can re-attempt both
-      the fence and the purge. A retry takes ownership with a fresh token,
-      so an older in-flight attempt cannot release or complete the newer
-      claim.
+      the fence and the purge after the failed attempt releases its claim.
+      Concurrent attempts are rejected while the current claim is active, so
+      no operation can take ownership from a live hard-delete.
     - LogStore wipe succeeds but op_store wipe fails: log rows are gone and
       the fence is established, but the user row + prior audit entries
       remain — the user is still soft-deleted, so the admin can retry
@@ -1046,10 +1059,23 @@ async def hard_delete_user(
       in ``status='deleted'``). The fence is already established, so the
       retry's ``INSERT ... ON CONFLICT DO NOTHING`` is a no-op.
 
+    If a worker exits after claiming the account but before the LogStore
+    transaction starts, an administrator who has confirmed that the old worker
+    is gone may retry with ``recover_stale_claim=True`` after the claim's
+    recovery grace period. That takeover is sticky until the fence and delete
+    complete; a failed recovery cannot reopen the account for resume.
+
     Requires: Admin authentication (JWT or ADMIN_TOKEN)
     """
     if not op_store:
         raise HTTPException(500, "Database not configured")
+
+    if not get_settings().erasure_fence_protocol_ready:
+        raise HTTPException(
+            503,
+            "Hard delete is unavailable until every api_logs writer has been "
+            "upgraded to the erasure-fence protocol and rollout readiness is enabled.",
+        )
 
     if not payload.confirm:
         raise HTTPException(400, "confirm=True is required to hard-delete a user")
@@ -1069,11 +1095,43 @@ async def hard_delete_user(
     try:
         claim_token = await op_store.begin_hard_delete_user(user_id)
     except HardDeleteStateChanged:
-        raise HTTPException(
-            409,
-            "Account state changed before hard-delete could begin. "
-            "Retry if the account is still soft-deleted.",
-        ) from None
+        # A durable LogStore fence makes an incomplete post-fence deletion
+        # safely retryable. The operational store reuses the existing claim
+        # token in that case; it never lets a normal concurrent request
+        # overwrite ownership. A pre-fence pending claim remains rejected.
+        fence_exists = (
+            False if log_store is None else await log_store.account_has_erasure_fence(user_id)
+        )
+        if not fence_exists and payload.recover_stale_claim:
+            try:
+                claim_token = await op_store.begin_hard_delete_user(
+                    user_id,
+                    recover_stale_claim=True,
+                )
+            except HardDeleteStateChanged:
+                raise HTTPException(
+                    409,
+                    "Account state changed before hard-delete could begin. "
+                    "The claim is still active or has not reached the recovery grace period.",
+                ) from None
+        elif not fence_exists:
+            raise HTTPException(
+                409,
+                "Account state changed before hard-delete could begin. "
+                "Retry if the account is still soft-deleted.",
+            ) from None
+        else:
+            try:
+                claim_token = await op_store.begin_hard_delete_user(
+                    user_id,
+                    allow_existing_fence=True,
+                )
+            except HardDeleteStateChanged:
+                raise HTTPException(
+                    409,
+                    "Account state changed before hard-delete could begin. "
+                    "Retry if the account is still soft-deleted.",
+                ) from None
 
     # Purge LogStore-owned rows FIRST (api_logs + email_broadcast_recipients).
     # Lives in a separate transaction from the operational store. Running
@@ -1105,7 +1163,7 @@ async def hard_delete_user(
             reason=payload.reason,
             email=email,
         )
-    except Exception:
+    except BaseException:
         if claim_token and not fence_established:
             # A LogStore transaction normally rolls back its fence before
             # raising. Check explicitly so an ambiguous post-commit failure

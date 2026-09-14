@@ -187,14 +187,28 @@ class OperationalStore(ABC):
         """
 
     @abstractmethod
-    async def begin_hard_delete_user(self, user_id: str) -> str:
+    async def begin_hard_delete_user(
+        self,
+        user_id: str,
+        *,
+        allow_existing_fence: bool = False,
+        recover_stale_claim: bool = False,
+    ) -> str:
         """Atomically claim a soft-deleted user for hard deletion.
 
         The durable operational-store marker serializes hard-delete with
         resume even when the LogStore uses a different database. Repeating
-        the claim for an already-pending deleted user takes ownership with a
-        fresh opaque token so a retry after a process failure can finish the
-        purge without allowing an older attempt to release or complete it.
+        the claim for an already-pending deleted user is rejected so a
+        concurrent attempt cannot take ownership from the active operation.
+        Once the caller has independently verified that the LogStore fence is
+        already durable, ``allow_existing_fence`` permits a retry to reuse the
+        current token and finish an incomplete post-fence deletion without
+        stealing the live operation's ownership. A retry without that proof
+        may begin only after a failed pre-fence attempt releases its claim.
+        ``recover_stale_claim`` is an explicit operator takeover for a claim
+        left by a process that exited before the fence transaction. It requires
+        the claim to be older than the implementation's recovery grace period;
+        reclaimed claims remain pending if the takeover fails before fencing.
         The returned token must be supplied to release or finish the claim.
         """
 

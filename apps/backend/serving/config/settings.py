@@ -83,6 +83,11 @@ class Settings(BaseSettings):
     # stable value; if unset, API_KEY_SECRET is used as a fallback (with a
     # startup warning) so single-secret deployments still get fence coverage.
     erasure_fence_secret: str = ""
+    # Keep hard-delete disabled until every api_logs writer in the deployment
+    # participates in the fence protocol. This is intentionally opt-in for
+    # the release that introduces the application-level fence: an older worker
+    # can still insert directly and bypass an advisory-lock convention.
+    erasure_fence_protocol_ready: bool = False
 
     # JWT (required in production)
     jwt_secret_key: str = ""
