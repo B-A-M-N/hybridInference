@@ -2811,6 +2811,11 @@ class RouteWiseRouter:
                             endpoint_failure_hook=self._prefill_load.forget_endpoint,
                             hedge_checkpoints_sec=hedge_plan.checkpoints_sec,
                             checkpoint_backup_selector=_select_checkpoint_backup_for_request,
+                            backup_dispatch_hook=lambda backup: (
+                                self._reserve_prefix_generation_for_dispatch(
+                                    str(trace.request_id), endpoint_id_for_adapter(backup)
+                                )
+                            ),
                         )
                     if self.prefix_cache.enabled:
                         self._stash_prefix_for_commit(
@@ -2872,11 +2877,13 @@ class RouteWiseRouter:
         prefix_context: tuple[tuple[Any, ...], dict[str, Any]] | None,
         request_id: str | None,
     ) -> None:
-        """Stash request blocks and eligible-candidate scopes for the warm on success.
+        """Stash request blocks and eligible-candidate scopes for a later dispatch.
 
         The scopes were collected by :meth:`_apply_prefix_cache_cost_adjustment`
         while pricing candidates, so only providers the cost estimate applied to
-        (direct, cache-priced, non-rotating) are present. The commit
+        (direct, cache-priced, non-rotating) are present. Generation ownership is
+        added later by :meth:`_reserve_prefix_generation_for_dispatch` for each
+        endpoint that actually starts a dispatch. The commit
         (:meth:`_commit_prefix_cache_observation`) looks the winning endpoint up by
         id, so a winner without a scope here -- e.g. a rotating-key or no-delta
         provider -- is simply not warmed.
@@ -2893,17 +2900,32 @@ class RouteWiseRouter:
         stash_key = str(request_id or "")
         if not stash_key:
             return
-        generations = self.prefix_cache.reserve_generations(scopes.values())
         self.pending_prefix_cache.put(
             stash_key,
             blocks,
             scopes,
-            generations={
-                endpoint_id: generations[scope]
-                for endpoint_id, scope in scopes.items()
-                if scope in generations
-            },
+            merge=True,
         )
+
+    def _reserve_prefix_generation_for_dispatch(
+        self,
+        request_id: str | None,
+        endpoint_id: str | None,
+    ) -> None:
+        """Reserve prefix ownership only after a concrete endpoint dispatch starts."""
+        if not self.prefix_cache.enabled or not request_id or not endpoint_id:
+            return
+        request_key = str(request_id)
+        endpoint_key = str(endpoint_id)
+        scope = self.pending_prefix_cache.scope_for(request_key, endpoint_key)
+        if scope is None:
+            return
+        if self.pending_prefix_cache.generation_for(request_key, endpoint_key) is not None:
+            return
+        generations = self.prefix_cache.reserve_generations([scope])
+        generation = generations.get(scope)
+        if generation is not None:
+            self.pending_prefix_cache.set_generation(request_key, endpoint_key, generation)
 
     def _commit_prefix_cache_observation(self, obs: RoutingObservation) -> None:
         """On a selected observation, update prefix memory and cache evidence.
@@ -3254,6 +3276,9 @@ class RouteWiseRouter:
 
         try:
             endpoint_id = endpoint_id_for_adapter(adapter)
+            self._reserve_prefix_generation_for_dispatch(decision.trace.request_id, endpoint_id)
+            # No req_ctx.UPSTREAM_PRIORITY here, deliberately: see the note on
+            # _execute_stream_adapter.
             if lease is None and self.config.prefill_load_routing_enabled:
                 # Use the prefill tracker's whole-request estimator to capture
                 # tools, response_format, tool_calls, etc. — not just message content.
@@ -3322,6 +3347,21 @@ class RouteWiseRouter:
 
         try:
             endpoint_id = endpoint_id_for_adapter(adapter)
+            self._reserve_prefix_generation_for_dispatch(decision.trace.request_id, endpoint_id)
+            # Deliberately no req_ctx.UPSTREAM_PRIORITY, in either execution
+            # path. A priority ranks a request by the *un-cached* prefill it
+            # imposes, and that discount comes from the per-caller prompt-size
+            # memory in FixedRouter's PrefillLoadTracker -- which this router
+            # neither owns nor feeds, because #1267 wired prefill accounting
+            # into FixedRouter only. Publishing the raw prompt size instead
+            # would stamp every warm long-context continuation as an elephant
+            # and have the upstream schedule it last and preempt it: worse than
+            # publishing nothing, which simply leaves an sglang backend using
+            # its own default priority for these models, exactly as before.
+            #
+            # So `priority_scheduling: true` is inert for a model on
+            # `router: routewise`. Giving RouteWise its own prefill accounting
+            # is what would fix it, and that is a larger change than this.
             # A caller that supplied the outer stream lease has already paid the
             # whole-request estimation cost. Only the fallback path estimates and
             # acquires here (for direct/internal callers without that lease).
