@@ -16,7 +16,14 @@ from typing import TYPE_CHECKING, Any, Literal
 from serving import grants, quota
 from serving.config.settings import ROLE_RANK, VALID_ROLES
 from serving.exceptions import DuplicateAPIKeyError, HardDeleteStateChanged
-from serving.storage.base import OperationalStore, ProviderDefinitionRow, ProviderKeyRow, Row
+from serving.storage.base import (
+    HardDeleteClaim,
+    HardDeleteClaimProvenance,
+    OperationalStore,
+    ProviderDefinitionRow,
+    ProviderKeyRow,
+    Row,
+)
 from serving.storage.log_schema import (
     SchemaLockUnavailable,
     apply_column_migrations,
@@ -54,6 +61,28 @@ class RequiredOperationalSchemaUnavailable(SchemaLockUnavailable):
 # The endpoint requires an explicit operator opt-in as well, and this grace
 # period prevents an ordinary retry from racing a slow but healthy worker.
 _HARD_DELETE_CLAIM_RECOVERY_GRACE = timedelta(hours=1)
+
+
+async def _lock_user_for_mutation(
+    conn: Any,
+    user_id: str,
+    *,
+    allowed_statuses: set[str] | None = None,
+) -> Row:
+    """Lock and validate a concrete user before mutating user-owned state."""
+    row = await conn.fetchrow(
+        "SELECT status, hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
+        user_id,
+    )
+    if row is None:
+        raise HardDeleteStateChanged(f"Account {user_id} no longer exists.")
+    if row["hard_delete_pending"]:
+        raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
+    if allowed_statuses is not None and row["status"] not in allowed_statuses:
+        raise HardDeleteStateChanged(
+            f"Account {user_id} cannot be mutated from status '{row['status']}'."
+        )
+    return dict(row)
 
 
 def _parse_command_tag_count(command_tag: str) -> int:
@@ -1022,19 +1051,7 @@ class PostgresOperationalStore(OperationalStore):
             params.append(val)
         sql = f"UPDATE users SET {', '.join(set_parts)} WHERE id = $1"
         async with self._pool.acquire() as conn, conn.transaction():
-            if "status" in fields:
-                # The route's preliminary read can race with a hard-delete
-                # claim. Lock and re-check the claim in the same transaction
-                # as the status update so no activation path can invalidate
-                # an in-flight erasure operation.
-                row = await conn.fetchrow(
-                    "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
-                    user_id,
-                )
-                if row is not None and row["hard_delete_pending"]:
-                    raise HardDeleteStateChanged(
-                        f"Account {user_id} has a hard-delete in progress."
-                    )
+            await _lock_user_for_mutation(conn, user_id)
             await conn.execute(sql, *params)
 
     async def update_user_last_login(self, user_id: str) -> None:
@@ -1056,6 +1073,11 @@ class PostgresOperationalStore(OperationalStore):
         All mutations and the audit-log insert are atomic (single transaction).
         """
         async with self._pool.acquire() as conn, conn.transaction():
+            await _lock_user_for_mutation(
+                conn,
+                user_id,
+                allowed_statuses={"active", "suspended"},
+            )
             await conn.execute("UPDATE users SET status = 'deleted' WHERE id = $1", user_id)
             await conn.execute(
                 "UPDATE api_keys SET status = 'revoked' "
@@ -1105,7 +1127,10 @@ class PostgresOperationalStore(OperationalStore):
                 )
             if row["hard_delete_pending"]:
                 if allow_existing_fence and row["hard_delete_claim_token"]:
-                    return row["hard_delete_claim_token"]
+                    return HardDeleteClaim(
+                        token=row["hard_delete_claim_token"],
+                        provenance=HardDeleteClaimProvenance.REUSED,
+                    )
                 if recover_stale_claim:
                     stale = await conn.fetchval(
                         "SELECT $1::TIMESTAMPTZ IS NOT NULL "
@@ -1122,7 +1147,10 @@ class PostgresOperationalStore(OperationalStore):
                             user_id,
                             claim_token,
                         )
-                        return claim_token
+                        return HardDeleteClaim(
+                            token=claim_token,
+                            provenance=HardDeleteClaimProvenance.RECOVERED,
+                        )
                 raise HardDeleteStateChanged(
                     f"Account {user_id} already has a hard-delete in progress or its "
                     "claim is not yet eligible for recovery."
@@ -1136,7 +1164,10 @@ class PostgresOperationalStore(OperationalStore):
                 user_id,
                 claim_token,
             )
-        return claim_token
+        return HardDeleteClaim(
+            token=claim_token,
+            provenance=HardDeleteClaimProvenance.NEW,
+        )
 
     async def release_hard_delete_user_claim(self, user_id: str, claim_token: str) -> None:
         """Release a still-unfenced hard-delete claim for a deleted user."""
@@ -1181,12 +1212,7 @@ class PostgresOperationalStore(OperationalStore):
         """
 
         async with self._pool.acquire() as conn, conn.transaction():
-            row = await conn.fetchrow(
-                "SELECT status, hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
-                user_id,
-            )
-            if row is not None and row["hard_delete_pending"]:
-                raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
+            await _lock_user_for_mutation(conn, user_id, allowed_statuses={"deleted"})
             await conn.execute("UPDATE users SET status = 'active' WHERE id = $1", user_id)
             await conn.execute(
                 "INSERT INTO admin_audit_log "
@@ -1761,15 +1787,7 @@ class PostgresOperationalStore(OperationalStore):
     ) -> None:
         """Set status='active', record reviewer and note."""
         async with self._pool.acquire() as conn, conn.transaction():
-            # The route's preliminary status check can race with a hard-delete
-            # claim. Lock the row and re-check the durable claim before any
-            # approval path can activate an account under erasure.
-            row = await conn.fetchrow(
-                "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
-                user_id,
-            )
-            if row is not None and row["hard_delete_pending"]:
-                raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
+            await _lock_user_for_mutation(conn, user_id)
             await conn.execute(
                 "UPDATE users SET status = 'active', approval_note = $1, "
                 "reviewed_at = NOW(), reviewed_by = $2 WHERE id = $3",
@@ -1787,16 +1805,7 @@ class PostgresOperationalStore(OperationalStore):
     ) -> None:
         """Set status='rejected', record reviewer and reason."""
         async with self._pool.acquire() as conn, conn.transaction():
-            # The route's preliminary status read can race with a hard-delete
-            # claim. Lock and re-check the durable claim in the same
-            # transaction as the status update, just like approval and the
-            # generic status-update path.
-            row = await conn.fetchrow(
-                "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
-                user_id,
-            )
-            if row is not None and row["hard_delete_pending"]:
-                raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
+            await _lock_user_for_mutation(conn, user_id)
             await conn.execute(
                 "UPDATE users SET status = 'rejected', approval_note = $1, "
                 "reviewed_at = NOW(), reviewed_by = $2 WHERE id = $3",
@@ -1935,7 +1944,8 @@ class PostgresOperationalStore(OperationalStore):
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
 
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            await _lock_user_for_mutation(conn, user_id)
             try:
                 row = await conn.fetchrow(
                     "INSERT INTO api_keys "
@@ -2077,12 +2087,14 @@ class PostgresOperationalStore(OperationalStore):
         sql = (
             f"UPDATE api_keys SET {', '.join(set_parts)} WHERE user_id = $1 AND status <> 'revoked'"
         )
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            await _lock_user_for_mutation(conn, user_id)
             await conn.execute(sql, *params)
 
     async def revoke_key(self, user_id: str, *, hard_delete: bool = False) -> None:
         """Soft-revoke (status='revoked') or hard-delete the key."""
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            await _lock_user_for_mutation(conn, user_id)
             if hard_delete:
                 await conn.execute("DELETE FROM api_keys WHERE user_id = $1", user_id)
             else:
@@ -2105,6 +2117,7 @@ class PostgresOperationalStore(OperationalStore):
         constraint (and resurrect revoked credentials).
         """
         async with self._pool.acquire() as conn, conn.transaction():
+            await _lock_user_for_mutation(conn, user_id)
             old_row = await conn.fetchrow(
                 "SELECT key_prefix FROM api_keys WHERE user_id = $1 AND status = 'active'",
                 user_id,
@@ -2518,8 +2531,10 @@ class PostgresOperationalStore(OperationalStore):
         details: dict[str, Any] | None = None,
         success: bool = True,
     ) -> None:
-        """Insert a row into admin_audit_log."""
-        async with self._pool.acquire() as conn:
+        """Insert an audit row, validating concrete targets transactionally."""
+        async with self._pool.acquire() as conn, conn.transaction():
+            if target_user_id is not None:
+                await _lock_user_for_mutation(conn, target_user_id)
             await conn.execute(
                 "INSERT INTO admin_audit_log "
                 "(admin_ip, action, target_user_id, details, success) "
@@ -2586,7 +2601,8 @@ class PostgresOperationalStore(OperationalStore):
         preferences: dict[str, Any],
     ) -> None:
         """Atomically replace the full preferences JSONB column."""
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            await _lock_user_for_mutation(conn, user_id)
             await conn.execute(
                 "UPDATE users SET preferences = $1::jsonb WHERE id = $2",
                 json.dumps(preferences),

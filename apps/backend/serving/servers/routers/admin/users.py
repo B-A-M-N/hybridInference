@@ -64,6 +64,7 @@ from serving.servers.deps import (
 )
 from serving.servers.routers.admin._common import _serialize_for_audit
 from serving.servers.routers.admin.providers import _enumerate_routable_providers
+from serving.storage.base import HardDeleteClaim, HardDeleteClaimProvenance
 from serving.utils.request_ip import get_client_ip
 
 router = APIRouter(prefix="/admin")
@@ -802,7 +803,13 @@ async def update_user(
 
     # Post-write side-effects that depend on the new status
     if new_status == "suspended":
-        await op_store.revoke_key(user_id, hard_delete=False)
+        try:
+            await op_store.revoke_key(user_id, hard_delete=False)
+        except HardDeleteStateChanged:
+            raise HTTPException(
+                409,
+                "This account has a hard-delete in progress or no longer exists.",
+            ) from None
 
     # Update key-level fields
     key_fields = {
@@ -815,7 +822,13 @@ async def update_user(
         if not has_key:
             raise HTTPException(409, "User has no active API key to update")
 
-        await op_store.update_key(user_id, **key_fields)
+        try:
+            await op_store.update_key(user_id, **key_fields)
+        except HardDeleteStateChanged:
+            raise HTTPException(
+                409,
+                "This account has a hard-delete in progress or no longer exists.",
+            ) from None
         updated.extend(key_fields)
 
     if "disabled_models" in payload_dict:
@@ -833,17 +846,29 @@ async def update_user(
         preferences[DISABLED_MODELS_PREFERENCE_KEY] = [
             model_id for model_id in normalized_disabled_models if model_id in known_model_ids
         ]
-        await op_store.update_user_preferences(user_id, preferences)
+        try:
+            await op_store.update_user_preferences(user_id, preferences)
+        except HardDeleteStateChanged:
+            raise HTTPException(
+                409,
+                "This account has a hard-delete in progress or no longer exists.",
+            ) from None
         payload_dict["disabled_models"] = preferences[DISABLED_MODELS_PREFERENCE_KEY]
         updated.append("disabled_models")
 
-    await log_admin_action(
-        op_store,
-        admin_id,
-        "update_user",
-        user_id,
-        _serialize_for_audit({"updated_fields": updated, "values": payload_dict}),
-    )
+    try:
+        await log_admin_action(
+            op_store,
+            admin_id,
+            "update_user",
+            user_id,
+            _serialize_for_audit({"updated_fields": updated, "values": payload_dict}),
+        )
+    except HardDeleteStateChanged:
+        raise HTTPException(
+            409,
+            "This account has a hard-delete in progress or no longer exists.",
+        ) from None
 
     return UpdateUserResponse(
         user_id=user_id,
@@ -936,13 +961,19 @@ async def delete_user(
 
     # Atomic: sets status='deleted', revokes keys, purges sessions/tokens,
     # and inserts audit log — all in a single transaction.
-    await op_store.delete_user(
-        user_id,
-        admin_ip=get_client_ip(request),
-        admin_id=admin_id,
-        reason=payload.reason,
-        email=user_row["email"],
-    )
+    try:
+        await op_store.delete_user(
+            user_id,
+            admin_ip=get_client_ip(request),
+            admin_id=admin_id,
+            reason=payload.reason,
+            email=user_row["email"],
+        )
+    except HardDeleteStateChanged:
+        raise HTTPException(
+            409,
+            "Account state changed before soft-delete could complete.",
+        ) from None
 
     return DeleteUserResponse(
         user_id=user_id,
@@ -1086,6 +1117,12 @@ async def hard_delete_user(
     if not payload.confirm:
         raise HTTPException(400, "confirm=True is required to hard-delete a user")
 
+    if log_store is None:
+        raise HTTPException(
+            503,
+            "Hard delete is unavailable until a LogStore can establish the erasure fence.",
+        )
+
     user_row = await op_store.get_user_by_id(user_id)
     if not user_row:
         raise HTTPException(404, f"User '{user_id}' not found")
@@ -1098,8 +1135,9 @@ async def hard_delete_user(
 
     email = user_row["email"]
 
+    claim: HardDeleteClaim | None = None
     try:
-        claim_token = await op_store.begin_hard_delete_user(user_id)
+        claim = await op_store.begin_hard_delete_user(user_id)
     except HardDeleteStateChanged:
         # A durable LogStore fence makes an incomplete post-fence deletion
         # safely retryable. The operational store reuses the existing claim
@@ -1110,7 +1148,7 @@ async def hard_delete_user(
         )
         if not fence_exists and payload.recover_stale_claim:
             try:
-                claim_token = await op_store.begin_hard_delete_user(
+                claim = await op_store.begin_hard_delete_user(
                     user_id,
                     recover_stale_claim=True,
                 )
@@ -1128,7 +1166,7 @@ async def hard_delete_user(
             ) from None
         else:
             try:
-                claim_token = await op_store.begin_hard_delete_user(
+                claim = await op_store.begin_hard_delete_user(
                     user_id,
                     allow_existing_fence=True,
                 )
@@ -1138,6 +1176,8 @@ async def hard_delete_user(
                     "Account state changed before hard-delete could begin. "
                     "Retry if the account is still soft-deleted.",
                 ) from None
+
+    assert claim is not None
 
     # Purge LogStore-owned rows FIRST (api_logs + email_broadcast_recipients).
     # Lives in a separate transaction from the operational store. Running
@@ -1151,9 +1191,8 @@ async def hard_delete_user(
     # hard-delete workflow — neither response_store nor op_store is touched.
     fence_established = False
     try:
-        if log_store is not None:
-            await log_store.hard_delete_user_data(user_id)
-            fence_established = True
+        await log_store.hard_delete_user_data(user_id)
+        fence_established = True
 
         # Purge stored Responses API rows (openai_responses).
         if response_store is not None:
@@ -1163,32 +1202,35 @@ async def hard_delete_user(
         # atomically.
         await op_store.hard_delete_user(
             user_id,
-            claim_token=claim_token,
+            claim_token=claim.token,
             admin_ip=get_client_ip(request),
             admin_id=admin_id,
             reason=payload.reason,
             email=email,
         )
     except BaseException:
-        if claim_token and not fence_established:
+        if (
+            claim is not None
+            and claim.provenance is HardDeleteClaimProvenance.NEW
+            and not fence_established
+        ):
             # A LogStore transaction normally rolls back its fence before
             # raising. Check explicitly so an ambiguous post-commit failure
             # cannot clear a claim that protects an already-erased account.
-            if log_store is not None:
-                try:
-                    fence_established = await log_store.account_has_erasure_fence(user_id)
-                except Exception:
-                    # A failed check is fail-closed: retain the claim rather
-                    # than risk allowing resume without knowing fence state.
-                    logger.exception(
-                        "Could not verify erasure fence after hard-delete failure for %s; "
-                        "retaining claim",
-                        user_id,
-                    )
-                    fence_established = True
+            try:
+                fence_established = await log_store.account_has_erasure_fence(user_id)
+            except Exception:
+                # A failed check is fail-closed: retain the claim rather
+                # than risk allowing resume without knowing fence state.
+                logger.exception(
+                    "Could not verify erasure fence after hard-delete failure for %s; "
+                    "retaining claim",
+                    user_id,
+                )
+                fence_established = True
             if not fence_established:
                 try:
-                    await op_store.release_hard_delete_user_claim(user_id, claim_token)
+                    await op_store.release_hard_delete_user_claim(user_id, claim.token)
                 except Exception:
                     # Keep the original failure. A retained claim is safe and
                     # the admin can retry once the operational store recovers.

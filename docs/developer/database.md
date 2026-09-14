@@ -37,7 +37,7 @@ the process environment.
 | `DB_USER` | `postgres` | Required by Compose. |
 | `DB_PASSWORD` | *(empty)* | Required by Compose. |
 | `DB_STORE_FULL_CONTENT` | `false` | Whether prompts and responses are stored verbatim. See [Request logging and privacy](#request-logging-and-privacy). |
-| `ERASURE_FENCE_SECRET` | *(empty; legacy fallback)* | Dedicated stable secret for erasure-fence tombstones. Provision it before the first upgraded worker starts and keep it unchanged after a fence is created. |
+| `ERASURE_FENCE_SECRET` | *(empty; legacy fallback)* | Dedicated stable secret for erasure-fence tombstones. Provision it before the first upgraded worker starts; the first accepted namespace is pinned before serving and a mismatch fails startup validation. |
 | `ERASURE_FENCE_PROTOCOL_READY` | `false` | Enables hard-delete only after every `api_logs` writer has been upgraded to use the erasure-fence protocol. |
 
 The bundled stack (`deploy/docker/docker-compose.yml`) runs `postgres:16`,
@@ -83,7 +83,11 @@ Before the first upgraded worker starts, provision `ERASURE_FENCE_SECRET` with a
 dedicated stable value and keep it available across restarts and replicas. The
 legacy `API_KEY_SECRET` fallback is retained for existing deployments only; using
 it for a new rollout couples ordinary API-key rotation to the permanent erasure
-tombstone namespace.
+tombstone namespace. If that fallback becomes the pinned namespace, changing
+`API_KEY_SECRET` causes startup/fence validation to fail; restore the original
+pinned value. Do not delete erasure tombstones or fingerprint metadata to work
+around the mismatch. Deliberate migration to a new namespace requires a
+separate migration procedure that preserves every existing fence.
 
 If you are contributing a column to `api_logs`, add it in `log_schema.py` only.
 That module exists because the DDL was once duplicated across two builders, they

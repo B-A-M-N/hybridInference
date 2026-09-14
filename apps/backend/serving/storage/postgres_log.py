@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from serving.analytics.automation_score import score_users_from_logs
 from serving.storage.base import LogStore, Row
 from serving.storage.log_schema import (
+    check_erasure_fence,
     ensure_api_logs_schema,
     establish_erasure_fence,
     fence_account_digest,
@@ -1250,13 +1251,9 @@ class PostgresLogStore(LogStore):
         return counts
 
     async def account_has_erasure_fence(self, user_id: str) -> bool:
-        """Return True if an erasure fence exists for *user_id*."""
+        """Return True after synchronizing with in-flight fence writers."""
         if not self.fence_secret:
             return False
         _fence_key = fence_account_digest(user_id, self.fence_secret)
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT 1 FROM erasure_fence WHERE account_digest = $1",
-                _fence_key,
-            )
-        return row is not None
+        async with self.pool.acquire() as conn, conn.transaction():
+            return await check_erasure_fence(conn, fence_keys=[_fence_key])

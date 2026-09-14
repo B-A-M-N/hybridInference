@@ -19,7 +19,14 @@ import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
-from .base import OperationalStore, ProviderDefinitionRow, ProviderKeyRow, Row
+from .base import (
+    HardDeleteClaim,
+    HardDeleteClaimProvenance,
+    OperationalStore,
+    ProviderDefinitionRow,
+    ProviderKeyRow,
+    Row,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -316,7 +323,7 @@ class CachedOperationalStore(OperationalStore):
         *,
         allow_existing_fence: bool = False,
         recover_stale_claim: bool = False,
-    ) -> str:
+    ) -> HardDeleteClaim:
         """Claim a hard-delete and invalidate caches.
 
         A caller may reuse an existing claim only after independently proving
@@ -330,14 +337,14 @@ class CachedOperationalStore(OperationalStore):
             )
         )
 
-        def _release_completed_claim(task: asyncio.Task[str]) -> None:
+        def _release_completed_claim(task: asyncio.Task[HardDeleteClaim]) -> None:
             if task.cancelled():
                 return
             try:
-                completed_token = task.result()
+                completed_claim = task.result()
             except BaseException:
                 return
-            cleanup_task = asyncio.create_task(self._release_claim_safely(user_id, completed_token))
+            cleanup_task = asyncio.create_task(self._release_claim_safely(user_id, completed_claim))
             self._background_cleanup_tasks.add(cleanup_task)
             cleanup_task.add_done_callback(self._background_cleanup_tasks.discard)
 
@@ -345,7 +352,7 @@ class CachedOperationalStore(OperationalStore):
             # Shield the durable claim from cancellation while we obtain its
             # token. If the caller is cancelled at this boundary, the done
             # callback releases the claim if the underlying transaction won.
-            claim_token = await asyncio.shield(claim_task)
+            claim = await asyncio.shield(claim_task)
         except BaseException:
             claim_task.add_done_callback(_release_completed_claim)
             raise
@@ -358,14 +365,16 @@ class CachedOperationalStore(OperationalStore):
             # The claim is committed before cache invalidation starts. Keep a
             # cancelled or failed cache operation from stranding a pre-fence
             # claim that the caller never received.
-            await self._release_claim_safely(user_id, claim_token)
+            await self._release_claim_safely(user_id, claim)
             raise
-        return claim_token
+        return claim
 
-    async def _release_claim_safely(self, user_id: str, claim_token: str) -> None:
+    async def _release_claim_safely(self, user_id: str, claim: HardDeleteClaim) -> None:
         """Release a claim after a cancelled/failed claim wrapper operation."""
+        if claim.provenance is not HardDeleteClaimProvenance.NEW:
+            return
         try:
-            await asyncio.shield(self._store.release_hard_delete_user_claim(user_id, claim_token))
+            await asyncio.shield(self._store.release_hard_delete_user_claim(user_id, claim.token))
         except BaseException:
             # Cleanup must not replace the original cancellation or cache
             # failure. A retained claim remains fail-closed and is recoverable

@@ -15,6 +15,7 @@ from fastapi import Depends, Header, HTTPException, Request
 from serving import grants, quota
 from serving.config.settings import get_settings
 from serving.config.site_identity import get_site_identity
+from serving.exceptions import HardDeleteStateChanged
 from serving.grant_auth import (
     AgentModelAuthError,
     AgentQuotaExceeded,
@@ -922,7 +923,18 @@ async def log_admin_action(
 
     import json
 
-    async with db_logger.pool.acquire() as conn:
+    async with db_logger.pool.acquire() as conn, conn.transaction():
+        if target_user_id is not None:
+            row = await conn.fetchrow(
+                "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
+                target_user_id,
+            )
+            if row is None:
+                raise HardDeleteStateChanged(f"Account {target_user_id} no longer exists.")
+            if row.get("hard_delete_pending", False):
+                raise HardDeleteStateChanged(
+                    f"Account {target_user_id} has a hard-delete in progress."
+                )
         await conn.execute(
             """
             INSERT INTO admin_audit_log (admin_ip, action, target_user_id, details, success)

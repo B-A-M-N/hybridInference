@@ -604,11 +604,13 @@ def fence_account_digest(user_id: str, secret: str) -> str:
         user_id: the account identifier being erased.
         secret: a dedicated, stable erasure-fence secret (preferably
             :data`ERASURE_FENCE_SETTING`). Must be stable for the lifetime
-            of any fence row — changing it silently invalidates existing
-            fences, which would let a previously-erased account's logs be
-            written again. Do NOT use a routinely-rotatable secret like
-            API_KEY_SECRET unless you accept that rotation temporarily
-            weakens the fence.
+            of any fence row — changing it fails startup fingerprint
+            validation rather than safely rotating the existing namespace. Do
+            NOT use a routinely-rotatable secret like
+            API_KEY_SECRET unless you treat it as a stable erasure-fence secret.
+            Once the fallback namespace is pinned, changing API_KEY_SECRET
+            fails startup fingerprint validation; it does not safely rotate
+            the existing fence namespace.
     """
     import hmac as _hmac
 
@@ -791,8 +793,9 @@ def resolve_fence_secret(secret: str | None) -> str:
         _log.warning(
             "Erasure fence: using API_KEY_SECRET as the fence derivation "
             "secret (set erasure_fence_secret to a dedicated, stable secret "
-            "to avoid this). Rotating API_KEY_SECRET will temporarily weaken "
-            "existing fences.",
+            "to avoid this). Once pinned, changing API_KEY_SECRET causes "
+            "startup fingerprint validation to fail; restore the pinned value "
+            "instead of deleting fence data.",
         )
         return fallback_secret
     raise ErasureFenceUnavailable(

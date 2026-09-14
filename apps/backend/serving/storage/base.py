@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
@@ -53,6 +54,27 @@ class ProviderDefinitionRow:
 
 Row = dict[str, Any]
 """Generic row type returned by store methods (column-name → value)."""
+
+
+class HardDeleteClaimProvenance(str, Enum):
+    """How a hard-delete claim was obtained by the current operation."""
+
+    NEW = "new"
+    REUSED = "reused"
+    RECOVERED = "recovered"
+
+
+@dataclass(frozen=True)
+class HardDeleteClaim:
+    """Durable claim token plus its ownership provenance."""
+
+    token: str
+    provenance: HardDeleteClaimProvenance
+
+    @property
+    def newly_acquired(self) -> bool:
+        """Whether this request owns a fresh, releasable pre-fence claim."""
+        return self.provenance is HardDeleteClaimProvenance.NEW
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +215,7 @@ class OperationalStore(ABC):
         *,
         allow_existing_fence: bool = False,
         recover_stale_claim: bool = False,
-    ) -> str:
+    ) -> HardDeleteClaim:
         """Atomically claim a soft-deleted user for hard deletion.
 
         The durable operational-store marker serializes hard-delete with
@@ -209,7 +231,9 @@ class OperationalStore(ABC):
         left by a process that exited before the fence transaction. It requires
         the claim to be older than the implementation's recovery grace period;
         reclaimed claims remain pending if the takeover fails before fencing.
-        The returned token must be supplied to release or finish the claim.
+        The returned claim token must be supplied to release or finish the
+        claim. Its provenance tells callers whether this request may release
+        it after a pre-fence failure.
         """
 
     @abstractmethod

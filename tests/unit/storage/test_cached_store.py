@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from serving.storage.base import HardDeleteClaim, HardDeleteClaimProvenance
 from serving.storage.cache import (
     _AUTH_CONTEXT_TTL,
     CachedOperationalStore,
@@ -48,7 +49,9 @@ def inner_store() -> MagicMock:
     store.delete_user = AsyncMock()
     store.approve_user = AsyncMock()
     store.reject_user = AsyncMock()
-    store.begin_hard_delete_user = AsyncMock(return_value="claim-token")
+    store.begin_hard_delete_user = AsyncMock(
+        return_value=HardDeleteClaim("claim-token", HardDeleteClaimProvenance.NEW)
+    )
     store.release_hard_delete_user_claim = AsyncMock()
     store.update_key = AsyncMock()
     store.revoke_key = AsyncMock()
@@ -398,6 +401,34 @@ class TestWriteInvalidation:
             await cached.begin_hard_delete_user("u1")
 
         inner_store.release_hard_delete_user_claim.assert_awaited_once_with("u1", "claim-token")
+
+    async def test_begin_hard_delete_does_not_release_reused_claim_on_cache_failure(
+        self, cached, inner_store, cache
+    ):
+        """A reused post-fence claim remains owned by the durable deletion."""
+        inner_store.begin_hard_delete_user.return_value = HardDeleteClaim(
+            "claim-token", HardDeleteClaimProvenance.REUSED
+        )
+        cache.delete = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await cached.begin_hard_delete_user("u1", allow_existing_fence=True)
+
+        inner_store.release_hard_delete_user_claim.assert_not_awaited()
+
+    async def test_begin_hard_delete_does_not_release_recovered_claim_on_cache_failure(
+        self, cached, inner_store, cache
+    ):
+        """A recovered claim remains sticky when cache invalidation is cancelled."""
+        inner_store.begin_hard_delete_user.return_value = HardDeleteClaim(
+            "claim-token", HardDeleteClaimProvenance.RECOVERED
+        )
+        cache.delete = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await cached.begin_hard_delete_user("u1", recover_stale_claim=True)
+
+        inner_store.release_hard_delete_user_claim.assert_not_awaited()
 
     async def test_mark_email_verified_invalidates_user_and_auth(self, cached, inner_store):
         # Populate user and auth caches with the pre-verification (stale) rows.
