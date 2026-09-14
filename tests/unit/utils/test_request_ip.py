@@ -17,6 +17,7 @@ from starlette.datastructures import Headers
 
 from serving.config.settings import Settings
 from serving.utils.request_ip import (
+    MAX_FORWARDED_HOPS,
     ClientIpInfo,
     _is_in_networks,
     _is_reportable_ip,
@@ -475,13 +476,13 @@ def test_duplicate_singleton_forwarding_header_is_rejected(header):
 
 
 def test_forwarded_hop_limit_fails_closed():
-    """A pathological forwarding chain cannot make parsing unbounded."""
+    """A pathological trusted-proxy chain cannot make traversal unbounded."""
     with _settings_env(
         proxy_headers=True,
         cf_headers=False,
-        proxy_nets=_networks("172.16.0.0/12"),
+        proxy_nets=_networks("10.0.0.0/8", "172.16.0.0/12"),
     ):
-        chain = ", ".join(["8.8.8.8"] * 33)
+        chain = ", ".join(["10.0.0.1"] * (MAX_FORWARDED_HOPS + 1))
         info = get_client_ip_info(
             _request(
                 {"x-forwarded-for": chain},
@@ -490,6 +491,26 @@ def test_forwarded_hop_limit_fails_closed():
         )
         assert info.client_ip == "unknown"
         assert info.source == "x-forwarded-for"
+
+
+def test_forwarded_hop_limit_ignores_attacker_history_left_of_boundary():
+    """Untrusted XFF history cannot invalidate a valid right-side client hop."""
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=False,
+        proxy_nets=_networks("172.16.0.0/12"),
+    ):
+        attacker_history = ["9.9.9.9"] * (MAX_FORWARDED_HOPS + 1)
+        chain = ", ".join([*attacker_history, "8.8.8.8", "172.19.0.1"])
+        info = get_client_ip_info(
+            _request(
+                {"x-forwarded-for": chain},
+                peer_ip="172.19.0.1",
+            )
+        )
+        assert info.client_ip == "8.8.8.8"
+        assert info.source == "x-forwarded-for"
+        assert info.resolved is True
 
 
 # ---------------------------------------------------------------------------

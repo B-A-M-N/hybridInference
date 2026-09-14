@@ -519,9 +519,11 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
         #     NEVER continue farther left
         if xff_present:
             hops = _parse_forwarded_chain(x_forwarded_for)
-            if len(hops) > MAX_FORWARDED_HOPS:
-                return _info("unknown", "x-forwarded-for", False)
+            inspected = 0
             for hop in reversed(hops):
+                inspected += 1
+                if inspected > MAX_FORWARDED_HOPS:
+                    return _info("unknown", "x-forwarded-for", False)
                 if _is_in_networks(hop, proxy_networks):
                     continue
                 # First untrusted hop: provenance terminates here.
