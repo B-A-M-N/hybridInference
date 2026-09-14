@@ -2641,9 +2641,18 @@ class PostgresOperationalStore(OperationalStore):
                             f"Account {target_user_id} has a hard-delete in progress."
                         )
                 else:
-                    if target_missing_identity_fenced:
-                        audit_target_user_id = None
-                        audit_details = {"target_user_id_redacted": "erasure_fence"}
+                    # The row lookup is the transaction's authoritative view.
+                    # A pre-transaction fence check can become stale while a
+                    # hard delete commits, so every missing identity is
+                    # redacted regardless of that earlier answer.
+                    audit_target_user_id = None
+                    audit_details = {
+                        "target_user_id_redacted": (
+                            "erasure_fence"
+                            if target_missing_identity_fenced
+                            else "missing_identity"
+                        )
+                    }
             await conn.execute(
                 "INSERT INTO admin_audit_log "
                 "(admin_ip, action, target_user_id, details, success) "

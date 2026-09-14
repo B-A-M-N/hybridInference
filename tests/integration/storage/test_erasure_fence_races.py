@@ -877,6 +877,19 @@ async def test_stale_soft_delete_after_hard_delete_cannot_recreate_identity(fenc
         target_user_id=_OWNER,
         target_missing_identity_fenced=True,
     )
+    await op_store.log_admin_action(
+        admin_ip="127.0.0.1",
+        action="stale_mutation_unverified",
+        target_user_id=_OWNER,
+        details={"reason": "stale pre-transaction fence result"},
+        target_missing_identity_fenced=False,
+    )
+    await op_store.log_admin_action(
+        admin_ip="127.0.0.1",
+        action="stale_mutation_unknown",
+        target_user_id=_OWNER,
+        target_missing_identity_fenced=None,
+    )
 
     async with pool.acquire() as conn:
         user_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE id = $1", _OWNER)
@@ -896,11 +909,21 @@ async def test_stale_soft_delete_after_hard_delete_cannot_recreate_identity(fenc
             "SELECT COUNT(*) FROM admin_audit_log WHERE target_user_id = $1",
             _OWNER,
         )
+        redacted = await conn.fetch(
+            "SELECT action, target_user_id, details->>'target_user_id_redacted' AS redaction "
+            "FROM admin_audit_log WHERE action IN "
+            "('stale_mutation_unverified', 'stale_mutation_unknown') "
+            "ORDER BY action"
+        )
     assert user_count == 0
     assert key_count == 0
     assert session_count == 0
     assert token_count == 0
     assert audit_after == audit_before
+    assert [(row["action"], row["target_user_id"], row["redaction"]) for row in redacted] == [
+        ("stale_mutation_unknown", None, "missing_identity"),
+        ("stale_mutation_unverified", None, "missing_identity"),
+    ]
 
 
 async def test_stale_admin_update_after_hard_delete_cannot_recreate_identity(fence_store):
