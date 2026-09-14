@@ -1003,9 +1003,6 @@ async def chat_completions(
         )
         else None
     )
-    dispatch_admission_callback_enabled = bool(
-        routing_options is not None and routing_options.on_dispatch_admitted is not None
-    )
 
     # Thread the external request id into params so the router correlates its
     # routing metadata, prefix-cache stash, and observation under one id instead
@@ -1034,8 +1031,11 @@ async def chat_completions(
             messages,
             **router_params,
         )
-        if not dispatch_admission_callback_enabled:
-            adapter_chunks = _record_stream_admission(adapter_chunks)
+        # Keep the fallback even for routers that accept typed options but do
+        # not invoke the optional admission callback. The recorder is
+        # idempotent, so built-in routers can call it early without causing a
+        # duplicate observation here.
+        adapter_chunks = _record_stream_admission(adapter_chunks)
 
         session = StreamSession(
             routing=routing,
@@ -1135,8 +1135,11 @@ async def chat_completions(
             messages,
             **router_params,
         )
-        if not dispatch_admission_callback_enabled:
-            _record_traffic_observation()
+        # Custom routers may accept ``routing_options`` while ignoring the
+        # optional admission callback. Record successful returns as a
+        # compatibility fallback; the recorder is idempotent when a built-in
+        # router already recorded at dispatch admission.
+        _record_traffic_observation()
         serializer_mode = resolve_mode(request.headers)
 
         # Apply serializer: strip _routing metadata and enforce reasoning_content

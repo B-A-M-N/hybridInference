@@ -40,6 +40,47 @@ class _CompletionsTestAdapter(BaseAdapter):
             yield ""
 
 
+class _StreamingCompletionsTestAdapter(_CompletionsTestAdapter):
+    async def stream_chat_completion(
+        self, messages: list[dict[str, Any]], **params: Any
+    ) -> AsyncGenerator[str, None]:
+        yield self.format_stream_chunk(content="ok", model=self.config.id)
+
+
+class _IgnoringAdmissionRouter(RouteExecutor):
+    """Typed-options router that intentionally ignores admission callbacks."""
+
+    async def chat_completion(
+        self,
+        model_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        routing_options: Any = None,
+        **params: Any,
+    ) -> dict[str, Any]:
+        return await super().chat_completion(
+            model_id,
+            messages,
+            routing_options=None,
+            **params,
+        )
+
+    def stream_chat_completion(
+        self,
+        model_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        routing_options: Any = None,
+        **params: Any,
+    ) -> Any:
+        return super().stream_chat_completion(
+            model_id,
+            messages,
+            routing_options=None,
+            **params,
+        )
+
+
 @pytest_asyncio.fixture
 async def traffic_completions_app(mock_db_logger, mock_log_store, monkeypatch):
     """Self-contained app fixture; sibling test-module fixtures are not global."""
@@ -520,6 +561,57 @@ async def test_completions_admitted_upstream_failure_records_traffic_history(
 
     assert response.status_code == 500
     identity_key = state._identity_key("user", "traffic-test-user")
+    assert state._identities[identity_key].request_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_completions_fallback_records_when_typed_router_ignores_callback(
+    traffic_completions_client,
+    traffic_completions_app,
+    stream,
+):
+    """Successful custom routers still record traffic without callback support."""
+    from serving.servers.deps import get_router
+    from serving.servers.routers.completions import verify_api_key
+
+    async def fake_verify_api_key():
+        return {
+            "authenticated": True,
+            "user_id": "traffic-test-user",
+            "role": "internal",
+            "is_admin": True,
+        }
+
+    config = ModelConfig(
+        id="gpt-4",
+        name="gpt-4",
+        provider="test",
+        base_url="http://test",
+        context_length=8192,
+        max_output_length=4096,
+        supported_params=["temperature", "top_p", "max_tokens", "stream"],
+    )
+    router = _IgnoringAdmissionRouter()
+    adapter_type = _StreamingCompletionsTestAdapter if stream else _CompletionsTestAdapter
+    router.register_route("gpt-4", [(adapter_type(config), 1.0)])
+    traffic_completions_app.dependency_overrides[verify_api_key] = fake_verify_api_key
+    traffic_completions_app.dependency_overrides[get_router] = lambda: router
+
+    response = await traffic_completions_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": stream,
+        },
+    )
+
+    assert response.status_code == 200
+    identity_key = get_traffic_observation_state()._identity_key(
+        "user", "traffic-test-user"
+    )
+    state = get_traffic_observation_state()
     assert state._identities[identity_key].request_count == 1
 
 
