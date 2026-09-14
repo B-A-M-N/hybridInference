@@ -63,6 +63,21 @@ def test_acquire_single_key_returns_that_key():
     assert lease.affinity_key == "user-A"
 
 
+def test_lease_context_neutral_cleanup_is_one_shot():
+    """Exceptional cleanup cannot later apply a second outcome to the lease."""
+    pool = KeyPool(keys=["only-key"], provider_label="test")
+    _, lease = pool.acquire(None)
+
+    with pytest.raises(RuntimeError, match="boom"), lease:
+        raise RuntimeError("boom")
+
+    # The context manager already finalized the lease neutrally. A late status
+    # must not count a second release or mute the key.
+    assert lease.release(status_code=429) is ReleaseOutcome.PROPAGATE
+    assert pool._keys[0].cooldown_until == 0.0
+    assert pool._keys[0].consecutive_failures == 0
+
+
 def test_new_users_all_get_the_first_key():
     """Sequential selection: every new user lands on k0 while it is usable."""
     pool = KeyPool(keys=["k0", "k1", "k2"], provider_label="test")

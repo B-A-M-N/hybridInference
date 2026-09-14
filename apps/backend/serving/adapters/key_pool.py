@@ -56,9 +56,9 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from serving.config.settings import ROLE_RANK, has_role
 
@@ -218,12 +218,16 @@ def _role_may_use(role: str | None, state: _KeyState) -> bool:
 
 @dataclass
 class Lease:
-    """Round-trip token returned by ``KeyPool.acquire`` and consumed by ``release``.
+    """One-shot lifecycle token returned by ``KeyPool.acquire``.
 
     ``role`` is the caller's role at acquire time (None for an unrestricted
     internal caller). ``release`` replays it so the sole-remaining-key backoff is
     judged against the keys *this* caller could have rotated to — a key reserved
     for a higher tier is not a fallback for a free-tier request.
+
+    A lease can be used as a context manager for neutral cleanup. Explicit
+    ``release`` calls finalize it with the observed outcome; a later release is
+    a no-op, which makes a ``finally`` cleanup safe on every exception path.
     """
 
     key_index: int
@@ -232,6 +236,21 @@ class Lease:
     # Topology generation at acquire time. Releases from before a key add,
     # removal, or re-tier must not repopulate state that the change cleared.
     topology_generation: int = 0
+    _pool: KeyPool | None = field(default=None, repr=False, compare=False)
+    _released: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def release(self, *, status_code: int | None, tried: Collection[int] = ()) -> ReleaseOutcome:
+        """Finalize this lease once, returning the pool's release decision."""
+        if self._pool is None:
+            raise RuntimeError("Lease is not attached to a KeyPool")
+        return self._pool.release(self, status_code=status_code, tried=tried)
+
+    def __enter__(self) -> Lease:
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc_value: Any, _traceback: Any) -> bool:
+        self.release(status_code=None)
+        return False
 
 
 class KeyPool:
@@ -540,7 +559,7 @@ class KeyPool:
                     idx = existing.key_index
                     self._keys[idx].request_count += 1
                     return self._keys[idx].key, Lease(
-                        idx, affinity_key, role, self._topology_generation
+                        idx, affinity_key, role, self._topology_generation, self
                     )
                 # Drop stale or unusable affinity; we'll re-pick below.
                 del self._affinity[affinity_key]
@@ -581,7 +600,9 @@ class KeyPool:
                     role=role,
                 )
             self._keys[idx].request_count += 1
-            return self._keys[idx].key, Lease(idx, affinity_key, role, self._topology_generation)
+            return self._keys[idx].key, Lease(
+                idx, affinity_key, role, self._topology_generation, self
+            )
 
     def _pick_first_available_locked(
         self, now: float, role: str | None = None, exclude: Collection[int] = ()
@@ -680,6 +701,11 @@ class KeyPool:
             A ``ReleaseOutcome``: ``ROTATED`` or ``MUTED`` if the caller should
             try another key, ``PROPAGATE`` if it should surface the error.
         """
+        with self._lock:
+            if lease._released:
+                return ReleaseOutcome.PROPAGATE
+            lease._released = True
+
         if status_code is None:
             if lease.affinity_key is None:
                 with self._lock:

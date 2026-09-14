@@ -151,7 +151,7 @@ The correct approach depends on the operation:
 
 - **Rate limiting**: When provenance is resolved, key on the client IP.
   When unresolved, never use the proxy IP: signup emits an
-  `unresolved_client_ip` warning and can fail closed with
+  `client_ip_resolution_unresolved` warning and can fail closed with
   `SIGNUP_REQUIRE_RESOLVED_CLIENT_IP=1`; otherwise signup and login use
   separate coarse global process-local budgets while retaining their
   per-email/per-request behavior. These budgets are traffic safeguards, not
@@ -206,9 +206,9 @@ Resolution walks the trust boundary correctly:
 Every request log carries `ip_source`, `ip_resolved`, and the two explicit
 header-authority flags. Aggregating those fields gives operators a durable
 resolution counter such as `client_ip_resolution_total{result,source}` without
-ever turning an unresolved peer into a client identity. Structured
-`client_ip_resolution_unresolved` and `unresolved_client_ip` events additionally
-make malformed-header and degraded-enforcement spikes alertable.
+ever turning an unresolved peer into a client identity. The structured
+`client_ip_resolution_unresolved` event additionally makes
+malformed-header and degraded-enforcement spikes alertable.
 
 ### Example: multi-hop chain
 

@@ -854,33 +854,29 @@ class OpenAICompatAdapter(BaseAdapter):
                 # pass picks a different key. The lease is released neutrally —
                 # nothing was sent, so the key is neither credited with a
                 # success nor charged with a failure, and it must not be muted.
-                self._key_pool.release(lease, status_code=None)
+                lease.release(status_code=None)
                 last_error = saturated
                 continue
             except BaseException:
                 # Cancellation before the upstream request starts must not
                 # leave a non-affine recovery probe claimed.
-                self._key_pool.release(lease, status_code=None)
+                lease.release(status_code=None)
                 raise
 
-            headers = self._build_headers(api_key_override=api_key)
+            lease_outcome: ReleaseOutcome | None = None
             try:
+                headers = self._build_headers(api_key_override=api_key)
                 response = await self.http.json_post(
                     url=url,
                     json=payload,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=_COMPLETION_TIMEOUT_S),
                 )
-            except asyncio.CancelledError:
-                # A cancelled request has no upstream outcome. Release the
-                # lease neutrally so cancellation cannot mute a key or leave a
-                # recovery probe permanently in flight.
-                self._key_pool.release(lease, status_code=None)
-                raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 status = e.status if isinstance(e, aiohttp.ClientResponseError) else 0
                 slot.release(status_code=status)
-                outcome = self._key_pool.release(lease, status_code=status, tried=tried)
+                outcome = lease.release(status_code=status, tried=tried)
+                lease_outcome = outcome
                 if outcome is ReleaseOutcome.PROPAGATE:
                     # Either a request-scoped client error (fails identically on
                     # every key) or a transient error on the last usable key —
@@ -908,11 +904,16 @@ class OpenAICompatAdapter(BaseAdapter):
                 continue  # try next key
             else:
                 slot.release(status_code=200)
+                lease_outcome = lease.release(status_code=200)
             finally:
-                # Idempotent; covers an exit neither branch above saw.
-                slot.release()
-
-            self._key_pool.release(lease, status_code=200)
+                # The lease is one-shot. This neutral fallback covers
+                # cancellation and arbitrary adapter/HTTP exceptions without
+                # requiring an exception-specific release branch.
+                try:
+                    slot.release()
+                finally:
+                    if lease_outcome is None:
+                        lease.release(status_code=None)
             logger.debug(
                 "key_pool_active_affinities",
                 extra={
@@ -1038,21 +1039,24 @@ class OpenAICompatAdapter(BaseAdapter):
                 # allowance is full, a sibling's may not be. Neutral lease
                 # release — nothing was sent, so the key is neither credited nor
                 # muted.
-                self._key_pool.release(lease, status_code=None)
+                lease.release(status_code=None)
                 last_error = saturated
                 continue
             except BaseException:
                 # Cancellation before the stream is opened still owns the
                 # lease, even though no slot was acquired.
-                self._key_pool.release(lease, status_code=None)
+                lease.release(status_code=None)
                 raise
 
-            headers = self._build_headers(api_key_override=api_key)
-            stream_iter = self.http.stream_post(
-                url=url, json=payload, headers=headers, timeout=timeout
-            )
+            handed_off = False
+            lease_outcome: ReleaseOutcome | None = None
             try:
+                headers = self._build_headers(api_key_override=api_key)
+                stream_iter = self.http.stream_post(
+                    url=url, json=payload, headers=headers, timeout=timeout
+                )
                 first = await stream_iter.__anext__()
+                handed_off = True
             except StopAsyncIteration:
                 # A 2xx response with no stream events is incomplete. Do not
                 # retry after the upstream accepted the generation request, but
@@ -1062,7 +1066,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 # signal, and it is the mute -- not a rotation here -- that moves
                 # the next request along.
                 slot.release(status_code=0)
-                self._key_pool.release(lease, status_code=0)
+                lease_outcome = lease.release(status_code=0)
                 logger.debug(
                     "key_pool_active_affinities",
                     extra={
@@ -1076,7 +1080,8 @@ class OpenAICompatAdapter(BaseAdapter):
                 # Status error — raised by the client before any response body
                 # byte is read, so re-issuing the request on another key is safe.
                 slot.release(status_code=e.status)
-                outcome = self._key_pool.release(lease, status_code=e.status, tried=tried)
+                outcome = lease.release(status_code=e.status, tried=tried)
+                lease_outcome = outcome
                 if outcome is ReleaseOutcome.PROPAGATE:
                     # Nothing to rotate to: request-scoped error, or a transient
                     # error on the last usable key — propagate.
@@ -1109,16 +1114,17 @@ class OpenAICompatAdapter(BaseAdapter):
                 # Neutral (None), NOT 200: crediting a success here would reset
                 # the sole-key backoff streak mid-outage.
                 slot.release(status_code=None)
-                self._key_pool.release(lease, status_code=None)
                 raise
             except BaseException:
                 # Cancellation before the first chunk: the slot is held for a
                 # request that no longer exists, so hand it back here — nothing
                 # downstream ever learns this attempt happened. The neutral
-                # lease release also clears any claimed recovery probe.
+                # lease fallback below also clears any claimed recovery probe.
                 slot.release()
-                self._key_pool.release(lease, status_code=None)
                 raise
+            finally:
+                if not handed_off and lease_outcome is None:
+                    lease.release(status_code=None)
 
             # First chunk read successfully — commit the lease and the slot
             # (caller releases both on stream end).
@@ -1602,7 +1608,7 @@ class OpenAICompatAdapter(BaseAdapter):
                     release_status = stream_error_status if stream_error_status else 0
                 else:
                     release_status = 200
-                self._key_pool.release(active_lease, status_code=release_status)
+                active_lease.release(status_code=release_status)
                 logger.debug(
                     "key_pool_active_affinities",
                     extra={
