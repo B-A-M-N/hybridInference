@@ -73,6 +73,7 @@ from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
 from serving.utils.request_ip import derive_affinity_key, get_client_ip_info
 from serving.utils.session_identity import consume_session_fields, session_identity
+from serving.utils.synthetic_probe import is_trusted_probe
 from serving.utils.tokens import estimate_prompt_tokens, estimate_text_tokens
 from serving.utils.traffic_classifier import (
     TrafficEvidence,
@@ -1410,6 +1411,17 @@ async def anthropic_messages(
     # below for provider dispatch.
     declared_session = session_identity(request.headers, body)
 
+    # Capture the arrival-side clock before model resolution, rerouting, and
+    # provider admission. The eventual post-admission commit must retain this
+    # timestamp so slow requests do not distort the next request's cadence.
+    is_authenticated = bool(user_ctx.get("authenticated"))
+    is_synthetic_probe = is_trusted_probe(request, user_ctx)
+    traffic_user_id = (
+        None if is_synthetic_probe else user_ctx.get("user_id") if is_authenticated else None
+    )
+    traffic_state = get_traffic_observation_state()
+    arrival_timestamp = float(traffic_state.preview_request(user_id=traffic_user_id)["observed_at"])
+
     # Before dispatch, so this covers the native passthrough as well as the
     # translated path. A native Anthropic upstream is forwarded this body
     # unchanged and rejects an inline `role: "system"` message outright, so
@@ -1531,11 +1543,6 @@ async def anthropic_messages(
     # This endpoint has a separate native-format path, so keeping the
     # observation here covers the Claude Code traffic it primarily serves.
     traffic_session = declared_session
-    is_authenticated = bool(user_ctx.get("authenticated"))
-    # ``anonymous`` is a deployment-wide sentinel when auth is disabled, not a
-    # safe behavioral identity. Keep this feature scoped to real user IDs.
-    traffic_user_id = user_ctx.get("user_id") if is_authenticated else None
-    traffic_state = get_traffic_observation_state()
     traffic_messages = body.get("messages")
     traffic_message_count = len(traffic_messages) if isinstance(traffic_messages, list) else 0
     traffic_shape_hash = compute_request_shape_hash(
@@ -1550,6 +1557,7 @@ async def anthropic_messages(
         user_id=traffic_user_id,
         shape_hash=traffic_shape_hash,
         session_id=traffic_session.session_id if traffic_session is not None else None,
+        observed_at=arrival_timestamp,
     )
     traffic_classification = classify_traffic(
         TrafficEvidence(

@@ -232,6 +232,40 @@ async def test_messages_human_hint_cannot_promote_elephant(
 
 
 @pytest.mark.asyncio
+async def test_messages_trusted_synthetic_probe_does_not_update_traffic_state(
+    anthropic_test_app,
+    anthropic_test_client,
+):
+    """Deployment probes must not become authenticated Messages history."""
+    from serving.servers.deps import get_router
+
+    router = RouteExecutor()
+    config = ModelConfig(
+        id="glm-4.7",
+        name="GLM-4.7",
+        provider="test",
+        base_url="http://test",
+        max_output_length=1024,
+        supported_params=["max_tokens"],
+    )
+    router.register_route("glm-4.7", [(_CompletionsTestAdapter(config), 1.0)])
+    anthropic_test_app.dependency_overrides[get_router] = lambda: router
+    state = get_traffic_observation_state()
+
+    try:
+        response = await anthropic_test_client.post(
+            "/v1/messages",
+            json=_messages_body(),
+            headers={**_auth(), "X-Probe": "synthetic"},
+        )
+    finally:
+        anthropic_test_app.dependency_overrides.pop(get_router, None)
+
+    assert response.status_code == 200
+    assert state.get_identity_count() == 0
+
+
+@pytest.mark.asyncio
 async def test_messages_rejected_model_does_not_update_traffic_state(
     anthropic_test_client,
 ):
