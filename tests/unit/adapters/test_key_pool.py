@@ -192,6 +192,71 @@ def test_non_affine_failover_reprobes_failed_preferred_key_on_bounded_cadence():
     assert pool.acquire(None)[0] == "preferred"
 
 
+def test_non_affine_recovery_probe_is_claimed_once():
+    """Concurrent unresolved callers do not all retry one due probe."""
+    pool = KeyPool(keys=["preferred", "fallback"], provider_label="test")
+
+    _, failed = pool.acquire(None)
+    pool.release(failed, status_code=503, tried={0})
+    pool._non_affine_reprobe_at[None] = time.monotonic()
+
+    probe_key, probe = pool.acquire(None)
+    assert probe_key == "preferred"
+    fallback_key, fallback = pool.acquire(None)
+    assert fallback_key == "fallback"
+
+    pool.release(probe, status_code=200)
+    pool.release(fallback, status_code=200)
+
+
+def test_non_affine_reprobe_preserves_original_failed_preference():
+    """Fallback failures do not replace the original recovery target."""
+    pool = KeyPool(keys=["preferred", "fallback", "last"], provider_label="test")
+
+    _, first = pool.acquire(None)
+    pool.release(first, status_code=503, tried={0})
+    _, second = pool.acquire(None)
+    pool.release(second, status_code=503, tried={0, 1})
+    _, third = pool.acquire(None)
+    pool.release(third, status_code=200)
+
+    pool._non_affine_reprobe_at[None] = time.monotonic()
+    probe_key, probe = pool.acquire(None)
+    assert probe_key == "preferred"
+    pool.release(probe, status_code=200)
+
+
+def test_key_pool_change_resets_non_affine_priority_state():
+    """A new reservation is not hidden behind a stale failover cursor."""
+    pool = KeyPool(keys=["preferred", "fallback"], provider_label="test")
+
+    _, failed = pool.acquire(None, role="pro")
+    pool.release(failed, status_code=503, tried={0})
+    _, fallback = pool.acquire(None, role="pro")
+    pool.release(fallback, status_code=200)
+
+    pool.add_key("reserved", min_role="pro")
+    selected, _lease = pool.acquire(None, role="pro")
+    assert selected == "reserved"
+
+
+def test_non_affine_probe_success_only_resets_its_role():
+    """A recovered role does not erase another role's recovery state."""
+    pool = KeyPool(keys=["preferred", "fallback"], provider_label="test")
+
+    _, free_failed = pool.acquire(None)
+    pool.release(free_failed, status_code=503, tried={0})
+    _, pro_failed = pool.acquire(None, role="pro")
+    pool.release(pro_failed, status_code=503, tried={0})
+
+    pool._non_affine_reprobe_at[None] = time.monotonic()
+    free_probe_key, free_probe = pool.acquire(None)
+    assert free_probe_key == "preferred"
+    pool.release(free_probe, status_code=200)
+
+    assert pool._non_affine_reprobe_index.get("pro") == 0
+
+
 def test_non_affine_fresh_cursor_preserves_reservation_priority():
     """A fresh non-affine caller starts in the highest eligible tier."""
     pool = KeyPool(

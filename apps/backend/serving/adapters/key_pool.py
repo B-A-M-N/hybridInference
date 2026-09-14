@@ -288,6 +288,7 @@ class KeyPool:
         # probe without making every request pay the failed round trip.
         self._non_affine_reprobe_index: dict[str | None, int] = {}
         self._non_affine_reprobe_at: dict[str | None, float] = {}
+        self._non_affine_reprobe_in_flight: dict[str | None, int] = {}
         self._lock = threading.Lock()
         self._provider_label = provider_label
 
@@ -352,9 +353,11 @@ class KeyPool:
                     retiered = state.min_role != normalized
                     state.min_role = normalized
                 if reactivated or retiered:
+                    self._clear_non_affine_state_locked()
                     self._drop_repointed_affinities_locked(now)
                 return idx
             self._keys.append(_KeyState(key=key, min_role=normalize_min_role(min_role)))
+            self._clear_non_affine_state_locked()
             self._drop_repointed_affinities_locked(now)
             return len(self._keys) - 1
 
@@ -390,8 +393,23 @@ class KeyPool:
                 state.min_role = normalized
                 changed = True
             if changed:
+                self._clear_non_affine_state_locked()
                 self._drop_repointed_affinities_locked(now)
         return found
+
+    def _clear_non_affine_state_locked(self) -> None:
+        """Forget cursor and recovery-probe state after key-pool changes."""
+        self._non_affine_cursor.clear()
+        self._non_affine_reprobe_index.clear()
+        self._non_affine_reprobe_at.clear()
+        self._non_affine_reprobe_in_flight.clear()
+
+    def _clear_non_affine_role_state_locked(self, role: str | None) -> None:
+        """Forget recovery state for one role without disturbing other roles."""
+        self._non_affine_cursor.pop(role, None)
+        self._non_affine_reprobe_index.pop(role, None)
+        self._non_affine_reprobe_at.pop(role, None)
+        self._non_affine_reprobe_in_flight.pop(role, None)
 
     def _drop_repointed_affinities_locked(self, now: float) -> None:
         """Drop bindings that no longer point at what selection would choose now.
@@ -440,6 +458,7 @@ class KeyPool:
             for _idx, state in enumerate(self._keys):
                 if state.key == key and not state.removed:
                     state.removed = True
+                    self._clear_non_affine_state_locked()
                     self._drop_repointed_affinities_locked(now)
                     return True
             return False
@@ -654,32 +673,56 @@ class KeyPool:
             try another key, ``PROPAGATE`` if it should surface the error.
         """
         if status_code is None:
+            if lease.affinity_key is None:
+                with self._lock:
+                    if self._non_affine_reprobe_in_flight.get(lease.role) == lease.key_index:
+                        self._non_affine_reprobe_in_flight.pop(lease.role, None)
             return ReleaseOutcome.PROPAGATE
         if not should_mute_status(status_code):
             if 200 <= status_code < 300:
                 with self._lock:
                     self._keys[lease.key_index].consecutive_failures = 0
-                    if (
-                        lease.affinity_key is None
-                        and self._non_affine_reprobe_index.get(lease.role) == lease.key_index
-                    ):
-                        # The skipped key recovered.  Return to the ordinary
-                        # preferred-key order for subsequent non-affine calls.
-                        self._non_affine_reprobe_index.pop(lease.role, None)
-                        self._non_affine_reprobe_at.pop(lease.role, None)
-                        self._non_affine_cursor.pop(lease.role, None)
+                    if lease.affinity_key is None:
+                        if self._non_affine_reprobe_in_flight.get(lease.role) == lease.key_index:
+                            self._non_affine_reprobe_in_flight.pop(lease.role, None)
+                        if self._non_affine_reprobe_index.get(lease.role) == lease.key_index:
+                            # The skipped key recovered.  Return to the ordinary
+                            # preferred-key order for subsequent non-affine calls.
+                            self._clear_non_affine_role_state_locked(lease.role)
+            elif lease.affinity_key is None:
+                with self._lock:
+                    if self._non_affine_reprobe_in_flight.get(lease.role) == lease.key_index:
+                        self._non_affine_reprobe_in_flight.pop(lease.role, None)
             return ReleaseOutcome.PROPAGATE
         with self._lock:
             now = time.monotonic()
             state = self._keys[lease.key_index]
+
+            if (
+                lease.affinity_key is None
+                and self._non_affine_reprobe_in_flight.get(lease.role) == lease.key_index
+            ):
+                # The claim belongs to this lease, regardless of whether the
+                # request eventually succeeds or fails.
+                self._non_affine_reprobe_in_flight.pop(lease.role, None)
+
             state.consecutive_failures += 1
 
             if lease.affinity_key is None:
                 self._non_affine_cursor[lease.role] = (lease.key_index + 1) % len(self._keys)
-                self._non_affine_reprobe_index[lease.role] = lease.key_index
-                self._non_affine_reprobe_at[lease.role] = (
-                    now + self.NON_AFFINE_REPROBE_INTERVAL_SECONDS
-                )
+                # Preserve the original preferred key as the recovery target
+                # while this role is failing over through other keys. Replacing
+                # it on every fallback failure can starve the preferred tier.
+                if lease.role not in self._non_affine_reprobe_index:
+                    self._non_affine_reprobe_index[lease.role] = lease.key_index
+                    self._non_affine_reprobe_at[lease.role] = (
+                        now + self.NON_AFFINE_REPROBE_INTERVAL_SECONDS
+                    )
+                elif self._non_affine_reprobe_index[lease.role] == lease.key_index:
+                    # A failed recovery probe gets another bounded retry window.
+                    self._non_affine_reprobe_at[lease.role] = (
+                        now + self.NON_AFFINE_REPROBE_INTERVAL_SECONDS
+                    )
 
             # Rotate before muting: somewhere untried to go means this failure
             # costs the request one retry, not the key its place in the pool.
@@ -753,7 +796,15 @@ class KeyPool:
             and now >= self._non_affine_reprobe_at.get(role, float("inf"))
             and reprobe_index in candidates
         ):
-            return reprobe_index
+            if role not in self._non_affine_reprobe_in_flight:
+                self._non_affine_reprobe_in_flight[role] = reprobe_index
+                return reprobe_index
+            # A recovery probe is already in flight. Do not send another
+            # unresolved caller to the same key; choose another candidate or
+            # report exhaustion if none is available.
+            candidates = [i for i in candidates if i != self._non_affine_reprobe_in_flight[role]]
+            if not candidates:
+                return None
 
         cursor = self._non_affine_cursor.get(role)
         if cursor is None:
