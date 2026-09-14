@@ -812,9 +812,21 @@ async def _safe_await_task(task: asyncio.Task[Any]) -> None:
 
 
 async def _safe_aclose(gen: AsyncGenerator[Any, None]) -> None:
-    """Close an async generator, suppressing errors."""
-    with contextlib.suppress(Exception):
+    """Close a losing async generator without masking caller cancellation.
+
+    A generator may raise ``CancelledError`` from its own cleanup even when
+    the request task was not cancelled.  That is non-fatal loser cleanup and
+    must not abort the winning stream.  A cancellation delivered to this
+    task, however, remains observable to the caller.
+    """
+    try:
         await gen.aclose()
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise
+    except Exception:
+        pass
 
 
 def _chunk_buffer_size(chunk: Any) -> int:
