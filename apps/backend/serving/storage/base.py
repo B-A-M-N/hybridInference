@@ -469,8 +469,16 @@ class OperationalStore(ABC):
         api_key_encrypted: str | None = None,
         metadata: str | None = None,
         account_id: str | None = None,
+        missing_identity_fenced: bool | None = None,
     ) -> Row:
-        """Insert a new API key. Returns the inserted row (at least ``id``, ``created_at``)."""
+        """Insert a new API key. Returns the inserted row (at least ``id``, ``created_at``).
+
+        ``missing_identity_fenced`` is the LogStore-validated erasure-fence
+        answer for a key-only identity whose ``users`` row is gone. The
+        LogStore owns the fence; the operational store must never query the
+        fence table itself. ``None`` means no LogStore verification is
+        available and a missing identity fails closed.
+        """
 
     @abstractmethod
     async def check_active_key_exists(self, user_id: str) -> bool:
@@ -491,12 +499,31 @@ class OperationalStore(ABC):
         """Fetch full key row for a given *user_id* (admin detail view)."""
 
     @abstractmethod
-    async def update_key(self, user_id: str, **fields: Any) -> None:
-        """Dynamically update key columns for *user_id*."""
+    async def update_key(
+        self,
+        user_id: str,
+        missing_identity_fenced: bool | None = None,
+        **fields: Any,
+    ) -> None:
+        """Dynamically update key columns for *user_id*.
+
+        ``missing_identity_fenced`` is the LogStore-validated erasure-fence
+        answer for a key-only identity (see :meth:`create_key`).
+        """
 
     @abstractmethod
-    async def revoke_key(self, user_id: str, *, hard_delete: bool = False) -> None:
-        """Soft-revoke (status='revoked') or hard-delete the key."""
+    async def revoke_key(
+        self,
+        user_id: str,
+        *,
+        hard_delete: bool = False,
+        missing_identity_fenced: bool | None = None,
+    ) -> None:
+        """Soft-revoke (status='revoked') or hard-delete the key.
+
+        ``missing_identity_fenced`` is the LogStore-validated erasure-fence
+        answer for a key-only identity (see :meth:`create_key`).
+        """
 
     @abstractmethod
     async def regenerate_key(
@@ -505,8 +532,13 @@ class OperationalStore(ABC):
         *,
         new_key_hash: str,
         new_key_prefix: str,
+        missing_identity_fenced: bool | None = None,
     ) -> str:
-        """Atomically replace the key hash/prefix. Returns old key_prefix."""
+        """Atomically replace the key hash/prefix. Returns old key_prefix.
+
+        ``missing_identity_fenced`` is the LogStore-validated erasure-fence
+        answer for a key-only identity (see :meth:`create_key`).
+        """
 
     @abstractmethod
     async def get_key_by_account_or_user(self, account_id: str) -> Row | None:
@@ -761,8 +793,15 @@ class OperationalStore(ABC):
         target_user_id: str | None = None,
         details: dict[str, Any] | None = None,
         success: bool = True,
+        target_missing_identity_fenced: bool | None = None,
     ) -> None:
-        """Insert a row into admin_audit_log."""
+        """Insert a row into admin_audit_log.
+
+        ``target_missing_identity_fenced`` carries the LogStore-validated
+        erasure-fence answer for a missing target, so the operational store
+        can redact identifying rows without querying the LogStore-owned fence
+        table.
+        """
 
     @abstractmethod
     async def list_audit_log(

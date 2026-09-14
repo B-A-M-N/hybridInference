@@ -29,6 +29,7 @@ def mock_stores():
 
     log_store = MagicMock()
     log_store.get_key_detail_usage = AsyncMock(return_value={})
+    log_store.account_has_erasure_fence = AsyncMock(return_value=False)
 
     return op_store, log_store
 
@@ -87,6 +88,7 @@ async def test_create_api_key_success(admin_client, monkeypatch):
     assert body["api_key"] == "hyi-fixed-key"
     assert body["key_prefix"] == "hyi-fixed-key"[:12]
     op_store.create_key.assert_awaited_once()
+    assert op_store.create_key.await_args.kwargs["missing_identity_fenced"] is False
     log_action.assert_awaited()
 
 
@@ -105,6 +107,7 @@ async def test_create_api_key_conflict(admin_client, monkeypatch):
     log_action.assert_awaited()
     call = log_action.await_args
     assert call.kwargs.get("success") is False
+    assert call.kwargs["target_missing_identity_fenced"] is False
 
 
 @pytest.mark.asyncio
@@ -205,6 +208,7 @@ async def test_update_api_key_success(admin_client):
     assert response.status_code == 200
     body = response.json()
     assert body["updated_fields"] == ["quota_daily_cost_usd"]
+    assert op_store.update_key.await_args.kwargs["missing_identity_fenced"] is False
     log_action.assert_awaited()
 
 
@@ -244,6 +248,7 @@ async def test_revoke_api_key_soft_delete(admin_client):
 
     assert response.status_code == 200
     op_store.revoke_key.assert_awaited_once()
+    assert op_store.revoke_key.await_args.kwargs["missing_identity_fenced"] is False
     log_action.assert_awaited()
 
 
@@ -260,3 +265,4 @@ async def test_revoke_api_key_hard_delete(admin_client):
 
     assert response.status_code == 200
     op_store.revoke_key.assert_awaited_once()
+    assert op_store.revoke_key.await_args.kwargs["missing_identity_fenced"] is False

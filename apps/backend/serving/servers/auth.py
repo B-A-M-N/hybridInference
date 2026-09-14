@@ -36,7 +36,6 @@ from serving.servers.deps import (
     get_log_store,
     get_operational_store,
 )
-from serving.storage.log_schema import check_erasure_fence, fence_account_digest
 from serving.utils import context as req_ctx
 from serving.utils.auth_failure_blocklist import is_ip_blocked, record_auth_failure
 from serving.utils.logging import get_logger
@@ -889,12 +888,15 @@ async def log_admin_action(
     target_user_id: str | None = None,
     details: dict[str, Any] | None = None,
     success: bool = True,
+    target_missing_identity_fenced: bool | None = None,
 ) -> None:
     """Log admin action to audit trail.
 
     Accepts either an OperationalStore or a legacy DatabaseLogger. Callers
     are migrating to pass the store directly; during transition both are
-    supported.
+    supported. When the target user row is missing, the callee decides
+    whether to redact the identifier: the LogStore owns the erasure fence and
+    the operational store never queries its table.
 
     Args:
         db_logger: OperationalStore or DatabaseLogger instance
@@ -903,6 +905,8 @@ async def log_admin_action(
         target_user_id: User ID affected by the action (if applicable)
         details: Additional context (will be stored as JSONB)
         success: Whether the action succeeded
+        target_missing_identity_fenced: Whether the LogStore reports an
+            erasure fence for a target whose ``users`` row is missing.
     """
     if not db_logger:
         return  # Silently skip if logging not configured
@@ -915,6 +919,7 @@ async def log_admin_action(
             target_user_id=target_user_id,
             details=details,
             success=success,
+            target_missing_identity_fenced=target_missing_identity_fenced,
         )
         return
 
@@ -933,14 +938,7 @@ async def log_admin_action(
                 target_user_id,
             )
             if row is None:
-                fence_secret = getattr(db_logger, "fence_secret", None)
-                if not fence_secret:
-                    raise HardDeleteStateChanged(
-                        f"Account {target_user_id} no longer exists and its erasure "
-                        "fence cannot be validated."
-                    )
-                fence_key = fence_account_digest(target_user_id, fence_secret)
-                if await check_erasure_fence(conn, fence_keys=[fence_key]):
+                if target_missing_identity_fenced:
                     audit_target_user_id = None
                     audit_details = {"target_user_id_redacted": "erasure_fence"}
             elif row.get("hard_delete_pending", False):

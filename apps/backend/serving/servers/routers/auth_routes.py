@@ -29,7 +29,7 @@ from serving.schemas_auth import (
     VerifyEmailResponse,
 )
 from serving.servers.auth import log_admin_action
-from serving.servers.deps import get_current_user, get_db_logger, get_operational_store
+from serving.servers.deps import get_current_user, get_db_logger, get_log_store, get_operational_store
 from serving.utils import password as password_utils
 from serving.utils.email import (
     is_email_enabled,
@@ -116,6 +116,7 @@ async def signup(
     background_tasks: BackgroundTasks,
     op_store=Depends(get_operational_store),
     db_logger=Depends(get_db_logger),
+    log_store=Depends(get_log_store),
 ) -> SignupResponse:
     """Register a new user account.
 
@@ -236,6 +237,11 @@ async def signup(
             )
 
     logger.info(f"New user registered: {user_id} ({body.email}) [status={initial_status}]")
+    missing_identity_fenced = (
+        None
+        if log_store is None
+        else await log_store.account_has_erasure_fence(user_id)
+    )
     await log_admin_action(
         db_logger,
         client_ip,
@@ -248,6 +254,7 @@ async def signup(
             "requires_approval": require_approval,
             "use_case": body.use_case or None,
         },
+        target_missing_identity_fenced=missing_identity_fenced,
     )
 
     if require_approval:

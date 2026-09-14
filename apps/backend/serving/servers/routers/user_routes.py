@@ -373,6 +373,7 @@ async def create_api_key(
     current_user=Depends(get_current_user),
     op_store=Depends(get_operational_store),
     db_logger=Depends(get_db_logger),
+    log_store=Depends(get_log_store),
 ) -> APIKeyResponse:
     """Generate a new API key for the current user.
 
@@ -410,6 +411,11 @@ async def create_api_key(
         rt = None
     default_quota = await get_default_daily_quota_for_role(current_user["role"], rt)
 
+    missing_identity_fenced = (
+        None
+        if log_store is None
+        else await log_store.account_has_erasure_fence(current_user["user_id"])
+    )
     await op_store.create_key(
         key_hash=key_hash,
         key_prefix=key_prefix,
@@ -417,6 +423,7 @@ async def create_api_key(
         account_id=current_user["user_id"],
         quota_daily_cost_usd=default_quota,
         api_key_encrypted=encrypt_api_key(api_key),
+        missing_identity_fenced=missing_identity_fenced,
     )
 
     logger.info(f"API key created for user: {current_user['user_id']}")
@@ -429,6 +436,7 @@ async def create_api_key(
             "actor": "user",
             "key_prefix": key_prefix,
         },
+        target_missing_identity_fenced=missing_identity_fenced,
     )
 
     return APIKeyResponse(
@@ -520,6 +528,7 @@ async def delete_api_key(
     current_user=Depends(get_current_user),
     db_logger=Depends(get_db_logger),
     op_store=Depends(get_operational_store),
+    log_store=Depends(get_log_store),
 ) -> APIKeyDeleteResponse:
     """Revoke an active key or remove a revoked key owned by the current user."""
     if not db_logger or not db_logger.pool:
@@ -588,12 +597,18 @@ async def delete_api_key(
                 audit_details = {"actor": "user", "key_prefix": deleted["key_prefix"]}
 
     if response and audit_action:
+        missing_identity_fenced = (
+            None
+            if log_store is None
+            else await log_store.account_has_erasure_fence(current_user["user_id"])
+        )
         await log_admin_action(
             db_logger,
             get_client_ip(request),
             audit_action,
             current_user["user_id"],
             audit_details,
+            target_missing_identity_fenced=missing_identity_fenced,
         )
         # Both branches write api_keys directly, bypassing
         # CachedOperationalStore, so the auth cache is evicted here rather than
@@ -616,6 +631,7 @@ async def regenerate_api_key(
     current_user=Depends(get_current_user),
     op_store=Depends(get_operational_store),
     db_logger=Depends(get_db_logger),
+    log_store=Depends(get_log_store),
 ) -> APIKeyRegenerateResponse:
     """Regenerate API key for current user.
 
@@ -642,7 +658,14 @@ async def regenerate_api_key(
     default_quota = await get_default_daily_quota_for_role(current_user["role"], rt)
 
     # Revoke old key via store, then create new one
-    await op_store.revoke_key(current_user["user_id"])
+    missing_identity_fenced = (
+        None
+        if log_store is None
+        else await log_store.account_has_erasure_fence(current_user["user_id"])
+    )
+    await op_store.revoke_key(
+        current_user["user_id"], missing_identity_fenced=missing_identity_fenced
+    )
     await op_store.create_key(
         key_hash=key_hash,
         key_prefix=key_prefix,
@@ -650,6 +673,7 @@ async def regenerate_api_key(
         account_id=current_user["user_id"],
         quota_daily_cost_usd=default_quota,
         api_key_encrypted=encrypt_api_key(api_key),
+        missing_identity_fenced=missing_identity_fenced,
     )
 
     logger.info(f"API key regenerated for user: {current_user['user_id']}")
@@ -663,6 +687,7 @@ async def regenerate_api_key(
             "old_key_prefix": old_key_row["key_prefix"],
             "new_key_prefix": key_prefix,
         },
+        target_missing_identity_fenced=missing_identity_fenced,
     )
 
     return APIKeyRegenerateResponse(

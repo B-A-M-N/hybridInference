@@ -930,7 +930,7 @@ async def initialize() -> AppServices:
 
         fence_secret = resolve_fence_secret(settings.erasure_fence_secret)
 
-        pg_operational = PostgresOperationalStore(db_logger.pool, fence_secret=fence_secret)
+        pg_operational = PostgresOperationalStore(db_logger.pool)
         await _initialize_operational_store(pg_operational)
         operational_store = CachedOperationalStore(pg_operational, InMemoryCache())
         log_store = PostgresLogStore(

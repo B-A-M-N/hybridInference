@@ -67,6 +67,21 @@ from serving.servers.routers.admin.providers import _enumerate_routable_provider
 from serving.storage.base import HardDeleteClaim, HardDeleteClaimProvenance
 from serving.utils.request_ip import get_client_ip
 
+
+async def _missing_identity_fence_state(log_store, user_id: str) -> bool | None:
+    """Return the LogStore's erasure-fence answer for a missing identity row.
+
+    ``None`` when no LogStore is available or the check itself fails: the
+    operational store then fails closed on missing identities and audit rows
+    retain the identifier only when it is proven un-fenced.
+    """
+    if log_store is None:
+        return None
+    try:
+        return await log_store.account_has_erasure_fence(user_id)
+    except Exception:
+        return None
+
 router = APIRouter(prefix="/admin")
 logger = logging.getLogger(__name__)
 
@@ -464,6 +479,7 @@ async def approve_user(
     payload: ApproveUserRequest | None = None,
     admin_id: str = Depends(verify_admin_access),
     op_store=Depends(get_operational_store),
+    log_store=Depends(get_log_store),
 ) -> ApproveUserResponse:
     """Approve a pending user registration.
 
@@ -501,6 +517,7 @@ async def approve_user(
         "approve_user",
         user_id,
         {"email": user_row["email"], "note": note},
+        target_missing_identity_fenced=await _missing_identity_fence_state(log_store, user_id),
     )
 
     from serving.utils.email import is_email_enabled, send_approval_email
@@ -523,6 +540,7 @@ async def reject_user(
     payload: RejectUserRequest,
     admin_id: str = Depends(verify_admin_access),
     op_store=Depends(get_operational_store),
+    log_store=Depends(get_log_store),
 ) -> RejectUserResponse:
     """Reject a pending user registration.
 
@@ -559,6 +577,7 @@ async def reject_user(
         "reject_user",
         user_id,
         {"email": user_row["email"], "reason": payload.reason},
+        target_missing_identity_fenced=await _missing_identity_fence_state(log_store, user_id),
     )
 
     from serving.utils.email import is_email_enabled, send_rejection_email
@@ -715,6 +734,7 @@ async def update_user(
     payload: UpdateUserRequest,
     admin_id: str = Depends(verify_admin_access),
     op_store=Depends(get_operational_store),
+    log_store=Depends(get_log_store),
     router_exec=Depends(get_router),
 ) -> UpdateUserResponse:
     """Update user account status or API key settings (quota).
@@ -863,6 +883,9 @@ async def update_user(
             "update_user",
             user_id,
             _serialize_for_audit({"updated_fields": updated, "values": payload_dict}),
+            target_missing_identity_fenced=await _missing_identity_fence_state(
+                log_store, user_id
+            ),
         )
     except HardDeleteStateChanged:
         raise HTTPException(

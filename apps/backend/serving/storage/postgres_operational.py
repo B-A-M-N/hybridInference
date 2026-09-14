@@ -28,13 +28,11 @@ from serving.storage.log_schema import (
     SchemaLockUnavailable,
     apply_column_migrations,
     bounded_ddl,
-    check_erasure_fence,
     column_metadata,
     constraint_admitted_values,
     constraint_definition,
     drop_columns_if_present,
     execute_ddl,
-    fence_account_digest,
 )
 from serving.utils.logging import get_logger
 
@@ -91,16 +89,18 @@ async def _validate_key_identity(
     conn: Any,
     user_id: str,
     *,
-    fence_secret: str | None,
     allow_fenced_missing: bool = False,
+    missing_identity_fenced: bool | None = None,
 ) -> None:
     """Validate a key identity without treating it as a user identity.
 
     ``api_keys.user_id`` intentionally has no foreign key to ``users``: legacy
-    deployments can retain credentials after their user row is gone. A missing
-    row is therefore allowed only after the erasure fence is checked under its
-    shared advisory lock. Creation/update/regeneration reject a fenced identity;
-    destructive revocation may remove an existing stale credential safely.
+    deployments can retain credentials after their user row is gone. The
+    LogStore owns the erasure fence and answers whether a missing identity is
+    fenced; this store only accepts that validated answer. A missing identity
+    whose fence state is unknown remains fail-closed, exactly as it did when
+    the store queried the LogStore table directly — but the operational store
+    never reads LogStore-owned schema anymore.
     """
     row = await conn.fetchrow(
         "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
@@ -111,14 +111,12 @@ async def _validate_key_identity(
             raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
         return
 
-    if not fence_secret:
+    if missing_identity_fenced is None:
         raise HardDeleteStateChanged(
             f"Account {user_id} no longer exists and its erasure fence cannot be validated."
         )
 
-    fence_key = fence_account_digest(user_id, fence_secret)
-    fenced = await check_erasure_fence(conn, fence_keys=[fence_key])
-    if fenced and not allow_fenced_missing:
+    if missing_identity_fenced and not allow_fenced_missing:
         raise HardDeleteStateChanged(
             f"Account {user_id} no longer exists and is protected by an erasure fence."
         )
@@ -186,17 +184,15 @@ def _coerce_user_row(row: Any) -> Row | None:
 class PostgresOperationalStore(OperationalStore):
     """OperationalStore backed by an asyncpg connection pool."""
 
-    def __init__(self, pool: asyncpg.Pool, *, fence_secret: str | None = None) -> None:
+    def __init__(self, pool: asyncpg.Pool) -> None:
         """Initialize with a shared asyncpg pool.
 
         Args:
-            pool: Shared asyncpg pool.
-            fence_secret: Retained for constructor compatibility. The
-                LogStore owns erasure-fence schema and tombstone checks;
-                this store owns the operational hard-delete claim.
+            pool: Shared asyncpg pool. The LogStore owns the erasure-fence
+                schema and tombstone checks; this store owns the operational
+                hard-delete claim and never reads LogStore-owned tables.
         """
         self._pool = pool
-        self.fence_secret = fence_secret
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -1967,8 +1963,15 @@ class PostgresOperationalStore(OperationalStore):
         api_key_encrypted: str | None = None,
         metadata: str | dict[str, Any] | None = None,
         account_id: str | None = None,
+        missing_identity_fenced: bool | None = None,
     ) -> Row:
-        """Insert a new API key. Returns the inserted row."""
+        """Insert a new API key. Returns the inserted row.
+
+        ``missing_identity_fenced`` is the LogStore-validated erasure-fence
+        answer for a key-only identity whose ``users`` row is gone; ``None``
+        means no LogStore verification is available and the mutation fails
+        closed.
+        """
         import asyncpg as _asyncpg
 
         # Default account_id to user_id so self-service AND admin-created keys
@@ -1987,7 +1990,7 @@ class PostgresOperationalStore(OperationalStore):
             await _validate_key_identity(
                 conn,
                 user_id,
-                fence_secret=self.fence_secret,
+                missing_identity_fenced=missing_identity_fenced,
             )
             try:
                 row = await conn.fetchrow(
@@ -2103,13 +2106,21 @@ class PostgresOperationalStore(OperationalStore):
                 d["metadata"] = None
         return d
 
-    async def update_key(self, user_id: str, **fields: Any) -> None:
+    async def update_key(
+        self,
+        user_id: str,
+        missing_identity_fenced: bool | None = None,
+        **fields: Any,
+    ) -> None:
         """Dynamically update key columns for *user_id*'s current key.
 
         Revoked rows are never touched: a user keeps old revoked rows after
         regenerating a key, and updating them would silently resurrect dead
         keys (``status='active'`` on every row also violates the
         one-active-key-per-user partial unique index).
+
+        ``missing_identity_fenced`` is the LogStore-validated erasure-fence
+        answer for a key-only identity (see :meth:`create_key`).
         """
         if not fields:
             return
@@ -2134,18 +2145,29 @@ class PostgresOperationalStore(OperationalStore):
             await _validate_key_identity(
                 conn,
                 user_id,
-                fence_secret=self.fence_secret,
+                missing_identity_fenced=missing_identity_fenced,
             )
             await conn.execute(sql, *params)
 
-    async def revoke_key(self, user_id: str, *, hard_delete: bool = False) -> None:
-        """Soft-revoke (status='revoked') or hard-delete the key."""
+    async def revoke_key(
+        self,
+        user_id: str,
+        *,
+        hard_delete: bool = False,
+        missing_identity_fenced: bool | None = None,
+    ) -> None:
+        """Soft-revoke (status='revoked') or hard-delete the key.
+
+        ``missing_identity_fenced`` is the LogStore-validated erasure-fence
+        answer for a key-only identity; destructive revocation may still
+        remove an existing stale credential safely.
+        """
         async with self._pool.acquire() as conn, conn.transaction():
             await _validate_key_identity(
                 conn,
                 user_id,
-                fence_secret=self.fence_secret,
                 allow_fenced_missing=True,
+                missing_identity_fenced=missing_identity_fenced,
             )
             if hard_delete:
                 await conn.execute("DELETE FROM api_keys WHERE user_id = $1", user_id)
@@ -2161,18 +2183,22 @@ class PostgresOperationalStore(OperationalStore):
         *,
         new_key_hash: str,
         new_key_prefix: str,
+        missing_identity_fenced: bool | None = None,
     ) -> str:
         """Atomically replace the active key's hash/prefix. Returns old key_prefix.
 
         Scoped to the active row: users keep old revoked rows around, and
         rewriting key_hash on all of them would violate the unique key_hash
         constraint (and resurrect revoked credentials).
+
+        ``missing_identity_fenced`` is the LogStore-validated erasure-fence
+        answer for a key-only identity (see :meth:`create_key`).
         """
         async with self._pool.acquire() as conn, conn.transaction():
             await _validate_key_identity(
                 conn,
                 user_id,
-                fence_secret=self.fence_secret,
+                missing_identity_fenced=missing_identity_fenced,
             )
             old_row = await conn.fetchrow(
                 "SELECT key_prefix FROM api_keys WHERE user_id = $1 AND status = 'active'",
@@ -2586,12 +2612,20 @@ class PostgresOperationalStore(OperationalStore):
         target_user_id: str | None = None,
         details: dict[str, Any] | None = None,
         success: bool = True,
+        target_missing_identity_fenced: bool | None = None,
     ) -> None:
         """Insert an audit row, validating concrete targets transactionally.
 
         A missing, unfenced target can be a legacy key-only identity. A missing
         fenced target is an erased identity, so retain the event but redact the
         target column rather than recreating identifying state after deletion.
+
+        ``target_missing_identity_fenced`` carries the LogStore-validated
+        erasure-fence answer for a missing target. The LogStore owns the
+        fence table, so this store never queries it directly; ``None`` means
+        no verification is available and a missing target (whose fence state
+        is therefore unknown) is fail-closed — the audit row is still written
+        with the target redacted so a committed admin mutation is not lost.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             audit_target_user_id = target_user_id
@@ -2607,13 +2641,7 @@ class PostgresOperationalStore(OperationalStore):
                             f"Account {target_user_id} has a hard-delete in progress."
                         )
                 else:
-                    if not self.fence_secret:
-                        raise HardDeleteStateChanged(
-                            f"Account {target_user_id} no longer exists and its erasure "
-                            "fence cannot be validated."
-                        )
-                    fence_key = fence_account_digest(target_user_id, self.fence_secret)
-                    if await check_erasure_fence(conn, fence_keys=[fence_key]):
+                    if target_missing_identity_fenced:
                         audit_target_user_id = None
                         audit_details = {"target_user_id_redacted": "erasure_fence"}
             await conn.execute(
