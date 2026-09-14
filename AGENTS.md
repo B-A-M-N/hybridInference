@@ -195,8 +195,9 @@ not duplicate their content.
 
 Some durable subsystem ownership boundaries may contain their own `AGENTS.md`.
 An agent working inside such a tree must follow the repository-wide guidance
-here and the nearest applicable subsystem guide. A nested guide supplements the
-root file; it does not override repository-wide workflow or quality rules.
+here and every applicable ancestor guide along the path. A nested guide
+supplements its ancestors; it does not override repository-wide workflow or
+quality rules.
 
 Nested guidance is intentionally sparse. Create it only where ownership,
 load-bearing invariants, staged migration, specialized verification, or
