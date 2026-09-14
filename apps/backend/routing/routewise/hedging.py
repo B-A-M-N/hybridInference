@@ -207,12 +207,14 @@ class HedgedAdapter(BaseAdapter):
         # slow loser cannot distort subsequent route selection. Provider
         # capacity remains held until the generator/task has actually stopped.
         self._release_stream_backup_prefill(dispatch)
-        _cancel_task(next_task)
-        await _safe_await_task(next_task)
-        if close_generator and self._stream_backup_gen is not None:
-            await _safe_aclose(self._stream_backup_gen)
-        self._stream_backup_released = True
-        self._finish_backup(dispatch)
+        try:
+            _cancel_task(next_task)
+            await _safe_await_task(next_task)
+            if close_generator and self._stream_backup_gen is not None:
+                await _safe_aclose(self._stream_backup_gen)
+        finally:
+            self._stream_backup_released = True
+            self._finish_backup(dispatch)
 
     def _release_stream_backup_prefill(
         self,
