@@ -70,15 +70,15 @@ Invalid CIDRs fail configuration at startup. Parsed networks are cached in
 
 ### Direct private client networks
 
-Private RFC1918 and ULA socket peers remain unresolved by default because a
-container bridge or shared internal proxy is not an individual client. If a
-deployment has clients connecting directly over a private network, authorize
-only those client CIDRs with `TRUSTED_DIRECT_CLIENT_NETWORKS`. This setting
-does not authorize forwarding headers and must not include shared proxy
-networks.
+Private RFC1918, CGNAT, and ULA socket peers remain unresolved by default
+because a container bridge or shared internal proxy is not an individual
+client. If a deployment has clients connecting directly over one of these
+networks, authorize only those client CIDRs with
+`TRUSTED_DIRECT_CLIENT_NETWORKS`. This setting does not authorize forwarding
+headers and must not include shared proxy networks.
 
 ```bash
-TRUSTED_DIRECT_CLIENT_NETWORKS=10.42.0.0/16,fd00:42::/64
+TRUSTED_DIRECT_CLIENT_NETWORKS=10.42.0.0/16,100.64.0.0/10,fd00:42::/64
 ```
 
 ### Cloudflare-header-authorized peers

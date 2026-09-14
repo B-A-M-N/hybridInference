@@ -103,6 +103,7 @@ _PRIVATE_CLIENT_NETWORKS = (
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
     ipaddress.ip_network("fc00::/7"),
 )
 _IP_INFO_STATE_KEY = "_hybrid_inference_client_ip_info"

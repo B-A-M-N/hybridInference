@@ -183,6 +183,28 @@ def test_direct_ula_peer_requires_explicit_client_network():
         assert info.resolved is True
 
 
+def test_direct_cgnat_peer_requires_explicit_client_network():
+    """CGNAT direct peers can be authorized without trusting forwarding headers."""
+    with _settings_env(
+        proxy_headers=False,
+        cf_headers=False,
+        direct_client_nets=_networks("100.64.0.0/10"),
+    ):
+        info = get_client_ip_info(_request({}, peer_ip="100.100.12.34"))
+        assert info.client_ip == "100.100.12.34"
+        assert info.source == "socket"
+        assert info.resolved is True
+
+
+def test_unconfigured_cgnat_peer_stays_unresolved():
+    """An unconfigured CGNAT peer is not treated as an individual client."""
+    with _settings_env(proxy_headers=False, cf_headers=False):
+        info = get_client_ip_info(_request({}, peer_ip="100.100.12.34"))
+        assert info.client_ip == "unknown"
+        assert info.source == "unknown"
+        assert info.resolved is False
+
+
 def test_forged_xff_ignored_without_trusted_peer():
     """Attacker cannot spoof XFF when peer is not a configured trusted proxy."""
     with _settings_env(proxy_headers=True, cf_headers=False):
