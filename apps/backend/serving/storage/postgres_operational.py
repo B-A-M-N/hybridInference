@@ -2652,7 +2652,10 @@ class PostgresOperationalStore(OperationalStore):
         with the target redacted so a committed admin mutation is not lost.
 
         ``target_is_user`` identifies whether ``target_user_id`` is a user
-        identity. Set it to ``False`` for non-user audit targets.
+        identity. Set it to ``False`` for non-user audit targets. A user target
+        claimed for hard-delete is redacted rather than rejected, because the
+        mutation being audited may have committed before this transaction
+        acquired its row lock.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             audit_target_user_id = target_user_id
@@ -2664,9 +2667,13 @@ class PostgresOperationalStore(OperationalStore):
                 )
                 if row is not None:
                     if row["hard_delete_pending"]:
-                        raise HardDeleteStateChanged(
-                            f"Account {target_user_id} has a hard-delete in progress."
-                        )
+                        # The audited mutation may have committed before the
+                        # hard-delete claim acquired this row lock. Preserve
+                        # the fact that it succeeded without returning a false
+                        # failure or retaining identifying data in a row that
+                        # can outlive the hard-delete cleanup.
+                        audit_target_user_id = None
+                        audit_details = {"target_user_id_redacted": "hard_delete_in_progress"}
                 else:
                     # The row lookup is the transaction's authoritative view.
                     # A pre-transaction fence check can become stale while a

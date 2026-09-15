@@ -15,7 +15,6 @@ from fastapi import Depends, Header, HTTPException, Request
 from serving import grants, quota
 from serving.config.settings import get_settings
 from serving.config.site_identity import get_site_identity
-from serving.exceptions import HardDeleteStateChanged
 from serving.grant_auth import (
     AgentModelAuthError,
     AgentQuotaExceeded,
@@ -952,9 +951,11 @@ async def log_admin_action(
                     )
                 }
             elif row.get("hard_delete_pending", False):
-                raise HardDeleteStateChanged(
-                    f"Account {target_user_id} has a hard-delete in progress."
-                )
+                # The mutation may have committed before this audit
+                # transaction acquired the claim row lock. Record success
+                # without allowing identifying details to outlive the purge.
+                audit_target_user_id = None
+                audit_details = {"target_user_id_redacted": "hard_delete_in_progress"}
         await conn.execute(
             """
             INSERT INTO admin_audit_log (admin_ip, action, target_user_id, details, success)

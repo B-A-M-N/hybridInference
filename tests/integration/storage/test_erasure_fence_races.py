@@ -1144,6 +1144,74 @@ async def test_non_user_audit_target_is_not_redacted_as_missing_user(fence_store
             await conn.execute("DELETE FROM admin_audit_log WHERE action = $1", action)
 
 
+async def test_audit_after_committed_mutation_during_hard_delete_is_redacted(fence_store):
+    """A claimed user audit records success without retaining identity data."""
+    _store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    action = "pending_mutation_audit_regression"
+    legacy_action = f"{action}_legacy"
+
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM admin_audit_log WHERE action = $1", action)
+            await conn.execute("DELETE FROM admin_audit_log WHERE action = $1", legacy_action)
+            await conn.execute(
+                "UPDATE users SET hard_delete_pending = TRUE, "
+                "hard_delete_claim_token = 'live-claim' WHERE id = $1",
+                _OWNER,
+            )
+
+        await op_store.log_admin_action(
+            admin_ip="127.0.0.1",
+            action=action,
+            target_user_id=_OWNER,
+            details={"email": "owner@example.com", "reason": "already committed"},
+            target_missing_identity_fenced=True,
+        )
+        from serving.servers.auth import log_admin_action
+        from serving.storage.database import DatabaseLogger
+
+        legacy_logger = DatabaseLogger({}, fence_secret=_SECRET)
+        legacy_logger.pool = pool
+        await log_admin_action(
+            legacy_logger,
+            "127.0.0.1",
+            legacy_action,
+            _OWNER,
+            {"email": "owner@example.com", "reason": "already committed"},
+            target_missing_identity_fenced=True,
+        )
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT target_user_id, details FROM admin_audit_log WHERE action = $1",
+                action,
+            )
+            legacy_row = await conn.fetchrow(
+                "SELECT target_user_id, details FROM admin_audit_log WHERE action = $1",
+                legacy_action,
+            )
+        assert row["target_user_id"] is None
+        assert legacy_row["target_user_id"] is None
+        details = row["details"]
+        if isinstance(details, str):
+            details = json.loads(details)
+        legacy_details = legacy_row["details"]
+        if isinstance(legacy_details, str):
+            legacy_details = json.loads(legacy_details)
+        assert details == {"target_user_id_redacted": "hard_delete_in_progress"}
+        assert legacy_details == {"target_user_id_redacted": "hard_delete_in_progress"}
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM admin_audit_log WHERE action = $1", action)
+            await conn.execute("DELETE FROM admin_audit_log WHERE action = $1", legacy_action)
+            await conn.execute(
+                "UPDATE users SET hard_delete_pending = FALSE, hard_delete_claim_token = NULL "
+                "WHERE id = $1",
+                _OWNER,
+            )
+
+
 @pytest.mark.asyncio
 async def test_fenced_key_only_identity_cannot_regain_credential_but_can_revoke(
     fence_store,
@@ -1672,11 +1740,6 @@ async def test_concrete_user_mutations_reject_active_claim(fence_store):
             _OWNER,
             new_key_hash="new-hash",
             new_key_prefix="new-prefix",
-        ),
-        op_store.log_admin_action(
-            admin_ip="127.0.0.1",
-            action="stale_mutation",
-            target_user_id=_OWNER,
         ),
     ]
     for mutation in mutation_calls:

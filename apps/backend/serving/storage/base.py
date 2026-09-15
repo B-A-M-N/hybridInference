@@ -805,7 +805,9 @@ class OperationalStore(ABC):
         erasure-fence answer for a missing target, so the operational store
         can redact identifying rows without querying the LogStore-owned fence
         table. ``target_is_user`` is false for non-user targets, such as
-        provider names, which must not be looked up or redacted as users.
+        provider names, which must not be looked up or redacted as users. If a
+        user is already claimed for hard-delete, the audit target and details
+        are redacted so a committed mutation is not reported as failed.
         """
 
     @abstractmethod
