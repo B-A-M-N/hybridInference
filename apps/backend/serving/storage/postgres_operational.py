@@ -1149,7 +1149,7 @@ class PostgresOperationalStore(OperationalStore):
         *,
         allow_existing_fence: bool = False,
         recover_stale_claim: bool = False,
-    ) -> str:
+    ) -> HardDeleteClaim:
         """Claim a soft-deleted user before purging rows in another store.
 
         A pending claim normally belongs exclusively to the worker that made
@@ -1171,31 +1171,41 @@ class PostgresOperationalStore(OperationalStore):
                     f"Account {user_id} is no longer eligible for hard-delete."
                 )
             if row["hard_delete_pending"]:
-                if allow_existing_fence and row["hard_delete_claim_token"]:
+                stale = False
+                if allow_existing_fence or recover_stale_claim:
+                    stale = bool(
+                        await conn.fetchval(
+                            "SELECT $1::TIMESTAMPTZ IS NOT NULL "
+                            "AND $1::TIMESTAMPTZ <= NOW() - $2::INTERVAL",
+                            row["hard_delete_claimed_at"],
+                            _HARD_DELETE_CLAIM_RECOVERY_GRACE,
+                        )
+                    )
+
+                # A durable fence makes an abandoned post-fence workflow
+                # retryable, but it does not make an active workflow shareable.
+                # Keep the ownership boundary in PostgreSQL: the row lock and
+                # recovery grace period prevent a concurrent caller from
+                # entering hard_delete_user() with the live worker's token.
+                if allow_existing_fence and row["hard_delete_claim_token"] and stale:
                     return HardDeleteClaim(
                         token=row["hard_delete_claim_token"],
                         provenance=HardDeleteClaimProvenance.REUSED,
                     )
-                if recover_stale_claim:
-                    stale = await conn.fetchval(
-                        "SELECT $1::TIMESTAMPTZ IS NOT NULL "
-                        "AND $1::TIMESTAMPTZ <= NOW() - $2::INTERVAL",
-                        row["hard_delete_claimed_at"],
-                        _HARD_DELETE_CLAIM_RECOVERY_GRACE,
+
+                if recover_stale_claim and stale:
+                    claim_token = secrets.token_urlsafe(32)
+                    await conn.execute(
+                        "UPDATE users SET hard_delete_claim_token = $2, "
+                        "hard_delete_claimed_at = NOW(), "
+                        "hard_delete_claim_recovered = TRUE WHERE id = $1",
+                        user_id,
+                        claim_token,
                     )
-                    if stale:
-                        claim_token = secrets.token_urlsafe(32)
-                        await conn.execute(
-                            "UPDATE users SET hard_delete_claim_token = $2, "
-                            "hard_delete_claimed_at = NOW(), "
-                            "hard_delete_claim_recovered = TRUE WHERE id = $1",
-                            user_id,
-                            claim_token,
-                        )
-                        return HardDeleteClaim(
-                            token=claim_token,
-                            provenance=HardDeleteClaimProvenance.RECOVERED,
-                        )
+                    return HardDeleteClaim(
+                        token=claim_token,
+                        provenance=HardDeleteClaimProvenance.RECOVERED,
+                    )
                 raise HardDeleteStateChanged(
                     f"Account {user_id} already has a hard-delete in progress or its "
                     "claim is not yet eligible for recovery."

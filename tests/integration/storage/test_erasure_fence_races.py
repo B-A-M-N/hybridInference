@@ -1788,13 +1788,25 @@ async def test_stale_claim_can_be_explicitly_recovered_without_releasing_safety(
 
 
 async def test_post_fence_retry_reuses_claim_without_stealing(fence_store):
-    """A durable fence permits completion retries with the original token."""
+    """Only an abandoned post-fence claim can be reused for completion."""
     store, pool = fence_store
     op_store = PostgresOperationalStore(pool)
 
     first_claim = await op_store.begin_hard_delete_user(_OWNER)
     await store.hard_delete_user_data(_OWNER)
     assert await store.account_has_erasure_fence(_OWNER) is True
+
+    with pytest.raises(HardDeleteStateChanged, match="already has a hard-delete"):
+        await op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True)
+
+    # Once the original worker is considered abandoned, a post-fence retry may
+    # safely finish with its token. The durable fence prevents any identifying
+    # log writes while this takeover waits for the operational wipe.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET hard_delete_claimed_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
+            _OWNER,
+        )
 
     retry_claim = await op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True)
     assert first_claim.provenance is HardDeleteClaimProvenance.NEW
@@ -1812,6 +1824,37 @@ async def test_post_fence_retry_reuses_claim_without_stealing(fence_store):
             "hard_delete_claim_token = NULL WHERE id = $1",
             _OWNER,
         )
+
+
+async def test_active_post_fence_retry_cannot_race_completion(fence_store):
+    """An active retry is rejected while the owner completes deletion."""
+    store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+
+    owner_claim = await op_store.begin_hard_delete_user(_OWNER)
+    await store.hard_delete_user_data(_OWNER)
+    assert await store.account_has_erasure_fence(_OWNER) is True
+
+    # This is the post-fence/pre-wipe window from the production race: the
+    # second caller must not receive the owner's live token.
+    retry = asyncio.create_task(op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True))
+    with pytest.raises(HardDeleteStateChanged, match="already has a hard-delete"):
+        await retry
+
+    counts = await op_store.hard_delete_user(
+        _OWNER,
+        claim_token=owner_claim.token,
+        admin_ip="127.0.0.1",
+        admin_id="admin",
+        email=f"{_OWNER}@example.com",
+    )
+    assert counts["users"] == 1
+
+    # A retry after the owner has completed is deterministic too: the user is
+    # gone, while the durable fence remains present.
+    with pytest.raises(HardDeleteStateChanged, match="no longer eligible"):
+        await op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True)
+    assert await store.account_has_erasure_fence(_OWNER) is True
 
 
 # ---------------------------------------------------------------------------

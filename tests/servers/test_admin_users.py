@@ -1667,8 +1667,8 @@ async def test_hard_delete_keeps_claim_when_fence_exists_after_failure(admin_cli
 
 
 @pytest.mark.asyncio
-async def test_hard_delete_retries_post_fence_claim_without_stealing(admin_client):
-    """A retry after a durable fence reuses the live claim token."""
+async def test_hard_delete_rejects_concurrent_post_fence_claim(admin_client):
+    """A concurrent post-fence request cannot reuse the live claim token."""
     client, op_store, log_store, _log = admin_client
     op_store.get_user_by_id.return_value = {
         "id": "u1",
@@ -1679,7 +1679,7 @@ async def test_hard_delete_retries_post_fence_claim_without_stealing(admin_clien
 
     op_store.begin_hard_delete_user.side_effect = [
         HardDeleteStateChanged("already pending"),
-        HardDeleteClaim("claim-token", HardDeleteClaimProvenance.REUSED),
+        HardDeleteStateChanged("already pending"),
     ]
     log_store.account_has_erasure_fence.return_value = True
 
@@ -1689,11 +1689,13 @@ async def test_hard_delete_retries_post_fence_claim_without_stealing(admin_clien
         json={"confirm": True},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 409
     assert op_store.begin_hard_delete_user.await_args_list[0].args == ("u1",)
     assert op_store.begin_hard_delete_user.await_args_list[1].kwargs == {
         "allow_existing_fence": True
     }
+    log_store.hard_delete_user_data.assert_not_awaited()
+    op_store.hard_delete_user.assert_not_awaited()
     op_store.release_hard_delete_user_claim.assert_not_awaited()
 
 

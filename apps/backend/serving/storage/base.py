@@ -224,9 +224,11 @@ class OperationalStore(ABC):
         concurrent attempt cannot take ownership from the active operation.
         Once the caller has independently verified that the LogStore fence is
         already durable, ``allow_existing_fence`` permits a retry to reuse the
-        current token and finish an incomplete post-fence deletion without
-        stealing the live operation's ownership. A retry without that proof
-        may begin only after a failed pre-fence attempt releases its claim.
+        current token only after the claim is past the recovery grace period.
+        An active claim remains owned by its current worker and is rejected, so
+        a concurrent request cannot enter the destructive phase with the same
+        token. A retry without that proof may begin only after a failed
+        pre-fence attempt releases its claim.
         ``recover_stale_claim`` is an explicit operator takeover for a claim
         left by a process that exited before the fence transaction. It requires
         the claim to be older than the implementation's recovery grace period;

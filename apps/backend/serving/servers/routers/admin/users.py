@@ -82,6 +82,7 @@ async def _missing_identity_fence_state(log_store, user_id: str) -> bool | None:
     except Exception:
         return None
 
+
 router = APIRouter(prefix="/admin")
 logger = logging.getLogger(__name__)
 
@@ -883,9 +884,7 @@ async def update_user(
             "update_user",
             user_id,
             _serialize_for_audit({"updated_fields": updated, "values": payload_dict}),
-            target_missing_identity_fenced=await _missing_identity_fence_state(
-                log_store, user_id
-            ),
+            target_missing_identity_fenced=await _missing_identity_fence_state(log_store, user_id),
         )
     except HardDeleteStateChanged:
         raise HTTPException(
@@ -1162,10 +1161,11 @@ async def hard_delete_user(
     try:
         claim = await op_store.begin_hard_delete_user(user_id)
     except HardDeleteStateChanged:
-        # A durable LogStore fence makes an incomplete post-fence deletion
-        # safely retryable. The operational store reuses the existing claim
-        # token in that case; it never lets a normal concurrent request
-        # overwrite ownership. A pre-fence pending claim remains rejected.
+        # A durable LogStore fence makes an abandoned post-fence deletion
+        # safely retryable after the claim recovery grace period. The
+        # operational store may reuse that claim only then; an active
+        # concurrent request remains rejected. A pre-fence pending claim also
+        # remains rejected unless the caller explicitly requests stale recovery.
         fence_exists = (
             False if log_store is None else await log_store.account_has_erasure_fence(user_id)
         )
