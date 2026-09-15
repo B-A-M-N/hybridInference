@@ -236,6 +236,9 @@ async def test_streaming_lease_is_taken_when_the_generator_runs(
 
     tracker = anthropic_compat_router.prefill_load
     endpoint_id = endpoint_id_for_adapter(_adapter(anthropic_compat_router))
+    from serving.utils.traffic_state import get_traffic_observation_state
+
+    traffic_state = get_traffic_observation_state()
     calls: list[str] = []
     real_acquire = tracker.acquire
 
@@ -251,6 +254,7 @@ async def test_streaming_lease_is_taken_when_the_generator_runs(
     class _Recording(real_cls):
         def __init__(self, content, **kwargs):
             at_construction["leases"] = len(calls)
+            at_construction["history"] = traffic_state.get_identity_count()
             super().__init__(content, **kwargs)
 
     monkeypatch.setattr(fastapi_responses, "StreamingResponse", _Recording)
@@ -267,6 +271,9 @@ async def test_streaming_lease_is_taken_when_the_generator_runs(
     assert r.status_code == 200
     # The response object existed before any lease did...
     assert at_construction["leases"] == 0
+    # ...and before behavioral history was committed: an abandoned stream is
+    # not a dispatched request.
+    assert at_construction["history"] == 0
     # ...the generator then took one, and gave it back.
     assert calls == ["acquire"]
     assert tracker.backlog(endpoint_id) == 0

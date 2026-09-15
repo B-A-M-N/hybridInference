@@ -1553,11 +1553,10 @@ async def anthropic_messages(
             body.get("temperature") if isinstance(body.get("temperature"), (int, float)) else None
         ),
     )
-    traffic_observations = traffic_state.record_request(
+    traffic_observations = traffic_state.preview_request(
         user_id=traffic_user_id,
         shape_hash=traffic_shape_hash,
         session_id=traffic_session.session_id if traffic_session is not None else None,
-        observed_at=arrival_timestamp,
     )
     traffic_classification = classify_traffic(
         TrafficEvidence(
@@ -1579,6 +1578,21 @@ async def anthropic_messages(
         )
     )
     req_ctx.update(classification_to_metadata(traffic_classification))
+
+    traffic_observation_recorded = False
+
+    def _record_traffic_observation() -> None:
+        """Commit behavioral history once this request actually dispatches."""
+        nonlocal traffic_observation_recorded
+        if traffic_observation_recorded:
+            return
+        traffic_state.record_request(
+            user_id=traffic_user_id,
+            shape_hash=traffic_shape_hash,
+            session_id=traffic_session.session_id if traffic_session is not None else None,
+            observed_at=arrival_timestamp,
+        )
+        traffic_observation_recorded = True
 
     # Snapshot messages before _sanitize_for_openai_backend mutates them in-place
     # (strips cache_control blocks). The log must preserve the original client payload.
@@ -1741,6 +1755,10 @@ async def anthropic_messages(
         }
 
         async def _gen():
+            # A StreamingResponse can be constructed and then abandoned before
+            # Starlette starts iterating it. Commit history only once the
+            # generator actually begins the dispatch lifecycle.
+            _record_traffic_observation()
             # Bound to this generator's execution: see _begin_prefill.
             prefill_lease = _begin_prefill()
             request_usage = {
@@ -2117,6 +2135,9 @@ async def anthropic_messages(
 
     prefill_lease = _begin_prefill()
     try:
+        # The non-streaming path reaches this point only after admission and
+        # prefill accounting succeeded, immediately before the adapter call.
+        _record_traffic_observation()
         resp = await adapter.messages(body, request_id=request_id, extra_headers=forwarded_headers)
         prefill_load.release(prefill_lease, prefill_confirmed=True)
     except HTTPException as exc:
