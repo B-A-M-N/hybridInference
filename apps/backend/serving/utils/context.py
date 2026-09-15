@@ -39,6 +39,11 @@ TRAFFIC_REASONS = "traffic_reasons"
 # avoids forwarding router-only controls through provider adapter kwargs.
 TRAFFIC_ADMISSION_CALLBACK = "traffic_admission_callback"
 
+# Request.state key stamped by RequestIdMiddleware at the ASGI request boundary.
+# Delegated handlers reuse the same Request object, so wrappers cannot move the
+# traffic cadence clock past dependency or translation work.
+REQUEST_ARRIVAL_TIMESTAMP = "request_arrival_timestamp"
+
 # UTC datetime captured once at the HTTP request boundary. Scheduled pricing
 # consumers use it so routing, logs, and quota charging cannot disagree when a
 # long-running request crosses a price-window boundary.
@@ -201,6 +206,7 @@ __all__ = [
     "MODEL_NOT_FOUND",
     "PRICING_TIME",
     "PROVIDER",
+    "REQUEST_ARRIVAL_TIMESTAMP",
     "REQUEST_SCOPED_KEYS",
     "ROUTER_PROVIDER_SENTINEL",
     "TRAFFIC_ADMISSION_CALLBACK",

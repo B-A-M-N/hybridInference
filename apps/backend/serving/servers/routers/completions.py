@@ -583,10 +583,16 @@ async def chat_completions(
     try:
         body = await request.json()
         payload = ChatCompletionRequest.model_validate(body)
-        # Capture arrival before any model-visibility or runtime-setting
-        # awaitables. Traffic cadence must describe client arrivals, not
-        # gateway preflight latency.
-        arrival_timestamp = time.monotonic()
+        # RequestIdMiddleware stamps this before FastAPI dependencies run, and
+        # delegated wrappers reuse the same Request object. The fallback keeps
+        # direct unit calls well-defined when middleware is not installed.
+        arrival_timestamp = getattr(
+            request.state,
+            req_ctx.REQUEST_ARRIVAL_TIMESTAMP,
+            None,
+        )
+        if not isinstance(arrival_timestamp, (int, float)):
+            arrival_timestamp = time.monotonic()
     except Exception as e:
         raise HTTPException(400, "Invalid JSON or schema in request body") from e
 
