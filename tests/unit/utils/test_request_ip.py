@@ -538,6 +538,29 @@ def test_cf_connecting_ip_when_cloudflare_authorized():
         assert info.trusted_proxy_headers is True
 
 
+def test_cf_optional_ipv6_ambiguity_does_not_invalidate_primary_ip():
+    """An ambiguous optional IPv6 companion cannot erase a valid primary IP."""
+    with _settings_env(
+        proxy_headers=True,
+        cf_headers=True,
+        cf_nets=_networks("172.16.0.0/12"),
+    ):
+        request = _request(
+            Headers(
+                raw=[
+                    (b"cf-connecting-ip", b"8.8.8.8"),
+                    (b"cf-connecting-ipv6", b"2001:4860:4860:abcd:1234::5"),
+                    (b"cf-connecting-ipv6", b""),
+                ]
+            ),
+            peer_ip="172.19.0.1",
+        )
+        info = get_client_ip_info(request)
+        assert info.client_ip == "8.8.8.8"
+        assert info.source == "cf-connecting-ip"
+        assert info.resolved is True
+
+
 def test_trusted_proxy_headers_true_for_cloudflare_only():
     """CF-only authorization is reflected in forwarding-header provenance."""
     with _settings_env(

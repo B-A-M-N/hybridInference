@@ -422,12 +422,10 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
     x_forwarded_for = ", ".join(xff_values) if xff_present else None
     x_real_ip_present, x_real_ip = _singleton_header(request, "x-real-ip")
     cf_connecting_ip_present, cf_connecting_ip = _singleton_header(request, "cf-connecting-ip")
-    cf_connecting_ipv6_present, cf_connecting_ipv6 = _singleton_header(
+    _, cf_connecting_ipv6 = _singleton_header(
         request, "cf-connecting-ipv6"
     )
-    cf_header_ambiguous = (cf_connecting_ip_present and cf_connecting_ip is None) or (
-        cf_connecting_ipv6_present and cf_connecting_ipv6 is None
-    )
+    cf_primary_header_ambiguous = cf_connecting_ip_present and cf_connecting_ip is None
 
     # Determine whether the immediate peer is a configured trusted proxy.
     # This is the gate for ALL forwarding-header trust. Without this, any
@@ -475,8 +473,11 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
             setattr(cache_owner, _IP_INFO_STATE_KEY, info)
         return info
 
-    if peer_is_cloudflare and cf_header_ambiguous and not peer_is_trusted_proxy:
-        # An ambiguous Cloudflare assertion must not become a client identity.
+    if peer_is_cloudflare and cf_primary_header_ambiguous and not peer_is_trusted_proxy:
+        # An ambiguous primary Cloudflare assertion must not become a client
+        # identity. An ambiguous optional IPv6 companion is handled below: it
+        # prevents Pseudo IPv4 reconstruction but does not invalidate an
+        # otherwise valid ordinary CF-Connecting-IP.
         # If this peer is also a generic trusted proxy, the independent XFF
         # contract below may still be used; otherwise no other authority exists.
         return _info("unknown", "cf-connecting-ip", False)
