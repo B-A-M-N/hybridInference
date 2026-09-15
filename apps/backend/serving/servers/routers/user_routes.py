@@ -373,7 +373,6 @@ async def create_api_key(
     current_user=Depends(get_current_user),
     op_store=Depends(get_operational_store),
     db_logger=Depends(get_db_logger),
-    log_store=Depends(get_log_store),
 ) -> APIKeyResponse:
     """Generate a new API key for the current user.
 
@@ -411,11 +410,6 @@ async def create_api_key(
         rt = None
     default_quota = await get_default_daily_quota_for_role(current_user["role"], rt)
 
-    missing_identity_fenced = (
-        None
-        if log_store is None
-        else await log_store.account_has_erasure_fence(current_user["user_id"])
-    )
     await op_store.create_key(
         key_hash=key_hash,
         key_prefix=key_prefix,
@@ -423,7 +417,6 @@ async def create_api_key(
         account_id=current_user["user_id"],
         quota_daily_cost_usd=default_quota,
         api_key_encrypted=encrypt_api_key(api_key),
-        missing_identity_fenced=missing_identity_fenced,
     )
 
     logger.info(f"API key created for user: {current_user['user_id']}")
@@ -436,7 +429,6 @@ async def create_api_key(
             "actor": "user",
             "key_prefix": key_prefix,
         },
-        target_missing_identity_fenced=missing_identity_fenced,
     )
 
     return APIKeyResponse(
