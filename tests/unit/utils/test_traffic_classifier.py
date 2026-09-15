@@ -176,7 +176,7 @@ def test_five_observations_can_receive_human_scheduling_hint():
 
 
 def test_sequential_interactive_history_can_reach_human_scheduling_hint():
-    """Mature sequential behavior is confidence evidence without volume."""
+    """Explicit session continuity can satisfy the confidence gate."""
     classification = classify_traffic(
         TrafficEvidence(
             inter_arrival_ms=5000,
@@ -192,6 +192,100 @@ def test_sequential_interactive_history_can_reach_human_scheduling_hint():
     assert classification.class_hint == TrafficClass.LIKELY_HUMAN
     assert classification.confidence >= 0.70
     assert is_high_confidence_human_hint(classification.class_hint.value, classification.confidence)
+
+
+@pytest.mark.parametrize("user_agent", ["OpenAI Python/1.0", "claude-code/1.0"])
+def test_sessionless_sequential_history_can_reach_human_scheduling_hint(user_agent):
+    """Normal authenticated multi-turn clients need no custom session ID."""
+    classification = classify_traffic(
+        TrafficEvidence(
+            inter_arrival_ms=5000,
+            concurrent_requests=1,
+            shape_repeat_count=1,
+            session_continuity=None,
+            is_authenticated=True,
+            user_agent=user_agent,
+            request_count=5,
+        )
+    )
+
+    assert classification.class_hint == TrafficClass.LIKELY_HUMAN
+    assert is_high_confidence_human_hint(classification.class_hint.value, classification.confidence)
+
+
+def test_sessionless_changing_shape_history_reaches_preference_gate():
+    """The bounded tracker infers continuity from normal changing chat turns."""
+    now = [100.0]
+    state = TrafficObservationState(clock=lambda: now[0])
+    classifications = []
+
+    for turn in range(5):
+        observation = state.record_request(
+            user_id="authenticated-user",
+            shape_hash=f"chat-turn-{turn}",
+        )
+        classifications.append(
+            classify_traffic(
+                TrafficEvidence(
+                    inter_arrival_ms=observation["inter_arrival_ms"],
+                    concurrent_requests=1,
+                    shape_repeat_count=observation["shape_repeat_count"],
+                    session_continuity=observation["session_continuity"],
+                    is_authenticated=True,
+                    user_agent="OpenAI Python/1.0",
+                    request_count=observation["request_count"],
+                )
+            )
+        )
+        now[0] += 5.0
+
+    assert all(
+        not is_high_confidence_human_hint(c.class_hint.value, c.confidence)
+        for c in classifications[:4]
+    )
+    assert is_high_confidence_human_hint(
+        classifications[-1].class_hint.value,
+        classifications[-1].confidence,
+    )
+
+
+def test_sessionless_sequential_history_stays_cold_until_mature():
+    """A few sequential requests do not receive a scheduling preference."""
+    classification = classify_traffic(
+        TrafficEvidence(
+            inter_arrival_ms=5000,
+            concurrent_requests=1,
+            shape_repeat_count=1,
+            is_authenticated=True,
+            user_agent="OpenAI Python/1.0",
+            request_count=4,
+        )
+    )
+
+    assert classification.class_hint in (TrafficClass.UNKNOWN, TrafficClass.LIKELY_HUMAN)
+    assert not is_high_confidence_human_hint(
+        classification.class_hint.value, classification.confidence
+    )
+
+
+def test_sessionless_history_does_not_override_machine_like_cadence():
+    """Accumulated count cannot turn high-rate automation into human traffic."""
+    classification = classify_traffic(
+        TrafficEvidence(
+            inter_arrival_ms=50,
+            concurrent_requests=1,
+            shape_repeat_count=1,
+            session_continuity=None,
+            is_authenticated=True,
+            user_agent="curl/8.0",
+            request_count=100,
+        )
+    )
+
+    assert classification.class_hint != TrafficClass.LIKELY_HUMAN
+    assert not is_high_confidence_human_hint(
+        classification.class_hint.value, classification.confidence
+    )
 
 
 def test_request_count_alone_cannot_establish_confidence():

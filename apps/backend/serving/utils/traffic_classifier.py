@@ -30,7 +30,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeGuard
 
 from serving.analytics.automation_score import ua_automation_value
 from serving.utils import context as req_ctx
@@ -139,7 +139,7 @@ def _clamp(value: float, min_val: float = 0.0, max_val: float = 1.0) -> float:
     return max(min_val, min(max_val, value))
 
 
-def _positive_finite(value: object) -> bool:
+def _positive_finite(value: object) -> TypeGuard[float | int]:
     """Return whether *value* is a usable positive duration."""
     return (
         isinstance(value, (int, float))
@@ -149,12 +149,12 @@ def _positive_finite(value: object) -> bool:
     )
 
 
-def _greater_than_one(value: object) -> bool:
+def _greater_than_one(value: object) -> TypeGuard[int]:
     """Return whether *value* is a usable count greater than one."""
     return isinstance(value, int) and not isinstance(value, bool) and value > 1
 
 
-def _positive_count(value: object) -> bool:
+def _positive_count(value: object) -> TypeGuard[int]:
     """Return whether *value* is a usable positive observation count."""
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
@@ -314,9 +314,9 @@ def classify_traffic(evidence: TrafficEvidence) -> TrafficClassification:
         score = _clamp(score * (MAX_SINGLE_SIGNAL_SCORE / max_signal_contribution))
 
     # Confidence is based on independent categories, including accumulated
-    # behavioral history and session continuity. History is deliberately not a
-    # multiplier: sequential interactive traffic needs a path to the routing
-    # gate even when each request is single-threaded and changes shape.
+    # behavioral history and longitudinal continuity. History is deliberately
+    # not a multiplier: sequential interactive traffic needs a path to the
+    # routing gate even when each request is single-threaded and changes shape.
     num_signals = len(signals)
     has_temporal = _positive_finite(evidence.inter_arrival_ms)
     has_volume = _greater_than_one(evidence.concurrent_requests) or _greater_than_one(
@@ -328,21 +328,28 @@ def classify_traffic(evidence: TrafficEvidence) -> TrafficClassification:
         and evidence.request_count >= HISTORY_OBSERVATION_TARGET
         and (has_temporal or has_volume)
     )
-    has_session_evidence = (
-        evidence.session_continuity is True
-        and _positive_count(evidence.request_count)
+    has_longitudinal_continuity = (
+        _positive_count(evidence.request_count)
         and evidence.request_count >= HISTORY_OBSERVATION_TARGET
+        and (
+            # An explicit session is one source of longitudinal continuity.
+            evidence.session_continuity is True
+            # Sessionless sequential traffic has the same evidence when it
+            # has accumulated history without volume-like repetition.
+            or (evidence.session_continuity is None and has_temporal and not has_volume)
+        )
     )
 
     # No category contributes more than 0.20. In particular, request count
     # alone cannot establish confidence: history requires behavioral evidence,
-    # and the session category requires both continuity and a mature history.
+    # and longitudinal continuity requires either explicit session evidence or
+    # mature, sequential temporal history.
     base_confidence = _clamp(
         (0.20 * has_temporal)
         + (0.20 * has_volume)
         + (0.15 * has_identity)
         + (0.20 * has_history)
-        + (0.15 * has_session_evidence)
+        + (0.15 * has_longitudinal_continuity)
         + (0.10 * min(num_signals, 5) / 5)
     )
     # A first request may expose a user-agent and authentication context, but
