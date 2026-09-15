@@ -89,7 +89,8 @@ async def _validate_key_identity(
     conn: Any,
     user_id: str,
     *,
-    allow_fenced_missing: bool = False,
+    allow_missing_identity: bool = False,
+    allow_unfenced_missing: bool = True,
     missing_identity_fenced: bool | None = None,
 ) -> None:
     """Validate a key identity without treating it as a user identity.
@@ -100,7 +101,10 @@ async def _validate_key_identity(
     fenced; this store only accepts that validated answer. A missing identity
     whose fence state is unknown remains fail-closed, exactly as it did when
     the store queried the LogStore table directly — but the operational store
-    never reads LogStore-owned schema anymore.
+    never reads LogStore-owned schema anymore. ``allow_unfenced_missing`` is
+    disabled for new-key creation, because a stale negative fence result must
+    not recreate a missing identity. ``allow_missing_identity`` is reserved
+    for destructive credential removal.
     """
     row = await conn.fetchrow(
         "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
@@ -111,15 +115,21 @@ async def _validate_key_identity(
             raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
         return
 
+    if allow_missing_identity:
+        return
+
     if missing_identity_fenced is None:
         raise HardDeleteStateChanged(
             f"Account {user_id} no longer exists and its erasure fence cannot be validated."
         )
 
-    if missing_identity_fenced and not allow_fenced_missing:
+    if missing_identity_fenced:
         raise HardDeleteStateChanged(
             f"Account {user_id} no longer exists and is protected by an erasure fence."
         )
+
+    if not allow_unfenced_missing:
+        raise HardDeleteStateChanged(f"Account {user_id} no longer exists.")
 
 
 def _parse_command_tag_count(command_tag: str) -> int:
@@ -1970,7 +1980,8 @@ class PostgresOperationalStore(OperationalStore):
         ``missing_identity_fenced`` is the LogStore-validated erasure-fence
         answer for a key-only identity whose ``users`` row is gone; ``None``
         means no LogStore verification is available and the mutation fails
-        closed.
+        closed. New key creation for a missing identity fails closed even
+        when this preflight answer is ``False``.
         """
         import asyncpg as _asyncpg
 
@@ -1990,6 +2001,7 @@ class PostgresOperationalStore(OperationalStore):
             await _validate_key_identity(
                 conn,
                 user_id,
+                allow_unfenced_missing=False,
                 missing_identity_fenced=missing_identity_fenced,
             )
             try:
@@ -2159,14 +2171,15 @@ class PostgresOperationalStore(OperationalStore):
         """Soft-revoke (status='revoked') or hard-delete the key.
 
         ``missing_identity_fenced`` is the LogStore-validated erasure-fence
-        answer for a key-only identity; destructive revocation may still
-        remove an existing stale credential safely.
+        answer for a key-only identity. Destructive revocation does not
+        require it: removing an existing stale credential is safe even when
+        LogStore is unavailable.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             await _validate_key_identity(
                 conn,
                 user_id,
-                allow_fenced_missing=True,
+                allow_missing_identity=True,
                 missing_identity_fenced=missing_identity_fenced,
             )
             if hard_delete:
@@ -2612,6 +2625,7 @@ class PostgresOperationalStore(OperationalStore):
         target_user_id: str | None = None,
         details: dict[str, Any] | None = None,
         success: bool = True,
+        target_is_user: bool = True,
         target_missing_identity_fenced: bool | None = None,
     ) -> None:
         """Insert an audit row, validating concrete targets transactionally.
@@ -2626,11 +2640,14 @@ class PostgresOperationalStore(OperationalStore):
         no verification is available and a missing target (whose fence state
         is therefore unknown) is fail-closed — the audit row is still written
         with the target redacted so a committed admin mutation is not lost.
+
+        ``target_is_user`` identifies whether ``target_user_id`` is a user
+        identity. Set it to ``False`` for non-user audit targets.
         """
         async with self._pool.acquire() as conn, conn.transaction():
             audit_target_user_id = target_user_id
             audit_details = dict(details) if details else None
-            if target_user_id is not None:
+            if target_user_id is not None and target_is_user:
                 row = await conn.fetchrow(
                     "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
                     target_user_id,

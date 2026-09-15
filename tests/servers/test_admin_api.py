@@ -238,7 +238,7 @@ async def test_update_api_key_not_found(admin_client):
 
 @pytest.mark.asyncio
 async def test_revoke_api_key_soft_delete(admin_client):
-    client, op_store, _log_store, log_action = admin_client
+    client, op_store, log_store, log_action = admin_client
     op_store.get_key_detail.return_value = {"user_id": "alice"}
 
     response = await client.delete(
@@ -248,13 +248,15 @@ async def test_revoke_api_key_soft_delete(admin_client):
 
     assert response.status_code == 200
     op_store.revoke_key.assert_awaited_once()
-    assert op_store.revoke_key.await_args.kwargs["missing_identity_fenced"] is False
+    assert op_store.revoke_key.await_args.args == ("alice",)
+    assert op_store.revoke_key.await_args.kwargs == {"hard_delete": False}
+    log_store.account_has_erasure_fence.assert_not_awaited()
     log_action.assert_awaited()
 
 
 @pytest.mark.asyncio
 async def test_revoke_api_key_hard_delete(admin_client):
-    client, op_store, _log_store, _log_action = admin_client
+    client, op_store, log_store, _log_action = admin_client
     op_store.get_key_detail.return_value = {"user_id": "alice"}
 
     response = await client.delete(
@@ -265,4 +267,6 @@ async def test_revoke_api_key_hard_delete(admin_client):
 
     assert response.status_code == 200
     op_store.revoke_key.assert_awaited_once()
-    assert op_store.revoke_key.await_args.kwargs["missing_identity_fenced"] is False
+    assert op_store.revoke_key.await_args.args == ("alice",)
+    assert op_store.revoke_key.await_args.kwargs == {"hard_delete": True}
+    log_store.account_has_erasure_fence.assert_not_awaited()

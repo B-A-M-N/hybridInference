@@ -522,7 +522,8 @@ class OperationalStore(ABC):
         """Soft-revoke (status='revoked') or hard-delete the key.
 
         ``missing_identity_fenced`` is the LogStore-validated erasure-fence
-        answer for a key-only identity (see :meth:`create_key`).
+        answer for a key-only identity (see :meth:`create_key`). Destructive
+        revocation does not require this cross-store answer.
         """
 
     @abstractmethod
@@ -793,6 +794,7 @@ class OperationalStore(ABC):
         target_user_id: str | None = None,
         details: dict[str, Any] | None = None,
         success: bool = True,
+        target_is_user: bool = True,
         target_missing_identity_fenced: bool | None = None,
     ) -> None:
         """Insert a row into admin_audit_log.
@@ -800,7 +802,8 @@ class OperationalStore(ABC):
         ``target_missing_identity_fenced`` carries the LogStore-validated
         erasure-fence answer for a missing target, so the operational store
         can redact identifying rows without querying the LogStore-owned fence
-        table.
+        table. ``target_is_user`` is false for non-user targets, such as
+        provider names, which must not be looked up or redacted as users.
         """
 
     @abstractmethod

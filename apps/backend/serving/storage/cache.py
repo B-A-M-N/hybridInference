@@ -865,6 +865,7 @@ class CachedOperationalStore(OperationalStore):
         target_user_id: str | None = None,
         details: dict[str, Any] | None = None,
         success: bool = True,
+        target_is_user: bool = True,
         target_missing_identity_fenced: bool | None = None,
     ) -> None:
         """Delegate to wrapped store."""
@@ -874,6 +875,7 @@ class CachedOperationalStore(OperationalStore):
             target_user_id=target_user_id,
             details=details,
             success=success,
+            target_is_user=target_is_user,
             target_missing_identity_fenced=target_missing_identity_fenced,
         )
 

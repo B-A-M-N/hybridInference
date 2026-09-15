@@ -888,6 +888,7 @@ async def log_admin_action(
     target_user_id: str | None = None,
     details: dict[str, Any] | None = None,
     success: bool = True,
+    target_is_user: bool = True,
     target_missing_identity_fenced: bool | None = None,
 ) -> None:
     """Log admin action to audit trail.
@@ -905,6 +906,8 @@ async def log_admin_action(
         target_user_id: User ID affected by the action (if applicable)
         details: Additional context (will be stored as JSONB)
         success: Whether the action succeeded
+        target_is_user: Whether ``target_user_id`` names a user identity. Set
+            false for non-user targets such as provider names.
         target_missing_identity_fenced: Whether the LogStore reports an
             erasure fence for a target whose ``users`` row is missing.
     """
@@ -919,6 +922,7 @@ async def log_admin_action(
             target_user_id=target_user_id,
             details=details,
             success=success,
+            target_is_user=target_is_user,
             target_missing_identity_fenced=target_missing_identity_fenced,
         )
         return
@@ -932,7 +936,7 @@ async def log_admin_action(
     async with db_logger.pool.acquire() as conn, conn.transaction():
         audit_target_user_id = target_user_id
         audit_details = dict(details) if details else None
-        if target_user_id is not None:
+        if target_user_id is not None and target_is_user:
             row = await conn.fetchrow(
                 "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
                 target_user_id,
@@ -944,9 +948,7 @@ async def log_admin_action(
                 audit_target_user_id = None
                 audit_details = {
                     "target_user_id_redacted": (
-                        "erasure_fence"
-                        if target_missing_identity_fenced
-                        else "missing_identity"
+                        "erasure_fence" if target_missing_identity_fenced else "missing_identity"
                     )
                 }
             elif row.get("hard_delete_pending", False):

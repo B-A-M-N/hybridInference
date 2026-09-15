@@ -975,9 +975,7 @@ async def test_stale_admin_update_after_hard_delete_cannot_recreate_identity(fen
         lambda: op_store.create_key(
             key_hash="hash", key_prefix="prefix", user_id=_OWNER, missing_identity_fenced=True
         ),
-        lambda: op_store.update_key(
-            _OWNER, quota_daily_cost_usd=10, missing_identity_fenced=True
-        ),
+        lambda: op_store.update_key(_OWNER, quota_daily_cost_usd=10, missing_identity_fenced=True),
         lambda: op_store.regenerate_key(
             _OWNER,
             new_key_hash="new-hash",
@@ -1029,15 +1027,27 @@ async def test_key_only_identity_lifecycle_and_audit_redacts_missing_identity(fe
                 "'key_only_update', 'legacy_key_only_update')"
             )
 
-        await op_store.create_key(
-            key_hash="key-only-hash-1",
-            key_prefix="key-only-prefix-1",
-            user_id=user_id,
-            missing_identity_fenced=False,
-        )
-        await op_store.update_key(
-            user_id, notes="legacy key-only", missing_identity_fenced=False
-        )
+        with pytest.raises(HardDeleteStateChanged, match="no longer exists"):
+            await op_store.create_key(
+                key_hash="key-only-hash-new",
+                key_prefix="key-only-prefix-new",
+                user_id=user_id,
+                missing_identity_fenced=False,
+            )
+
+        # This is a legacy row that predates the transactional user-identity
+        # guard; it is seeded directly so the test does not use the guarded
+        # new-key creation path to manufacture a missing identity.
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO api_keys "
+                "(key_hash, key_prefix, user_id, account_id) "
+                "VALUES ($1, $2, $3, NULL)",
+                "key-only-hash-1",
+                "key-only-prefix-1",
+                user_id,
+            )
+        await op_store.update_key(user_id, notes="legacy key-only", missing_identity_fenced=False)
         old_prefix = await op_store.regenerate_key(
             user_id,
             new_key_hash="key-only-hash-2",
@@ -1064,15 +1074,14 @@ async def test_key_only_identity_lifecycle_and_audit_redacts_missing_identity(fe
             user_id,
             target_missing_identity_fenced=False,
         )
-        await op_store.revoke_key(user_id, missing_identity_fenced=False)
+        # Destructive removal does not need LogStore's fence result.
+        await op_store.revoke_key(user_id)
         async with pool.acquire() as conn:
             assert (
                 await conn.fetchval("SELECT status FROM api_keys WHERE user_id = $1", user_id)
                 == "revoked"
             )
-        await op_store.revoke_key(
-            user_id, hard_delete=True, missing_identity_fenced=False
-        )
+        await op_store.revoke_key(user_id, hard_delete=True)
 
         async with pool.acquire() as conn:
             assert (
@@ -1101,6 +1110,41 @@ async def test_key_only_identity_lifecycle_and_audit_redacts_missing_identity(fe
 
 
 @pytest.mark.asyncio
+async def test_non_user_audit_target_is_not_redacted_as_missing_user(fence_store):
+    """Provider/resource targets retain their audit identity without a user row."""
+    _store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    action = "provider_target_audit_regression"
+    target = "provider-without-a-user-row"
+
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM admin_audit_log WHERE action = $1", action)
+
+        await op_store.log_admin_action(
+            admin_ip="127.0.0.1",
+            action=action,
+            target_user_id=target,
+            target_is_user=False,
+            details={"provider": target, "disabled": True},
+        )
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT target_user_id, details FROM admin_audit_log WHERE action = $1",
+                action,
+            )
+        assert row["target_user_id"] == target
+        details = row["details"]
+        if isinstance(details, str):
+            details = json.loads(details)
+        assert details == {"provider": target, "disabled": True}
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM admin_audit_log WHERE action = $1", action)
+
+
+@pytest.mark.asyncio
 async def test_fenced_key_only_identity_cannot_regain_credential_but_can_revoke(
     fence_store,
 ):
@@ -1118,12 +1162,15 @@ async def test_fenced_key_only_identity_cannot_regain_credential_but_can_revoke(
                 "('key_only_fenced_revoke', 'legacy_key_only_fenced_revoke')"
             )
 
-        await op_store.create_key(
-            key_hash="erased-key-hash",
-            key_prefix="erased-key-prefix",
-            user_id=user_id,
-            missing_identity_fenced=False,
-        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO api_keys "
+                "(key_hash, key_prefix, user_id, account_id) "
+                "VALUES ($1, $2, $3, NULL)",
+                "erased-key-hash",
+                "erased-key-prefix",
+                user_id,
+            )
         await store.hard_delete_user_data(user_id)
         assert await store.account_has_erasure_fence(user_id) is True
 
@@ -1167,9 +1214,7 @@ async def test_fenced_key_only_identity_cannot_regain_credential_but_can_revoke(
             {"key_prefix": "erased-key-prefix"},
             target_missing_identity_fenced=True,
         )
-        await op_store.revoke_key(
-            user_id, hard_delete=True, missing_identity_fenced=True
-        )
+        await op_store.revoke_key(user_id, hard_delete=True, missing_identity_fenced=True)
 
         async with pool.acquire() as conn:
             assert (
@@ -1226,15 +1271,16 @@ async def test_separate_store_schemas_route_fence_checks_to_log_store(
     try:
         unfenced = await log_store.account_has_erasure_fence(user_id)
         assert unfenced is False
-        await op_store.create_key(
-            key_hash="separate-store-hash-1",
-            key_prefix="separate-store-prefix-1",
-            user_id=user_id,
-            missing_identity_fenced=unfenced,
-        )
-        await op_store.update_key(
-            user_id, notes="separate-store", missing_identity_fenced=unfenced
-        )
+        async with operational_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO api_keys "
+                "(key_hash, key_prefix, user_id, account_id) "
+                "VALUES ($1, $2, $3, NULL)",
+                "separate-store-hash-1",
+                "separate-store-prefix-1",
+                user_id,
+            )
+        await op_store.update_key(user_id, notes="separate-store", missing_identity_fenced=unfenced)
         old_prefix = await op_store.regenerate_key(
             user_id,
             new_key_hash="separate-store-hash-2",
@@ -1242,7 +1288,7 @@ async def test_separate_store_schemas_route_fence_checks_to_log_store(
             missing_identity_fenced=unfenced,
         )
         assert old_prefix == "separate-store-prefix-1"
-        await op_store.revoke_key(user_id, missing_identity_fenced=unfenced)
+        await op_store.revoke_key(user_id)
         await op_store.log_admin_action(
             admin_ip="127.0.0.1",
             action="separate_store_unfenced",
@@ -1254,6 +1300,13 @@ async def test_separate_store_schemas_route_fence_checks_to_log_store(
         fenced = await log_store.account_has_erasure_fence(user_id)
         assert fenced is True
 
+        with pytest.raises(HardDeleteStateChanged, match="no longer exists"):
+            await op_store.create_key(
+                key_hash="separate-store-stale-negative-hash",
+                key_prefix="separate-store-stale-negative-prefix",
+                user_id=user_id,
+                missing_identity_fenced=False,
+            )
         with pytest.raises(HardDeleteStateChanged, match="erasure fence"):
             await op_store.create_key(
                 key_hash="separate-store-hash-3",
@@ -1274,7 +1327,7 @@ async def test_separate_store_schemas_route_fence_checks_to_log_store(
             )
 
         # Destructive removal remains allowed for a stale fenced credential.
-        await op_store.revoke_key(user_id, hard_delete=True, missing_identity_fenced=fenced)
+        await op_store.revoke_key(user_id, hard_delete=True)
         await op_store.log_admin_action(
             admin_ip="127.0.0.1",
             action="separate_store_fenced_revoke",

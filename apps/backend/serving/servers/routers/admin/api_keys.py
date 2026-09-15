@@ -279,9 +279,7 @@ async def update_api_key(
 
     try:
         missing_identity_fenced = (
-            None
-            if log_store is None
-            else await log_store.account_has_erasure_fence(user_id)
+            None if log_store is None else await log_store.account_has_erasure_fence(user_id)
         )
         await op_store.update_key(
             user_id, missing_identity_fenced=missing_identity_fenced, **payload_dict
@@ -315,7 +313,6 @@ async def revoke_api_key(
     hard_delete: bool = False,
     admin_id: str = Depends(verify_admin_access),
     op_store=Depends(get_operational_store),
-    log_store=Depends(get_log_store),
 ) -> RevokeAPIKeyResponse:
     """Revoke or delete an API key.
 
@@ -333,16 +330,7 @@ async def revoke_api_key(
         raise HTTPException(404, f"User '{user_id}' not found")
 
     try:
-        missing_identity_fenced = (
-            None
-            if log_store is None
-            else await log_store.account_has_erasure_fence(user_id)
-        )
-        await op_store.revoke_key(
-            user_id,
-            hard_delete=hard_delete,
-            missing_identity_fenced=missing_identity_fenced,
-        )
+        await op_store.revoke_key(user_id, hard_delete=hard_delete)
     except HardDeleteStateChanged:
         raise HTTPException(
             409,
@@ -366,7 +354,6 @@ async def revoke_api_key(
         action_type,
         user_id,
         {"hard_delete": hard_delete},
-        target_missing_identity_fenced=missing_identity_fenced,
     )
 
     return RevokeAPIKeyResponse(user_id=user_id, action=response_action, message=message)
