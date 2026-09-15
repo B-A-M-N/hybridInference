@@ -16,6 +16,7 @@ import aiohttp
 from serving.config.settings import get_settings
 from serving.exceptions import UpstreamStreamIdleError
 from serving.stream import done_sentinel
+from serving.utils.context import notify_traffic_admitted
 from serving.utils.logging import get_logger
 from serving.utils.messages import flatten_text_content, merge_leading_system_messages
 from serving.utils.tokens import estimate_prompt_tokens, estimate_text_tokens
@@ -772,6 +773,7 @@ class OpenAICompatAdapter(BaseAdapter):
         if self._key_pool is None:
             headers = self._build_headers()
             slot = await self._acquire_upstream_slot(self.config.api_key)
+            notify_traffic_admitted()
             # retries=1 => exactly one attempt, NO retry. A chat.completion POST
             # is non-idempotent: re-sending on any ClientError (which includes a
             # response-phase >=400, or a total timeout that fires while the
@@ -856,6 +858,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 last_error = saturated
                 continue
 
+            notify_traffic_admitted()
             headers = self._build_headers(api_key_override=api_key)
             try:
                 response = await self.http.json_post(
@@ -960,6 +963,7 @@ class OpenAICompatAdapter(BaseAdapter):
         if self._key_pool is None:
             headers = self._build_headers()
             slot = await self._acquire_upstream_slot(self.config.api_key)
+            notify_traffic_admitted()
             stream_iter = self.http.stream_post(
                 url=url, json=payload, headers=headers, timeout=timeout
             )
@@ -1029,6 +1033,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 last_error = saturated
                 continue
 
+            notify_traffic_admitted()
             headers = self._build_headers(api_key_override=api_key)
             stream_iter = self.http.stream_post(
                 url=url, json=payload, headers=headers, timeout=timeout
@@ -1548,7 +1553,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 float(sock_read) if sock_read else 0.0,
                 endpoint_id=stream_endpoint_id,
             ) from exc
-        except aiohttp.ClientError:
+        except aiohttp.ClientError as exc:
             # Mid-stream upstream I/O failure (disconnect, ClientPayloadError):
             # mute the key, then propagate to the client as before.
             stream_error = True
@@ -1557,8 +1562,8 @@ class OpenAICompatAdapter(BaseAdapter):
             # sideline a working credential over someone else's bad request.
             # Hand the pool the real status and let its own policy decide;
             # everything statusless keeps the historical 0 ("non-HTTP failure").
-            if isinstance(e, UpstreamStreamError):
-                stream_error_status = e.status
+            if isinstance(exc, UpstreamStreamError):
+                stream_error_status = exc.status
             raise
         finally:
             # The outbound slot was held for the whole generation, not just the

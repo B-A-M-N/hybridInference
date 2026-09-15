@@ -43,6 +43,14 @@ from serving.utils.logging import get_logger
 logger = get_logger(__name__)
 _LEGACY_ROUTING_OPTION_UNSET = object()
 
+
+def _dispatch_context(routing_options: Any) -> dict[str, Any]:
+    """Expose typed dispatch hooks to adapters without forwarding them."""
+    if routing_options is None or routing_options.on_dispatch_admitted is None:
+        return {}
+    return {req_ctx.TRAFFIC_ADMISSION_CALLBACK: routing_options.on_dispatch_admitted}
+
+
 # ============================================================================
 # Exceptions
 # ============================================================================
@@ -1220,12 +1228,11 @@ class FixedRouter:
                 )
             raise ValueError(f"No route configured for model {model_id}")
         try:
-            if routing_options is not None and routing_options.on_dispatch_admitted is not None:
-                routing_options.on_dispatch_admitted()
             endpoint_id = endpoint_id_for_adapter(primary)
             with req_ctx.push(
                 model=model_id,
                 provider=primary.config.provider,
+                **_dispatch_context(routing_options),
                 **{
                     req_ctx.UPSTREAM_PRIORITY: self._dispatch_priority(
                         endpoint_id,
@@ -1326,6 +1333,7 @@ class FixedRouter:
                     with req_ctx.push(
                         model=model_id,
                         provider=adapter.config.provider,
+                        **_dispatch_context(routing_options),
                         **{
                             req_ctx.UPSTREAM_PRIORITY: self._dispatch_priority(
                                 endpoint_id,
@@ -1448,12 +1456,11 @@ class FixedRouter:
         chunks_yielded = False
         lease: PrefillLease | None = None
         try:
-            if routing_options is not None and routing_options.on_dispatch_admitted is not None:
-                routing_options.on_dispatch_admitted()
             primary_endpoint_id = endpoint_id_for_adapter(primary)
             with req_ctx.push(
                 model=model_id,
                 provider=primary.config.provider,
+                **_dispatch_context(routing_options),
                 **{
                     req_ctx.UPSTREAM_PRIORITY: self._dispatch_priority(
                         primary_endpoint_id,
@@ -1581,6 +1588,7 @@ class FixedRouter:
                     with req_ctx.push(
                         model=model_id,
                         provider=adapter.config.provider,
+                        **_dispatch_context(routing_options),
                         **{
                             req_ctx.UPSTREAM_PRIORITY: self._dispatch_priority(
                                 adapter_endpoint_id,

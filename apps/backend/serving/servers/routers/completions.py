@@ -199,6 +199,22 @@ def _router_supports_routing_options(router: Any) -> bool:
     return True
 
 
+def _is_synthetic_routing_chunk(chunk: Any) -> bool:
+    """Identify router metadata that precedes the provider stream."""
+    if not isinstance(chunk, str) or not chunk.startswith("data: "):
+        return False
+    try:
+        chunk_json = json.loads(chunk[6:])
+    except json.JSONDecodeError:
+        return False
+    return (
+        isinstance(chunk_json, dict)
+        and isinstance(chunk_json.get("_routing"), dict)
+        and not chunk_json.get("choices")
+        and chunk_json.get("usage") is None
+    )
+
+
 async def _should_force_chat_completions_streaming(
     runtime_settings: RuntimeSettings | None,
     requested_stream: bool,
@@ -1020,10 +1036,10 @@ async def chat_completions(
         router_params["routing_options"] = routing_options
 
     async def _record_stream_admission(chunks: Any) -> Any:
-        """Fallback commit for legacy routers without an admission callback."""
+        """Fallback commit for routers without an adapter admission callback."""
         recorded = False
         async for chunk in chunks:
-            if not recorded:
+            if not recorded and not _is_synthetic_routing_chunk(chunk):
                 _record_traffic_observation()
                 recorded = True
             yield chunk

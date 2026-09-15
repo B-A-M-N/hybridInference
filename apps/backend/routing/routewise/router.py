@@ -122,6 +122,13 @@ _WORKER_COUNT_ENV_KEYS = (
 )
 
 
+def _dispatch_context(routing_options: Any) -> dict[str, Any]:
+    """Expose typed dispatch hooks to adapters without forwarding them."""
+    if routing_options is None or routing_options.on_dispatch_admitted is None:
+        return {}
+    return {req_ctx.TRAFFIC_ADMISSION_CALLBACK: routing_options.on_dispatch_admitted}
+
+
 async def _await_cancelled_child(task: asyncio.Task[Any]) -> None:
     """Await a cancelled child without swallowing cancellation of this task."""
     try:
@@ -2941,12 +2948,8 @@ class RouteWiseRouter:
                 primary = decision.adapter
                 last_attempted = primary
                 try:
-                    if (
-                        routing_options is not None
-                        and routing_options.on_dispatch_admitted is not None
-                    ):
-                        routing_options.on_dispatch_admitted()
-                    resp = await self._execute_adapter(decision, model_id, messages, **params)
+                    with req_ctx.push(**_dispatch_context(routing_options)):
+                        resp = await self._execute_adapter(decision, model_id, messages, **params)
                     self._ensure_response_routing(
                         resp,
                         primary,
@@ -3063,29 +3066,25 @@ class RouteWiseRouter:
                 primary = decision.adapter
                 last_attempted = primary
                 try:
-                    if (
-                        routing_options is not None
-                        and routing_options.on_dispatch_admitted is not None
-                    ):
-                        routing_options.on_dispatch_admitted()
                     yield routing_chunk(
                         primary,
                         fallback=bool(trace.failed_attempts),
                         failed_attempts=trace.failed_attempts,
                     )
                     decision.metadata["is_streaming"] = True
-                    async for chunk in self._execute_stream_adapter(
-                        decision,
-                        model_id,
-                        messages,
-                        **params,
-                    ):
-                        self.pending_prefix_cache.touch(str(request_id))
-                        if isinstance(chunk, str) and chunk.strip() == "data: [DONE]":
-                            done_chunk = chunk
-                            continue
-                        yield chunk
-                        chunks_yielded = True
+                    with req_ctx.push(**_dispatch_context(routing_options)):
+                        async for chunk in self._execute_stream_adapter(
+                            decision,
+                            model_id,
+                            messages,
+                            **params,
+                        ):
+                            self.pending_prefix_cache.touch(str(request_id))
+                            if isinstance(chunk, str) and chunk.strip() == "data: [DONE]":
+                                done_chunk = chunk
+                                continue
+                            yield chunk
+                            chunks_yielded = True
 
                     decision.metadata["is_streaming"] = True
                     routing: dict[str, Any] = {}

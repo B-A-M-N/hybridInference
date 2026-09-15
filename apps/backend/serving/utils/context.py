@@ -34,6 +34,10 @@ TRAFFIC_CLASSIFICATION = "traffic_classification"
 TRAFFIC_AUTOMATION_SCORE = "traffic_automation_score"
 TRAFFIC_CONFIDENCE = "traffic_confidence"
 TRAFFIC_REASONS = "traffic_reasons"
+# Callback installed by typed serving routers and fired by an adapter only once
+# its own outbound admission gate has succeeded. Keeping this in request context
+# avoids forwarding router-only controls through provider adapter kwargs.
+TRAFFIC_ADMISSION_CALLBACK = "traffic_admission_callback"
 
 # UTC datetime captured once at the HTTP request boundary. Scheduled pricing
 # consumers use it so routing, logs, and quota charging cannot disagree when a
@@ -81,6 +85,7 @@ REQUEST_SCOPED_KEYS = (
     TRAFFIC_AUTOMATION_SCORE,
     TRAFFIC_CONFIDENCE,
     TRAFFIC_REASONS,
+    TRAFFIC_ADMISSION_CALLBACK,
     PRICING_TIME,
     CLIENT_ERROR_KIND,
     PROVIDER,
@@ -114,6 +119,13 @@ def update(values: dict[str, Any]) -> None:
     current = dict(current_value) if current_value is not None else {}
     current.update(values)
     _ctx.set(current)
+
+
+def notify_traffic_admitted() -> None:
+    """Notify the current request after adapter-level admission succeeds."""
+    callback = get().get(TRAFFIC_ADMISSION_CALLBACK)
+    if callable(callback):
+        callback()
 
 
 @contextmanager
@@ -191,6 +203,7 @@ __all__ = [
     "PROVIDER",
     "REQUEST_SCOPED_KEYS",
     "ROUTER_PROVIDER_SENTINEL",
+    "TRAFFIC_ADMISSION_CALLBACK",
     "TRAFFIC_AUTOMATION_SCORE",
     "TRAFFIC_CLASSIFICATION",
     "TRAFFIC_CONFIDENCE",
@@ -198,6 +211,7 @@ __all__ = [
     "USER_ROLE",
     "get",
     "mark_model_not_found",
+    "notify_traffic_admitted",
     "publish_upstream_provider",
     "push",
     "reset_request_scope",

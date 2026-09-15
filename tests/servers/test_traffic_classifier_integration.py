@@ -20,6 +20,7 @@ from serving.adapters.base import BaseAdapter, ModelConfig
 from serving.servers.deps import AppServices
 from serving.servers.middleware.error import install_error_handlers
 from serving.servers.routers import completions
+from serving.utils.context import notify_traffic_admitted
 from serving.utils.traffic_classifier import TrafficClass, TrafficClassification
 from serving.utils.traffic_state import get_traffic_observation_state
 
@@ -549,6 +550,7 @@ async def test_completions_admitted_upstream_failure_records_traffic_history(
     adapter, _weight = traffic_completions_app.state.services.router.routes["gpt-4"].adapters[0]
 
     async def fail_upstream(messages, **params):
+        notify_traffic_admitted()
         raise RuntimeError("upstream failed")
 
     monkeypatch.setattr(adapter, "chat_completion", fail_upstream)
@@ -608,9 +610,7 @@ async def test_completions_fallback_records_when_typed_router_ignores_callback(
     )
 
     assert response.status_code == 200
-    identity_key = get_traffic_observation_state()._identity_key(
-        "user", "traffic-test-user"
-    )
+    identity_key = get_traffic_observation_state()._identity_key("user", "traffic-test-user")
     state = get_traffic_observation_state()
     assert state._identities[identity_key].request_count == 1
 

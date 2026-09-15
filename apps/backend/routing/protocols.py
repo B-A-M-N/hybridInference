@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
 
     from routing.routers import RoutingObservation
 
@@ -21,8 +20,9 @@ class RoutingRequestOptions:
     Traffic fields are server-generated online evidence. They are carried as a
     typed routing hint so strategies can make an explicit, conservative
     scheduling decision without reading arbitrary request-context keys. The
-    admission callback is consumed by typed routers at their dispatch boundary;
-    it is never forwarded to provider adapters.
+    admission callback is consumed by typed routers and installed in the
+    dispatch context; provider adapters fire it after their outbound admission
+    gate succeeds. It is never forwarded through provider adapter kwargs.
     """
 
     pin_provider: str | None = None
