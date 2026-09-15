@@ -436,6 +436,7 @@ class AnthropicAdapter(BaseAdapter):
                 timeout=timeout,
             ) as resp,
         ):
+            notify_traffic_admitted()
             if resp.status >= 400:
                 error_body = await resp.text()
                 raise aiohttp.ClientResponseError(

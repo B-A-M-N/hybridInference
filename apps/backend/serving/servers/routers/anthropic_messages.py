@@ -1420,7 +1420,12 @@ async def anthropic_messages(
         None if is_synthetic_probe else user_ctx.get("user_id") if is_authenticated else None
     )
     traffic_state = get_traffic_observation_state()
-    arrival_timestamp = float(traffic_state.preview_request(user_id=traffic_user_id)["observed_at"])
+    arrival_value = getattr(request.state, req_ctx.REQUEST_ARRIVAL_TIMESTAMP, None)
+    arrival_timestamp = (
+        float(arrival_value)
+        if isinstance(arrival_value, (int, float)) and not isinstance(arrival_value, bool)
+        else time.monotonic()
+    )
 
     # Before dispatch, so this covers the native passthrough as well as the
     # translated path. A native Anthropic upstream is forwarded this body
@@ -1757,9 +1762,9 @@ async def anthropic_messages(
 
         async def _gen():
             # A StreamingResponse can be constructed and then abandoned before
-            # Starlette starts iterating it. Commit history only once the
-            # generator actually begins the dispatch lifecycle.
-            _record_traffic_observation()
+            # Starlette starts iterating it. The callback is installed below in
+            # the request context and fires only after the adapter's outbound
+            # admission gate succeeds in the reader task.
             # Bound to this generator's execution: see _begin_prefill.
             prefill_lease = _begin_prefill()
             request_usage = {
@@ -1900,6 +1905,10 @@ async def anthropic_messages(
                         # here on.
                         saw_upstream_frame = True
                         if item is _STREAM_SENTINEL:
+                            # A clean sentinel proves the adapter entered and
+                            # completed its stream, even when it emitted no
+                            # content-bearing frame.
+                            _record_traffic_observation()
                             # Clean end of body. ``_parse_sse_chunk`` only emits
                             # an event once it sees the blank line SSE delimits
                             # events with, so an upstream that closed straight
@@ -1935,6 +1944,10 @@ async def anthropic_messages(
                             break
                         if isinstance(item, Exception):
                             raise item
+                        # Custom adapters may not know the internal callback.
+                        # Reaching the queue means their stream actually
+                        # yielded after any adapter-side admission work.
+                        _record_traffic_observation()
                         chunk = item
                         if isinstance(chunk, str):
                             chunk = chunk.encode("utf-8")
@@ -2132,14 +2145,21 @@ async def anthropic_messages(
                         user_id=user_ctx.get("user_id"),
                     )
 
+        # The stream is consumed after this handler returns, often in a task
+        # with a copied context. Publish the callback durably so the adapter's
+        # slot acquisition can notify the same idempotent recorder.
+        req_ctx.update({req_ctx.TRAFFIC_ADMISSION_CALLBACK: _record_traffic_observation})
         return StreamingResponse(_gen(), media_type="text/event-stream", headers=sse_headers)
 
     prefill_lease = _begin_prefill()
     try:
-        # The non-streaming path reaches this point only after admission and
-        # prefill accounting succeeded, immediately before the adapter call.
+        # The adapter owns outbound admission. Its callback fires after the
+        # slot/key gate; the post-success call keeps legacy adapters compatible.
+        with req_ctx.push(**{req_ctx.TRAFFIC_ADMISSION_CALLBACK: _record_traffic_observation}):
+            resp = await adapter.messages(
+                body, request_id=request_id, extra_headers=forwarded_headers
+            )
         _record_traffic_observation()
-        resp = await adapter.messages(body, request_id=request_id, extra_headers=forwarded_headers)
         prefill_load.release(prefill_lease, prefill_confirmed=True)
     except HTTPException as exc:
         # Not str(exc.detail): unlike the router's own HTTPExceptions (static

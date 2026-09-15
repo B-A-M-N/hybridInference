@@ -170,6 +170,7 @@ async def test_lease_is_returned_after_a_failed_request(
     # Every except arm on this handler returns its own error response, so the
     # release has to come from a finally that covers all of them.
     from serving.adapters.key_pool import KeyPoolExhausted
+    from serving.utils.traffic_state import get_traffic_observation_state
 
     async def fake_post(self, url, payload):
         raise KeyPoolExhausted("all keys muted")
@@ -178,11 +179,24 @@ async def test_lease_is_returned_after_a_failed_request(
 
     monkeypatch.setattr(OpenAICompatAdapter, "_post_with_pool", fake_post)
     endpoint_id = endpoint_id_for_adapter(_adapter(anthropic_compat_router))
+    traffic_state = get_traffic_observation_state()
+    identity_key = traffic_state._identity_key("user", "test-user")
+    previous_count = (
+        traffic_state._identities[identity_key].request_count
+        if identity_key in traffic_state._identities
+        else 0
+    )
 
     r = await anthropic_test_client.post("/v1/messages", json=_body(), headers=_auth())
 
     assert r.status_code == 429
     assert anthropic_compat_router.prefill_load.backlog(endpoint_id) == 0
+    current_count = (
+        traffic_state._identities[identity_key].request_count
+        if identity_key in traffic_state._identities
+        else 0
+    )
+    assert current_count == previous_count
     await asyncio.sleep(0)
 
 
