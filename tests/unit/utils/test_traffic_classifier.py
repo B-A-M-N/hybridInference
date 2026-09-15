@@ -520,11 +520,12 @@ def test_traffic_state_commit_preserves_preview_timestamp():
     state = TrafficObservationState(clock=lambda: now[0])
     state.record_request(user_id="user_1")
 
-    now[0] = 110.0
-    preview = state.preview_request(user_id="user_1")
+    # The tracker clock has advanced during gateway preflight, but the router
+    # captured this request's arrival at 110.0 before those awaits.
+    now[0] = 210.0
+    preview = state.preview_request(user_id="user_1", observed_at=110.0)
 
     # Simulate a slow upstream response before dispatch admission is confirmed.
-    now[0] = 210.0
     committed = state.record_request(
         user_id="user_1",
         observed_at=float(preview["observed_at"]),
@@ -532,6 +533,27 @@ def test_traffic_state_commit_preserves_preview_timestamp():
 
     assert committed["observed_at"] == 110.0
     assert committed["inter_arrival_ms"] == pytest.approx(10_000.0)
+
+
+def test_traffic_state_backdated_observation_preserves_latest_session():
+    """A late commit cannot replace the session from a newer arrival."""
+    now = [100.0]
+    state = TrafficObservationState(clock=lambda: now[0])
+    state.record_request(user_id="user_1", session_id="new-session", observed_at=100.0)
+
+    backdated = state.record_request(
+        user_id="user_1",
+        session_id="old-session",
+        observed_at=90.0,
+    )
+    assert backdated["session_continuity"] is False
+
+    latest = state.record_request(
+        user_id="user_1",
+        session_id="new-session",
+        observed_at=110.0,
+    )
+    assert latest["session_continuity"] is True
 
 
 def test_traffic_state_bystander_isolation():

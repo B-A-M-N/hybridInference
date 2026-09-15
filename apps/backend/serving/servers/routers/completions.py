@@ -567,6 +567,10 @@ async def chat_completions(
     try:
         body = await request.json()
         payload = ChatCompletionRequest.model_validate(body)
+        # Capture arrival before any model-visibility or runtime-setting
+        # awaitables. Traffic cadence must describe client arrivals, not
+        # gateway preflight latency.
+        arrival_timestamp = time.monotonic()
     except Exception as e:
         raise HTTPException(400, "Invalid JSON or schema in request body") from e
 
@@ -937,8 +941,8 @@ async def chat_completions(
         user_id=traffic_user_id,
         shape_hash=shape_hash,
         session_id=session_id,
+        observed_at=arrival_timestamp,
     )
-    arrival_timestamp = float(observations["observed_at"])
     traffic_evidence = TrafficEvidence(
         inter_arrival_ms=observations.get("inter_arrival_ms"),
         concurrent_requests=(concurrency_observation if is_authenticated else None),

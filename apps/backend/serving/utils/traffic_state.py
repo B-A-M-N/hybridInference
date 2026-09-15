@@ -154,7 +154,10 @@ class TrafficObservationState:
             inter_arrival_ms = max(0.0, (request_time - entry.last_request_ts) * 1000)
 
         # Update last request timestamp
-        if entry.last_request_ts is None or request_time >= entry.last_request_ts:
+        is_latest_observation = (
+            entry.last_request_ts is None or request_time >= entry.last_request_ts
+        )
+        if is_latest_observation:
             entry.last_request_ts = request_time
         entry.request_count += 1
 
@@ -180,7 +183,8 @@ class TrafficObservationState:
                 session_continuity = True
             elif entry.session_id is not None:
                 session_continuity = False
-            entry.session_id = session_key
+            if is_latest_observation:
+                entry.session_id = session_key
 
         return {
             "inter_arrival_ms": inter_arrival_ms,
@@ -196,6 +200,7 @@ class TrafficObservationState:
         user_id: str | None,
         shape_hash: str | None = None,
         session_id: str | None = None,
+        observed_at: float | None = None,
     ) -> dict[str, float | int | bool | None]:
         """Return prospective evidence without mutating tracker state.
 
@@ -206,6 +211,7 @@ class TrafficObservationState:
         after dispatch admission succeeds.
         """
         now = self._clock()
+        request_time = now if observed_at is None else observed_at
         key = self._resolve_identity_key(user_id)
 
         if key is None:
@@ -215,7 +221,7 @@ class TrafficObservationState:
                 "session_continuity": None,
                 "request_count": 0,
                 "tracked": False,
-                "observed_at": now,
+                "observed_at": request_time,
             }
 
         entry = self._identities.get(key)
@@ -233,12 +239,12 @@ class TrafficObservationState:
                 "session_continuity": None,
                 "request_count": 1,
                 "tracked": True,
-                "observed_at": now,
+                "observed_at": request_time,
             }
 
         inter_arrival_ms: float | None = None
         if entry.last_request_ts is not None:
-            inter_arrival_ms = (now - entry.last_request_ts) * 1000
+            inter_arrival_ms = max(0.0, (request_time - entry.last_request_ts) * 1000)
 
         shape_repeat_count: int | None = None
         if shape_hash:
@@ -259,7 +265,7 @@ class TrafficObservationState:
             "session_continuity": session_continuity,
             "request_count": entry.request_count + 1,
             "tracked": True,
-            "observed_at": now,
+            "observed_at": request_time,
         }
 
     def _evict_one(self) -> None:

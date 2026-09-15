@@ -1557,6 +1557,7 @@ async def anthropic_messages(
         user_id=traffic_user_id,
         shape_hash=traffic_shape_hash,
         session_id=traffic_session.session_id if traffic_session is not None else None,
+        observed_at=arrival_timestamp,
     )
     traffic_classification = classify_traffic(
         TrafficEvidence(
