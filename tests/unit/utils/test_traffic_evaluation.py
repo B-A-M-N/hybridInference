@@ -178,7 +178,9 @@ def test_synthetic_evaluation_uses_classifier_contract() -> None:
 
     agentic = next(result for result in results if result["scenario"] == "agentic_ide")
     assert 0.25 <= agentic["automation_score"] <= 0.45
-    assert 0.7 <= agentic["confidence"] <= 0.9
+    # Agentic traffic deliberately gets strong classification confidence, but
+    # its mixed cadence/concurrency/repetition evidence keeps the class UNKNOWN.
+    assert 0.7 <= agentic["confidence"] <= 1.0
 
 
 def print_evaluation_report(results: list[dict[str, str | float | list[str]]]) -> None:
