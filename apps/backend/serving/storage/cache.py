@@ -326,8 +326,10 @@ class CachedOperationalStore(OperationalStore):
     ) -> HardDeleteClaim:
         """Claim a hard-delete and invalidate caches.
 
-        A caller may reuse an existing claim only after independently proving
-        that the LogStore fence is already durable.
+        A caller may take over an abandoned existing claim only after
+        independently proving that the LogStore fence is already durable.
+        The durable store atomically replaces the stale token before returning
+        the recovered claim.
         """
         claim_task = asyncio.create_task(
             self._store.begin_hard_delete_user(

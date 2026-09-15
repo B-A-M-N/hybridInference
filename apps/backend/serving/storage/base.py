@@ -223,8 +223,10 @@ class OperationalStore(ABC):
         the claim for an already-pending deleted user is rejected so a
         concurrent attempt cannot take ownership from the active operation.
         Once the caller has independently verified that the LogStore fence is
-        already durable, ``allow_existing_fence`` permits a retry to reuse the
-        current token only after the claim is past the recovery grace period.
+        already durable, ``allow_existing_fence`` permits a retry to take over
+        a claim only after it is past the recovery grace period. The takeover
+        replaces and renews the claim token atomically; a live token is never
+        shared by concurrent destructive operations.
         An active claim remains owned by its current worker and is rejected, so
         a concurrent request cannot enter the destructive phase with the same
         token. A retry without that proof may begin only after a failed

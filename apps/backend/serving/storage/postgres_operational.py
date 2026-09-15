@@ -1187,13 +1187,13 @@ class PostgresOperationalStore(OperationalStore):
                 # Keep the ownership boundary in PostgreSQL: the row lock and
                 # recovery grace period prevent a concurrent caller from
                 # entering hard_delete_user() with the live worker's token.
-                if allow_existing_fence and row["hard_delete_claim_token"] and stale:
-                    return HardDeleteClaim(
-                        token=row["hard_delete_claim_token"],
-                        provenance=HardDeleteClaimProvenance.REUSED,
-                    )
-
-                if recover_stale_claim and stale:
+                if (allow_existing_fence or recover_stale_claim) and stale:
+                    # A stale claim is abandoned, not shareable. Replace its
+                    # token and renew the ownership timestamp in the same
+                    # row-locked transaction, so two recovery callers cannot
+                    # both proceed with the destructive phase. The recovered
+                    # provenance also keeps cancellation cleanup from clearing
+                    # a claim that may already have crossed the fence.
                     claim_token = secrets.token_urlsafe(32)
                     await conn.execute(
                         "UPDATE users SET hard_delete_claim_token = $2, "

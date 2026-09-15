@@ -23,7 +23,7 @@ import pytest
 import pytest_asyncio
 
 from serving.exceptions import HardDeleteStateChanged
-from serving.storage.base import HardDeleteClaimProvenance
+from serving.storage.base import HardDeleteClaim, HardDeleteClaimProvenance
 from serving.storage.database import DatabaseLogger
 from serving.storage.log_schema import (
     ErasureFenceUnavailable,
@@ -1850,8 +1850,8 @@ async def test_stale_claim_can_be_explicitly_recovered_without_releasing_safety(
     assert row["hard_delete_claim_recovered"] is True
 
 
-async def test_post_fence_retry_reuses_claim_without_stealing(fence_store):
-    """Only an abandoned post-fence claim can be reused for completion."""
+async def test_post_fence_retry_recovers_stale_claim_without_sharing_ownership(fence_store):
+    """Only an abandoned post-fence claim can be recovered for completion."""
     store, pool = fence_store
     op_store = PostgresOperationalStore(pool)
 
@@ -1873,8 +1873,8 @@ async def test_post_fence_retry_reuses_claim_without_stealing(fence_store):
 
     retry_claim = await op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True)
     assert first_claim.provenance is HardDeleteClaimProvenance.NEW
-    assert retry_claim.provenance is HardDeleteClaimProvenance.REUSED
-    assert retry_claim.token == first_claim.token
+    assert retry_claim.provenance is HardDeleteClaimProvenance.RECOVERED
+    assert retry_claim.token != first_claim.token
 
     with pytest.raises(HardDeleteStateChanged, match="already has a hard-delete"):
         await op_store.begin_hard_delete_user(_OWNER)
@@ -1887,6 +1887,43 @@ async def test_post_fence_retry_reuses_claim_without_stealing(fence_store):
             "hard_delete_claim_token = NULL WHERE id = $1",
             _OWNER,
         )
+
+
+async def test_concurrent_stale_post_fence_recovery_has_one_owner(fence_store):
+    """Concurrent stale retries renew ownership instead of sharing a token."""
+    store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+
+    first_claim = await op_store.begin_hard_delete_user(_OWNER)
+    await store.hard_delete_user_data(_OWNER)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET hard_delete_claimed_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
+            _OWNER,
+        )
+
+    results = await asyncio.gather(
+        op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True),
+        op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True),
+        return_exceptions=True,
+    )
+    recovered = [result for result in results if isinstance(result, HardDeleteClaim)]
+    rejected = [result for result in results if isinstance(result, HardDeleteStateChanged)]
+
+    assert len(recovered) == 1, results
+    assert len(rejected) == 1, results
+    assert recovered[0].provenance is HardDeleteClaimProvenance.RECOVERED
+    assert recovered[0].token != first_claim.token
+
+    counts = await op_store.hard_delete_user(
+        _OWNER,
+        claim_token=recovered[0].token,
+        admin_ip="127.0.0.1",
+        admin_id="admin",
+        email=f"{_OWNER}@example.com",
+    )
+    assert counts["users"] == 1
 
 
 async def test_active_post_fence_retry_cannot_race_completion(fence_store):
