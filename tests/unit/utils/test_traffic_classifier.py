@@ -175,6 +175,33 @@ def test_five_observations_can_receive_human_scheduling_hint():
     assert is_high_confidence_human_hint(classification.class_hint.value, classification.confidence)
 
 
+def test_sequential_interactive_history_can_reach_human_scheduling_hint():
+    """Mature sequential behavior is confidence evidence without volume."""
+    classification = classify_traffic(
+        TrafficEvidence(
+            inter_arrival_ms=5000,
+            concurrent_requests=1,
+            shape_repeat_count=1,
+            session_continuity=True,
+            is_authenticated=True,
+            user_agent="browser/1.0",
+            request_count=5,
+        )
+    )
+
+    assert classification.class_hint == TrafficClass.LIKELY_HUMAN
+    assert classification.confidence >= 0.70
+    assert is_high_confidence_human_hint(classification.class_hint.value, classification.confidence)
+
+
+def test_request_count_alone_cannot_establish_confidence():
+    """A large count without behavioral evidence remains cold."""
+    classification = classify_traffic(TrafficEvidence(is_authenticated=True, request_count=100))
+
+    assert classification.confidence == 0.0
+    assert classification.class_hint == TrafficClass.UNKNOWN
+
+
 def test_service_time_cannot_flip_human_hint_via_concurrency():
     """Downstream latency cannot turn stable human traffic into automation."""
     common_evidence = {

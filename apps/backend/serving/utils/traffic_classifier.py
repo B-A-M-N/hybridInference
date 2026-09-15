@@ -94,8 +94,9 @@ class TrafficEvidence:
     user_agent: str | None = None
 
     # Number of requests observed for this authenticated identity, including
-    # the current request. This gates confidence separately from signal
-    # strength so a second request cannot receive a production scheduling hint.
+    # the current request. This is confidence evidence only when paired with
+    # behavioral or session evidence; count alone cannot receive a production
+    # scheduling hint.
     request_count: int | None = None
 
 
@@ -112,7 +113,7 @@ MIN_CONFIDENCE_FOR_CLASSIFICATION = 0.40
 # traffic never receives the preference.
 HUMAN_SCHEDULING_CONFIDENCE = 0.70
 
-# Confidence reaches its full historical-evidence multiplier after five
+# Accumulated behavioral history becomes decision-grade after five
 # observations, matching the online tracker's intentionally quick adaptation
 # while preserving the offline scorer's insufficient-data caution.
 HISTORY_OBSERVATION_TARGET = 5.0
@@ -312,20 +313,36 @@ def classify_traffic(evidence: TrafficEvidence) -> TrafficClassification:
         # Scale down to ensure no single signal dominates
         score = _clamp(score * (MAX_SINGLE_SIGNAL_SCORE / max_signal_contribution))
 
-    # Confidence is based on the number and diversity of independent signals
-    # More signals → higher confidence
+    # Confidence is based on independent categories, including accumulated
+    # behavioral history and session continuity. History is deliberately not a
+    # multiplier: sequential interactive traffic needs a path to the routing
+    # gate even when each request is single-threaded and changes shape.
     num_signals = len(signals)
     has_temporal = _positive_finite(evidence.inter_arrival_ms)
     has_volume = _greater_than_one(evidence.concurrent_requests) or _greater_than_one(
         evidence.shape_repeat_count
     )
     has_identity = evidence.is_authenticated is True
+    has_history = (
+        _positive_count(evidence.request_count)
+        and evidence.request_count >= HISTORY_OBSERVATION_TARGET
+        and (has_temporal or has_volume)
+    )
+    has_session_evidence = (
+        evidence.session_continuity is True
+        and _positive_count(evidence.request_count)
+        and evidence.request_count >= HISTORY_OBSERVATION_TARGET
+    )
 
-    # Confidence requires at least 2 independent evidence categories
+    # No category contributes more than 0.20. In particular, request count
+    # alone cannot establish confidence: history requires behavioral evidence,
+    # and the session category requires both continuity and a mature history.
     base_confidence = _clamp(
         (0.20 * has_temporal)
-        + (0.30 * has_volume)
-        + (0.20 * has_identity)
+        + (0.20 * has_volume)
+        + (0.15 * has_identity)
+        + (0.20 * has_history)
+        + (0.15 * has_session_evidence)
         + (0.10 * min(num_signals, 5) / 5)
     )
     # A first request may expose a user-agent and authentication context, but
@@ -333,12 +350,7 @@ def classify_traffic(evidence: TrafficEvidence) -> TrafficClassification:
     # until at least one temporal or volume observation exists.
     if not has_temporal and not has_volume:
         base_confidence = 0.0
-    history_factor = (
-        min(evidence.request_count / HISTORY_OBSERVATION_TARGET, 1.0)
-        if _positive_count(evidence.request_count)
-        else 0.0
-    )
-    confidence = _clamp(base_confidence * history_factor)
+    confidence = base_confidence
 
     # Derive class from score and confidence
     class_hint = _derive_class(score, confidence)
