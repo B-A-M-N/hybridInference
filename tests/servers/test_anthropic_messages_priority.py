@@ -239,6 +239,7 @@ async def test_streaming_lease_is_taken_when_the_generator_runs(
     from serving.utils.traffic_state import get_traffic_observation_state
 
     traffic_state = get_traffic_observation_state()
+    history_before = traffic_state.get_identity_count()
     calls: list[str] = []
     real_acquire = tracker.acquire
 
@@ -273,7 +274,7 @@ async def test_streaming_lease_is_taken_when_the_generator_runs(
     assert at_construction["leases"] == 0
     # ...and before behavioral history was committed: an abandoned stream is
     # not a dispatched request.
-    assert at_construction["history"] == 0
+    assert at_construction["history"] == history_before
     # ...the generator then took one, and gave it back.
     assert calls == ["acquire"]
     assert tracker.backlog(endpoint_id) == 0
