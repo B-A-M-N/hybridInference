@@ -352,6 +352,11 @@ async def test_messages_lost_half_open_probe_does_not_update_traffic_state(
     original_messages = adapter.messages
 
     async def hold_messages(body, **kwargs):
+        # This double represents the adapter-level admission callback. The
+        # production Anthropic adapter fires it after its outbound slot and
+        # response context are acquired; a custom adapter that omits it is
+        # covered by the handler's post-success fallback instead.
+        notify_traffic_admitted()
         entered.set()
         await release.wait()
         return {

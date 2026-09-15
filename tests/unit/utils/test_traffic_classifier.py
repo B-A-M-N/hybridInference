@@ -609,6 +609,17 @@ def test_traffic_state_session_continuity():
     assert result["session_continuity"] is True
 
 
+def test_traffic_state_hashes_lone_surrogate_session_deterministically():
+    """Malformed-but-decodable JSON session text must not become a 500."""
+    state = TrafficObservationState()
+    session_id = "session-\ud800"
+
+    state.record_request(user_id="user_1", session_id=session_id)
+    result = state.record_request(user_id="user_1", session_id=session_id)
+
+    assert result["session_continuity"] is True
+
+
 def test_traffic_state_reset():
     """Reset clears all state."""
     state = TrafficObservationState()

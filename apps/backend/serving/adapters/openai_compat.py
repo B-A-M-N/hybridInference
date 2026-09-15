@@ -773,7 +773,6 @@ class OpenAICompatAdapter(BaseAdapter):
         if self._key_pool is None:
             headers = self._build_headers()
             slot = await self._acquire_upstream_slot(self.config.api_key)
-            notify_traffic_admitted()
             # retries=1 => exactly one attempt, NO retry. A chat.completion POST
             # is non-idempotent: re-sending on any ClientError (which includes a
             # response-phase >=400, or a total timeout that fires while the
@@ -784,6 +783,7 @@ class OpenAICompatAdapter(BaseAdapter):
             # re-running the same generation (mirrors the pooled path, which does
             # one json_post per key).
             try:
+                notify_traffic_admitted()
                 response = await self.http.json_post_with_retry(
                     url=url,
                     json=payload,
@@ -858,9 +858,9 @@ class OpenAICompatAdapter(BaseAdapter):
                 last_error = saturated
                 continue
 
-            notify_traffic_admitted()
-            headers = self._build_headers(api_key_override=api_key)
             try:
+                notify_traffic_admitted()
+                headers = self._build_headers(api_key_override=api_key)
                 response = await self.http.json_post(
                     url=url,
                     json=payload,
@@ -896,13 +896,16 @@ class OpenAICompatAdapter(BaseAdapter):
                 )
                 last_error = e
                 continue  # try next key
+            except BaseException:
+                # Admission bookkeeping is request-local and may still fail
+                # (for example, while hashing malformed client metadata). It
+                # must never strand either resource already acquired here.
+                slot.release()
+                self._key_pool.release(lease, status_code=None)
+                raise
             else:
                 slot.release(status_code=200)
-            finally:
-                # Idempotent; covers an exit neither branch above saw.
-                slot.release()
-
-            self._key_pool.release(lease, status_code=200)
+                self._key_pool.release(lease, status_code=200)
             logger.debug(
                 "key_pool_active_affinities",
                 extra={
@@ -963,11 +966,11 @@ class OpenAICompatAdapter(BaseAdapter):
         if self._key_pool is None:
             headers = self._build_headers()
             slot = await self._acquire_upstream_slot(self.config.api_key)
-            notify_traffic_admitted()
-            stream_iter = self.http.stream_post(
-                url=url, json=payload, headers=headers, timeout=timeout
-            )
             try:
+                notify_traffic_admitted()
+                stream_iter = self.http.stream_post(
+                    url=url, json=payload, headers=headers, timeout=timeout
+                )
                 first = await stream_iter.__anext__()
             except StopAsyncIteration:
                 # Empty stream is incomplete. Yield no lease/chunk so the
@@ -1033,12 +1036,12 @@ class OpenAICompatAdapter(BaseAdapter):
                 last_error = saturated
                 continue
 
-            notify_traffic_admitted()
-            headers = self._build_headers(api_key_override=api_key)
-            stream_iter = self.http.stream_post(
-                url=url, json=payload, headers=headers, timeout=timeout
-            )
             try:
+                notify_traffic_admitted()
+                headers = self._build_headers(api_key_override=api_key)
+                stream_iter = self.http.stream_post(
+                    url=url, json=payload, headers=headers, timeout=timeout
+                )
                 first = await stream_iter.__anext__()
             except StopAsyncIteration:
                 # A 2xx response with no stream events is incomplete. Do not
@@ -1104,6 +1107,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 # downstream ever learns this attempt happened. The key pool
                 # needs nothing; a neutral release is its no-op.
                 slot.release()
+                self._key_pool.release(lease, status_code=None)
                 raise
 
             # First chunk read successfully — commit the lease and the slot

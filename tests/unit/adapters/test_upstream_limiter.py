@@ -520,6 +520,29 @@ async def test_traffic_admission_callback_waits_for_outbound_slot(stream):
     assert admitted == []
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("pooled", [False, True])
+async def test_admission_callback_failure_releases_outbound_slot(installed_limiter, stream, pooled):
+    """Bookkeeping failure must not strand a slot after adapter admission."""
+    adapter = _adapter(api_keys=[KEY_A] if pooled else None)
+
+    def fail_admission():
+        raise RuntimeError("traffic observation failed")
+
+    with req_ctx.push(**{req_ctx.TRAFFIC_ADMISSION_CALLBACK: fail_admission}):
+        if stream:
+            with pytest.raises(RuntimeError, match="traffic observation failed"):
+                async for _chunk in adapter.stream_chat_completion(
+                    [{"role": "user", "content": "x"}]
+                ):
+                    pass
+        else:
+            with pytest.raises(RuntimeError, match="traffic observation failed"):
+                await adapter.chat_completion([{"role": "user", "content": "x"}])
+
+    assert _state(installed_limiter)["in_flight"] == 0
+
+
 def _chunk(delta: dict, finish_reason: str | None = None) -> str:
     payload = {
         "id": "chatcmpl-test",

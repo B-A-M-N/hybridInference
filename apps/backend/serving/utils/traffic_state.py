@@ -74,7 +74,13 @@ class TrafficObservationState:
     @staticmethod
     def _identity_key(kind: str, value: str) -> str:
         """Return a bounded, non-sensitive key for an identity value."""
-        digest = hashlib.sha256(f"{kind}\0{value}".encode()).hexdigest()
+        # Request bodies can legally carry lone UTF-16 surrogates after JSON
+        # decoding.  The value is only used as an in-process hash input, so
+        # preserve those code points deterministically instead of letting
+        # strict UTF-8 encoding turn a client-declared session into a 500.
+        digest = hashlib.sha256(
+            f"{kind}\0{value}".encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
         return f"{kind}:{digest}"
 
     def _resolve_identity_key(
