@@ -65,10 +65,13 @@ async def admin_client(monkeypatch, mock_stores):
 
 @pytest.mark.asyncio
 async def test_create_api_key_success(admin_client, monkeypatch):
-    client, op_store, _log_store, log_action = admin_client
+    client, op_store, log_store, log_action = admin_client
     created_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
     op_store.check_active_key_exists.return_value = False
     op_store.create_key.return_value = {"id": 1, "created_at": created_at}
+    log_store.account_has_erasure_fence.side_effect = AssertionError(
+        "admin key creation must not preflight LogStore"
+    )
 
     monkeypatch.setattr(
         "serving.servers.routers.admin.api_keys.generate_api_key", lambda: "hyi-fixed-key"
@@ -88,14 +91,18 @@ async def test_create_api_key_success(admin_client, monkeypatch):
     assert body["api_key"] == "hyi-fixed-key"
     assert body["key_prefix"] == "hyi-fixed-key"[:12]
     op_store.create_key.assert_awaited_once()
-    assert op_store.create_key.await_args.kwargs["missing_identity_fenced"] is False
+    assert "missing_identity_fenced" not in op_store.create_key.await_args.kwargs
+    log_store.account_has_erasure_fence.assert_not_awaited()
     log_action.assert_awaited()
 
 
 @pytest.mark.asyncio
 async def test_create_api_key_conflict(admin_client, monkeypatch):
-    client, op_store, _log_store, log_action = admin_client
+    client, op_store, log_store, log_action = admin_client
     op_store.check_active_key_exists.return_value = True
+    log_store.account_has_erasure_fence.side_effect = AssertionError(
+        "admin key conflict audit must not preflight LogStore"
+    )
 
     response = await client.post(
         "/admin/api-keys",
@@ -107,7 +114,7 @@ async def test_create_api_key_conflict(admin_client, monkeypatch):
     log_action.assert_awaited()
     call = log_action.await_args
     assert call.kwargs.get("success") is False
-    assert call.kwargs["target_missing_identity_fenced"] is False
+    assert "target_missing_identity_fenced" not in call.kwargs
 
 
 @pytest.mark.asyncio
@@ -196,8 +203,11 @@ async def test_get_api_key_detail_success(admin_client):
 
 @pytest.mark.asyncio
 async def test_update_api_key_success(admin_client):
-    client, op_store, _log_store, log_action = admin_client
+    client, op_store, log_store, log_action = admin_client
     op_store.get_key_detail.return_value = {"user_id": "alice"}
+    log_store.account_has_erasure_fence.side_effect = AssertionError(
+        "admin key update must not preflight LogStore"
+    )
 
     response = await client.patch(
         "/admin/api-keys/alice",
@@ -208,7 +218,8 @@ async def test_update_api_key_success(admin_client):
     assert response.status_code == 200
     body = response.json()
     assert body["updated_fields"] == ["quota_daily_cost_usd"]
-    assert op_store.update_key.await_args.kwargs["missing_identity_fenced"] is False
+    assert "missing_identity_fenced" not in op_store.update_key.await_args.kwargs
+    log_store.account_has_erasure_fence.assert_not_awaited()
     log_action.assert_awaited()
 
 

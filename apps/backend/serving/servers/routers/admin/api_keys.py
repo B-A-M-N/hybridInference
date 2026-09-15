@@ -40,7 +40,6 @@ async def create_api_key(
     payload: CreateAPIKeyRequest,
     admin_id: str = Depends(verify_admin_access),
     op_store=Depends(get_operational_store),
-    log_store=Depends(get_log_store),
 ) -> CreateAPIKeyResponse:
     """Create a new API key for a user.
 
@@ -52,11 +51,6 @@ async def create_api_key(
         raise HTTPException(500, "Database not configured")
 
     if await op_store.check_active_key_exists(payload.user_id):
-        target_missing_identity_fenced = (
-            None
-            if log_store is None
-            else await log_store.account_has_erasure_fence(payload.user_id)
-        )
         await log_admin_action(
             op_store,
             admin_id,
@@ -64,7 +58,6 @@ async def create_api_key(
             payload.user_id,
             {"error": "user_id already exists"},
             success=False,
-            target_missing_identity_fenced=target_missing_identity_fenced,
         )
         raise HTTPException(
             status_code=409,
@@ -77,11 +70,6 @@ async def create_api_key(
     key_prefix = plaintext_key[:12]
 
     try:
-        missing_identity_fenced = (
-            None
-            if log_store is None
-            else await log_store.account_has_erasure_fence(payload.user_id)
-        )
         row = await op_store.create_key(
             key_hash=key_hash,
             key_prefix=key_prefix,
@@ -92,7 +80,6 @@ async def create_api_key(
             expires_at=payload.expires_at,
             notes=payload.notes,
             metadata=payload.metadata,
-            missing_identity_fenced=missing_identity_fenced,
         )
     except HardDeleteStateChanged:
         raise HTTPException(
@@ -109,7 +96,6 @@ async def create_api_key(
             "quota_daily_usd": float(payload.quota_daily_cost_usd),
             "key_prefix": key_prefix,
         },
-        target_missing_identity_fenced=missing_identity_fenced,
     )
 
     return CreateAPIKeyResponse(
@@ -258,7 +244,6 @@ async def update_api_key(
     payload: UpdateAPIKeyRequest,
     admin_id: str = Depends(verify_admin_access),
     op_store=Depends(get_operational_store),
-    log_store=Depends(get_log_store),
 ) -> UpdateAPIKeyResponse:
     """Update an existing API key's settings.
 
@@ -278,12 +263,7 @@ async def update_api_key(
         raise HTTPException(404, f"User '{user_id}' not found")
 
     try:
-        missing_identity_fenced = (
-            None if log_store is None else await log_store.account_has_erasure_fence(user_id)
-        )
-        await op_store.update_key(
-            user_id, missing_identity_fenced=missing_identity_fenced, **payload_dict
-        )
+        await op_store.update_key(user_id, **payload_dict)
     except HardDeleteStateChanged:
         raise HTTPException(
             409,
@@ -296,7 +276,6 @@ async def update_api_key(
         "update_key",
         user_id,
         _serialize_for_audit({"updated_fields": list(payload_dict), "new_values": payload_dict}),
-        target_missing_identity_fenced=missing_identity_fenced,
     )
 
     return UpdateAPIKeyResponse(
