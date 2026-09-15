@@ -184,7 +184,12 @@ class TrafficObservationState:
             elif entry.session_id is not None:
                 session_continuity = False
             if is_latest_observation:
+                # A sessionless request is an intentional break in explicit
+                # session continuity. Do not let an older marker make a later
+                # return to that session look uninterrupted.
                 entry.session_id = session_key
+        elif is_latest_observation:
+            entry.session_id = None
 
         return {
             "inter_arrival_ms": inter_arrival_ms,

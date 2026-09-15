@@ -556,6 +556,17 @@ def test_traffic_state_backdated_observation_preserves_latest_session():
     assert latest["session_continuity"] is True
 
 
+def test_traffic_state_sessionless_request_breaks_explicit_continuity():
+    """A sessionless turn clears the prior explicit session marker."""
+    state = TrafficObservationState(clock=lambda: 100.0)
+    state.record_request(user_id="user_1", session_id="session-a")
+    sessionless = state.record_request(user_id="user_1")
+    assert sessionless["session_continuity"] is None
+
+    resumed = state.record_request(user_id="user_1", session_id="session-a")
+    assert resumed["session_continuity"] is None
+
+
 def test_traffic_state_bystander_isolation():
     """Two authenticated users are tracked separately."""
     state = TrafficObservationState()
