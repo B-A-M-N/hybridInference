@@ -295,12 +295,24 @@ class HedgedAdapter(BaseAdapter):
         # backup if it is still sleeping; if the real request is already
         # in-flight, cancelling it would waste an otherwise-useful attempt.
         backup_past_sleep = False
+        backup_dispatch: CheckpointBackupDispatch[BaseAdapter] | None = None
+        backup_prefill_released = False
+
+        def _release_backup_prefill() -> None:
+            """Drop a losing backup's load charge before awaiting cancellation."""
+            nonlocal backup_prefill_released
+            if backup_dispatch is None or backup_prefill_released:
+                return
+            backup_prefill_released = True
+            callback = backup_dispatch.metadata.get("prefill_release")
+            if callable(callback):
+                callback()
 
         async def _run_primary() -> dict[str, Any]:
             return await self.primary.chat_completion(messages, **params)
 
         async def _run_backup_delayed() -> dict[str, Any]:
-            nonlocal backup_past_sleep
+            nonlocal backup_dispatch, backup_past_sleep
             loop = asyncio.get_running_loop()
             schedule_start = loop.time()
             for checkpoint_sec in self.hedge_checkpoints_sec:
@@ -310,6 +322,7 @@ class HedgedAdapter(BaseAdapter):
                 dispatch = self._start_backup_at(checkpoint_sec)
                 if dispatch is None:
                     continue
+                backup_dispatch = dispatch
                 backup_past_sleep = True
                 try:
                     result = await dispatch.backup.chat_completion(messages, **params)
@@ -320,7 +333,7 @@ class HedgedAdapter(BaseAdapter):
             raise HedgeBackupUnavailable("no checkpoint hedge backup selected")
 
         async def _run_backup_immediate() -> dict[str, Any]:
-            nonlocal backup_past_sleep
+            nonlocal backup_dispatch, backup_past_sleep
             elapsed_sec = max(
                 0.0,
                 asyncio.get_running_loop().time() - schedule_start,
@@ -328,6 +341,7 @@ class HedgedAdapter(BaseAdapter):
             dispatch = self._start_backup_at(elapsed_sec)
             if dispatch is None:
                 raise HedgeBackupUnavailable("no checkpoint hedge backup selected")
+            backup_dispatch = dispatch
             backup_past_sleep = True
             try:
                 result = await dispatch.backup.chat_completion(messages, **params)
@@ -383,6 +397,8 @@ class HedgedAdapter(BaseAdapter):
                         if task is primary_task:
                             self.event_sink.record_success(primary_endpoint)
                             # self.config stays as primary.config (already correct).
+                            if backup_task in pending:
+                                _release_backup_prefill()
                             backup_task.cancel()
                             await _safe_await_task(backup_task)
                         else:
