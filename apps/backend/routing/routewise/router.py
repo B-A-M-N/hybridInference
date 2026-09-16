@@ -2792,7 +2792,6 @@ class RouteWiseRouter:
         """
         return LeafBackend.for_binding(binding_for_adapter(adapter, model_id=model_id))
 
-
     def _acquire_prefill_lease(
         self,
         selected: FeasibleProviderCandidate,
