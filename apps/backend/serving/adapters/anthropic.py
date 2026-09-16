@@ -280,63 +280,63 @@ class AnthropicAdapter(BaseAdapter):
         finish_reason = "stop"
         total_content = ""
 
-        # The slot is chained onto the response context manager so it is held for
-        # the whole body iteration below — a generation in flight, not just an
-        # open response — and released on every exit, client disconnect included.
-        async with (
-            self._upstream_slot(),
-            session.post(
+        # Hold the slot for the whole body iteration below — a generation in
+        # flight, not just an open response — and release it on every exit,
+        # client disconnect included. Notify immediately after slot admission,
+        # before awaiting response headers, so traffic history reflects the
+        # actual outbound admission boundary.
+        async with self._upstream_slot():
+            notify_traffic_admitted()
+            async with session.post(
                 self._upstream_url(),
                 json=payload,
                 headers=self._upstream_headers(streaming=True),
                 timeout=timeout,
-            ) as resp,
-        ):
-            notify_traffic_admitted()
-            if resp.status >= 400:
-                error_body = await resp.text()
-                raise aiohttp.ClientResponseError(
-                    request_info=resp.request_info,
-                    history=resp.history,
-                    status=resp.status,
-                    message=error_body[:500],
-                    headers=resp.headers,
-                )
-            buf = b""
-            async for raw in _with_eof_frame_terminator(resp.content.iter_any()):
-                buf += raw
-                while b"\n\n" in buf:
-                    frame, buf = buf.split(b"\n\n", 1)
-                    for line in frame.split(b"\n"):
-                        if not line.startswith(b"data: "):
-                            continue
-                        payload_bytes = line[len(b"data: ") :].strip()
-                        if not payload_bytes:
-                            continue
-                        try:
-                            evt = json.loads(payload_bytes)
-                        except json.JSONDecodeError:
-                            continue
+            ) as resp:
+                if resp.status >= 400:
+                    error_body = await resp.text()
+                    raise aiohttp.ClientResponseError(
+                        request_info=resp.request_info,
+                        history=resp.history,
+                        status=resp.status,
+                        message=error_body[:500],
+                        headers=resp.headers,
+                    )
+                buf = b""
+                async for raw in _with_eof_frame_terminator(resp.content.iter_any()):
+                    buf += raw
+                    while b"\n\n" in buf:
+                        frame, buf = buf.split(b"\n\n", 1)
+                        for line in frame.split(b"\n"):
+                            if not line.startswith(b"data: "):
+                                continue
+                            payload_bytes = line[len(b"data: ") :].strip()
+                            if not payload_bytes:
+                                continue
+                            try:
+                                evt = json.loads(payload_bytes)
+                            except json.JSONDecodeError:
+                                continue
 
-                        result = handle_stream_event(evt, accum)
+                            result = handle_stream_event(evt, accum)
 
-                        if result.input_tokens:
-                            input_tokens = result.input_tokens
-                        if result.output_tokens:
-                            output_tokens = result.output_tokens
-                        if result.cache_read_tokens:
-                            cache_read_input_tokens = result.cache_read_tokens
-                        if result.cache_read_reported:
-                            cache_read_reported = True
-                        if result.cache_write_tokens:
-                            cache_creation_input_tokens = result.cache_write_tokens
+                            if result.input_tokens:
+                                input_tokens = result.input_tokens
+                            if result.output_tokens:
+                                output_tokens = result.output_tokens
+                            if result.cache_read_tokens:
+                                cache_read_input_tokens = result.cache_read_tokens
+                            if result.cache_read_reported:
+                                cache_read_reported = True
+                            if result.cache_write_tokens:
+                                cache_creation_input_tokens = result.cache_write_tokens
 
-                        if result.text_delta:
-                            total_content += result.text_delta
-                            yield self.format_stream_chunk(result.text_delta, self.config.id)
+                            if result.text_delta:
+                                total_content += result.text_delta
+                                yield self.format_stream_chunk(result.text_delta, self.config.id)
 
-                        if result.finish_reason:
-                            finish_reason = result.finish_reason
+                            if result.finish_reason:
+                                finish_reason = result.finish_reason
 
         # Always emit final usage chunk and [DONE] after upstream closes,
         # even if message_stop was never received (truncated upstream).
@@ -427,38 +427,37 @@ class AnthropicAdapter(BaseAdapter):
         }
 
         # Slot held for the whole passthrough stream; see stream_chat_completion.
-        async with (
-            self._upstream_slot(),
-            session.post(
+        # Notify at slot admission, before waiting for response headers.
+        async with self._upstream_slot():
+            notify_traffic_admitted()
+            async with session.post(
                 self._upstream_url(),
                 json=forward,
                 headers=self._upstream_headers(streaming=True, extra_headers=extra_headers),
                 timeout=timeout,
-            ) as resp,
-        ):
-            notify_traffic_admitted()
-            if resp.status >= 400:
-                error_body = await resp.text()
-                raise aiohttp.ClientResponseError(
-                    request_info=resp.request_info,
-                    history=resp.history,
-                    status=resp.status,
-                    message=error_body[:500],
-                    headers=resp.headers,
-                )
-            buf = b""
-            async for chunk in resp.content.iter_any():
-                yield chunk
-                buf += chunk
-                while b"\n\n" in buf:
-                    frame, buf = buf.split(b"\n\n", 1)
-                    extract_anthropic_usage_from_sse(frame + b"\n\n", usage)
-            # Clean EOF with the last event left unterminated: complete it for
-            # usage extraction, or this request's output tokens go uncounted.
-            # Only our accounting needs this -- the client already received
-            # those bytes verbatim above, so nothing is added to the wire.
-            if buf.strip():
-                extract_anthropic_usage_from_sse(buf + b"\n\n", usage)
+            ) as resp:
+                if resp.status >= 400:
+                    error_body = await resp.text()
+                    raise aiohttp.ClientResponseError(
+                        request_info=resp.request_info,
+                        history=resp.history,
+                        status=resp.status,
+                        message=error_body[:500],
+                        headers=resp.headers,
+                    )
+                buf = b""
+                async for chunk in resp.content.iter_any():
+                    yield chunk
+                    buf += chunk
+                    while b"\n\n" in buf:
+                        frame, buf = buf.split(b"\n\n", 1)
+                        extract_anthropic_usage_from_sse(frame + b"\n\n", usage)
+                # Clean EOF with the last event left unterminated: complete it for
+                # usage extraction, or this request's output tokens go uncounted.
+                # Only our accounting needs this -- the wire already received
+                # those bytes above, so nothing is added to the response.
+                if buf.strip():
+                    extract_anthropic_usage_from_sse(buf + b"\n\n", usage)
 
         self.last_stream_usage = usage  # keep for backward-compat with tests
         if usage_sink is not None:
