@@ -109,6 +109,7 @@ async def admin_client(monkeypatch, mock_stores):
     monkeypatch.setattr("serving.servers.routers.admin.users.log_admin_action", mock_log_action)
     monkeypatch.setenv("ADMIN_TOKEN", "test-admin")
     monkeypatch.setenv("API_KEY_SECRET", "unit-test-secret")
+    monkeypatch.setenv("ERASURE_FENCE_PROTOCOL_READY", "true")
 
     try:
         yield client, op_store, log_store, mock_log_action
