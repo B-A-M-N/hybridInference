@@ -2782,7 +2782,6 @@ class RouteWiseRouter:
                 return None
         return None
 
-<<<<<<< HEAD
     def _leaf_for_adapter(self, adapter: Any, model_id: str) -> LeafBackend:
         """Return the leaf that executes one already-chosen endpoint.
 
@@ -2792,7 +2791,8 @@ class RouteWiseRouter:
         reservation this router holds stays the one that gets released.
         """
         return LeafBackend.for_binding(binding_for_adapter(adapter, model_id=model_id))
-=======
+
+
     def _acquire_prefill_lease(
         self,
         selected: FeasibleProviderCandidate,
@@ -2816,7 +2816,6 @@ class RouteWiseRouter:
             selected.endpoint_id,
             tracked_tokens,
         )
->>>>>>> f65094a2 (fix(routewise): enforce hedge lease lifecycle)
 
     def _stash_prefix_for_commit(
         self,
