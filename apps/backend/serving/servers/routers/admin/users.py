@@ -67,6 +67,22 @@ from serving.servers.routers.admin.providers import _enumerate_routable_provider
 from serving.storage.base import HardDeleteClaim, HardDeleteClaimProvenance
 from serving.utils.request_ip import get_client_ip
 
+
+async def _missing_identity_fence_state(log_store, user_id: str) -> bool | None:
+    """Return the LogStore's erasure-fence answer for a missing identity row.
+
+    ``None`` when no LogStore is available or the check itself fails: the
+    operational store then fails closed on missing identities and audit rows
+    retain the identifier only when it is proven un-fenced.
+    """
+    if log_store is None:
+        return None
+    try:
+        return await log_store.account_has_erasure_fence(user_id)
+    except Exception:
+        return None
+
+
 router = APIRouter(prefix="/admin")
 logger = logging.getLogger(__name__)
 
@@ -464,6 +480,7 @@ async def approve_user(
     payload: ApproveUserRequest | None = None,
     admin_id: str = Depends(verify_admin_access),
     op_store=Depends(get_operational_store),
+    log_store=Depends(get_log_store),
 ) -> ApproveUserResponse:
     """Approve a pending user registration.
 
@@ -501,6 +518,7 @@ async def approve_user(
         "approve_user",
         user_id,
         {"email": user_row["email"], "note": note},
+        target_missing_identity_fenced=await _missing_identity_fence_state(log_store, user_id),
     )
 
     from serving.utils.email import is_email_enabled, send_approval_email
@@ -523,6 +541,7 @@ async def reject_user(
     payload: RejectUserRequest,
     admin_id: str = Depends(verify_admin_access),
     op_store=Depends(get_operational_store),
+    log_store=Depends(get_log_store),
 ) -> RejectUserResponse:
     """Reject a pending user registration.
 
@@ -545,7 +564,13 @@ async def reject_user(
             f"User is not pending approval (current status: {user_row['status']})",
         )
 
-    await op_store.reject_user(user_id, admin_id=admin_id, reason=payload.reason)
+    try:
+        await op_store.reject_user(user_id, admin_id=admin_id, reason=payload.reason)
+    except HardDeleteStateChanged:
+        raise HTTPException(
+            409,
+            "This account has a hard-delete in progress and cannot be rejected.",
+        ) from None
 
     await log_admin_action(
         op_store,
@@ -553,6 +578,7 @@ async def reject_user(
         "reject_user",
         user_id,
         {"email": user_row["email"], "reason": payload.reason},
+        target_missing_identity_fenced=await _missing_identity_fence_state(log_store, user_id),
     )
 
     from serving.utils.email import is_email_enabled, send_rejection_email
@@ -709,6 +735,7 @@ async def update_user(
     payload: UpdateUserRequest,
     admin_id: str = Depends(verify_admin_access),
     op_store=Depends(get_operational_store),
+    log_store=Depends(get_log_store),
     router_exec=Depends(get_router),
 ) -> UpdateUserResponse:
     """Update user account status or API key settings (quota).
@@ -797,7 +824,13 @@ async def update_user(
 
     # Post-write side-effects that depend on the new status
     if new_status == "suspended":
-        await op_store.revoke_key(user_id, hard_delete=False)
+        try:
+            await op_store.revoke_key(user_id, hard_delete=False)
+        except HardDeleteStateChanged:
+            raise HTTPException(
+                409,
+                "This account has a hard-delete in progress or no longer exists.",
+            ) from None
 
     # Update key-level fields
     key_fields = {
@@ -810,7 +843,13 @@ async def update_user(
         if not has_key:
             raise HTTPException(409, "User has no active API key to update")
 
-        await op_store.update_key(user_id, **key_fields)
+        try:
+            await op_store.update_key(user_id, **key_fields)
+        except HardDeleteStateChanged:
+            raise HTTPException(
+                409,
+                "This account has a hard-delete in progress or no longer exists.",
+            ) from None
         updated.extend(key_fields)
 
     if "disabled_models" in payload_dict:
@@ -828,17 +867,30 @@ async def update_user(
         preferences[DISABLED_MODELS_PREFERENCE_KEY] = [
             model_id for model_id in normalized_disabled_models if model_id in known_model_ids
         ]
-        await op_store.update_user_preferences(user_id, preferences)
+        try:
+            await op_store.update_user_preferences(user_id, preferences)
+        except HardDeleteStateChanged:
+            raise HTTPException(
+                409,
+                "This account has a hard-delete in progress or no longer exists.",
+            ) from None
         payload_dict["disabled_models"] = preferences[DISABLED_MODELS_PREFERENCE_KEY]
         updated.append("disabled_models")
 
-    await log_admin_action(
-        op_store,
-        admin_id,
-        "update_user",
-        user_id,
-        _serialize_for_audit({"updated_fields": updated, "values": payload_dict}),
-    )
+    try:
+        await log_admin_action(
+            op_store,
+            admin_id,
+            "update_user",
+            user_id,
+            _serialize_for_audit({"updated_fields": updated, "values": payload_dict}),
+            target_missing_identity_fenced=await _missing_identity_fence_state(log_store, user_id),
+        )
+    except HardDeleteStateChanged:
+        raise HTTPException(
+            409,
+            "This account has a hard-delete in progress or no longer exists.",
+        ) from None
 
     return UpdateUserResponse(
         user_id=user_id,
@@ -931,13 +983,19 @@ async def delete_user(
 
     # Atomic: sets status='deleted', revokes keys, purges sessions/tokens,
     # and inserts audit log — all in a single transaction.
-    await op_store.delete_user(
-        user_id,
-        admin_ip=get_client_ip(request),
-        admin_id=admin_id,
-        reason=payload.reason,
-        email=user_row["email"],
-    )
+    try:
+        await op_store.delete_user(
+            user_id,
+            admin_ip=get_client_ip(request),
+            admin_id=admin_id,
+            reason=payload.reason,
+            email=user_row["email"],
+        )
+    except HardDeleteStateChanged:
+        raise HTTPException(
+            409,
+            "Account state changed before soft-delete could complete.",
+        ) from None
 
     return DeleteUserResponse(
         user_id=user_id,
@@ -1050,15 +1108,21 @@ async def hard_delete_user(
       user remains soft-deleted (``status='deleted'``), and the admin can
       retry the hard-delete. The fence is NOT established (the whole
       LogStore transaction is rolled back), so a retry can re-attempt both
-      the fence and the purge. A retry takes ownership with a fresh token,
-      so an older in-flight attempt cannot release or complete the newer
-      claim.
+      the fence and the purge after the failed attempt releases its claim.
+      Concurrent attempts are rejected while the current claim is active, so
+      no operation can take ownership from a live hard-delete.
     - LogStore wipe succeeds but op_store wipe fails: log rows are gone and
       the fence is established, but the user row + prior audit entries
       remain — the user is still soft-deleted, so the admin can retry
       hard-delete (which will re-attempt and succeed since the user is still
       in ``status='deleted'``). The fence is already established, so the
       retry's ``INSERT ... ON CONFLICT DO NOTHING`` is a no-op.
+
+    If a worker exits after claiming the account but before the LogStore
+    transaction starts, an administrator who has confirmed that the old worker
+    is gone may retry with ``recover_stale_claim=True`` after the claim's
+    recovery grace period. That takeover is sticky until the fence and delete
+    complete; a failed recovery cannot reopen the account for resume.
 
     Requires: Admin authentication (JWT or ADMIN_TOKEN)
     """
@@ -1099,10 +1163,12 @@ async def hard_delete_user(
     except HardDeleteStateChanged:
         # A durable LogStore fence makes an abandoned post-fence deletion
         # safely retryable after the claim recovery grace period. The
-        # operational store may take over that claim only then; an active
+        # operational store may reuse that claim only then; an active
         # concurrent request remains rejected. A pre-fence pending claim also
         # remains rejected unless the caller explicitly requests stale recovery.
-        fence_exists = await log_store.account_has_erasure_fence(user_id)
+        fence_exists = (
+            False if log_store is None else await log_store.account_has_erasure_fence(user_id)
+        )
         if not fence_exists and payload.recover_stale_claim:
             try:
                 claim = await op_store.begin_hard_delete_user(
@@ -1166,7 +1232,11 @@ async def hard_delete_user(
             email=email,
         )
     except BaseException:
-        if claim.provenance is HardDeleteClaimProvenance.NEW and not fence_established:
+        if (
+            claim is not None
+            and claim.provenance is HardDeleteClaimProvenance.NEW
+            and not fence_established
+        ):
             # A LogStore transaction normally rolls back its fence before
             # raising. Check explicitly so an ambiguous post-commit failure
             # cannot clear a claim that protects an already-erased account.

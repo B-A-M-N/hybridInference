@@ -63,6 +63,75 @@ class RequiredOperationalSchemaUnavailable(SchemaLockUnavailable):
 _HARD_DELETE_CLAIM_RECOVERY_GRACE = timedelta(hours=1)
 
 
+async def _lock_user_for_mutation(
+    conn: Any,
+    user_id: str,
+    *,
+    allowed_statuses: set[str] | None = None,
+) -> Row:
+    """Lock and validate a concrete user before mutating user-owned state."""
+    row = await conn.fetchrow(
+        "SELECT status, hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
+        user_id,
+    )
+    if row is None:
+        raise HardDeleteStateChanged(f"Account {user_id} no longer exists.")
+    if row["hard_delete_pending"]:
+        raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
+    if allowed_statuses is not None and row["status"] not in allowed_statuses:
+        raise HardDeleteStateChanged(
+            f"Account {user_id} cannot be mutated from status '{row['status']}'."
+        )
+    return dict(row)
+
+
+async def _validate_key_identity(
+    conn: Any,
+    user_id: str,
+    *,
+    allow_missing_identity: bool = False,
+    allow_unfenced_missing: bool = True,
+    missing_identity_fenced: bool | None = None,
+) -> None:
+    """Validate a key identity without treating it as a user identity.
+
+    ``api_keys.user_id`` intentionally has no foreign key to ``users``: legacy
+    deployments can retain credentials after their user row is gone. The
+    LogStore owns the erasure fence and answers whether a missing identity is
+    fenced; this store only accepts that validated answer. A missing identity
+    whose fence state is unknown remains fail-closed, exactly as it did when
+    the store queried the LogStore table directly — but the operational store
+    never reads LogStore-owned schema anymore. ``allow_unfenced_missing`` is
+    disabled for new-key creation, because a stale negative fence result must
+    not recreate a missing identity. ``allow_missing_identity`` is reserved
+    for destructive credential removal.
+    """
+    row = await conn.fetchrow(
+        "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
+        user_id,
+    )
+    if row is not None:
+        if row["hard_delete_pending"]:
+            raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
+        return
+
+    if allow_missing_identity:
+        return
+
+    if missing_identity_fenced is None:
+        raise HardDeleteStateChanged(
+            f"Account {user_id} no longer exists and its erasure fence cannot be validated."
+        )
+
+    if missing_identity_fenced:
+        raise HardDeleteStateChanged(
+            f"Account {user_id} no longer exists and is protected by an erasure fence."
+        )
+
+    if not allow_unfenced_missing:
+        raise HardDeleteStateChanged(f"Account {user_id} no longer exists.")
+
+
 def _parse_command_tag_count(command_tag: str) -> int:
     """Extract the affected row count from an asyncpg command tag."""
     parts = command_tag.split()
@@ -125,17 +194,15 @@ def _coerce_user_row(row: Any) -> Row | None:
 class PostgresOperationalStore(OperationalStore):
     """OperationalStore backed by an asyncpg connection pool."""
 
-    def __init__(self, pool: asyncpg.Pool, *, fence_secret: str | None = None) -> None:
+    def __init__(self, pool: asyncpg.Pool) -> None:
         """Initialize with a shared asyncpg pool.
 
         Args:
-            pool: Shared asyncpg pool.
-            fence_secret: Retained for constructor compatibility. The
-                LogStore owns erasure-fence schema and tombstone checks;
-                this store owns the operational hard-delete claim.
+            pool: Shared asyncpg pool. The LogStore owns the erasure-fence
+                schema and tombstone checks; this store owns the operational
+                hard-delete claim and never reads LogStore-owned tables.
         """
         self._pool = pool
-        self.fence_secret = fence_secret
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -1029,19 +1096,7 @@ class PostgresOperationalStore(OperationalStore):
             params.append(val)
         sql = f"UPDATE users SET {', '.join(set_parts)} WHERE id = $1"
         async with self._pool.acquire() as conn, conn.transaction():
-            if "status" in fields:
-                # The route's preliminary read can race with a hard-delete
-                # claim. Lock and re-check the claim in the same transaction
-                # as the status update so no activation path can invalidate
-                # an in-flight erasure operation.
-                row = await conn.fetchrow(
-                    "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
-                    user_id,
-                )
-                if row is not None and row["hard_delete_pending"]:
-                    raise HardDeleteStateChanged(
-                        f"Account {user_id} has a hard-delete in progress."
-                    )
+            await _lock_user_for_mutation(conn, user_id)
             await conn.execute(sql, *params)
 
     async def update_user_last_login(self, user_id: str) -> None:
@@ -1063,6 +1118,11 @@ class PostgresOperationalStore(OperationalStore):
         All mutations and the audit-log insert are atomic (single transaction).
         """
         async with self._pool.acquire() as conn, conn.transaction():
+            await _lock_user_for_mutation(
+                conn,
+                user_id,
+                allowed_statuses={"active", "suspended"},
+            )
             await conn.execute("UPDATE users SET status = 'deleted' WHERE id = $1", user_id)
             await conn.execute(
                 "UPDATE api_keys SET status = 'revoked' "
@@ -1207,12 +1267,7 @@ class PostgresOperationalStore(OperationalStore):
         """
 
         async with self._pool.acquire() as conn, conn.transaction():
-            row = await conn.fetchrow(
-                "SELECT status, hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
-                user_id,
-            )
-            if row is not None and row["hard_delete_pending"]:
-                raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
+            await _lock_user_for_mutation(conn, user_id, allowed_statuses={"deleted"})
             await conn.execute("UPDATE users SET status = 'active' WHERE id = $1", user_id)
             await conn.execute(
                 "INSERT INTO admin_audit_log "
@@ -1787,14 +1842,7 @@ class PostgresOperationalStore(OperationalStore):
     ) -> None:
         """Set status='active', record reviewer and note."""
         async with self._pool.acquire() as conn, conn.transaction():
-            # Lock the row and re-check the durable claim before any approval
-            # path can activate an account under erasure.
-            row = await conn.fetchrow(
-                "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
-                user_id,
-            )
-            if row is not None and row["hard_delete_pending"]:
-                raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
+            await _lock_user_for_mutation(conn, user_id)
             await conn.execute(
                 "UPDATE users SET status = 'active', approval_note = $1, "
                 "reviewed_at = NOW(), reviewed_by = $2 WHERE id = $3",
@@ -1812,14 +1860,7 @@ class PostgresOperationalStore(OperationalStore):
     ) -> None:
         """Set status='rejected', record reviewer and reason."""
         async with self._pool.acquire() as conn, conn.transaction():
-            # Rejection also mutates a concrete user status and must share the
-            # same row-lock guard as approval and generic status updates.
-            row = await conn.fetchrow(
-                "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
-                user_id,
-            )
-            if row is not None and row["hard_delete_pending"]:
-                raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
+            await _lock_user_for_mutation(conn, user_id)
             await conn.execute(
                 "UPDATE users SET status = 'rejected', approval_note = $1, "
                 "reviewed_at = NOW(), reviewed_by = $2 WHERE id = $3",
@@ -1942,8 +1983,16 @@ class PostgresOperationalStore(OperationalStore):
         api_key_encrypted: str | None = None,
         metadata: str | dict[str, Any] | None = None,
         account_id: str | None = None,
+        missing_identity_fenced: bool | None = None,
     ) -> Row:
-        """Insert a new API key. Returns the inserted row."""
+        """Insert a new API key. Returns the inserted row.
+
+        ``missing_identity_fenced`` is the LogStore-validated erasure-fence
+        answer for a key-only identity whose ``users`` row is gone; ``None``
+        means no LogStore verification is available and the mutation fails
+        closed. New key creation for a missing identity fails closed even
+        when this preflight answer is ``False``.
+        """
         import asyncpg as _asyncpg
 
         # Default account_id to user_id so self-service AND admin-created keys
@@ -1958,7 +2007,13 @@ class PostgresOperationalStore(OperationalStore):
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
 
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            await _validate_key_identity(
+                conn,
+                user_id,
+                allow_unfenced_missing=False,
+                missing_identity_fenced=missing_identity_fenced,
+            )
             try:
                 row = await conn.fetchrow(
                     "INSERT INTO api_keys "
@@ -2073,13 +2128,21 @@ class PostgresOperationalStore(OperationalStore):
                 d["metadata"] = None
         return d
 
-    async def update_key(self, user_id: str, **fields: Any) -> None:
+    async def update_key(
+        self,
+        user_id: str,
+        missing_identity_fenced: bool | None = None,
+        **fields: Any,
+    ) -> None:
         """Dynamically update key columns for *user_id*'s current key.
 
         Revoked rows are never touched: a user keeps old revoked rows after
         regenerating a key, and updating them would silently resurrect dead
         keys (``status='active'`` on every row also violates the
         one-active-key-per-user partial unique index).
+
+        ``missing_identity_fenced`` is the LogStore-validated erasure-fence
+        answer for a key-only identity (see :meth:`create_key`).
         """
         if not fields:
             return
@@ -2100,12 +2163,35 @@ class PostgresOperationalStore(OperationalStore):
         sql = (
             f"UPDATE api_keys SET {', '.join(set_parts)} WHERE user_id = $1 AND status <> 'revoked'"
         )
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            await _validate_key_identity(
+                conn,
+                user_id,
+                missing_identity_fenced=missing_identity_fenced,
+            )
             await conn.execute(sql, *params)
 
-    async def revoke_key(self, user_id: str, *, hard_delete: bool = False) -> None:
-        """Soft-revoke (status='revoked') or hard-delete the key."""
-        async with self._pool.acquire() as conn:
+    async def revoke_key(
+        self,
+        user_id: str,
+        *,
+        hard_delete: bool = False,
+        missing_identity_fenced: bool | None = None,
+    ) -> None:
+        """Soft-revoke (status='revoked') or hard-delete the key.
+
+        ``missing_identity_fenced`` is the LogStore-validated erasure-fence
+        answer for a key-only identity. Destructive revocation does not
+        require it: removing an existing stale credential is safe even when
+        LogStore is unavailable.
+        """
+        async with self._pool.acquire() as conn, conn.transaction():
+            await _validate_key_identity(
+                conn,
+                user_id,
+                allow_missing_identity=True,
+                missing_identity_fenced=missing_identity_fenced,
+            )
             if hard_delete:
                 await conn.execute("DELETE FROM api_keys WHERE user_id = $1", user_id)
             else:
@@ -2120,14 +2206,23 @@ class PostgresOperationalStore(OperationalStore):
         *,
         new_key_hash: str,
         new_key_prefix: str,
+        missing_identity_fenced: bool | None = None,
     ) -> str:
         """Atomically replace the active key's hash/prefix. Returns old key_prefix.
 
         Scoped to the active row: users keep old revoked rows around, and
         rewriting key_hash on all of them would violate the unique key_hash
         constraint (and resurrect revoked credentials).
+
+        ``missing_identity_fenced`` is the LogStore-validated erasure-fence
+        answer for a key-only identity (see :meth:`create_key`).
         """
         async with self._pool.acquire() as conn, conn.transaction():
+            await _validate_key_identity(
+                conn,
+                user_id,
+                missing_identity_fenced=missing_identity_fenced,
+            )
             old_row = await conn.fetchrow(
                 "SELECT key_prefix FROM api_keys WHERE user_id = $1 AND status = 'active'",
                 user_id,
@@ -2540,17 +2635,66 @@ class PostgresOperationalStore(OperationalStore):
         target_user_id: str | None = None,
         details: dict[str, Any] | None = None,
         success: bool = True,
+        target_is_user: bool = True,
+        target_missing_identity_fenced: bool | None = None,
     ) -> None:
-        """Insert a row into admin_audit_log."""
-        async with self._pool.acquire() as conn:
+        """Insert an audit row, validating concrete targets transactionally.
+
+        A missing, unfenced target can be a legacy key-only identity. A missing
+        fenced target is an erased identity, so retain the event but redact the
+        target column rather than recreating identifying state after deletion.
+
+        ``target_missing_identity_fenced`` carries the LogStore-validated
+        erasure-fence answer for a missing target. The LogStore owns the
+        fence table, so this store never queries it directly; ``None`` means
+        no verification is available and a missing target (whose fence state
+        is therefore unknown) is fail-closed — the audit row is still written
+        with the target redacted so a committed admin mutation is not lost.
+
+        ``target_is_user`` identifies whether ``target_user_id`` is a user
+        identity. Set it to ``False`` for non-user audit targets. A user target
+        claimed for hard-delete is redacted rather than rejected, because the
+        mutation being audited may have committed before this transaction
+        acquired its row lock.
+        """
+        async with self._pool.acquire() as conn, conn.transaction():
+            audit_target_user_id = target_user_id
+            audit_details = dict(details) if details else None
+            if target_user_id is not None and target_is_user:
+                row = await conn.fetchrow(
+                    "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
+                    target_user_id,
+                )
+                if row is not None:
+                    if row["hard_delete_pending"]:
+                        # The audited mutation may have committed before the
+                        # hard-delete claim acquired this row lock. Preserve
+                        # the fact that it succeeded without returning a false
+                        # failure or retaining identifying data in a row that
+                        # can outlive the hard-delete cleanup.
+                        audit_target_user_id = None
+                        audit_details = {"target_user_id_redacted": "hard_delete_in_progress"}
+                else:
+                    # The row lookup is the transaction's authoritative view.
+                    # A pre-transaction fence check can become stale while a
+                    # hard delete commits, so every missing identity is
+                    # redacted regardless of that earlier answer.
+                    audit_target_user_id = None
+                    audit_details = {
+                        "target_user_id_redacted": (
+                            "erasure_fence"
+                            if target_missing_identity_fenced
+                            else "missing_identity"
+                        )
+                    }
             await conn.execute(
                 "INSERT INTO admin_audit_log "
                 "(admin_ip, action, target_user_id, details, success) "
                 "VALUES ($1, $2, $3, $4::jsonb, $5)",
                 admin_ip,
                 action,
-                target_user_id,
-                json.dumps(details) if details else None,
+                audit_target_user_id,
+                json.dumps(audit_details) if audit_details else None,
                 success,
             )
 
@@ -2609,7 +2753,8 @@ class PostgresOperationalStore(OperationalStore):
         preferences: dict[str, Any],
     ) -> None:
         """Atomically replace the full preferences JSONB column."""
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            await _lock_user_for_mutation(conn, user_id)
             await conn.execute(
                 "UPDATE users SET preferences = $1::jsonb WHERE id = $2",
                 json.dumps(preferences),

@@ -353,8 +353,7 @@ class CachedOperationalStore(OperationalStore):
         try:
             # Shield the durable claim from cancellation while we obtain its
             # token. If the caller is cancelled at this boundary, the done
-            # callback releases it only when this request obtained a fresh
-            # pre-fence claim.
+            # callback releases the claim if the underlying transaction won.
             claim = await asyncio.shield(claim_task)
         except BaseException:
             claim_task.add_done_callback(_release_completed_claim)
@@ -365,8 +364,9 @@ class CachedOperationalStore(OperationalStore):
             await self._cache.delete_pattern("auth:*")
             await self._cache.delete_pattern("auth_light:*")
         except BaseException:
-            # A claim obtained from a durable fence or stale recovery remains
-            # fail-closed; only a new pre-fence claim may be released here.
+            # The claim is committed before cache invalidation starts. Keep a
+            # cancelled or failed cache operation from stranding a pre-fence
+            # claim that the caller never received.
             await self._release_claim_safely(user_id, claim)
             raise
         return claim
@@ -458,16 +458,35 @@ class CachedOperationalStore(OperationalStore):
 
     # -- key writes (invalidate auth caches) ---------------------------------
 
-    async def update_key(self, user_id: str, **fields: Any) -> None:
+    async def update_key(
+        self,
+        user_id: str,
+        missing_identity_fenced: bool | None = None,
+        **fields: Any,
+    ) -> None:
         """Delegate then invalidate auth caches."""
-        await self._store.update_key(user_id, **fields)
+        await self._store.update_key(
+            user_id,
+            missing_identity_fenced=missing_identity_fenced,
+            **fields,
+        )
         # We don't know which key_hash maps to this user, so clear all auth entries.
         await self._cache.delete_pattern("auth:*")
         await self._cache.delete_pattern("auth_light:*")
 
-    async def revoke_key(self, user_id: str, *, hard_delete: bool = False) -> None:
+    async def revoke_key(
+        self,
+        user_id: str,
+        *,
+        hard_delete: bool = False,
+        missing_identity_fenced: bool | None = None,
+    ) -> None:
         """Delegate then invalidate auth caches."""
-        await self._store.revoke_key(user_id, hard_delete=hard_delete)
+        await self._store.revoke_key(
+            user_id,
+            hard_delete=hard_delete,
+            missing_identity_fenced=missing_identity_fenced,
+        )
         await self._cache.delete_pattern("auth:*")
         await self._cache.delete_pattern("auth_light:*")
 
@@ -477,10 +496,14 @@ class CachedOperationalStore(OperationalStore):
         *,
         new_key_hash: str,
         new_key_prefix: str,
+        missing_identity_fenced: bool | None = None,
     ) -> str:
         """Delegate then invalidate auth caches."""
         old_prefix = await self._store.regenerate_key(
-            user_id, new_key_hash=new_key_hash, new_key_prefix=new_key_prefix
+            user_id,
+            new_key_hash=new_key_hash,
+            new_key_prefix=new_key_prefix,
+            missing_identity_fenced=missing_identity_fenced,
         )
         await self._cache.delete_pattern("auth:*")
         await self._cache.delete_pattern("auth_light:*")
@@ -597,6 +620,7 @@ class CachedOperationalStore(OperationalStore):
         api_key_encrypted: str | None = None,
         metadata: str | None = None,
         account_id: str | None = None,
+        missing_identity_fenced: bool | None = None,
     ) -> Row:
         """Delegate to wrapped store."""
         return await self._store.create_key(
@@ -611,6 +635,7 @@ class CachedOperationalStore(OperationalStore):
             api_key_encrypted=api_key_encrypted,
             metadata=metadata,
             account_id=account_id,
+            missing_identity_fenced=missing_identity_fenced,
         )
 
     async def check_active_key_exists(self, user_id: str) -> bool:
@@ -842,6 +867,8 @@ class CachedOperationalStore(OperationalStore):
         target_user_id: str | None = None,
         details: dict[str, Any] | None = None,
         success: bool = True,
+        target_is_user: bool = True,
+        target_missing_identity_fenced: bool | None = None,
     ) -> None:
         """Delegate to wrapped store."""
         return await self._store.log_admin_action(
@@ -850,6 +877,8 @@ class CachedOperationalStore(OperationalStore):
             target_user_id=target_user_id,
             details=details,
             success=success,
+            target_is_user=target_is_user,
+            target_missing_identity_fenced=target_missing_identity_fenced,
         )
 
     async def list_audit_log(

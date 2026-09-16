@@ -219,6 +219,30 @@ async def test_approve_rejects_hard_delete_claim_after_stale_status_read(admin_c
 
 
 @pytest.mark.asyncio
+async def test_reject_rejects_hard_delete_claim_after_stale_status_read(admin_client):
+    """Rejection cannot change status after a hard-delete claim wins."""
+    client, op_store, _log_store, mock_log_action = admin_client
+    op_store.get_user_by_id.return_value = _user_row(status="pending_approval")
+    op_store.reject_user.side_effect = HardDeleteStateChanged(
+        "account has a hard-delete in progress"
+    )
+
+    response = await client.post(
+        "/admin/users/u1/reject",
+        headers=AUTH,
+        json={"reason": "not eligible"},
+    )
+
+    assert response.status_code == 409
+    op_store.reject_user.assert_awaited_once_with(
+        "u1",
+        admin_id="127.0.0.1",
+        reason="not eligible",
+    )
+    mock_log_action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_list_users_search(admin_client):
     """GET /admin/users?search=alice returns matching users."""
     client, op_store, _log_store, _log = admin_client
@@ -560,6 +584,24 @@ async def test_delete_user_audit_inside_transaction(admin_client):
     op_store.delete_user.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_stale_soft_delete_fails_without_audit_recreation(admin_client):
+    """A stale soft-delete cannot report success after hard-delete removal."""
+    client, op_store, _log_store, mock_log = admin_client
+    op_store.get_user_by_id.return_value = _user_row()
+    op_store.delete_user.side_effect = HardDeleteStateChanged("account removed")
+
+    response = await client.post(
+        "/admin/users/u1/delete",
+        headers=AUTH,
+        json={"reason": "stale request"},
+    )
+
+    assert response.status_code == 409
+    op_store.delete_user.assert_awaited_once()
+    mock_log.assert_not_awaited()
+
+
 # ========================================================================
 # PATCH /admin/users/{id} — delete bypass guard
 # ========================================================================
@@ -595,6 +637,24 @@ async def test_patch_user_rejects_status_change_during_hard_delete(admin_client)
 
     assert response.status_code == 409
     op_store.update_user_fields.assert_awaited_once_with("u1", status="suspended")
+
+
+@pytest.mark.asyncio
+async def test_stale_patch_fails_without_audit_recreation(admin_client):
+    """A stale admin PATCH cannot report success after hard-delete removal."""
+    client, op_store, _log_store, mock_log = admin_client
+    op_store.get_user_by_id.return_value = _user_row()
+    op_store.update_user_fields.side_effect = HardDeleteStateChanged("account removed")
+
+    response = await client.patch(
+        "/admin/users/u1",
+        headers=AUTH,
+        json={"admin_note": "stale update"},
+    )
+
+    assert response.status_code == 409
+    op_store.update_user_fields.assert_awaited_once_with("u1", admin_note="stale update")
+    mock_log.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1204,7 +1264,7 @@ async def test_resume_user_success(admin_client):
 @pytest.mark.asyncio
 async def test_resume_user_not_deleted(admin_client):
     """Cannot resume a user that is not soft-deleted — 409."""
-    client, op_store, _log_store, _log = admin_client
+    client, op_store, _log_store, mock_log = admin_client
     op_store.get_user_by_id.return_value = {
         "id": "u1",
         "email": "alice@example.com",
@@ -1219,12 +1279,13 @@ async def test_resume_user_not_deleted(admin_client):
 
     assert response.status_code == 409
     op_store.resume_user.assert_not_awaited()
+    mock_log.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_resume_user_not_found(admin_client):
     """Resume non-existent user returns 404."""
-    client, op_store, _log_store, _log = admin_client
+    client, op_store, _log_store, mock_log = admin_client
     op_store.get_user_by_id.return_value = None
 
     response = await client.post(
@@ -1234,6 +1295,26 @@ async def test_resume_user_not_found(admin_client):
     )
 
     assert response.status_code == 404
+    op_store.resume_user.assert_not_awaited()
+    mock_log.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resume_user_storage_conflict_fails_without_audit(admin_client):
+    """A stale resume rejected by storage cannot report success or audit."""
+    client, op_store, _log_store, mock_log = admin_client
+    op_store.get_user_by_id.return_value = _user_row(status="deleted")
+    op_store.resume_user.side_effect = HardDeleteStateChanged("account removed")
+
+    response = await client.post(
+        "/admin/users/u1/resume",
+        headers=AUTH,
+        json={"reason": "stale resume"},
+    )
+
+    assert response.status_code == 409
+    op_store.resume_user.assert_awaited_once()
+    mock_log.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1326,6 +1407,30 @@ async def test_hard_delete_requires_fence_protocol_rollout_ready(admin_client, m
     assert response.status_code == 503
     assert "every api_logs writer" in response.json()["detail"]
     op_store.begin_hard_delete_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_requires_log_store(admin_client):
+    """No operational or response deletion is allowed without a LogStore."""
+    client, op_store, log_store, _log = admin_client
+    client._transport.app.state.services.log_store = None
+
+    from serving.config.settings import get_settings
+
+    get_settings.cache_clear()
+    response_store = client._transport.app.state.services.responses_store
+    response = await client.post(
+        "/admin/users/u1/hard-delete",
+        headers=AUTH,
+        json={"confirm": True},
+    )
+
+    assert response.status_code == 503
+    assert "LogStore" in response.json()["detail"]
+    op_store.begin_hard_delete_user.assert_not_awaited()
+    op_store.hard_delete_user.assert_not_awaited()
+    response_store.delete_user_responses.assert_not_awaited()
+    log_store.hard_delete_user_data.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1478,30 +1583,6 @@ async def test_hard_delete_user_wipes_data(admin_client):
 
 
 @pytest.mark.asyncio
-async def test_hard_delete_requires_log_store(admin_client):
-    """No permanent deletion occurs when the erasure-fence store is absent."""
-    client, op_store, _log_store, _log = admin_client
-    client._transport.app.state.services.log_store = None
-    op_store.get_user_by_id.return_value = {
-        "id": "u1",
-        "email": "alice@example.com",
-        "status": "deleted",
-    }
-
-    response = await client.post(
-        "/admin/users/u1/hard-delete",
-        headers=AUTH,
-        json={"confirm": True},
-    )
-
-    assert response.status_code == 503
-    op_store.begin_hard_delete_user.assert_not_awaited()
-    op_store.hard_delete_user.assert_not_awaited()
-    response_store = client._transport.app.state.services.responses_store
-    response_store.delete_user_responses.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_hard_delete_aborts_when_resume_wins_race(admin_client):
     """Hard-delete aborts when a concurrent resume wins the race.
 
@@ -1619,8 +1700,8 @@ async def test_hard_delete_rejects_concurrent_post_fence_claim(admin_client):
 
 
 @pytest.mark.asyncio
-async def test_hard_delete_does_not_release_recovered_claim_on_failure(admin_client):
-    """A failed recovered retry never releases the durable safety claim."""
+async def test_hard_delete_does_not_release_reused_claim_on_failure(admin_client):
+    """A reused post-fence claim is never released by a failed retry."""
     client, op_store, log_store, _log = admin_client
     op_store.get_user_by_id.return_value = {
         "id": "u1",
@@ -1629,7 +1710,7 @@ async def test_hard_delete_does_not_release_recovered_claim_on_failure(admin_cli
     }
     op_store.begin_hard_delete_user.side_effect = [
         HardDeleteStateChanged("already pending"),
-        HardDeleteClaim("claim-token", HardDeleteClaimProvenance.RECOVERED),
+        HardDeleteClaim("claim-token", HardDeleteClaimProvenance.REUSED),
     ]
     log_store.account_has_erasure_fence.return_value = True
     log_store.hard_delete_user_data.side_effect = RuntimeError("retry failed")
