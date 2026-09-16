@@ -422,9 +422,7 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
     x_forwarded_for = ", ".join(xff_values) if xff_present else None
     x_real_ip_present, x_real_ip = _singleton_header(request, "x-real-ip")
     cf_connecting_ip_present, cf_connecting_ip = _singleton_header(request, "cf-connecting-ip")
-    _, cf_connecting_ipv6 = _singleton_header(
-        request, "cf-connecting-ipv6"
-    )
+    _, cf_connecting_ipv6 = _singleton_header(request, "cf-connecting-ipv6")
     cf_primary_header_ambiguous = cf_connecting_ip_present and cf_connecting_ip is None
 
     # Determine whether the immediate peer is a configured trusted proxy.
