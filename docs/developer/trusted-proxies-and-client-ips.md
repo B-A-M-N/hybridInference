@@ -6,10 +6,10 @@ the gateway sees is the proxy, not the caller, and the caller's address only
 survives in a request header that anyone can also set by hand.
 
 `apps/backend/serving/utils/request_ip.py` is the single place that decides
-which address to believe. Everything downstream — request logs, per-IP rate
-limits, the auth-failure blocklist, sticky routing affinity, and the rows
-written to `api_logs` — reads its answer. This page describes what that module
-does, how to configure it, and what ends up stored as a result.
+which address to believe. This page describes that resolver and its
+configuration. Downstream policy consumers adopt its provenance result in the
+follow-up consumer-contract change; they must not reconstruct proxy trust from
+request headers independently.
 
 ## The server underneath
 
@@ -136,39 +136,17 @@ flags (issue #1036) asserted only that *some* proxy exists; they did not
 restrict which peer may assert forwarding provenance. The new model makes
 trust explicit and fail-closed.
 
-### The "unknown" outcome and enforcement identity
+### The "unknown" outcome
 
 When the gateway cannot determine a trustworthy routable client address, the
 **provenance identity** (`get_client_ip()`) returns `"unknown"`. This is
 correct: it accurately reflects that we don't know the client.
 
-However, enforcement functions (rate limits, auth-failure blocks, affinity)
-must **never** key on a shared `"unknown"` value — that would collapse all
-untrusted callers onto one key, allowing a single caller to exhaust a rate
-limit or trigger a block that affects everyone.
-
-The correct approach depends on the operation:
-
-- **Rate limiting**: When provenance is resolved, key on the client IP.
-  When unresolved, never use the proxy IP: signup emits an
-  `client_ip_resolution_unresolved` warning and can fail closed with
-  `SIGNUP_REQUIRE_RESOLVED_CLIENT_IP=1`; otherwise signup and login use
-  separate coarse global process-local budgets while retaining their
-  per-email/per-request behavior. These budgets are traffic safeguards, not
-  client attribution, and their warning events can be counted by log/metrics
-  pipelines.
-- **Auth-failure blocking**: Resolved failures block on client IP. Unresolved
-  failures use a separate coarse global process-local circuit breaker and are
-  never stored under the proxy address, `"unknown"`, or any other client key.
-- **Affinity routing**: When resolved, key on client IP bucket. When
-  unresolved, return `None` for non-sticky routing (don't collapse clients).
-
-| Use case | Resolved | Unresolved |
-|----------|----------|------------|
-| Logging, audit, display | `get_client_ip()` | `"unknown"` |
-| Rate limiting | Key on client IP | Coarse global budget; no proxy/client attribution. Signup may fail closed when configured. |
-| Auth-failure blocking | Block on client IP | Coarse global unresolved-traffic circuit breaker |
-| Affinity routing | `ip:<bucket>` | `None` (non-sticky) |
+The resolver returns `ClientIpInfo.resolved=False` and the display value
+`"unknown"` when it cannot establish trustworthy client provenance. This
+foundation deliberately does not define rate-limit, authentication, or
+affinity policy for that outcome. The later consumer-contract change must use
+the canonical result and must not turn `"unknown"` into a shared client key.
 
 ## Resolution order
 
