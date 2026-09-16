@@ -148,6 +148,8 @@ class HedgedAdapter(BaseAdapter):
         self._stream_backup_released = False
         self._stream_backup_prefill_released = False
         self._backup_prefill_confirmed = False
+        self._stream_backup_cleanup_task: asyncio.Task[None] | None = None
+        self._stream_backup_cleanup_owns_generator = False
         self.stream_race_deadline_sec = (
             None if stream_race_deadline_sec is None else max(0.0, float(stream_race_deadline_sec))
         )
@@ -202,6 +204,12 @@ class HedgedAdapter(BaseAdapter):
         dispatch = self._stream_backup_dispatch
         if dispatch is None or self._stream_backup_released:
             return
+        cleanup_task = self._stream_backup_cleanup_task
+        if cleanup_task is not None and cleanup_task is not asyncio.current_task():
+            # A winning stream hands loser cleanup to an independent task so
+            # its first output is not delayed by a slow provider close. That
+            # task owns both the generator and the reservation from here on.
+            return
         # A losing leg is no longer useful prefill work as soon as the race
         # resolves. Drop its load charge before waiting on cancellation so a
         # slow loser cannot distort subsequent route selection. Provider
@@ -215,6 +223,29 @@ class HedgedAdapter(BaseAdapter):
         finally:
             self._stream_backup_released = True
             self._finish_backup(dispatch)
+
+    def _schedule_stream_backup_cleanup(
+        self,
+        *,
+        next_task: asyncio.Task[Any] | None = None,
+        close_generator: bool = False,
+    ) -> None:
+        """Finish a losing backup without delaying the winning stream."""
+        if (
+            self._stream_backup_dispatch is None
+            or self._stream_backup_released
+            or self._stream_backup_cleanup_task is not None
+        ):
+            return
+        self._stream_backup_cleanup_owns_generator = close_generator
+        task = asyncio.create_task(
+            self._finish_stream_backup(
+                next_task=next_task,
+                close_generator=close_generator,
+            )
+        )
+        self._stream_backup_cleanup_task = task
+        task.add_done_callback(_consume_task_result)
 
     def _release_stream_backup_prefill(
         self,
@@ -503,6 +534,11 @@ class HedgedAdapter(BaseAdapter):
                 # Close every generator we may have opened.
                 seen: set[int] = set()
                 for gen in (primary_gen, winner_gen, loser_gen, self._stream_backup_gen):
+                    if (
+                        self._stream_backup_cleanup_owns_generator
+                        and gen is self._stream_backup_gen
+                    ):
+                        continue
                     if gen is not None and id(gen) not in seen:
                         seen.add(id(gen))
                         await _safe_aclose(gen)
@@ -591,6 +627,8 @@ class HedgedAdapter(BaseAdapter):
             self._stream_backup_dispatch = dispatch
             self._stream_backup_released = False
             self._stream_backup_prefill_released = False
+            self._stream_backup_cleanup_task = None
+            self._stream_backup_cleanup_owns_generator = False
             self._stream_backup_gen = dispatch.backup.stream_chat_completion(
                 messages,
                 **params,
@@ -725,7 +763,7 @@ class HedgedAdapter(BaseAdapter):
                     # Tiebreaker: primary wins.
                     self.event_sink.record_success(primary_endpoint)
                     # self.config stays as primary.config (already correct).
-                    await self._finish_stream_backup(
+                    self._schedule_stream_backup_cleanup(
                         next_task=backup_next_task,
                         close_generator=True,
                     )
@@ -734,7 +772,7 @@ class HedgedAdapter(BaseAdapter):
                     return primary_gen, backup_gen, primary_buffer
                 elif primary_has_content:
                     self.event_sink.record_success(primary_endpoint)
-                    await self._finish_stream_backup(
+                    self._schedule_stream_backup_cleanup(
                         next_task=backup_next_task,
                         close_generator=True,
                     )
@@ -829,6 +867,12 @@ async def _safe_await_task(task: asyncio.Task[Any]) -> None:
     """Await a task, suppressing any exception (CancelledError or otherwise)."""
     with contextlib.suppress(BaseException):
         await task
+
+
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    """Observe detached cleanup failures so they do not become warnings."""
+    with contextlib.suppress(BaseException):
+        task.exception()
 
 
 async def _safe_aclose(gen: AsyncGenerator[Any, None]) -> None:

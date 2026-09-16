@@ -4301,6 +4301,43 @@ class TestPrefillLoadCandidateFields:
 class TestPrefillLoadRoutingDecision:
     """Tests for prefill-load-aware routing decisions."""
 
+    def test_prefill_tracker_lock_is_not_held_during_candidate_computation(self, monkeypatch):
+        """Expensive route computation must not block tracker readers."""
+        adapter = _make_adapter(endpoint_id="test-model:prefill-lock")
+        route_table = _FakeRouteTable()
+        route_table.add("test-model", [(adapter, 1.0)])
+        router = RouteWiseRouter(
+            route_table=route_table,
+            config=RouteWiseConfig(prefill_load_routing_enabled=True),
+        )
+        original_build_candidates = router._build_candidates
+        probe_done = threading.Event()
+        probe_acquired: list[bool] = []
+
+        def probe_tracker_lock() -> None:
+            acquired = router._prefill_load._lock.acquire(blocking=False)
+            probe_acquired.append(acquired)
+            if acquired:
+                router._prefill_load._lock.release()
+            probe_done.set()
+
+        def build_candidates(*args: Any, **kwargs: Any):
+            probe = threading.Thread(target=probe_tracker_lock)
+            probe.start()
+            assert probe_done.wait(timeout=1)
+            probe.join()
+            return original_build_candidates(*args, **kwargs)
+
+        monkeypatch.setattr(router, "_build_candidates", build_candidates)
+
+        decision = router._select_decision(
+            "test-model",
+            {"prompt_tokens": 1000, "request_id": "req-prefill-lock"},
+        )
+
+        assert decision is not None
+        assert probe_acquired == [True]
+
     def test_primary_lease_is_reserved_before_decision_returns(self):
         """A serving decision publishes its load reservation atomically."""
         adapter = _make_adapter(endpoint_id="test-model:primary")

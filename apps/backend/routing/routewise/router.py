@@ -1525,6 +1525,13 @@ class RouteWiseRouter:
         raw_ms = self.config.prefill_load_scale_ms_per_1k * outstanding_tokens / 1000.0
         return min(raw_ms, self.config.prefill_load_max_penalty_ms)
 
+    def _prefill_backlog_snapshot(self, model_id: str) -> dict[str, int] | None:
+        """Capture route backlog briefly before doing local route computation."""
+        if not self.config.prefill_load_routing_enabled:
+            return None
+        entries = self.route_candidates.get(self.canonical_model_id(model_id), ())
+        return self._prefill_load.backlog_snapshot(entry.endpoint_id for entry in entries)
+
     @staticmethod
     def _tracked_prefill_tokens(messages: Any, params: Mapping[str, Any] | None) -> int:
         """Estimate the complete request body charged to prefill accounting."""
@@ -1625,6 +1632,7 @@ class RouteWiseRouter:
         envelope: CostEnvelopeSnapshot | None,
         now: float,
         context: dict[str, Any] | None = None,
+        prefill_backlog: Mapping[str, int] | None = None,
         admission_refused: set[str] | None = None,
         capacity_refused: set[str] | None = None,
     ) -> tuple[list[FeasibleProviderCandidate], tuple[tuple[Any, ...], dict[str, Any]] | None]:
@@ -1772,7 +1780,11 @@ class RouteWiseRouter:
             outstanding_prefill_tokens = 0
             prefill_load_adjusted_ttft_sec: float | None = None
             if self.config.prefill_load_routing_enabled:
-                outstanding_prefill_tokens = self._prefill_load.backlog(endpoint_id)
+                outstanding_prefill_tokens = (
+                    prefill_backlog.get(endpoint_id, 0)
+                    if prefill_backlog is not None
+                    else self._prefill_load.backlog(endpoint_id)
+                )
                 penalty_ms = self._prefill_load_penalty_ms(outstanding_prefill_tokens)
                 if penalty_ms > 0:
                     prefill_load_adjusted_ttft_sec = mean_ttft_sec + penalty_ms / 1000.0
@@ -2207,21 +2219,7 @@ class RouteWiseRouter:
     ) -> CheckpointBackupDispatch | None:
         """Select and reserve a backup at one in-flight checkpoint."""
         with self._route_commit_lock:
-            if self.config.prefill_load_routing_enabled:
-                with self._prefill_load.routing_transaction():
-                    return self._select_checkpoint_backup_locked(
-                        model_id=model_id,
-                        decision=decision,
-                        context=context,
-                        prompt_tokens=prompt_tokens,
-                        predicted_output_tokens=predicted_output_tokens,
-                        envelope=envelope,
-                        selected=selected,
-                        checkpoints_sec=checkpoints_sec,
-                        latency_slo_sec=latency_slo_sec,
-                        elapsed_sec=elapsed_sec,
-                        checkpoint_ts=checkpoint_ts,
-                    )
+            prefill_backlog = self._prefill_backlog_snapshot(model_id)
             return self._select_checkpoint_backup_locked(
                 model_id=model_id,
                 decision=decision,
@@ -2234,6 +2232,7 @@ class RouteWiseRouter:
                 latency_slo_sec=latency_slo_sec,
                 elapsed_sec=elapsed_sec,
                 checkpoint_ts=checkpoint_ts,
+                prefill_backlog=prefill_backlog,
             )
 
     def _select_checkpoint_backup_locked(
@@ -2250,6 +2249,7 @@ class RouteWiseRouter:
         latency_slo_sec: float,
         elapsed_sec: float,
         checkpoint_ts: float,
+        prefill_backlog: Mapping[str, int] | None = None,
     ) -> CheckpointBackupDispatch | None:
         primary_profile = self._latency_profiles.get(selected.endpoint_id)
         if primary_profile is None:
@@ -2262,6 +2262,7 @@ class RouteWiseRouter:
             envelope=envelope,
             now=checkpoint_ts,
             context=context,
+            prefill_backlog=prefill_backlog,
         )
         candidates = [
             candidate
@@ -2323,10 +2324,11 @@ class RouteWiseRouter:
                 context.get("messages") if isinstance(context, dict) else None,
                 request_params if isinstance(request_params, dict) else None,
             )
-            backup_lease = self._prefill_load.acquire(
-                backup.endpoint_id,
-                tracked_tokens,
-            )
+            with self._prefill_load.routing_transaction():
+                backup_lease = self._prefill_load.acquire(
+                    backup.endpoint_id,
+                    tracked_tokens,
+                )
 
         def _confirm_backup_prefill() -> None:
             self._prefill_load.release(backup_lease, prefill_confirmed=True)
@@ -2594,18 +2596,29 @@ class RouteWiseRouter:
             trace.request_id = str(request_id)
 
         with self._route_commit_lock:
-            if self.config.prefill_load_routing_enabled and reserve_prefill:
-                # The tracker lock makes the load snapshot used by
-                # _build_candidates and the primary lease reservation one
-                # linearizable operation.  No provider I/O occurs here.
-                with self._prefill_load.routing_transaction():
-                    return self._select_decision_locked(
-                        model_id,
-                        context,
-                        trace,
-                        reserve_prefill=True,
-                    )
-            return self._select_decision_locked(model_id, context, trace)
+            # The shared tracker is locked only for this short snapshot and
+            # again while the selected request is charged.  Prompt sizing,
+            # prediction, pricing, LP solving, and metadata construction stay
+            # outside that process-wide lock.
+            prefill_backlog = self._prefill_backlog_snapshot(model_id)
+            prompt_tokens = self._prompt_tokens_from_context(context)
+            prediction = self._predict_output(model_id, prompt_tokens, context)
+            pool = self._routewise_pool(model_id)
+            envelope = (
+                self.envelope.snapshot(pool) if model_id in self._quota_bearing_models else None
+            )
+            now = time.time()
+            return self._select_decision_locked(
+                model_id,
+                context,
+                trace,
+                prompt_tokens=prompt_tokens,
+                prediction=prediction,
+                envelope=envelope,
+                now=now,
+                prefill_backlog=prefill_backlog,
+                reserve_prefill=reserve_prefill,
+            )
 
     def _select_decision_locked(
         self,
@@ -2613,17 +2626,13 @@ class RouteWiseRouter:
         context: dict[str, Any],
         trace: RoutingTrace,
         *,
+        prompt_tokens: int,
+        prediction: BucketMeanPrediction,
+        envelope: CostEnvelopeSnapshot | None,
+        now: float,
+        prefill_backlog: Mapping[str, int] | None = None,
         reserve_prefill: bool = False,
     ) -> RoutingDecision | None:
-        prompt_tokens = self._prompt_tokens_from_context(context)
-        prediction = self._predict_output(model_id, prompt_tokens, context)
-        pool = self._routewise_pool(model_id)
-        # Only quota candidates are priced off the envelope. Sorting a window of
-        # workload costs to reach three unread metadata fields is the whole cost
-        # of the snapshot for an on-demand-only model, so skip it.
-        envelope = self.envelope.snapshot(pool) if model_id in self._quota_bearing_models else None
-        now = time.time()
-
         admission_refused: set[str] = set()
         capacity_refused: set[str] = set()
         candidates, prefix_context = self._build_candidates(
@@ -2633,6 +2642,7 @@ class RouteWiseRouter:
             envelope=envelope,
             now=now,
             context=context,
+            prefill_backlog=prefill_backlog,
             admission_refused=admission_refused,
             capacity_refused=capacity_refused,
         )
@@ -2700,7 +2710,8 @@ class RouteWiseRouter:
                 prefill_lease = None
                 try:
                     if reserve_prefill:
-                        prefill_lease = self._acquire_prefill_lease(selected, context)
+                        with self._prefill_load.routing_transaction():
+                            prefill_lease = self._acquire_prefill_lease(selected, context)
                     hedge_plan = self._select_hedge_plan(
                         selected=selected,
                         now=now,

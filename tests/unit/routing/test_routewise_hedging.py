@@ -963,6 +963,9 @@ class TestHedgedAdapterStreaming:
         stream = hedged.stream_chat_completion([{"role": "user", "content": "hi"}])
         first = await asyncio.wait_for(stream.__anext__(), timeout=0.2)
         assert "primary" in first
+        cleanup_task = hedged._stream_backup_cleanup_task
+        assert cleanup_task is not None
+        await cleanup_task
         assert released == ["backup"]
 
         primary_done.set()
@@ -1011,6 +1014,9 @@ class TestHedgedAdapterStreaming:
         stream = hedged.stream_chat_completion([{"role": "user", "content": "hi"}])
         first = await asyncio.wait_for(stream.__anext__(), timeout=0.2)
         assert "primary" in first
+        cleanup_task = hedged._stream_backup_cleanup_task
+        assert cleanup_task is not None
+        await cleanup_task
         assert backup_cancelled.is_set()
         assert release_saw_cancellation == [True]
 
@@ -1058,6 +1064,9 @@ class TestHedgedAdapterStreaming:
         stream = hedged.stream_chat_completion([{"role": "user", "content": "hi"}])
         first = await asyncio.wait_for(stream.__anext__(), timeout=0.2)
         assert "primary" in first
+        cleanup_task = hedged._stream_backup_cleanup_task
+        assert cleanup_task is not None
+        await cleanup_task
         assert events[0] == "prefill"
         assert events[-1] == "capacity"
         assert events.index("backup_closed") < events.index("capacity")
@@ -1120,6 +1129,9 @@ class TestHedgedAdapterStreaming:
         first = await stream.__anext__()
 
         assert "primary" in first
+        cleanup_task = hedged._stream_backup_cleanup_task
+        assert cleanup_task is not None
+        await cleanup_task
         assert sink.successes == ["test:primary"]
         assert release_calls == ["backup"]
         assert tracker.backlog("test:backup") == 0
@@ -1132,8 +1144,8 @@ class TestHedgedAdapterStreaming:
         assert len(close_calls) >= 1
 
     @pytest.mark.asyncio
-    async def test_stream_losing_backup_propagates_caller_cancellation_during_close(self):
-        """Caller cancellation during loser cleanup remains observable."""
+    async def test_stream_losing_backup_cleanup_cancellation_releases_capacity(self):
+        """Canceling detached loser cleanup still releases its reservation."""
         sink = _FakeEventSink()
         tracker = PrefillLoadTracker()
         backup_lease = tracker.acquire("test:backup", 100)
@@ -1186,12 +1198,15 @@ class TestHedgedAdapterStreaming:
         )
 
         stream = hedged.stream_chat_completion([{"role": "user", "content": "hi"}])
-        consumer = asyncio.create_task(stream.__anext__())
+        first = await stream.__anext__()
+        assert "primary" in first
         await close_started.wait()
-        consumer.cancel()
 
-        with pytest.raises(asyncio.CancelledError):
-            await consumer
+        cleanup_task = hedged._stream_backup_cleanup_task
+        assert cleanup_task is not None
+        cleanup_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cleanup_task
 
         assert release_calls == ["backup"]
         assert tracker.backlog("test:backup") == 0
@@ -1199,7 +1214,61 @@ class TestHedgedAdapterStreaming:
         with contextlib.suppress(asyncio.CancelledError):
             await stream.aclose()
         assert release_calls == ["backup"]
-        assert len(close_calls) >= 2
+        assert close_calls == ["backup"]
+
+    @pytest.mark.asyncio
+    async def test_stream_primary_winner_does_not_wait_for_loser_cleanup(self):
+        """A slow loser cleanup cannot delay the primary's first output."""
+        sink = _FakeEventSink()
+        backup_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        release_calls: list[str] = []
+        primary = _make_fake_adapter(provider="primary")
+
+        async def _primary_stream(*args: Any, **kwargs: Any) -> AsyncGenerator[str, None]:
+            await backup_started.wait()
+            yield 'data: {"choices":[{"delta":{"content":"primary"}}]}\n\n'
+
+        primary.stream_chat_completion = _primary_stream
+        backup = _make_fake_adapter(provider="backup")
+
+        async def _backup_stream(*args: Any, **kwargs: Any) -> AsyncGenerator[str, None]:
+            backup_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_started.set()
+                await allow_cleanup.wait()
+            if False:
+                yield "unreachable"
+
+        backup.stream_chat_completion = _backup_stream
+        dispatch = CheckpointBackupDispatch(
+            backup=backup,
+            elapsed_sec=0.0,
+            release=lambda: release_calls.append("backup"),
+        )
+        hedged = HedgedAdapter(
+            primary=primary,
+            event_sink=sink,
+            hedge_checkpoints_sec=(0.0,),
+            checkpoint_backup_selector=lambda _elapsed, _timestamp: dispatch,
+        )
+
+        stream = hedged.stream_chat_completion([{"role": "user", "content": "hi"}])
+        first = await asyncio.wait_for(stream.__anext__(), timeout=0.2)
+
+        assert "primary" in first
+        await asyncio.wait_for(cleanup_started.wait(), timeout=0.2)
+        assert release_calls == []
+
+        allow_cleanup.set()
+        cleanup_task = hedged._stream_backup_cleanup_task
+        assert cleanup_task is not None
+        await cleanup_task
+        assert release_calls == ["backup"]
+        await stream.aclose()
 
     @pytest.mark.asyncio
     async def test_stream_backup_releases_when_outer_generator_close_is_cancelled(
