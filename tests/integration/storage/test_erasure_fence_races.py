@@ -899,7 +899,7 @@ async def test_fingerprint_pins_during_startup_and_rejects_mixed_secret(fence_st
             "SELECT config_value FROM erasure_fence_metadata WHERE config_key = 'secret_fingerprint'"
         ) == fingerprint_secret(first_secret)
 
-        with pytest.raises(ErasureFenceUnavailable, match="restore the original"):
+        with pytest.raises(ErasureFenceUnavailable, match="Restore the original"):
             await validate_or_init_fingerprint(conn, secret=second_secret)
 
         assert await conn.fetchval(
