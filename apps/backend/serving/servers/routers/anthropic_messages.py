@@ -36,6 +36,7 @@ from routing.prefill_load import (
     priority_for_prefill,
     prompt_anchor,
 )
+from routing.traffic_policy import scheduling_priority_for_traffic
 from serving.adapters.anthropic_aliases import resolve_anthropic_alias
 from serving.adapters.anthropic_translator import normalize_inline_system
 from serving.adapters.key_pool import KeyPool, KeyPoolExhausted
@@ -1667,19 +1668,22 @@ async def anthropic_messages(
         until the process restarts. Selection would then steer traffic away
         from a replica that is idle, which is worse than not accounting at all.
         """
-        req_ctx.update(
-            {
-                req_ctx.UPSTREAM_PRIORITY: priority_for_prefill(
-                    prefill_load.uncached_estimate(
-                        dispatch_endpoint_id,
-                        prefill_tokens,
-                        prefill_affinity,
-                        fingerprint=prefill_fingerprint,
-                        messages=prefill_messages,
-                    )
-                )
-            }
+        priority = priority_for_prefill(
+            prefill_load.uncached_estimate(
+                dispatch_endpoint_id,
+                prefill_tokens,
+                prefill_affinity,
+                fingerprint=prefill_fingerprint,
+                messages=prefill_messages,
+            )
         )
+        priority = scheduling_priority_for_traffic(
+            priority,
+            traffic_classification.class_hint.value,
+            traffic_classification.confidence,
+            interactive_priority=priority_for_prefill(0),
+        )
+        req_ctx.update({req_ctx.UPSTREAM_PRIORITY: priority})
         return prefill_load.acquire(
             dispatch_endpoint_id,
             prefill_tokens,
