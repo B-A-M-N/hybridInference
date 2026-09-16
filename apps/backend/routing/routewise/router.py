@@ -2596,11 +2596,11 @@ class RouteWiseRouter:
             trace.request_id = str(request_id)
 
         with self._route_commit_lock:
-            # The shared tracker is locked only for this short snapshot and
-            # again while the selected request is charged.  Prompt sizing,
-            # prediction, pricing, LP solving, and metadata construction stay
-            # outside that process-wide lock.
-            prefill_backlog = self._prefill_backlog_snapshot(model_id)
+            # Request-derived preprocessing stays outside the shared tracker
+            # transaction. Once a primary prefill lease is requested, however,
+            # the tracker must remain held from its backlog snapshot through
+            # selection and reservation. Otherwise two router instances that
+            # share one tracker can select from the same stale load view.
             prompt_tokens = self._prompt_tokens_from_context(context)
             prediction = self._predict_output(model_id, prompt_tokens, context)
             pool = self._routewise_pool(model_id)
@@ -2608,17 +2608,24 @@ class RouteWiseRouter:
                 self.envelope.snapshot(pool) if model_id in self._quota_bearing_models else None
             )
             now = time.time()
-            return self._select_decision_locked(
-                model_id,
-                context,
-                trace,
-                prompt_tokens=prompt_tokens,
-                prediction=prediction,
-                envelope=envelope,
-                now=now,
-                prefill_backlog=prefill_backlog,
-                reserve_prefill=reserve_prefill,
+            tracker_transaction = (
+                self._prefill_load.routing_transaction()
+                if reserve_prefill
+                else contextlib.nullcontext()
             )
+            with tracker_transaction:
+                prefill_backlog = self._prefill_backlog_snapshot(model_id)
+                return self._select_decision_locked(
+                    model_id,
+                    context,
+                    trace,
+                    prompt_tokens=prompt_tokens,
+                    prediction=prediction,
+                    envelope=envelope,
+                    now=now,
+                    prefill_backlog=prefill_backlog,
+                    reserve_prefill=reserve_prefill,
+                )
 
     def _select_decision_locked(
         self,

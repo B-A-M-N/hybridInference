@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import routing.routewise.router as routewise_router_module
+from routing.prefill_load import PrefillLoadTracker
 from routing.route_table import EffectiveRoute
 from routing.routers import FixedRouter, RoutingObservation
 from routing.routewise.candidates import QuotaSource
@@ -4302,7 +4303,7 @@ class TestPrefillLoadRoutingDecision:
     """Tests for prefill-load-aware routing decisions."""
 
     def test_prefill_tracker_lock_is_not_held_during_candidate_computation(self, monkeypatch):
-        """Expensive route computation must not block tracker readers."""
+        """Preview selection without a lease must not block tracker readers."""
         adapter = _make_adapter(endpoint_id="test-model:prefill-lock")
         route_table = _FakeRouteTable()
         route_table.add("test-model", [(adapter, 1.0)])
@@ -4337,6 +4338,100 @@ class TestPrefillLoadRoutingDecision:
 
         assert decision is not None
         assert probe_acquired == [True]
+
+    def test_shared_tracker_serializes_snapshot_selection_and_reservation(self, monkeypatch):
+        """Routers sharing load state cannot select from the same stale snapshot."""
+        adapter = _make_adapter(endpoint_id="test-model:shared-prefill")
+        route_table = _FakeRouteTable()
+        route_table.add("test-model", [(adapter, 1.0)])
+        tracker = PrefillLoadTracker()
+        config = RouteWiseConfig(prefill_load_routing_enabled=True)
+        first_router = RouteWiseRouter(
+            route_table=route_table,
+            config=config,
+            prefill_load=tracker,
+        )
+        second_router = RouteWiseRouter(
+            route_table=route_table,
+            config=config,
+            prefill_load=tracker,
+        )
+        context = {
+            "messages": [{"role": "user", "content": "x" * 4000}],
+            "params": {},
+        }
+        expected_tokens = first_router._tracked_prefill_tokens(
+            context["messages"], context["params"]
+        )
+        first_build_entered = threading.Event()
+        release_first_build = threading.Event()
+        second_build_entered = threading.Event()
+        original_first_build = first_router._build_candidates
+        original_second_build = second_router._build_candidates
+
+        def first_build(*args: Any, **kwargs: Any):
+            first_build_entered.set()
+            assert release_first_build.wait(timeout=1)
+            return original_first_build(*args, **kwargs)
+
+        def second_build(*args: Any, **kwargs: Any):
+            second_build_entered.set()
+            return original_second_build(*args, **kwargs)
+
+        monkeypatch.setattr(first_router, "_build_candidates", first_build)
+        monkeypatch.setattr(second_router, "_build_candidates", second_build)
+
+        results: dict[str, RoutingDecision] = {}
+        errors: list[BaseException] = []
+
+        def select_first() -> None:
+            try:
+                decision = first_router._select_decision(
+                    "test-model",
+                    {**context, "request_id": "shared-first"},
+                    reserve_prefill=True,
+                )
+                assert decision is not None
+                results["first"] = decision
+            except BaseException as exc:
+                errors.append(exc)
+
+        def select_second() -> None:
+            try:
+                decision = second_router._select_decision(
+                    "test-model",
+                    {**context, "request_id": "shared-second"},
+                    reserve_prefill=True,
+                )
+                assert decision is not None
+                results["second"] = decision
+            except BaseException as exc:
+                errors.append(exc)
+
+        first_thread = threading.Thread(target=select_first)
+        second_thread = threading.Thread(target=select_second)
+        first_thread.start()
+        assert first_build_entered.wait(timeout=1)
+        second_thread.start()
+        second_thread.join(timeout=0.05)
+        assert second_thread.is_alive()
+        assert not second_build_entered.is_set()
+
+        release_first_build.set()
+        first_thread.join(timeout=1)
+        second_thread.join(timeout=1)
+        assert not first_thread.is_alive()
+        assert not second_thread.is_alive()
+        assert errors == []
+        assert set(results) == {"first", "second"}
+        assert results["second"].metadata["candidate_outstanding_prefill_tokens"] == {
+            "test-model:shared-prefill": expected_tokens
+        }
+        assert tracker.backlog("test-model:shared-prefill") == expected_tokens * 2
+
+        results["first"].release()
+        results["second"].release()
+        assert tracker.backlog("test-model:shared-prefill") == 0
 
     def test_primary_lease_is_reserved_before_decision_returns(self):
         """A serving decision publishes its load reservation atomically."""
