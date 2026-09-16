@@ -203,12 +203,11 @@ Resolution walks the trust boundary correctly:
    forwarded hop is usable. If the peer itself is non-routable, the result is
    `"unknown"`.
 
-Every request log carries `ip_source`, `ip_resolved`, and the two explicit
-header-authority flags. Aggregating those fields gives operators a durable
-resolution counter such as `client_ip_resolution_total{result,source}` without
-ever turning an unresolved peer into a client identity. The structured
-`client_ip_resolution_unresolved` event additionally makes
-malformed-header and degraded-enforcement spikes alertable.
+Request logs carry `ip_source` together with the socket peer and raw forwarding
+fields. The structured `client_ip_resolution_unresolved` event is the canonical
+signal for malformed-header and degraded-enforcement spikes; its structured
+`event="client_ip_resolution"` metadata identifies the resolution event
+without turning an unresolved peer into a client identity.
 
 ### Example: multi-hop chain
 
