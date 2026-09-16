@@ -139,7 +139,7 @@ def test_no_state_leak_after_multiple_requests() -> None:
 
     snapshot = router._prefill_load.snapshot()
     # Either no endpoints in snapshot, or all have zero tokens
-    for _ep_id, data in snapshot.items():
+    for data in snapshot.values():
         assert data["prefill_tokens"] == 0
 
 
