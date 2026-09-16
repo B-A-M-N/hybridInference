@@ -126,6 +126,13 @@ _WORKER_COUNT_ENV_KEYS = (
 )
 
 
+def _dispatch_context(routing_options: Any) -> dict[str, Any]:
+    """Expose typed dispatch hooks to adapters without forwarding them."""
+    if routing_options is None or routing_options.on_dispatch_admitted is None:
+        return {}
+    return {req_ctx.TRAFFIC_ADMISSION_CALLBACK: routing_options.on_dispatch_admitted}
+
+
 async def _await_cancelled_child(task: asyncio.Task[Any]) -> None:
     """Await a cancelled child without swallowing cancellation of this task."""
     try:
@@ -1248,7 +1255,12 @@ class RouteWiseRouter:
                     )
 
         quota_pools: dict[str, QuotaPool] = {}
-        for pool_id, (policy, source, endpoint, uses_local_fallback) in quota_specs.items():
+        for pool_id, (
+            policy,
+            source,
+            endpoint,
+            uses_local_fallback,
+        ) in quota_specs.items():
             if source is None:  # pragma: no cover - enforced in candidates.py
                 raise ValueError(
                     f"RouteWise quota_pool {pool_id!r} ({endpoint!r}) has no quota_source"
@@ -1430,7 +1442,9 @@ class RouteWiseRouter:
             )
 
     @staticmethod
-    def _parse_reference_api_price(raw: dict[str, Any] | None) -> CandidatePricing | None:
+    def _parse_reference_api_price(
+        raw: dict[str, Any] | None,
+    ) -> CandidatePricing | None:
         if raw is None:
             return None
         return CandidatePricing.from_raw(raw, context="reference_api_price")
@@ -2763,6 +2777,15 @@ class RouteWiseRouter:
                         selected=selected,
                         hedge_plan=hedge_plan,
                     )
+                    for key in (
+                        "traffic_classification",
+                        "traffic_automation_score",
+                        "traffic_confidence",
+                        "traffic_reasons",
+                    ):
+                        value = context.get(key)
+                        if value is not None and value != ():
+                            metadata[key] = value
                     trace.begin_decision(metadata)
                     decision = RoutingDecision(
                         adapter=leaf,
@@ -3232,7 +3255,9 @@ class RouteWiseRouter:
         return "error"
 
     @staticmethod
-    def _bootstrap_failed_attempts(row: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    def _bootstrap_failed_attempts(
+        row: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], ...]:
         attempts = row.get("failed_attempts")
         if not isinstance(attempts, (list, tuple)):
             return ()
@@ -3495,6 +3520,18 @@ class RouteWiseRouter:
                 else None
             ),
             "routing_options": routing_options,
+            "traffic_classification": (
+                routing_options.traffic_classification if routing_options is not None else None
+            ),
+            "traffic_automation_score": (
+                routing_options.traffic_automation_score if routing_options is not None else None
+            ),
+            "traffic_confidence": (
+                routing_options.traffic_confidence if routing_options is not None else None
+            ),
+            "traffic_reasons": (
+                routing_options.traffic_reasons if routing_options is not None else ()
+            ),
         }
         trace = RoutingTrace(request_id=str(request_id))
         decision: RoutingDecision | None = None
@@ -3522,7 +3559,8 @@ class RouteWiseRouter:
                 primary = decision.adapter
                 last_attempted = primary
                 try:
-                    resp = await self._execute_adapter(decision, model_id, messages, **params)
+                    with req_ctx.push(**_dispatch_context(routing_options)):
+                        resp = await self._execute_adapter(decision, model_id, messages, **params)
                     self._ensure_response_routing(
                         resp,
                         primary,
@@ -3622,6 +3660,18 @@ class RouteWiseRouter:
                 else None
             ),
             "routing_options": routing_options,
+            "traffic_classification": (
+                routing_options.traffic_classification if routing_options is not None else None
+            ),
+            "traffic_automation_score": (
+                routing_options.traffic_automation_score if routing_options is not None else None
+            ),
+            "traffic_confidence": (
+                routing_options.traffic_confidence if routing_options is not None else None
+            ),
+            "traffic_reasons": (
+                routing_options.traffic_reasons if routing_options is not None else ()
+            ),
         }
         trace = RoutingTrace(request_id=str(request_id))
         decision: RoutingDecision | None = None
@@ -3657,19 +3707,20 @@ class RouteWiseRouter:
                         failed_attempts=trace.failed_attempts,
                     )
                     decision.metadata["is_streaming"] = True
-                    async for chunk in self._execute_stream_adapter(
-                        decision,
-                        model_id,
-                        messages,
-                        prefill_lease=decision.prefill_lease,
-                        **params,
-                    ):
-                        self.pending_prefix_cache.touch(str(request_id))
-                        if isinstance(chunk, str) and chunk.strip() == "data: [DONE]":
-                            done_chunk = chunk
-                            continue
-                        yield chunk
-                        chunks_yielded = True
+                    with req_ctx.push(**_dispatch_context(routing_options)):
+                        async for chunk in self._execute_stream_adapter(
+                            decision,
+                            model_id,
+                            messages,
+                            prefill_lease=decision.prefill_lease,
+                            **params,
+                        ):
+                            self.pending_prefix_cache.touch(str(request_id))
+                            if isinstance(chunk, str) and chunk.strip() == "data: [DONE]":
+                                done_chunk = chunk
+                                continue
+                            yield chunk
+                            chunks_yielded = True
 
                     decision.metadata["is_streaming"] = True
                     routing: dict[str, Any] = {}
