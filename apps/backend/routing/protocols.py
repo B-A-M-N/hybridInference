@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
 
     from routing.dispatch import EndpointBinding
     from routing.routers import RoutingObservation
@@ -54,6 +54,12 @@ class RoutingRequestOptions:
             that planned one candidate per attempt learns the candidate is
             unavailable rather than silently getting a different one.
         required_modalities: Non-text input modalities the request needs.
+    Traffic fields are server-generated online evidence. They are carried as a
+    typed routing hint so strategies can make an explicit, conservative
+    scheduling decision without reading arbitrary request-context keys. The
+    admission callback is consumed by typed routers and installed in the
+    dispatch context; provider adapters fire it after their outbound admission
+    gate succeeds. It is never forwarded through provider adapter kwargs.
     """
 
     pin_provider: str | None = None
@@ -63,6 +69,11 @@ class RoutingRequestOptions:
     bound_endpoint: EndpointBinding | None = None
     require_target: bool = False
     required_modalities: frozenset[str] = frozenset()
+    traffic_classification: str | None = None
+    traffic_automation_score: float | None = None
+    traffic_confidence: float | None = None
+    traffic_reasons: tuple[str, ...] = ()
+    on_dispatch_admitted: Callable[[], None] | None = None
 
 
 @runtime_checkable
