@@ -37,6 +37,7 @@ from routing.prefill_load import (
 from routing.route_table import EffectiveRoute, RouteTableSnapshot
 from routing.streaming import has_non_empty_content
 from routing.telemetry import failed_attempt, routing_chunk
+from routing.traffic_policy import scheduling_priority_for_traffic
 from serving.exceptions import operator_safe_error
 from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
@@ -1459,6 +1460,8 @@ class FixedRouter:
         affinity_key: str | None,
         fingerprint: str | None = None,
         messages: Sequence[dict[str, Any]] | None = None,
+        traffic_classification: str | None = None,
+        traffic_confidence: float | None = None,
     ) -> int:
         """Scheduling priority for one dispatch, ranked on *this* endpoint's work.
 
@@ -1483,7 +1486,7 @@ class FixedRouter:
         never seen this conversation, and that fallback really is facing the
         cold prefill.
         """
-        return priority_for_prefill(
+        priority = priority_for_prefill(
             self._prefill_load.uncached_estimate(
                 endpoint_id,
                 prefill_tokens,
@@ -1491,6 +1494,16 @@ class FixedRouter:
                 fingerprint=fingerprint,
                 messages=messages,
             )
+        )
+        # A high-confidence human-like signal receives only a bounded
+        # within-tier preference. It cannot cross the large or elephant
+        # prefill-cost boundaries. Unknown and automated classifications retain
+        # the existing size-based policy.
+        return scheduling_priority_for_traffic(
+            priority,
+            traffic_classification,
+            traffic_confidence,
+            interactive_priority=priority_for_prefill(0),
         )
 
     async def chat_completion(
@@ -1570,7 +1583,21 @@ class FixedRouter:
                 **_dispatch_context(routing_options),
                 **{
                     req_ctx.UPSTREAM_PRIORITY: self._dispatch_priority(
-                        endpoint_id, prefill_tokens, affinity_key, fingerprint, messages
+                        endpoint_id,
+                        prefill_tokens,
+                        affinity_key,
+                        fingerprint,
+                        messages,
+                        traffic_classification=(
+                            routing_options.traffic_classification
+                            if routing_options is not None
+                            else None
+                        ),
+                        traffic_confidence=(
+                            routing_options.traffic_confidence
+                            if routing_options is not None
+                            else None
+                        ),
                     )
                 },
             ):
@@ -1673,7 +1700,21 @@ class FixedRouter:
                         **_dispatch_context(routing_options),
                         **{
                             req_ctx.UPSTREAM_PRIORITY: self._dispatch_priority(
-                                endpoint_id, prefill_tokens, affinity_key, fingerprint, messages
+                                endpoint_id,
+                                prefill_tokens,
+                                affinity_key,
+                                fingerprint,
+                                messages,
+                                traffic_classification=(
+                                    routing_options.traffic_classification
+                                    if routing_options is not None
+                                    else None
+                                ),
+                                traffic_confidence=(
+                                    routing_options.traffic_confidence
+                                    if routing_options is not None
+                                    else None
+                                ),
                             )
                         },
                     ):
@@ -1797,7 +1838,21 @@ class FixedRouter:
                 **_dispatch_context(routing_options),
                 **{
                     req_ctx.UPSTREAM_PRIORITY: self._dispatch_priority(
-                        primary_endpoint_id, prefill_tokens, affinity_key, fingerprint, messages
+                        primary_endpoint_id,
+                        prefill_tokens,
+                        affinity_key,
+                        fingerprint,
+                        messages,
+                        traffic_classification=(
+                            routing_options.traffic_classification
+                            if routing_options is not None
+                            else None
+                        ),
+                        traffic_confidence=(
+                            routing_options.traffic_confidence
+                            if routing_options is not None
+                            else None
+                        ),
                     )
                 },
             ):
@@ -1930,6 +1985,16 @@ class FixedRouter:
                                 affinity_key,
                                 fingerprint,
                                 messages,
+                                traffic_classification=(
+                                    routing_options.traffic_classification
+                                    if routing_options is not None
+                                    else None
+                                ),
+                                traffic_confidence=(
+                                    routing_options.traffic_confidence
+                                    if routing_options is not None
+                                    else None
+                                ),
                             )
                         },
                     ):
