@@ -99,13 +99,6 @@ _NON_ROUTABLE_NETWORKS = (
     ipaddress.ip_network("2001:db8::/32"),
 )
 
-_PRIVATE_CLIENT_NETWORKS = (
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("100.64.0.0/10"),
-    ipaddress.ip_network("fc00::/7"),
-)
 _IP_INFO_STATE_KEY = "_hybrid_inference_client_ip_info"
 
 
@@ -319,7 +312,7 @@ def normalize_ip_bucket(ip: str) -> str:
 
 def derive_affinity_key(
     auth_key_hash: str | None,
-    client_ip_info: ClientIpInfo,
+    client_ip_info: ClientIpInfo | str,
     *,
     grant_id: str | None = None,
 ) -> str | None:
@@ -338,7 +331,10 @@ def derive_affinity_key(
     When client provenance is unresolved (``resolved=False``), there is no
     information to distinguish clients behind a shared proxy. Returns ``None``
     so the caller can use non-sticky routing rather than collapsing all
-    unrelated clients onto a single backend.
+    unrelated clients onto a single backend. A string is accepted for
+    compatibility with request surfaces that have not yet migrated to the
+    provenance-aware contract; those callers retain the previous string-based
+    behavior until the consumer migration is complete.
 
     Anonymous IPv6 clients key on their ``/64`` so rotating privacy addresses
     within the delegated prefix keeps landing on the same backend.
@@ -351,9 +347,13 @@ def derive_affinity_key(
         return auth_key_hash
     if grant_id:
         return f"grant:{grant_id}"
-    if client_ip_info.resolved:
-        return f"ip:{normalize_ip_bucket(client_ip_info.client_ip)}"
-    return None
+    if isinstance(client_ip_info, ClientIpInfo):
+        if not client_ip_info.resolved:
+            return None
+        client_ip = client_ip_info.client_ip
+    else:
+        client_ip = client_ip_info
+    return f"ip:{normalize_ip_bucket(client_ip)}"
 
 
 def _trusted_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
@@ -362,7 +362,7 @@ def _trusted_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, 
 
 
 def _trusted_direct_client_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
-    """Return private networks authorized to identify direct socket peers."""
+    """Return explicitly authorized networks for direct socket peers."""
     return get_settings().trusted_direct_client_parsed
 
 
@@ -555,13 +555,8 @@ def get_client_ip_info(request: Request) -> ClientIpInfo:
     # logging it as one is the pollution this fix eliminates.
     if _is_reportable_ip(peer_ip):
         return _info(peer_ip, "socket", True)
-    parsed_peer = _parse_ip(peer_ip)
     direct_networks = _trusted_direct_client_networks()
-    if (
-        parsed_peer is not None
-        and any(parsed_peer in network for network in _PRIVATE_CLIENT_NETWORKS)
-        and _is_in_networks(peer_ip, direct_networks)
-    ):
+    if _is_in_networks(peer_ip, direct_networks):
         return _info(peer_ip, "socket", True)
     return _info("unknown", "unknown", False)
 

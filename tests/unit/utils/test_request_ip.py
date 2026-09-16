@@ -197,6 +197,19 @@ def test_direct_cgnat_peer_requires_explicit_client_network():
         assert info.resolved is True
 
 
+def test_explicit_direct_client_network_overrides_non_routable_classification():
+    """Any explicitly configured direct-client CIDR is authoritative."""
+    with _settings_env(
+        proxy_headers=False,
+        cf_headers=False,
+        direct_client_nets=_networks("198.18.0.0/15"),
+    ):
+        info = get_client_ip_info(_request({}, peer_ip="198.18.1.7"))
+        assert info.client_ip == "198.18.1.7"
+        assert info.source == "socket"
+        assert info.resolved is True
+
+
 def test_unconfigured_cgnat_peer_stays_unresolved():
     """An unconfigured CGNAT peer is not treated as an individual client."""
     with _settings_env(proxy_headers=False, cf_headers=False):
@@ -961,6 +974,12 @@ def test_affinity_key_grant_preferred():
         resolved=True,
     )
     assert derive_affinity_key(None, ip_info, grant_id="g1") == "grant:g1"
+
+
+def test_affinity_key_accepts_legacy_client_ip_string():
+    """Old request surfaces may pass the string form during migration."""
+    assert derive_affinity_key(None, "8.8.8.8") == "ip:8.8.8.8"
+    assert derive_affinity_key(None, "unknown") == "ip:unknown"
 
 
 # ---------------------------------------------------------------------------
