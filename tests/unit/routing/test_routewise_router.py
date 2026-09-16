@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 import weakref
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -4432,6 +4433,141 @@ class TestPrefillLoadRoutingDecision:
         results["first"].release()
         results["second"].release()
         assert tracker.backlog("test-model:shared-prefill") == 0
+
+    def test_shared_tracker_serializes_checkpoint_backup_selection_and_reservation(
+        self, monkeypatch
+    ):
+        """Checkpoint hedges cannot select from a snapshot before backup reservation."""
+        primary = _make_adapter(endpoint_id="test-model:checkpoint-primary")
+        backup = _make_adapter(endpoint_id="test-model:checkpoint-backup")
+        route_table = _FakeRouteTable()
+        route_table.add("test-model", [(primary, 0.5), (backup, 0.5)])
+        tracker = PrefillLoadTracker()
+        config = RouteWiseConfig(prefill_load_routing_enabled=True)
+        first_router = RouteWiseRouter(
+            route_table=route_table,
+            config=config,
+            prefill_load=tracker,
+        )
+        second_router = RouteWiseRouter(
+            route_table=route_table,
+            config=config,
+            prefill_load=tracker,
+        )
+        context = {
+            "messages": [{"role": "user", "content": "x" * 4000}],
+            "params": {},
+        }
+        candidates, _ = first_router._build_candidates(
+            "test-model",
+            prompt_tokens=1000,
+            predicted_output_tokens=1.0,
+            envelope=None,
+            now=time.time(),
+            context=context,
+            prefill_backlog={},
+        )
+        selected = next(candidate for candidate in candidates if candidate.adapter is primary)
+        first_decision = _unreserved_decision(primary)
+        second_decision = _unreserved_decision(primary)
+
+        def select_backup(**kwargs: Any) -> SimpleNamespace:
+            candidate = next(
+                candidate
+                for candidate in kwargs["candidates"]
+                if candidate.endpoint_id == "test-model:checkpoint-backup"
+            )
+            return SimpleNamespace(provider=candidate, success_probability=0.5)
+
+        monkeypatch.setattr(first_router, "_select_hedge_candidate_at_elapsed", select_backup)
+        monkeypatch.setattr(second_router, "_select_hedge_candidate_at_elapsed", select_backup)
+        monkeypatch.setattr(first_router, "_record_hedge_dispatch", lambda **_kwargs: None)
+        monkeypatch.setattr(second_router, "_record_hedge_dispatch", lambda **_kwargs: None)
+
+        first_build_entered = threading.Event()
+        release_first_build = threading.Event()
+        second_build_entered = threading.Event()
+        observed_second_backlog: dict[str, int] = {}
+        original_first_build = first_router._build_candidates
+        original_second_build = second_router._build_candidates
+
+        def first_build(*args: Any, **kwargs: Any):
+            first_build_entered.set()
+            assert release_first_build.wait(timeout=1)
+            return original_first_build(*args, **kwargs)
+
+        def second_build(*args: Any, **kwargs: Any):
+            second_build_entered.set()
+            observed_second_backlog.update(kwargs["prefill_backlog"])
+            return original_second_build(*args, **kwargs)
+
+        monkeypatch.setattr(first_router, "_build_candidates", first_build)
+        monkeypatch.setattr(second_router, "_build_candidates", second_build)
+
+        results: dict[str, Any] = {}
+        errors: list[BaseException] = []
+
+        def select_first() -> None:
+            try:
+                results["first"] = first_router._select_checkpoint_backup(
+                    model_id="test-model",
+                    decision=first_decision,
+                    context=context,
+                    prompt_tokens=1000,
+                    predicted_output_tokens=1.0,
+                    envelope=None,
+                    selected=selected,
+                    checkpoints_sec=(1.0,),
+                    latency_slo_sec=1.0,
+                    elapsed_sec=1.0,
+                    checkpoint_ts=time.time(),
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        def select_second() -> None:
+            try:
+                results["second"] = second_router._select_checkpoint_backup(
+                    model_id="test-model",
+                    decision=second_decision,
+                    context=context,
+                    prompt_tokens=1000,
+                    predicted_output_tokens=1.0,
+                    envelope=None,
+                    selected=selected,
+                    checkpoints_sec=(1.0,),
+                    latency_slo_sec=1.0,
+                    elapsed_sec=1.0,
+                    checkpoint_ts=time.time(),
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        first_thread = threading.Thread(target=select_first)
+        second_thread = threading.Thread(target=select_second)
+        first_thread.start()
+        assert first_build_entered.wait(timeout=1)
+        second_thread.start()
+        second_thread.join(timeout=0.05)
+        assert second_thread.is_alive()
+        assert not second_build_entered.is_set()
+
+        release_first_build.set()
+        first_thread.join(timeout=1)
+        second_thread.join(timeout=1)
+        assert not first_thread.is_alive()
+        assert not second_thread.is_alive()
+        assert errors == []
+        assert results["first"] is not None
+        assert results["second"] is not None
+        expected_tokens = first_router._tracked_prefill_tokens(
+            context["messages"], context["params"]
+        )
+        assert observed_second_backlog["test-model:checkpoint-backup"] == expected_tokens
+
+        results["first"].release()
+        results["second"].release()
+        assert tracker.backlog("test-model:checkpoint-backup") == 0
 
     def test_primary_lease_is_reserved_before_decision_returns(self):
         """A serving decision publishes its load reservation atomically."""

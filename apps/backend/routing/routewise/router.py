@@ -2219,21 +2219,27 @@ class RouteWiseRouter:
     ) -> CheckpointBackupDispatch | None:
         """Select and reserve a backup at one in-flight checkpoint."""
         with self._route_commit_lock:
-            prefill_backlog = self._prefill_backlog_snapshot(model_id)
-            return self._select_checkpoint_backup_locked(
-                model_id=model_id,
-                decision=decision,
-                context=context,
-                prompt_tokens=prompt_tokens,
-                predicted_output_tokens=predicted_output_tokens,
-                envelope=envelope,
-                selected=selected,
-                checkpoints_sec=checkpoints_sec,
-                latency_slo_sec=latency_slo_sec,
-                elapsed_sec=elapsed_sec,
-                checkpoint_ts=checkpoint_ts,
-                prefill_backlog=prefill_backlog,
+            tracker_transaction = (
+                self._prefill_load.routing_transaction()
+                if self.config.prefill_load_routing_enabled
+                else contextlib.nullcontext()
             )
+            with tracker_transaction:
+                prefill_backlog = self._prefill_backlog_snapshot(model_id)
+                return self._select_checkpoint_backup_locked(
+                    model_id=model_id,
+                    decision=decision,
+                    context=context,
+                    prompt_tokens=prompt_tokens,
+                    predicted_output_tokens=predicted_output_tokens,
+                    envelope=envelope,
+                    selected=selected,
+                    checkpoints_sec=checkpoints_sec,
+                    latency_slo_sec=latency_slo_sec,
+                    elapsed_sec=elapsed_sec,
+                    checkpoint_ts=checkpoint_ts,
+                    prefill_backlog=prefill_backlog,
+                )
 
     def _select_checkpoint_backup_locked(
         self,
@@ -2324,11 +2330,10 @@ class RouteWiseRouter:
                 context.get("messages") if isinstance(context, dict) else None,
                 request_params if isinstance(request_params, dict) else None,
             )
-            with self._prefill_load.routing_transaction():
-                backup_lease = self._prefill_load.acquire(
-                    backup.endpoint_id,
-                    tracked_tokens,
-                )
+            backup_lease = self._prefill_load.acquire(
+                backup.endpoint_id,
+                tracked_tokens,
+            )
 
         def _confirm_backup_prefill() -> None:
             self._prefill_load.release(backup_lease, prefill_confirmed=True)
