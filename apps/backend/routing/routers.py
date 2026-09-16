@@ -1568,7 +1568,11 @@ class FixedRouter:
         # committed to one, and the leaf is built here -- before the attempt --
         # so a binding that cannot be honored is refused as a composition error
         # instead of being recorded as a provider failure.
-        leaf = self.bind_execution(primary, routing_options, model_id, primary_claim)
+        try:
+            leaf = self.bind_execution(primary, routing_options, model_id, primary_claim)
+        except BaseException:
+            self._prefill_load.release(lease)
+            raise
         execution = leaf.adapter
         try:
             endpoint_id = endpoint_id_for_adapter(primary)
@@ -1801,7 +1805,11 @@ class FixedRouter:
                     f"Pinned provider '{pin_provider}' not found for model {model_id}"
                 )
             raise ValueError(f"No route configured for model {model_id}")
-        leaf = self.bind_execution(primary, routing_options, model_id, primary_claim)
+        try:
+            leaf = self.bind_execution(primary, routing_options, model_id, primary_claim)
+        except BaseException:
+            self._prefill_load.release(lease)
+            raise
         execution = leaf.adapter
         chunks_yielded = False
         try:

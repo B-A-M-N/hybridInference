@@ -1141,6 +1141,50 @@ class TestHedgedAdapterStreaming:
         assert len(close_calls) >= 2
 
     @pytest.mark.asyncio
+    async def test_stream_backup_releases_when_outer_generator_close_is_cancelled(
+        self, monkeypatch
+    ):
+        """Outer cleanup releases the backup even when generator close is cancelled."""
+        sink = _FakeEventSink()
+        release_calls: list[str] = []
+        primary = _make_fake_adapter(provider="primary")
+        backup = _make_fake_adapter(provider="backup")
+
+        dispatch = CheckpointBackupDispatch(
+            backup=backup,
+            elapsed_sec=0.0,
+            release=lambda: release_calls.append("backup"),
+        )
+        hedged = HedgedAdapter(
+            primary=primary,
+            event_sink=sink,
+            hedge_checkpoints_sec=(0.0,),
+            checkpoint_backup_selector=lambda _elapsed, _timestamp: dispatch,
+        )
+
+        async def _empty_backup() -> AsyncGenerator[str, None]:
+            if False:
+                yield ""
+
+        async def _race_raises(*args: Any, **kwargs: Any) -> Any:
+            hedged._stream_backup_dispatch = dispatch
+            hedged._stream_backup_gen = _empty_backup()
+            raise RuntimeError("race failed")
+
+        async def _close_raises_cancelled(gen: AsyncGenerator[Any, None]) -> None:
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(hedged, "_race_streams", _race_raises)
+        monkeypatch.setattr(hedging_module, "_safe_aclose", _close_raises_cancelled)
+
+        stream = hedged.stream_chat_completion([{"role": "user", "content": "hi"}])
+        with pytest.raises(asyncio.CancelledError):
+            await stream.__anext__()
+
+        assert release_calls == ["backup"]
+        assert hedged._stream_backup_released is True
+
+    @pytest.mark.asyncio
     async def test_stream_backup_winner_releases_primary_when_race_resolves(self):
         """A backup winner releases the canceled primary before output consumption."""
         sink = _FakeEventSink()

@@ -4078,6 +4078,36 @@ async def test_start_reports_whether_this_call_activated_the_router():
 class TestPrefillLoadPenalty:
     """Tests for the _prefill_load_penalty_ms helper."""
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ("chat", "stream"))
+    async def test_binding_failure_releases_prefill_lease(self, operation):
+        """A refused leaf binding cannot strand the dispatch's prefill lease."""
+        adapter = _make_adapter(endpoint_id=f"test-model:bind-{operation}")
+        router = FixedRouter()
+        router.register_route("test-model", [(adapter, 1.0)])
+
+        with (
+            patch.object(
+                router,
+                "bind_execution",
+                side_effect=RuntimeError("binding refused"),
+            ),
+            pytest.raises(RuntimeError, match="binding refused"),
+        ):
+            if operation == "chat":
+                await router.chat_completion(
+                    "test-model",
+                    [{"role": "user", "content": "x" * 4000}],
+                )
+            else:
+                stream = router.stream_chat_completion(
+                    "test-model",
+                    [{"role": "user", "content": "x" * 4000}],
+                )
+                await stream.__anext__()
+
+        assert router._prefill_load.backlog(f"test-model:bind-{operation}") == 0
+
     def test_zero_backlog_returns_zero(self):
         router = RouteWiseRouter(config=RouteWiseConfig(prefill_load_routing_enabled=True))
         assert router._prefill_load_penalty_ms(0) == 0.0

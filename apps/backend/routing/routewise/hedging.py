@@ -483,15 +483,19 @@ class HedgedAdapter(BaseAdapter):
                 yield chunk
 
         finally:
-            # Close every generator we may have opened.
-            seen: set[int] = set()
-            for gen in (primary_gen, winner_gen, loser_gen, self._stream_backup_gen):
-                if gen is not None and id(gen) not in seen:
-                    seen.add(id(gen))
-                    await _safe_aclose(gen)
-            await self._finish_stream_backup()
-            self._stream_backup_dispatch = None
-            self._stream_backup_gen = None
+            try:
+                # Close every generator we may have opened.
+                seen: set[int] = set()
+                for gen in (primary_gen, winner_gen, loser_gen, self._stream_backup_gen):
+                    if gen is not None and id(gen) not in seen:
+                        seen.add(id(gen))
+                        await _safe_aclose(gen)
+            finally:
+                # A caller cancellation while closing an earlier generator must
+                # not strand the backup reservation behind this cleanup loop.
+                await self._finish_stream_backup()
+                self._stream_backup_dispatch = None
+                self._stream_backup_gen = None
 
     async def _race_streams(
         self,
