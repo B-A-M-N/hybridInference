@@ -438,6 +438,11 @@ class HedgedAdapter(BaseAdapter):
                             assert self.backup is not None
                             self.config = self.backup.config
                             self.backup_won = True
+                            # The primary is no longer prefilling once the
+                            # backup has won.  Release its load charge before
+                            # awaiting cancellation so slow loser cleanup does
+                            # not distort concurrent endpoint selection.
+                            _release_primary_prefill()
                             primary_task.cancel()
                             await _safe_await_task(primary_task)
                         return winner_result

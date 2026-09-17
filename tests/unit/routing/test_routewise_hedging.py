@@ -435,6 +435,69 @@ class TestHedgedAdapterNonStreaming:
         assert events == ["prefill", "backup-cancellation-started", "capacity"]
 
     @pytest.mark.asyncio
+    async def test_backup_winner_releases_primary_prefill_before_cancellation_finishes(self):
+        """A slow primary cancellation cannot keep its prefill charge reserved."""
+        sink = _FakeEventSink()
+        tracker = PrefillLoadTracker()
+        lease = tracker.acquire("test:primary", 100)
+        primary_started = asyncio.Event()
+        prefill_released = asyncio.Event()
+        allow_primary_cleanup = asyncio.Event()
+        events: list[str] = []
+        primary = _make_fake_adapter(provider="primary", endpoint_id="test:primary")
+
+        async def _primary_chat(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            primary_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("primary-cancellation-started")
+                await allow_primary_cleanup.wait()
+            raise AssertionError("primary unexpectedly completed")
+
+        primary.chat_completion = _primary_chat
+        backup = _make_fake_adapter(
+            provider="backup",
+            endpoint_id="test:backup",
+            chat_result={"source": "backup"},
+        )
+        dispatch = CheckpointBackupDispatch(
+            backup=backup,
+            elapsed_sec=0.0,
+            release=lambda: events.append("capacity"),
+        )
+        hedged = HedgedAdapter(
+            primary=primary,
+            event_sink=sink,
+            hedge_checkpoints_sec=(0.0,),
+            checkpoint_backup_selector=lambda _elapsed, _timestamp: dispatch,
+        )
+
+        def _release_primary_prefill() -> None:
+            events.append("prefill")
+            tracker.release(lease)
+            prefill_released.set()
+
+        request = asyncio.create_task(
+            hedged.chat_completion(
+                [{"role": "user", "content": "hi"}],
+                primary_prefill_release=_release_primary_prefill,
+            )
+        )
+        await primary_started.wait()
+        await asyncio.wait_for(prefill_released.wait(), timeout=0.2)
+
+        assert tracker.backlog("test:primary") == 0
+        assert events == ["capacity", "prefill"]
+
+        allow_primary_cleanup.set()
+        result = await request
+
+        assert result["source"] == "backup"
+        assert events == ["capacity", "prefill", "primary-cancellation-started"]
+        assert tracker.backlog("test:primary") == 0
+
+    @pytest.mark.asyncio
     async def test_backup_failure_forwards_health_and_forgets_only_backup(self):
         """A failed backup leg updates health without duplicating the failure."""
         sink = _FakeEventSink()
