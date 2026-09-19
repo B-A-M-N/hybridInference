@@ -61,10 +61,16 @@ Store these repository secrets for scheduled publication:
 * The workflow's `GITHUB_TOKEN` needs **Contents: read/write** on
   `B-A-M-N/hybridInference`; checkout/git use it to update prepared branches
   in the fork.
-* `HYBRIDINFERENCE_PR_TOKEN`: fine-grained token scoped to
-  `HarvardMadSys/hybridInference` with **Pull requests: read/write** and
-  **Contents: read** (metadata read is implicit). It is used by `gh` to read
-  merge state, detect duplicate PRs, and create cross-repository PRs.
+* `HYBRIDINFERENCE_PR_TOKEN`: the existing **classic PAT** for `B-A-M-N`,
+  stored only as a fork Actions secret. Its `repo` and `workflow` scopes are
+  required by the current cross-repository workflow: a fork-only fine-grained
+  token is not sufficient for creating the upstream PR. It is used by `gh` to
+  read merge state, detect duplicate PRs, and create cross-repository PRs.
+
+The deployed credential was verified as `B-A-M-N` with fork push access and
+upstream PR-read access. GitHub does not expose a non-mutating check for the
+final upstream PR-create permission, so the workflow does not create a test
+PR; its real publication call remains the final permission gate.
 
 No credential is committed. A manual dry-run can use the workflow token for
 public reads and does not push or open PRs; scheduled publication fails closed
