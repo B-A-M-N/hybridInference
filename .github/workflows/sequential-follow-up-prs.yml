@@ -1,0 +1,68 @@
+name: Sequential follow-up PRs
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Inspect and validate eligible units without pushing or opening PRs"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: hybridinference-sequential-prs
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  advance:
+    runs-on: ubuntu-latest
+    env:
+      # gh reads upstream state and creates the cross-repository PR with this
+      # token. The workflow GITHUB_TOKEN handles writes to this fork.
+      GH_TOKEN: ${{ secrets.HYBRIDINFERENCE_PR_TOKEN || github.token }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+    steps:
+      - name: Check out the fork's dev workflow revision
+        uses: actions/checkout@v6
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          version: "0.5.0"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Fetch current upstream and prepared refs
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/HarvardMadSys/hybridInference.git 2>/dev/null || true
+          git fetch --prune upstream dev
+          git fetch --prune origin '+refs/heads/prep/*:refs/remotes/origin/prep/*'
+
+      - name: Require publication credentials
+        if: env.DRY_RUN != 'true'
+        env:
+          UPSTREAM_TOKEN: ${{ secrets.HYBRIDINFERENCE_PR_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${UPSTREAM_TOKEN}" || { echo 'HYBRIDINFERENCE_PR_TOKEN is required for scheduled publication' >&2; exit 1; }
+
+      - name: Run sequencer
+        run: |
+          set -euo pipefail
+          if [ "${DRY_RUN}" = "true" ]; then
+            uv run python ops/sequential_prs.py --manifest .github/sequential-prs.yml --dry-run
+          else
+            uv run python ops/sequential_prs.py --manifest .github/sequential-prs.yml
+          fi

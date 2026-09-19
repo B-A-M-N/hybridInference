@@ -1,0 +1,248 @@
+version: 1
+
+upstream:
+  repository: HarvardMadSys/hybridInference
+  fork_owner: B-A-M-N
+  fork_repository: hybridInference
+  base_ref: dev
+  upstream_remote: upstream
+  fork_remote: origin
+
+# Already-published foundation PRs. The sequencer asks GitHub for live state
+# and never rewrites these branches.
+threads:
+  - id: prefill
+    foundation:
+      pr: 1419
+      branch: bamn/routewise/prefill-load-routing-v2
+    units:
+      - id: reviewable-core
+        branch: prep/1419-reviewable-core
+        source_base: 82d2a62af7073d3cbfb28b038656251fd7b11cca
+        source_tip: 935c0a9bff9fd921eb306109dc65d263deff3cda
+        title: "fix(routewise): complete prefill reservation lifecycle"
+        body: |
+          ## Summary
+
+          - Completes the RouteWise prefill and hedge reservation lifecycle.
+          - Keeps winner/loser cleanup and cancellation paths bounded and
+            reviewable after #1419 lands.
+
+          ## Scope
+
+          This is the first sequential follow-up to #1419. Mixed-workload
+          benchmark tooling remains deferred to the next unit; no benchmark
+          publication is included here.
+
+          ## Validation
+
+          The sequencer reconstructs this unit from its isolated source range
+          on current `dev` and runs the focused RouteWise tests plus repository
+          quality gates before publication.
+        validation:
+          - [uv, run, ruff, format, --check, "."]
+          - [uv, run, ruff, check, --no-fix, "."]
+          - [uv, run, pytest, -q, tests/unit/routing/test_routewise_hedging.py, tests/unit/routing/test_routewise_router.py]
+      - id: prefill-benchmarks
+        branch: prep/1419-prefill-benchmarks
+        source_base: 935c0a9bff9fd921eb306109dc65d263deff3cda
+        source_tip: 6d9e1ff672a035a39be4bb4f0fe1111c005d0e31
+        title: "bench(routewise): validate prefill-load routing"
+        body: |
+          ## Summary
+
+          - Adds the deferred mixed-workload prefill benchmark and validation
+            coverage for the completed RouteWise lifecycle.
+
+          ## Scope
+
+          This is the measurement-only follow-up after the #1419 foundation and
+          its reviewable lifecycle unit have landed. It does not change the
+          routing implementation or combine later work.
+
+          ## Validation
+
+          The sequencer reconstructs only this benchmark unit on current `dev`
+          and runs the focused benchmark tests plus repository quality gates
+          before publication.
+        validation:
+          - [uv, run, ruff, format, --check, "."]
+          - [uv, run, ruff, check, --no-fix, "."]
+          - [uv, run, pytest, -q, tests/benchmarks/test_prefill_load_benchmark.py, tests/benchmarks/test_prefill_load_validation.py]
+
+  - id: trusted-proxy
+    foundation:
+      pr: 1427
+      branch: fix/trusted-proxy-ip
+    retired_refs:
+      - branch: prep/1427-provenance-foundation
+        reason: "superseded by published PR #1427 head; never publish this ref"
+    units:
+      - id: consumer-contract
+        branch: prep/1427-consumer-contract
+        source_base: b06f1c24ae07fe1062476934f0fd65b49be46ec9
+        source_tip: b505dc1181a0c625ac12bf9b1375a4722138ea89
+        title: "fix(serving): apply trusted provenance to consumers"
+        body: |
+          ## Summary
+
+          - Applies the trusted client provenance contract to authentication,
+            rate limiting, adapters, and request logging consumers.
+
+          ## Scope
+
+          This is the first sequential follow-up after #1427 lands. Generalized
+          non-affine key-pool recovery remains deferred to the next unit.
+
+          ## Validation
+
+          The sequencer reconstructs only this consumer unit on current `dev`
+          and runs its focused server tests plus repository quality gates.
+        validation:
+          - [uv, run, ruff, format, --check, "."]
+          - [uv, run, ruff, check, --no-fix, "."]
+          - [uv, run, pytest, -q, tests/servers/test_admin_auth.py, tests/servers/test_admin_auth_blocks.py, tests/servers/test_public_signup_policy.py]
+      - id: keypool-lifecycle
+        branch: prep/1427-keypool-lifecycle
+        source_base: b505dc1181a0c625ac12bf9b1375a4722138ea89
+        source_tip: ae7d787375209f29ee7ea8d6b721ba7ce923bce0
+        title: "feat(key-pool): define non-affine recovery lifecycle"
+        body: |
+          ## Summary
+
+          - Defines the non-affine key-pool recovery lifecycle and its focused
+            adapter/integration coverage.
+
+          ## Scope
+
+          This is the later sequential follow-up after the trusted provenance
+          foundation and consumer contract. It is isolated from unrelated
+          authentication or routing work.
+
+          ## Validation
+
+          The sequencer reconstructs only this key-pool unit on current `dev`
+          and runs the focused key-pool tests plus repository quality gates.
+        validation:
+          - [uv, run, ruff, format, --check, "."]
+          - [uv, run, ruff, check, --no-fix, "."]
+          - [uv, run, pytest, -q, tests/unit/adapters/test_key_pool.py, tests/integration/test_openai_compat_multi_key.py]
+
+  - id: erasure
+    foundation:
+      pr: 1428
+      branch: fix/hard-delete-erasure-fence-1421
+    retired_refs:
+      - branch: prep/1428-fence-substrate
+        reason: "foundation mirror already represented by published PR #1428"
+    units:
+      - id: claim-state-machine
+        branch: prep/1428-claim-state-machine
+        source_base: 6d37b1224064ff4982daddb1b65edd2c51b5a07e
+        source_tip: d9e0481697df5b86fde5272ab2059aace74b46dd
+        title: "feat(storage): isolate hard-delete claim state"
+        body: |
+          ## Summary
+
+          - Isolates hard-delete claim ownership and recovery transitions after
+            the erasure-fence substrate lands.
+
+          ## Scope
+
+          This is the first sequential follow-up to #1428. Identity-protection
+          and admin integration remain deferred to the next unit.
+
+          ## Validation
+
+          The sequencer reconstructs only this claim-state unit on current
+          `dev` and runs focused storage/admin tests plus repository quality
+          gates.
+        validation:
+          - [uv, run, ruff, format, --check, "."]
+          - [uv, run, ruff, check, --no-fix, "."]
+          - [uv, run, pytest, -q, tests/servers/test_admin_users.py, tests/servers/test_bootstrap.py, tests/unit/storage/test_schema_lock_timeout.py, tests/unit/storage/test_login_events.py]
+      - id: identity-protection
+        branch: prep/1428-identity-protection
+        source_base: d9e0481697df5b86fde5272ab2059aace74b46dd
+        source_tip: 779ab13f6c4e82c48ac92584441ccadf90a01418
+        title: "feat(storage): enforce erased identity protection"
+        body: |
+          ## Summary
+
+          - Enforces erased-identity protection across the remaining admin,
+            authentication, provider, and storage paths.
+
+          ## Scope
+
+          This is the later sequential follow-up after the #1428 fence
+          substrate and claim-state unit. It does not include unrelated
+          workflow or routing changes.
+
+          ## Validation
+
+          The sequencer reconstructs only this identity-protection unit on
+          current `dev` and runs focused storage/admin tests plus repository
+          quality gates.
+        validation:
+          - [uv, run, ruff, format, --check, "."]
+          - [uv, run, ruff, check, --no-fix, "."]
+          - [uv, run, pytest, -q, tests/servers/test_admin_api.py, tests/servers/test_admin_auth.py, tests/servers/test_admin_users.py, tests/servers/test_user_routes.py]
+
+  - id: classifier
+    foundation:
+      pr: 1430
+      branch: feat/traffic-classifier
+    retired_refs:
+      - branch: prep/1430-evidence-model
+        reason: "foundation mirror already represented by published PR #1430"
+    units:
+      - id: admission-recording
+        branch: prep/1430-admission-recording
+        source_base: 391c818471370d1f3f6b42f159def341d4855677
+        source_tip: 3a4b292034a11ec29f50dc9a1c2086af61857624
+        title: "refactor(traffic): keep admission separate from policy"
+        body: |
+          ## Summary
+
+          - Records admitted traffic evidence at the request execution
+            boundary while keeping admission separate from policy.
+
+          ## Scope
+
+          This is the first sequential follow-up to #1430. Routing consumption
+          remains deferred to the next unit.
+
+          ## Validation
+
+          The sequencer reconstructs only this admission unit on current `dev`
+          and runs the focused server/routing tests plus repository quality
+          gates.
+        validation:
+          - [uv, run, ruff, format, --check, "."]
+          - [uv, run, ruff, check, --no-fix, "."]
+          - [uv, run, pytest, -q, tests/servers/test_compat.py, tests/servers/test_completions.py, tests/servers/test_responses_router.py]
+      - id: routing-consumption
+        branch: prep/1430-routing-consumption
+        source_base: 3a4b292034a11ec29f50dc9a1c2086af61857624
+        source_tip: 992f96b66eecaa2bc8588d650aaef60dc6e01d0b
+        title: "feat(routing): consume traffic scheduling hints"
+        body: |
+          ## Summary
+
+          - Consumes the bounded traffic scheduling hints in routing policy.
+
+          ## Scope
+
+          This is the later sequential follow-up after #1430's classifier and
+          admission-recording units. No additional classifier or workflow work
+          is included.
+
+          ## Validation
+
+          The sequencer reconstructs only this routing-consumption unit on
+          current `dev` and runs focused routing/server tests plus repository
+          quality gates.
+        validation:
+          - [uv, run, ruff, format, --check, "."]
+          - [uv, run, ruff, check, --no-fix, "."]
+          - [uv, run, pytest, -q, tests/unit/routing/test_traffic_routing.py, tests/servers/test_anthropic_messages_priority.py, tests/servers/test_traffic_classifier_integration.py]
