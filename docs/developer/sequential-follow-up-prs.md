@@ -39,10 +39,13 @@ before push and after push to cover partial failures.
 
 An eligible unit is reconstructed by applying the manifest's
 `source_base..source_tip` patch with `git apply --3way --index` onto a fresh
-`upstream/dev` worktree. The resulting changed paths must exactly equal the
-source unit's paths. `git diff --check`, the focused tests, Ruff formatting,
-Ruff lint, the sequencer's mypy check, and the unit's declared gates must pass
-before publication.
+`upstream/dev` worktree. `source_ref` may pin the immutable source commit
+directly; when omitted, the sequencer verifies the corresponding prepared fork
+branch. The resulting changed paths must exactly equal the source unit's paths.
+`git diff --check`, the focused tests, Ruff formatting, Ruff lint, the
+sequencer's mypy check, and the unit's declared gates must pass before
+publication. Repaired units use pinned clean commits rather than the obsolete
+stacked prep ancestry.
 
 Existing prepared branches are updated with
 `--force-with-lease`, never an unguarded force push. A changed remote ref

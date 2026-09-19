@@ -60,6 +60,7 @@ class Unit:
     title: str
     body: str
     validation: tuple[tuple[str, ...], ...]
+    source_ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,12 @@ def load_manifest(path: Path) -> Manifest:
                 str(_required(unit_raw, "source_tip", unit_context)),
                 f"{unit_context}.source_tip",
             )
+            source_ref_raw = unit_raw.get("source_ref")
+            source_ref = (
+                ""
+                if source_ref_raw is None
+                else _no_placeholders(str(source_ref_raw), f"{unit_context}.source_ref")
+            )
             validation_raw = _required(unit_raw, "validation", unit_context)
             if not isinstance(validation_raw, list) or not all(
                 isinstance(command, list)
@@ -196,6 +203,7 @@ def load_manifest(path: Path) -> Manifest:
                     title=str(_required(unit_raw, "title", unit_context)),
                     body=str(_required(unit_raw, "body", unit_context)),
                     validation=tuple(tuple(command) for command in validation_raw),
+                    source_ref=source_ref,
                 )
             )
         threads.append(
@@ -473,7 +481,7 @@ class Git(CommandRunner):
                 )
 
     def reconstruct_and_validate(self, unit: Unit, manifest: Manifest) -> tuple[str, set[str], str]:
-        source_ref = f"{manifest.fork_remote}/{unit.branch}"
+        source_ref = unit.source_ref or f"{manifest.fork_remote}/{unit.branch}"
         source_tip = self.resolve(source_ref)
         if source_tip != unit.source_tip:
             raise ValidationFailure(

@@ -18,8 +18,9 @@ threads:
     units:
       - id: reviewable-core
         branch: prep/1419-reviewable-core
-        source_base: 82d2a62af7073d3cbfb28b038656251fd7b11cca
-        source_tip: 935c0a9bff9fd921eb306109dc65d263deff3cda
+        source_ref: bd00ad67bb9d0aba81ad26e7f3dd67d94170a8c3
+        source_base: 4462e6308c475761c71bdbea37439573afaa91cf
+        source_tip: bd00ad67bb9d0aba81ad26e7f3dd67d94170a8c3
         title: "fix(routewise): complete prefill reservation lifecycle"
         body: |
           ## Summary
@@ -80,8 +81,9 @@ threads:
     units:
       - id: consumer-contract
         branch: prep/1427-consumer-contract
-        source_base: b06f1c24ae07fe1062476934f0fd65b49be46ec9
-        source_tip: b505dc1181a0c625ac12bf9b1375a4722138ea89
+        source_ref: 1ac53e3f6fff43ee3c484e527ac71570814289f4
+        source_base: a7f699eb34baf7eb69595c6df581b35a88ff2649
+        source_tip: 1ac53e3f6fff43ee3c484e527ac71570814289f4
         title: "fix(serving): apply trusted provenance to consumers"
         body: |
           ## Summary
