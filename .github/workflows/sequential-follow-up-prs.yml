@@ -58,6 +58,42 @@ jobs:
           set -euo pipefail
           test -n "${UPSTREAM_TOKEN}" || { echo 'HYBRIDINFERENCE_PR_TOKEN is required for scheduled publication' >&2; exit 1; }
 
+      - name: Preflight upstream, fork, and publication access
+        env:
+          UPSTREAM_REPOSITORY: HarvardMadSys/hybridInference
+          FORK_REPOSITORY: B-A-M-N/hybridInference
+        run: |
+          set -euo pipefail
+
+          upstream_url=$(git config --get remote.upstream.url)
+          origin_url=$(git config --get remote.origin.url)
+          case "${upstream_url}" in
+            "https://github.com/${UPSTREAM_REPOSITORY}"|"https://github.com/${UPSTREAM_REPOSITORY}.git") ;;
+            *) echo "unexpected upstream remote: ${upstream_url}" >&2; exit 1 ;;
+          esac
+          case "${origin_url}" in
+            "https://github.com/${FORK_REPOSITORY}"|"https://github.com/${FORK_REPOSITORY}.git") ;;
+            *) echo "unexpected origin remote: ${origin_url}" >&2; exit 1 ;;
+          esac
+          git ls-remote --exit-code upstream refs/heads/dev >/dev/null
+          git ls-remote --exit-code origin refs/heads/dev >/dev/null
+
+          identity=$(gh api user --jq .login)
+          test -n "${identity}"
+          test "$(gh api "repos/${UPSTREAM_REPOSITORY}" --jq .full_name)" = "${UPSTREAM_REPOSITORY}"
+          test "$(gh api "repos/${FORK_REPOSITORY}" --jq .full_name)" = "${FORK_REPOSITORY}"
+
+          for pr in 1419 1427 1428 1430; do
+            state=$(gh api "repos/${UPSTREAM_REPOSITORY}/pulls/${pr}" --jq .state)
+            base=$(gh api "repos/${UPSTREAM_REPOSITORY}/pulls/${pr}" --jq .base.ref)
+            test "${state}" = open
+            test "${base}" = dev
+          done
+
+          # This is a non-mutating write-auth check. It must succeed before
+          # the sequencer is allowed to publish a prepared branch.
+          git push --dry-run origin "HEAD:refs/heads/.sequencer-preflight/${GITHUB_RUN_ID}"
+
       - name: Run sequencer
         run: |
           set -euo pipefail

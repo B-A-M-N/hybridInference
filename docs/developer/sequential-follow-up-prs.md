@@ -68,6 +68,13 @@ No credential is committed. A manual dry-run can use the workflow token for
 public reads and does not push or open PRs; scheduled publication fails closed
 when `HYBRIDINFERENCE_PR_TOKEN` is absent.
 
+Before the sequencer runs, the workflow preflight verifies the upstream and
+fork remotes, both `dev` refs, authenticated reads of all four foundation PRs,
+and fork write authorization with a non-mutating `git push --dry-run`. GitHub
+does not expose a non-mutating test for creating a cross-repository PR, so the
+token's upstream pull-request permission remains enforced by the real
+publication call; no test PR is created.
+
 ## Operations
 
 The schedule runs every ten minutes. `workflow_dispatch` defaults to
