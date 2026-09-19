@@ -46,6 +46,34 @@ class FailingGit:
         self.pushed = True
 
 
+class VerifyingGit:
+    def __init__(self) -> None:
+        self.refs: list[str] = []
+
+    def verify_source_reference(self, unit: Unit, manifest: Manifest) -> str:
+        self.refs.append(unit.branch)
+        return f"origin/{unit.branch}"
+
+
+def test_dry_run_verifies_next_source_for_open_foundation() -> None:
+    thread = make_thread("1419", 1419, ("prep/1419-a",))
+    github = FakeGitHub({1419: pr(1419)})
+    plan = plan_thread(thread, github)
+    git = VerifyingGit()
+    manifest = Manifest(
+        "HarvardMadSys/hybridInference",
+        "B-A-M-N",
+        "hybridInference",
+        "dev",
+        "upstream",
+        "origin",
+        (thread,),
+    )
+
+    assert execute_plan(plan, git=git, github=github, manifest=manifest, dry_run=True) is None
+    assert git.refs == ["prep/1419-a"]
+
+
 def pr(
     number: int,
     state: str = "OPEN",

@@ -464,6 +464,17 @@ class Git(CommandRunner):
         output = self.text(["diff", "--cached", "--name-only"], cwd=cwd)
         return {line for line in output.splitlines() if line}
 
+    def verify_source_reference(self, unit: Unit, manifest: Manifest) -> str:
+        """Resolve a durable source ref and enforce its immutable manifest tip."""
+
+        source_ref = unit.source_ref or f"{manifest.fork_remote}/{unit.branch}"
+        source_tip = self.resolve(source_ref)
+        if source_tip != unit.source_tip:
+            raise ValidationFailure(
+                f"{unit.branch} tip changed: manifest {unit.source_tip}, fetched {source_tip}"
+            )
+        return source_ref
+
     @contextmanager
     def candidate_worktree(self, base_ref: str):
         with tempfile.TemporaryDirectory(prefix="hybridinference-sequencer-") as directory:
@@ -481,12 +492,8 @@ class Git(CommandRunner):
                 )
 
     def reconstruct_and_validate(self, unit: Unit, manifest: Manifest) -> tuple[str, set[str], str]:
-        source_ref = unit.source_ref or f"{manifest.fork_remote}/{unit.branch}"
-        source_tip = self.resolve(source_ref)
-        if source_tip != unit.source_tip:
-            raise ValidationFailure(
-                f"{unit.branch} tip changed: manifest {unit.source_tip}, fetched {source_tip}"
-            )
+        self.verify_source_reference(unit, manifest)
+        source_tip = unit.source_tip
         expected_paths = self.expected_paths(unit.source_base, source_tip)
         if not expected_paths:
             raise ValidationFailure(f"{unit.branch} source range is empty")
@@ -588,9 +595,16 @@ def execute_plan(
 ) -> str | None:
     """Validate and optionally publish one planned unit."""
 
-    if plan.action != "publish" or plan.next_unit is None:
+    if plan.next_unit is None:
         return None
     unit = plan.next_unit
+
+    if dry_run:
+        source_ref = git.verify_source_reference(unit, manifest)
+        print(f"[{plan.thread.thread_id}] source={source_ref}@{unit.source_tip} reachable")
+
+    if plan.action != "publish":
+        return None
 
     # A second duplicate check closes the validation-time race before any push.
     existing = github.list_head_prs(unit.branch)
