@@ -92,7 +92,7 @@ jobs:
 
           # This is a non-mutating write-auth check. It must succeed before
           # the sequencer is allowed to publish a prepared branch.
-          git push --dry-run origin "HEAD:refs/heads/.sequencer-preflight/${GITHUB_RUN_ID}"
+          git push --dry-run origin "HEAD:refs/heads/sequencer-preflight/${GITHUB_RUN_ID}"
 
       - name: Run sequencer
         run: |
