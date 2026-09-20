@@ -1548,7 +1548,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 float(sock_read) if sock_read else 0.0,
                 endpoint_id=stream_endpoint_id,
             ) from exc
-        except aiohttp.ClientError:
+        except aiohttp.ClientError as e:
             # Mid-stream upstream I/O failure (disconnect, ClientPayloadError):
             # mute the key, then propagate to the client as before.
             stream_error = True

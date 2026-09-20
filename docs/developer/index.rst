@@ -122,6 +122,7 @@ how those overlays resolve.
    staging
    trusted-proxies-and-client-ips
    automation-score
+   sequential-follow-up-prs
 
 .. toctree::
    :maxdepth: 2
