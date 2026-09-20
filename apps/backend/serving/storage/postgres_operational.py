@@ -1046,7 +1046,6 @@ class PostgresOperationalStore(OperationalStore):
 
     async def begin_hard_delete_user(self, user_id: str) -> str:
         """Claim a soft-deleted user before purging rows in another store."""
-
         claim_token = secrets.token_urlsafe(32)
         async with self._pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
@@ -1070,7 +1069,6 @@ class PostgresOperationalStore(OperationalStore):
 
     async def release_hard_delete_user_claim(self, user_id: str, claim_token: str) -> None:
         """Release a still-unfenced hard-delete claim for a deleted user."""
-
         async with self._pool.acquire() as conn, conn.transaction():
             # The status and claim predicates make this a guarded cleanup:
             # never clear a claim after another operation has changed the
@@ -1108,7 +1106,6 @@ class PostgresOperationalStore(OperationalStore):
         hard-delete claim. The row lock makes resume and the operational
         hard-delete claim mutually exclusive.
         """
-
         async with self._pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 "SELECT status, hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",

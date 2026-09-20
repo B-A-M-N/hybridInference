@@ -655,7 +655,7 @@ def test_resolve_fence_secret_fails_closed(monkeypatch):
 
     monkeypatch.setattr(
         "serving.config.settings.get_settings",
-        lambda: Settings(),
+        lambda: Settings(erasure_fence_secret="", api_key_secret=""),
     )
     with pytest.raises(ErasureFenceUnavailable):
         resolve_fence_secret(None)

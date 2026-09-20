@@ -741,8 +741,9 @@ async def protect_api_logs_insert(
 
 
 class ErasureFenceUnavailable(RuntimeError):
-    """The erasure fence could not be established because no fence secret is
-    available. Distinct from a transient lock timeout: the connection is
+    """The erasure fence could not be established because no fence secret is available.
+
+    This is distinct from a transient lock timeout: the connection is
     healthy, but the deployment has not configured a stable erasure-fence
     secret and the fallback is also missing. Callers should treat this as
     a hard failure and abort the hard-delete rather than silently proceeding
@@ -773,7 +774,6 @@ def resolve_fence_secret(secret: str | None) -> str:
     the original secret instead; existing tombstones must remain intact
     because they are the durable deletion record.
     """
-
     # 1. Explicitly passed secret (for tests/diagnostics)
     if secret and secret.strip():
         return secret.strip()
@@ -888,8 +888,11 @@ async def get_pinned_fingerprint(conn: asyncpg.Connection) -> str | None:
 
 
 async def try_insert_fingerprint(conn: asyncpg.Connection, *, fingerprint: str) -> bool:
-    """Attempt to insert the fingerprint. Returns True if inserted, False if
-    a fingerprint already existed (ON CONFLICT DO NOTHING)."""
+    """Attempt to insert the fingerprint.
+
+    Return ``True`` if inserted, or ``False`` if a fingerprint already
+    existed and ``ON CONFLICT DO NOTHING`` skipped the insert.
+    """
     result = await conn.execute(
         f"""
         INSERT INTO {_TABLE} ({_KEY_COL}, {_VALUE_COL})
