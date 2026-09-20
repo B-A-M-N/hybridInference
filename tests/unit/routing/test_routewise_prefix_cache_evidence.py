@@ -206,7 +206,7 @@ class TestEvidenceAwarePrefixCacheFailingBaseline:
 
     def test_request1_miss_does_not_create_false_discount(self) -> None:
         """Request 1 to prov-a returns cached_tokens=0. Next request: no discount."""
-        router, expensive_cold, cheap_cold = self._router()
+        router, _expensive_cold, cheap_cold = self._router()
 
         # Request 1: prov-a served, reported NO cache reuse
         self._stash_commit(router, "r1", "prov-a:h:1", cached_tokens=0)
@@ -216,7 +216,7 @@ class TestEvidenceAwarePrefixCacheFailingBaseline:
         meta = decision.metadata
 
         # B must win: A showed no verified reuse, so no cache discount may apply.
-        assert decision.adapter is cheap_cold, (
+        assert decision.adapter.config.endpoint_id == cheap_cold.config.endpoint_id, (
             "B should win: prov-a reported cached_tokens=0 (no verified reuse), "
             "so no cache discount may lower its effective cost. "
             f"Got {decision.adapter.config.provider}."
@@ -230,7 +230,7 @@ class TestEvidenceAwarePrefixCacheFailingBaseline:
 
     def test_request1_unknown_evidence_no_false_discount(self) -> None:
         """Request 1 to prov-a returns cached_tokens=None. Next request: no discount."""
-        router, expensive_cold, cheap_cold = self._router()
+        router, _expensive_cold, cheap_cold = self._router()
 
         # Request 1: prov-a served, cache usage UNKNOWN
         self._stash_commit(router, "r1", "prov-a:h:1", cached_tokens=None)
@@ -239,7 +239,7 @@ class TestEvidenceAwarePrefixCacheFailingBaseline:
         decision = self._select(router)
         meta = decision.metadata
 
-        assert decision.adapter is cheap_cold, (
+        assert decision.adapter.config.endpoint_id == cheap_cold.config.endpoint_id, (
             "B should win: cached_tokens=None is not evidence of reuse."
         )
         assert meta["candidate_cost_reasons"]["prov-a:h:1"] == "cold_api_cost"
@@ -248,7 +248,7 @@ class TestEvidenceAwarePrefixCacheFailingBaseline:
 
     def test_positive_hit_creates_verified_discount(self) -> None:
         """Request 1 to prov-a returns cached_tokens>0. Next request: A wins."""
-        router, expensive_cold, cheap_cold = self._router()
+        router, expensive_cold, _cheap_cold = self._router()
 
         # Request 1: prov-a served, reported verified cache reuse
         self._stash_commit(router, "r1", "prov-a:h:1", cached_tokens=750)
@@ -258,7 +258,7 @@ class TestEvidenceAwarePrefixCacheFailingBaseline:
         meta = decision.metadata
 
         # A must now win: verified reuse makes A's effective cost lower.
-        assert decision.adapter is expensive_cold, (
+        assert decision.adapter.config.endpoint_id == expensive_cold.config.endpoint_id, (
             "A should win: cached_tokens=750 is verified reuse, so the "
             "cache discount legitimately lowers its effective cost."
         )
@@ -273,7 +273,7 @@ class TestEvidenceAwarePrefixCacheFailingBaseline:
         self._stash_commit(router, "r1", "prov-a:h:1", cached_tokens=800)
         # Request 2: should now prefer A
         d2 = self._select(router)
-        assert d2.adapter is expensive_cold
+        assert d2.adapter.config.endpoint_id == expensive_cold.config.endpoint_id
 
         # Request 3: A reports a miss before the request can materialize its
         # prefix. It must not be treated as durable future coldness.
@@ -281,7 +281,7 @@ class TestEvidenceAwarePrefixCacheFailingBaseline:
         # Request 4: no verified discount exists yet, so B still wins, but A
         # remains eligible to become verified on a subsequent hit.
         d4 = self._select(router)
-        assert d4.adapter is cheap_cold, (
+        assert d4.adapter.config.endpoint_id == cheap_cold.config.endpoint_id, (
             "A materialization candidate must not receive an unverified discount."
         )
         scope = self._scope(router, "prov-a", "prov-a:h:1")
@@ -294,16 +294,16 @@ class TestEvidenceAwarePrefixCacheFailingBaseline:
         # Request 1: miss
         self._stash_commit(router, "r1", "prov-a:h:1", cached_tokens=0)
         # Request 2: B wins (no evidence)
-        assert self._select(router).adapter is cheap_cold
+        assert self._select(router).adapter.config.endpoint_id == cheap_cold.config.endpoint_id
 
         # Request 3: verified hit
         self._stash_commit(router, "r3", "prov-a:h:1", cached_tokens=800)
         # Request 4: A wins again
-        assert self._select(router).adapter is expensive_cold
+        assert self._select(router).adapter.config.endpoint_id == expensive_cold.config.endpoint_id
 
     def test_zero_does_not_permanently_blacklist(self) -> None:
         """A string of misses must not permanently prevent future reuse."""
-        router, expensive_cold, cheap_cold = self._router()
+        router, expensive_cold, _cheap_cold = self._router()
 
         # Many misses
         for i in range(5):
@@ -312,7 +312,7 @@ class TestEvidenceAwarePrefixCacheFailingBaseline:
         # But then a verified hit
         self._stash_commit(router, "r-hit", "prov-a:h:1", cached_tokens=800)
         # A should win
-        assert self._select(router).adapter is expensive_cold
+        assert self._select(router).adapter.config.endpoint_id == expensive_cold.config.endpoint_id
 
 
 @pytest.mark.unit
@@ -448,7 +448,7 @@ class TestEvidenceAwareFallbackAndHedge:
 
     def test_fallback_evidence_attributed_to_winner(self) -> None:
         """If A fails and B wins, only B may receive positive cache evidence."""
-        router, expensive_cold, cheap_cold = self._router()
+        router, _expensive_cold, _cheap_cold = self._router()
 
         scope_a = self._scope(router, "prov-a", "prov-a:h:1")
         scope_b = self._scope(router, "prov-b", "prov-b:h:1")
@@ -520,7 +520,7 @@ class TestEvidenceBoundToStashedPrefix:
 
     def test_evidence_bound_to_stashed_prefix_on_streamed_empty(self) -> None:
         """Streamed empty completion with cached_tokens>0 should bind evidence to stashed blocks."""
-        router, expensive_cold, cheap_cold = self._router()
+        router, _expensive_cold, _cheap_cold = self._router()
 
         scope_a = self._scope(router, "prov-a", "prov-a:h:1")
         blocks1 = router.prefix_cache.build_blocks(_MSGS1)
@@ -602,7 +602,7 @@ class TestEvidenceInvalidationOnMemoryEviction:
 
     def test_evidence_invalidated_on_memory_eviction(self) -> None:
         """Evidence must not survive prefix memory eviction."""
-        router, expensive_cold, cheap_cold = self._router()
+        router, _expensive_cold, _cheap_cold = self._router()
 
         scope_a = self._scope(router, "prov-a", "prov-a:h:1")
         blocks1 = router.prefix_cache.build_blocks(_MSGS1)
@@ -754,7 +754,7 @@ class TestEvidenceLRURecency:
 
     def test_evidence_recency_refreshed_on_record(self) -> None:
         """Recording evidence should refresh its LRU recency."""
-        router, expensive_cold, cheap_cold = self._router()
+        router, _expensive_cold, _cheap_cold = self._router()
 
         scope_a = self._scope(router, "prov-a", "prov-a:h:1")
         blocks1 = router.prefix_cache.build_blocks(_MSGS1)
@@ -853,7 +853,7 @@ class TestEvidenceLRURecency:
 
     def test_hot_session_not_evicted_by_new_scopes(self) -> None:
         """A hot session being continuously evaluated should not be evicted by new scopes."""
-        router, expensive_cold, cheap_cold = self._router()
+        router, _expensive_cold, _cheap_cold = self._router()
 
         # Use reflection to set a small max_entries for testing
         router.prefix_cache._evidence._max_entries = 2
@@ -935,7 +935,7 @@ class TestEvidenceInvalidationOnPrefixChange:
 
     def test_evidence_invalidated_when_prefix_changes(self) -> None:
         """VERIFIED_REUSABLE evidence must not transfer to an unrelated new prefix."""
-        router, expensive_cold, cheap_cold = self._router()
+        router, _expensive_cold, _cheap_cold = self._router()
 
         scope_a = self._scope(router, "prov-a", "prov-a:h:1")
         blocks1 = router.prefix_cache.build_blocks(_MSGS1)
@@ -1016,7 +1016,7 @@ class TestEvidenceAwareStreamedEmptyCompletion:
 
     def test_streamed_empty_completion_records_negative_evidence(self) -> None:
         """Streamed HTTP 200 with no content: cached_tokens=0 must still record NEGATIVE."""
-        router, expensive_cold, cheap_cold = self._router()
+        router, _expensive_cold, _cheap_cold = self._router()
 
         scope_a = self._scope(router, "prov-a", "prov-a:h:1")
         blocks = router.prefix_cache.build_blocks(_MSGS1)

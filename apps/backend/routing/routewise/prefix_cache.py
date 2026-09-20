@@ -335,6 +335,7 @@ class _CacheLocalityEstimator:
             return estimated_tokens, ev.state, decayed
 
     def invalidate(self, scope: CacheScope) -> None:
+        """Remove evidence for a scope when its remembered prefix is evicted."""
         with self._lock:
             if scope in self._evidence:
                 del self._evidence[scope]
