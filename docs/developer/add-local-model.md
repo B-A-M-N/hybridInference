@@ -348,10 +348,12 @@ minus the prefix this endpoint is expected to have cached. The three tiers
 default to interactive 20, large 15, elephant 0
 (`apps/backend/routing/prefill_load.py`), and clients cannot set their own:
 a `priority` field in a client request body is dropped by `validate_params`.
-Both `/v1/chat/completions` and `/v1/messages` stamp it. A model on
-`router: routewise` keeps the upstream's default priority instead, because that
-router has no prefill accounting to compute the discount from — so
-`priority_scheduling: true` is inert there.
+Both `/v1/chat/completions` and `/v1/messages` stamp it. RouteWise emits the
+same prefill-derived scheduling priority when
+`prefill_load_routing_enabled: true`; when that feature is disabled, it leaves
+the upstream's default priority untouched. `priority_scheduling: true` still
+belongs only on SGLang routes whose server was launched with priority
+scheduling.
 
 Set it only on routes pointing at a server launched with the flag. A server
 without it ignores the field, but a remote provider that validates its request

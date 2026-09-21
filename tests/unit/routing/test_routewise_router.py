@@ -18,7 +18,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import routing.routewise.router as routewise_router_module
-from routing.prefill_load import PrefillLoadTracker
+from routing.prefill_load import (
+    PRIORITY_ELEPHANT,
+    PRIORITY_INTERACTIVE,
+    PrefillLoadTracker,
+    conversation_fingerprint,
+    prompt_anchor,
+)
 from routing.route_table import EffectiveRoute
 from routing.routers import FixedRouter, RoutingObservation
 from routing.routewise.candidates import QuotaSource
@@ -3928,24 +3934,13 @@ class TestRouteWiseEnvelopeCalibration:
         assert selected is api
 
 
-class TestUpstreamPriorityIsNotPublished:
-    """RouteWise leaves the upstream's own scheduling priority alone, on purpose.
-
-    A priority ranks a request by the *un-cached* prefill it imposes, and that
-    discount lives in FixedRouter's PrefillLoadTracker, which this router does
-    not own or feed. Publishing the raw prompt size instead would stamp every
-    warm long-context continuation as an elephant and have an sglang backend
-    schedule it last and preempt it -- worse than publishing nothing, which
-    leaves those models on the upstream's own default. Pinned here so the
-    omission stays a decision rather than becoming a silent regression.
-    """
+class TestUpstreamPriority:
+    """RouteWise publishes strict uncached-prefill scheduling priority."""
 
     @pytest.mark.unit
     @pytest.mark.asyncio
     @pytest.mark.parametrize("operation", ("chat", "stream"))
-    async def test_dispatch_publishes_no_priority(self, operation):
-        from serving.utils import context as req_ctx
-
+    async def test_disabled_dispatch_publishes_no_priority(self, operation):
         seen: list[Any] = []
         adapter = _make_adapter(provider="sglang", endpoint_id="test-model:local-8003")
         adapter.reports_leg_outcomes = False
@@ -3960,7 +3955,12 @@ class TestUpstreamPriorityIsNotPublished:
 
         adapter.chat_completion = _chat
         adapter.stream_chat_completion = _stream
-        router = RouteWiseRouter(config=RouteWiseConfig(db_bootstrap_enabled=False))
+        router = RouteWiseRouter(
+            config=RouteWiseConfig(
+                db_bootstrap_enabled=False,
+                prefill_load_routing_enabled=False,
+            )
+        )
 
         messages = [{"role": "user", "content": "hi"}]
         if operation == "chat":
@@ -3972,7 +3972,210 @@ class TestUpstreamPriorityIsNotPublished:
                 pass
 
         # The dispatch ran (so the assertion is not vacuous) and carried no
-        # priority: an sglang backend serves these at its own default.
+        # priority while the feature is disabled.
+        assert seen == [None]
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ("chat", "stream"))
+    @pytest.mark.parametrize(
+        ("estimated_tokens", "expected_priority"),
+        (
+            (200_000, PRIORITY_ELEPHANT),
+            (1_000, PRIORITY_INTERACTIVE),
+        ),
+    )
+    async def test_enabled_dispatch_publishes_prefill_priority(
+        self, operation, estimated_tokens, expected_priority
+    ):
+        seen: list[Any] = []
+        adapter = _make_adapter(provider="sglang", endpoint_id="test-model:local-8003")
+        adapter.reports_leg_outcomes = False
+
+        async def _chat(messages, **params):
+            seen.append(req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY))
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+        async def _stream(messages, **params):
+            seen.append(req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY))
+            yield json.dumps({"choices": [{"delta": {"content": "ok"}}]})
+
+        adapter.chat_completion = _chat
+        adapter.stream_chat_completion = _stream
+        router = RouteWiseRouter(
+            config=RouteWiseConfig(
+                db_bootstrap_enabled=False,
+                prefill_load_routing_enabled=True,
+            )
+        )
+
+        with (
+            patch.object(
+                routewise_router_module, "estimate_prefill_tokens", return_value=estimated_tokens
+            ),
+            req_ctx.push(affinity_key="caller"),
+        ):
+            if operation == "chat":
+                await router._execute_adapter(
+                    _unreserved_decision(adapter),
+                    "test-model",
+                    [{"role": "user", "content": "prompt"}],
+                )
+            else:
+                async for _chunk in router._execute_stream_adapter(
+                    _unreserved_decision(adapter),
+                    "test-model",
+                    [{"role": "user", "content": "prompt"}],
+                ):
+                    pass
+
+        assert seen == [expected_priority]
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ("chat", "stream"))
+    async def test_warm_continuation_uses_uncached_delta(self, operation):
+        seen: list[Any] = []
+        adapter = _make_adapter(provider="sglang", endpoint_id="test-model:local-8003")
+        adapter.reports_leg_outcomes = False
+
+        async def _chat(messages, **params):
+            seen.append(req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY))
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+        async def _stream(messages, **params):
+            seen.append(req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY))
+            yield json.dumps({"choices": [{"delta": {"content": "ok"}}]})
+
+        adapter.chat_completion = _chat
+        adapter.stream_chat_completion = _stream
+        router = RouteWiseRouter(
+            config=RouteWiseConfig(
+                db_bootstrap_enabled=False,
+                prefill_load_routing_enabled=True,
+            )
+        )
+        first = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "start"},
+        ]
+        continuation = [
+            *first,
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "continue"},
+        ]
+
+        with (
+            patch.object(
+                routewise_router_module,
+                "estimate_prefill_tokens",
+                side_effect=(200_000, 205_000),
+            ),
+            req_ctx.push(affinity_key="caller"),
+        ):
+            for messages in (first, continuation):
+                decision = _unreserved_decision(adapter)
+                if operation == "chat":
+                    await router._execute_adapter(decision, "test-model", messages)
+                else:
+                    async for _chunk in router._execute_stream_adapter(
+                        decision,
+                        "test-model",
+                        messages,
+                    ):
+                        pass
+
+        assert seen == [PRIORITY_ELEPHANT, PRIORITY_INTERACTIVE]
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_same_api_key_different_conversation_stays_cold(self):
+        seen: list[Any] = []
+        adapter = _make_adapter(provider="sglang", endpoint_id="test-model:local-8003")
+        adapter.reports_leg_outcomes = False
+
+        async def _chat(messages, **params):
+            seen.append(req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY))
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+        adapter.chat_completion = _chat
+        router = RouteWiseRouter(
+            config=RouteWiseConfig(
+                db_bootstrap_enabled=False,
+                prefill_load_routing_enabled=True,
+            )
+        )
+
+        with (
+            patch.object(
+                routewise_router_module,
+                "estimate_prefill_tokens",
+                side_effect=(200_000, 205_000),
+            ),
+            req_ctx.push(affinity_key="caller"),
+        ):
+            await router._execute_adapter(
+                _unreserved_decision(adapter),
+                "test-model",
+                [{"role": "user", "content": "conversation A"}],
+            )
+            await router._execute_adapter(
+                _unreserved_decision(adapter),
+                "test-model",
+                [{"role": "user", "content": "conversation B"}],
+            )
+
+        assert seen == [PRIORITY_ELEPHANT, PRIORITY_ELEPHANT]
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ("chat", "stream"))
+    async def test_hedged_dispatch_publishes_no_shared_priority(self, operation):
+        seen: list[Any] = []
+        router = RouteWiseRouter(
+            config=RouteWiseConfig(
+                db_bootstrap_enabled=False,
+                prefill_load_routing_enabled=True,
+            )
+        )
+        primary = _make_adapter(provider="sglang", endpoint_id="test-model:primary")
+        backup = _make_adapter(provider="sglang", endpoint_id="test-model:backup")
+
+        async def _chat(messages, **params):
+            seen.append(req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY))
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+        async def _stream(messages, **params):
+            seen.append(req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY))
+            yield json.dumps({"choices": [{"delta": {"content": "ok"}}]})
+
+        primary.chat_completion = _chat
+        primary.stream_chat_completion = _stream
+        hedged = HedgedAdapter(
+            primary=primary,
+            backup=backup,
+            hedge_threshold_sec=60.0,
+            event_sink=router._health_registry,
+        )
+
+        with (
+            patch.object(routewise_router_module, "estimate_prefill_tokens", return_value=200_000),
+            req_ctx.push(affinity_key="caller"),
+        ):
+            if operation == "chat":
+                await router._execute_adapter(
+                    _unreserved_decision(hedged),
+                    "test-model",
+                    [{"role": "user", "content": "cold"}],
+                )
+            else:
+                async for _chunk in router._execute_stream_adapter(
+                    _unreserved_decision(hedged),
+                    "test-model",
+                    [{"role": "user", "content": "cold"}],
+                ):
+                    pass
+
         assert seen == [None]
 
 
@@ -4631,8 +4834,8 @@ class TestPrefillLoadRoutingDecision:
         second.release()
         assert router._prefill_load.backlog("test-model:primary") == 0
 
-    def test_routewise_lease_does_not_consume_unverified_caller_hint(self):
-        """RouteWise charges cold work until verified cache evidence is wired in."""
+    def test_routewise_lease_records_conversation_cache_evidence(self):
+        """Primary leases carry the fingerprint and anchor used by priority."""
         adapter = _make_adapter(endpoint_id="test-model:primary")
         route_table = _FakeRouteTable()
         route_table.add("test-model", [(adapter, 1.0)])
@@ -4661,8 +4864,9 @@ class TestPrefillLoadRoutingDecision:
             )
 
         assert decision is not None
-        expected = router._tracked_prefill_tokens(messages, {})
-        assert router._prefill_load.backlog("test-model:primary") == expected
+        assert decision.prefill_lease is not None
+        assert decision.prefill_lease.fingerprint == conversation_fingerprint(messages)
+        assert decision.prefill_lease.anchor == prompt_anchor(messages)
         decision.release()
 
     def test_lower_load_preferred_when_otherwise_equivalent(self):
