@@ -6,6 +6,7 @@ Anthropic-format passthrough (messages/stream_messages) lands in Task 8.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -213,6 +214,145 @@ async def test_stream_admission_notified_before_opening_response(method, monkeyp
 
     assert events[:4] == ["slot-enter", "admitted", "response-open", "response-enter"]
     assert events[-2:] == ["response-exit", "slot-exit"]
+    assert events.count("admitted") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ("stream_chat_completion", "stream_messages"))
+async def test_stream_admission_is_recorded_before_header_timeout(method, monkeypatch):
+    """A timeout opening response headers still records one admitted request."""
+    events: list[str] = []
+
+    class _Slot:
+        async def __aenter__(self):
+            events.append("slot-enter")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            events.append("slot-exit")
+
+    class _Response:
+        async def __aenter__(self):
+            events.append("response-enter")
+            raise asyncio.TimeoutError
+
+        async def __aexit__(self, exc_type, exc, tb):
+            events.append("response-exit")
+
+    class _Session:
+        def post(self, *args, **kwargs):
+            events.append("response-open")
+            return _Response()
+
+    async def _ensure_session(self):
+        return _Session()
+
+    from serving.http import AsyncHTTPClient
+
+    monkeypatch.setattr(AsyncHTTPClient, "_ensure_session", _ensure_session)
+    monkeypatch.setattr(
+        "serving.adapters.anthropic.notify_traffic_admitted",
+        lambda: events.append("admitted"),
+    )
+
+    adapter = AnthropicAdapter(_cfg())
+    monkeypatch.setattr(adapter, "_upstream_slot", lambda: _Slot())
+    if method == "stream_chat_completion":
+        stream = adapter.stream_chat_completion(
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=64,
+            stream=True,
+        )
+    else:
+        stream = adapter.stream_messages(
+            {
+                "model": "claude-opus-4.7",
+                "max_tokens": 64,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            request_id="req_header_timeout",
+        )
+
+    with pytest.raises(asyncio.TimeoutError):
+        async for _chunk in stream:
+            pass
+
+    assert events == ["slot-enter", "admitted", "response-open", "response-enter", "slot-exit"]
+    assert events.count("admitted") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ("stream_chat_completion", "stream_messages"))
+async def test_stream_admission_is_recorded_before_header_cancellation(method, monkeypatch):
+    """Cancelling while waiting for headers releases the slot after one notice."""
+    events: list[str] = []
+    response_entered = asyncio.Event()
+
+    class _Slot:
+        async def __aenter__(self):
+            events.append("slot-enter")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            events.append("slot-exit")
+
+    class _Response:
+        async def __aenter__(self):
+            events.append("response-enter")
+            response_entered.set()
+            await asyncio.Future()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            events.append("response-exit")
+
+    class _Session:
+        def post(self, *args, **kwargs):
+            events.append("response-open")
+            return _Response()
+
+    async def _ensure_session(self):
+        return _Session()
+
+    from serving.http import AsyncHTTPClient
+
+    monkeypatch.setattr(AsyncHTTPClient, "_ensure_session", _ensure_session)
+    monkeypatch.setattr(
+        "serving.adapters.anthropic.notify_traffic_admitted",
+        lambda: events.append("admitted"),
+    )
+
+    adapter = AnthropicAdapter(_cfg())
+    monkeypatch.setattr(adapter, "_upstream_slot", lambda: _Slot())
+    if method == "stream_chat_completion":
+        stream = adapter.stream_chat_completion(
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=64,
+            stream=True,
+        )
+    else:
+        stream = adapter.stream_messages(
+            {
+                "model": "claude-opus-4.7",
+                "max_tokens": 64,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            request_id="req_header_cancel",
+        )
+
+    async def _consume() -> None:
+        async for _chunk in stream:
+            pass
+
+    task = asyncio.create_task(_consume())
+    await asyncio.wait_for(response_entered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert events == ["slot-enter", "admitted", "response-open", "response-enter", "slot-exit"]
+    assert events.count("admitted") == 1
 
 
 @pytest.mark.asyncio
