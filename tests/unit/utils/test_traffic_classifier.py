@@ -438,6 +438,16 @@ def test_shape_hash_no_content():
     assert h1 == h2
 
 
+def test_shape_hash_handles_lone_surrogate():
+    """Malformed-but-decodable model identifiers remain deterministic and distinct."""
+    first = compute_request_shape_hash("\ud800", 1, 1, None)
+    second = compute_request_shape_hash("\ud800", 1, 1, None)
+    other = compute_request_shape_hash("\ud801", 1, 1, None)
+
+    assert first == second
+    assert first != other
+
+
 # ---------------------------------------------------------------------------
 # Traffic state
 # ---------------------------------------------------------------------------
