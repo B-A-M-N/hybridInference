@@ -98,6 +98,30 @@ def test_parse_forwarded_chain_empty_input():
     assert _parse_forwarded_chain(" , ") == ["", ""]
 
 
+def test_parse_forwarded_chain_bounds_attacker_history():
+    chain = ",".join(["9.9.9.9"] * 10_000)
+
+    parsed = _parse_forwarded_chain(chain)
+
+    assert len(parsed) <= MAX_FORWARDED_HOPS + 1
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "64:ff9b:1::1",
+        "100::1",
+        "100:0:0:1::1",
+        "2001:2::1",
+        "3fff::1",
+        "5f00::1",
+        "fec0::1",
+    ],
+)
+def test_is_reportable_ip_rejects_explicit_iana_special_use_ranges(value):
+    assert _is_reportable_ip(value) is False
+
+
 def test_is_reportable_ip_rejects_non_routable():
     assert _is_reportable_ip("172.19.0.1") is False
     assert _is_reportable_ip("10.0.0.1") is False

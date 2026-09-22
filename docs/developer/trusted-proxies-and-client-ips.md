@@ -224,8 +224,10 @@ leftmost-trust model would have returned `8.8.8.8`.
 Duplicate field handling is fail closed. All physical `X-Forwarded-For` field
 lines are joined in wire order before parsing, preserving empty hops. The
 singleton `X-Real-IP` and `CF-Connecting-*` fields are rejected when repeated;
-the resolver never selects first or last based on framework ordering. Chains
-with more than 32 hops are rejected as unresolved.
+the resolver never selects first or last based on framework ordering. At most
+32 hops are inspected from the trusted side. Entries left of the first
+untrusted boundary are ignored, while a provenance chain that requires more
+than 32 inspected hops fails closed.
 
 ### What counts as routable
 
@@ -239,17 +241,19 @@ multicast and unspecified addresses, and these networks:
 198.18.0.0/15     (benchmarking)   240.0.0.0/4       (reserved Class E)
 fc00::/7          (IPv6 unique local)
 2001:db8::/32     (IPv6 documentation)
+64:ff9b:1::/48    100::/64        100:0:0:1::/64     (IPv6 special-use)
+2001:2::/48       3fff::/20       5f00::/16          (IPv6 special-use)
+fec0::/10         (deprecated IPv6 site-local)
 ```
 
 An IPv4-mapped IPv6 literal is judged by its embedded IPv4 address. A mapped
 private peer is accepted only when its embedded address falls inside
 `TRUSTED_DIRECT_CLIENT_NETWORKS`.
 
-The list is written out explicitly rather than delegating to
-`ipaddress.is_private` / `is_global`, because those reclassified special-use
-ranges between CPython releases. Hard-coding the stable internal,
-documentation, benchmarking, and reserved ranges keeps IP resolution from
-depending on the interpreter version.
+The list is an explicit IANA-derived snapshot rather than a delegation to
+`ipaddress.is_private` / `is_global`, because those reclassify special-use
+ranges between CPython releases. It requires maintenance when the IANA
+special-purpose registry changes.
 
 ## The "unknown" outcome
 

@@ -78,11 +78,10 @@ MAX_FORWARDED_HOPS = 32
 PSEUDO_IPV4_NETWORK = ipaddress.ip_network("240.0.0.0/4")
 
 # Non-routable ranges that can never identify a remote client. This is an
-# explicit list rather than ``ipaddress.is_private`` / ``is_global`` on purpose:
-# those reclassified special-use ranges across CPython releases, so relying on
-# them would make IP resolution depend on the interpreter version. Keep the
-# explicit deny set stable and include documentation, benchmarking, and
-# reserved ranges that must never be treated as real client addresses.
+# explicit IANA-derived snapshot rather than ``ipaddress.is_private`` /
+# ``is_global``: those reclassify special-use ranges across CPython releases,
+# so relying on them would make IP resolution depend on the interpreter
+# version. Keep this explicit deny set maintained as the registry changes.
 _NON_ROUTABLE_NETWORKS = (
     ipaddress.ip_network("0.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
@@ -97,6 +96,13 @@ _NON_ROUTABLE_NETWORKS = (
     ipaddress.ip_network("240.0.0.0/4"),
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("2001:db8::/32"),
+    ipaddress.ip_network("64:ff9b:1::/48"),
+    ipaddress.ip_network("100::/64"),
+    ipaddress.ip_network("100:0:0:1::/64"),
+    ipaddress.ip_network("2001:2::/48"),
+    ipaddress.ip_network("3fff::/20"),
+    ipaddress.ip_network("5f00::/16"),
+    ipaddress.ip_network("fec0::/10"),
 )
 
 _IP_INFO_STATE_KEY = "_hybrid_inference_client_ip_info"
@@ -279,10 +285,13 @@ def _parse_forwarded_chain(raw: str) -> list[str]:
 
     Silently dropping empty elements would be inconsistent with the fail-closed
     design: a malformed empty hop must terminate the chain, not disappear.
-    A chain of ``""`` or pure whitespace yields a single empty string so the
-    caller can reject it.
+    To bound parsing work independently of server header-size settings, retain
+    only the rightmost ``MAX_FORWARDED_HOPS + 1`` chunks. The extra leading
+    chunk acts as a sentinel: if traversal needs it, the resolver fails closed;
+    if an untrusted boundary appears sooner, attacker-controlled history farther
+    left is irrelevant and is never tokenized.
     """
-    return [hop.strip() for hop in raw.split(",")] if raw else []
+    return [hop.strip() for hop in raw.rsplit(",", MAX_FORWARDED_HOPS)] if raw else []
 
 
 def normalize_ip_bucket(ip: str) -> str:
