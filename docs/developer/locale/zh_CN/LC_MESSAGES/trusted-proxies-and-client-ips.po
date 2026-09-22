@@ -435,9 +435,10 @@ msgid ""
 "field lines are joined in wire order before parsing, preserving empty "
 "hops. The singleton `X-Real-IP` and `CF-Connecting-*` fields are rejected"
 " when repeated; the resolver never selects first or last based on "
-"framework ordering. Chains with more than 32 hops are rejected as "
-"unresolved."
-msgstr "重复字段的处理采用安全失败。所有物理上的 `X-Forwarded-For` 字段行会按线路顺序拼接后再解析，并保留空跳数。重复出现的单例 `X-Real-IP` 和 `CF-Connecting-*` 字段会被拒绝；解析器不会根据框架的字段排序选择第一个或最后一个。超过 32 跳的链会被拒绝并视为未解析。"
+"framework ordering. At most 32 hops are inspected from the trusted side. "
+"Entries left of the first untrusted boundary are ignored, while a "
+"provenance chain that requires more than 32 inspected hops fails closed."
+msgstr "重复字段的处理采用安全失败。所有物理上的 `X-Forwarded-For` 字段行会按线路顺序拼接后再解析，并保留空跳数。重复出现的单例 `X-Real-IP` 和 `CF-Connecting-*` 字段会被拒绝；解析器不会根据框架的字段排序选择第一个或最后一个。最多从可信一侧检查 32 个跳数。第一个不可信边界左侧的条目会被忽略；如果来源链需要检查超过 32 个跳数，则安全失败。"
 
 #: ../developer/trusted-proxies-and-client-ips.md:230
 msgid "What counts as routable"
@@ -458,12 +459,11 @@ msgstr "IPv4-mapped 的 IPv6 字面量按其内嵌的 IPv4 地址判定。只有
 
 #: ../developer/trusted-proxies-and-client-ips.md:248
 msgid ""
-"The list is written out explicitly rather than delegating to "
-"`ipaddress.is_private` / `is_global`, because those reclassified special-"
-"use ranges between CPython releases. Hard-coding the stable internal, "
-"documentation, benchmarking, and reserved ranges keeps IP resolution from"
-" depending on the interpreter version."
-msgstr "这份清单是显式写出的，而不是委托给 `ipaddress.is_private` / `is_global`，因为这些属性会在不同 CPython 版本之间重新分类特殊用途网段。硬编码稳定的内部、文档、基准测试和保留网段，可以让 IP 解析不依赖解释器版本。"
+"The list is an explicit IANA-derived snapshot rather than a delegation to"
+" `ipaddress.is_private` / `is_global`, because those reclassify special-"
+"use ranges between CPython releases. It requires maintenance when the "
+"IANA special-purpose registry changes."
+msgstr "这份清单是显式的 IANA 派生快照，而不是委托给 `ipaddress.is_private` / `is_global`，因为这些属性会在不同 CPython 版本之间重新分类特殊用途网段。IANA 特殊用途注册表发生变化时，需要维护这份清单。"
 
 #: ../developer/trusted-proxies-and-client-ips.md:256
 msgid ""
