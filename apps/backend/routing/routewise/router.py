@@ -2602,10 +2602,11 @@ class RouteWiseRouter:
             trace.request_id = str(request_id)
 
         with self._route_commit_lock:
-            # The shared tracker is locked only for this short snapshot and
-            # again while the selected request is charged.  Prompt sizing,
-            # prediction, pricing, LP solving, and metadata construction stay
-            # outside that process-wide lock.
+            # The routing lock serializes load snapshot -> selection ->
+            # reservation across selectors so concurrent decisions cannot
+            # commit from the same stale load view. The tracker state lock
+            # remains independent, allowing release and cache/accounting
+            # updates while candidate construction and LP solving run.
             prompt_tokens = self._prompt_tokens_from_context(context)
             prediction = self._predict_output(model_id, prompt_tokens, context)
             pool = self._routewise_pool(model_id)
