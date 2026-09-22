@@ -2365,11 +2365,6 @@ class RouteWiseRouter:
                 context.get("messages") if isinstance(context, dict) else None,
                 request_params if isinstance(request_params, dict) else None,
             )
-            with self._prefill_load.routing_transaction():
-                backup_lease = self._prefill_load.acquire(
-                    backup.endpoint_id,
-                    tracked_tokens,
-                )
 
         def _confirm_backup_prefill() -> None:
             self._prefill_load.release(backup_lease, prefill_confirmed=True)
