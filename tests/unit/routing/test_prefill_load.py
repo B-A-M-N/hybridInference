@@ -134,6 +134,16 @@ def test_estimate_tolerates_malformed_messages():
     assert estimate_prefill_tokens([None, 5, {"role": "user"}]) == 0  # type: ignore[list-item]
 
 
+@pytest.mark.unit
+def test_surrogate_heavy_prompt_is_not_dropped_during_sizing():
+    messages = [{"role": "user", "content": "\ud800" * (4 * prefill_load.ELEPHANT_TOKENS)}]
+
+    estimated = estimate_prefill_tokens(messages)
+
+    assert estimated >= prefill_load.ELEPHANT_TOKENS
+    assert prefill_load.priority_for_prefill(estimated) == prefill_load.PRIORITY_ELEPHANT
+
+
 # ---------------------------------------------------------------------------
 # Tracker accounting
 # ---------------------------------------------------------------------------
@@ -1002,6 +1012,53 @@ def test_fingerprint_ignores_binary_blocks():
     two = [{"role": "user", "content": [payload, {"type": "text", "text": "translate this"}]}]
 
     assert prefill_load.conversation_fingerprint(one) != prefill_load.conversation_fingerprint(two)
+
+
+@pytest.mark.unit
+def test_surrogate_identity_evidence_preserves_code_point_differences():
+    first = [{"role": "user", "content": "\ud800"}]
+    other = [{"role": "user", "content": "\ud801"}]
+
+    assert prefill_load.conversation_fingerprint(first) != prefill_load.conversation_fingerprint(
+        other
+    )
+    first_anchor = prefill_load.prompt_anchor(first)
+    other_anchor = prefill_load.prompt_anchor(other)
+    assert first_anchor is not None
+    assert other_anchor is not None
+    assert first_anchor != other_anchor
+    assert not prefill_load._anchor_holds(other, first_anchor)
+
+
+@pytest.mark.unit
+def test_surrogate_prompt_does_not_inherit_warm_prefix_evidence():
+    first = [{"role": "user", "content": "\ud800" * (4 * 300_000)}]
+    other = [{"role": "user", "content": "\ud801" * (4 * 300_000)}]
+    tracker = PrefillLoadTracker()
+    first_size = estimate_prefill_tokens(first)
+    first_fingerprint = prefill_load.conversation_fingerprint(first)
+    tracker.release(
+        tracker.acquire(
+            "ep",
+            first_size,
+            affinity_key="u1",
+            fingerprint=first_fingerprint,
+            anchor=prefill_load.prompt_anchor(first),
+        ),
+        prefill_confirmed=True,
+    )
+
+    other_size = estimate_prefill_tokens(other)
+    uncached = tracker.uncached_estimate(
+        "ep",
+        other_size,
+        "u1",
+        fingerprint=prefill_load.conversation_fingerprint(other),
+        messages=other,
+    )
+
+    assert uncached == other_size
+    assert prefill_load.priority_for_prefill(uncached) == prefill_load.PRIORITY_ELEPHANT
 
 
 @pytest.mark.unit
