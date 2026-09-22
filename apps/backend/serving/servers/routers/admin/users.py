@@ -1055,10 +1055,10 @@ async def hard_delete_user(
       claim.
     - LogStore wipe succeeds but op_store wipe fails: log rows are gone and
       the fence is established, but the user row + prior audit entries
-      remain — the user is still soft-deleted, so the admin can retry
-      hard-delete (which will re-attempt and succeed since the user is still
-      in ``status='deleted'``). The fence is already established, so the
-      retry's ``INSERT ... ON CONFLICT DO NOTHING`` is a no-op.
+      remain — the user is still soft-deleted. An immediate retry is rejected
+      while the existing claim is active or within its recovery grace period;
+      after that period, a retry can explicitly take over the stale claim,
+      re-attempt the operational purge, and complete the deletion.
 
     Requires: Admin authentication (JWT or ADMIN_TOKEN)
     """
@@ -1131,7 +1131,7 @@ async def hard_delete_user(
                 raise HTTPException(
                     409,
                     "Account state changed before hard-delete could begin. "
-                    "Retry if the account is still soft-deleted.",
+                    "An active claim or recovery grace period must expire before retrying.",
                 ) from None
 
     assert claim is not None
