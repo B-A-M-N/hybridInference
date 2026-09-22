@@ -60,7 +60,6 @@ class HardDeleteClaimProvenance(str, Enum):
     """How a hard-delete claim was obtained by the current operation."""
 
     NEW = "new"
-    REUSED = "reused"
     RECOVERED = "recovered"
 
 
