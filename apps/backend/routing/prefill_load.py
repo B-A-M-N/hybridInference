@@ -177,7 +177,12 @@ def _text_size(text: str) -> int:
     of this fleet's traffic, where the byte length is the character length. Only
     text that is actually multibyte pays for an encode.
     """
-    return len(text) if text.isascii() else len(text.encode("utf-8", "ignore"))
+    return len(text) if text.isascii() else len(text.encode("utf-8", errors="backslashreplace"))
+
+
+def _identity_bytes(text: str) -> bytes:
+    """Encode identity evidence without collapsing distinct code points."""
+    return text.encode("utf-8", errors="surrogatepass")
 
 
 def _content_chars(content: Any) -> int:
@@ -284,7 +289,7 @@ def _media_identity(block: dict[str, Any]) -> str:
         payload = payload.get("url") or payload.get("data") or ""
     if not isinstance(payload, str):
         payload = str(payload)
-    digest = hashlib.blake2b(payload.encode("utf-8", "ignore"), digest_size=8).hexdigest()
+    digest = hashlib.blake2b(_identity_bytes(payload), digest_size=8).hexdigest()
     return f"\x03{kind}:{len(payload)}:{digest}"
 
 
@@ -362,7 +367,7 @@ def prompt_anchor(messages: Sequence[dict[str, Any]] | None) -> tuple[int, str] 
     digest = hashlib.blake2b(digest_size=8)
     length = 0
     for unit in _prefix_units(messages):
-        digest.update(unit.encode("utf-8", "ignore"))
+        digest.update(_identity_bytes(unit))
         length += len(unit)
     if length == 0:
         return None
@@ -380,7 +385,7 @@ def _anchor_holds(messages: Sequence[dict[str, Any]] | None, anchor: tuple[int, 
         if seen >= length:
             break
         take = unit[: length - seen]
-        digest.update(take.encode("utf-8", "ignore"))
+        digest.update(_identity_bytes(take))
         seen += len(take)
     # Short of the remembered length: cannot contain it, let alone extend it.
     return seen == length and digest.hexdigest() == expected
@@ -527,7 +532,7 @@ def conversation_fingerprint(
             break
     if not head:
         return None
-    return hashlib.blake2b("\x00".join(head).encode("utf-8", "ignore"), digest_size=8).hexdigest()
+    return hashlib.blake2b(_identity_bytes("\x00".join(head)), digest_size=8).hexdigest()
 
 
 def priority_for_prefill(tokens: int) -> int:
