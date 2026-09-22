@@ -302,6 +302,15 @@ class OperationalStore(ABC):
         """
 
     @abstractmethod
+    async def purge_erased_user_cache(self, user_id: str) -> None:
+        """Idempotently purge cache entries for an identity already erased.
+
+        This operation must not read or recreate the user row. It exists so a
+        cache invalidation failure after the durable delete can be repaired
+        using the erasure fence even though the identity no longer exists.
+        """
+
+    @abstractmethod
     async def list_user_activity_providers(self, *, days: int = 30) -> list[str]:
         """Return the distinct ``api_logs.provider`` values seen in the last *days*.
 

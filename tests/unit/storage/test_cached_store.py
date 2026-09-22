@@ -53,6 +53,8 @@ def inner_store() -> MagicMock:
         return_value=HardDeleteClaim("claim-token", HardDeleteClaimProvenance.NEW)
     )
     store.release_hard_delete_user_claim = AsyncMock()
+    store.hard_delete_user = AsyncMock(return_value={})
+    store.purge_erased_user_cache = AsyncMock()
     store.update_key = AsyncMock()
     store.revoke_key = AsyncMock()
     store.regenerate_key = AsyncMock(return_value="old-pfx")
@@ -402,12 +404,12 @@ class TestWriteInvalidation:
 
         inner_store.release_hard_delete_user_claim.assert_awaited_once_with("u1", "claim-token")
 
-    async def test_begin_hard_delete_does_not_release_reused_claim_on_cache_failure(
+    async def test_begin_hard_delete_does_not_release_recovered_claim_on_stale_recovery_failure(
         self, cached, inner_store, cache
     ):
-        """A reused post-fence claim remains owned by the durable deletion."""
+        """A recovered post-fence claim remains owned by the durable deletion."""
         inner_store.begin_hard_delete_user.return_value = HardDeleteClaim(
-            "claim-token", HardDeleteClaimProvenance.REUSED
+            "claim-token", HardDeleteClaimProvenance.RECOVERED
         )
         cache.delete = AsyncMock(side_effect=asyncio.CancelledError())
 
@@ -416,7 +418,44 @@ class TestWriteInvalidation:
 
         inner_store.release_hard_delete_user_claim.assert_not_awaited()
 
-    async def test_begin_hard_delete_does_not_release_recovered_claim_on_cache_failure(
+    async def test_hard_delete_repair_purges_cache_after_durable_delete(
+        self, cached, inner_store, cache
+    ):
+        """A failed post-delete purge can be retried without recreating identity."""
+        await cached.get_user_by_id("u1")
+        await cached.get_auth_context_by_key_hash("h1")
+        inner_store.hard_delete_user.return_value = {"users": 1}
+
+        original_delete = cache.delete
+        first = True
+
+        async def fail_once(key: str) -> None:
+            nonlocal first
+            if first:
+                first = False
+                raise RuntimeError("cache unavailable")
+            await original_delete(key)
+
+        cache.delete = fail_once
+        with pytest.raises(RuntimeError, match="cache unavailable"):
+            await cached.hard_delete_user(
+                "u1",
+                claim_token="claim-token",
+                admin_ip="127.0.0.1",
+                admin_id="admin",
+            )
+
+        inner_store.hard_delete_user.assert_awaited_once()
+        inner_store.get_user_by_id.return_value = None
+        await cached.purge_erased_user_cache("u1")
+
+        assert await cached.get_user_by_id("u1") is None
+        assert await cached.get_auth_context_by_key_hash("h1") == {
+            "id": 1,
+            "user_id": "u1",
+        }
+
+    async def test_begin_hard_delete_does_not_release_recovered_claim_on_stale_retry_failure(
         self, cached, inner_store, cache
     ):
         """A recovered claim remains sticky when cache invalidation is cancelled."""

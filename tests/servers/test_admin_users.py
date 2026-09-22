@@ -40,6 +40,7 @@ def mock_stores():
     )
     op_store.release_hard_delete_user_claim = AsyncMock()
     op_store.hard_delete_user = AsyncMock(return_value={})
+    op_store.purge_erased_user_cache = AsyncMock()
     op_store.list_audit_log = AsyncMock(return_value=(0, []))
     op_store.log_admin_action = AsyncMock()
     op_store.update_user_fields = AsyncMock()
@@ -1502,6 +1503,26 @@ async def test_hard_delete_user_not_found(admin_client):
 
 
 @pytest.mark.asyncio
+async def test_hard_delete_repairs_cache_for_already_erased_user(admin_client):
+    """A durable fence permits cache repair after the user row is gone."""
+    client, op_store, log_store, _log = admin_client
+    op_store.get_user_by_id.return_value = None
+    log_store.account_has_erasure_fence.return_value = True
+
+    response = await client.post(
+        "/admin/users/erased/hard-delete",
+        headers=AUTH,
+        json={"confirm": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["email"] == ""
+    op_store.purge_erased_user_cache.assert_awaited_once_with("erased")
+    op_store.begin_hard_delete_user.assert_not_awaited()
+    log_store.hard_delete_user_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_hard_delete_user_requires_auth(admin_client):
     """POST /admin/users/{id}/hard-delete without auth returns 401."""
     client, _op_store, _log_store, _log = admin_client
@@ -1700,8 +1721,8 @@ async def test_hard_delete_rejects_concurrent_post_fence_claim(admin_client):
 
 
 @pytest.mark.asyncio
-async def test_hard_delete_does_not_release_reused_claim_on_failure(admin_client):
-    """A reused post-fence claim is never released by a failed retry."""
+async def test_hard_delete_does_not_release_recovered_claim_on_failure(admin_client):
+    """A recovered post-fence claim is never released by a failed retry."""
     client, op_store, log_store, _log = admin_client
     op_store.get_user_by_id.return_value = {
         "id": "u1",
@@ -1710,7 +1731,7 @@ async def test_hard_delete_does_not_release_reused_claim_on_failure(admin_client
     }
     op_store.begin_hard_delete_user.side_effect = [
         HardDeleteStateChanged("already pending"),
-        HardDeleteClaim("claim-token", HardDeleteClaimProvenance.REUSED),
+        HardDeleteClaim("claim-token", HardDeleteClaimProvenance.RECOVERED),
     ]
     log_store.account_has_erasure_fence.return_value = True
     log_store.hard_delete_user_data.side_effect = RuntimeError("retry failed")

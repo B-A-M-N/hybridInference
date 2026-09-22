@@ -1378,6 +1378,10 @@ class PostgresOperationalStore(OperationalStore):
 
         return counts
 
+    async def purge_erased_user_cache(self, user_id: str) -> None:
+        """Satisfy the cache-repair contract; PostgreSQL owns no cache state."""
+        return None
+
     async def list_user_activity_providers(self, *, days: int = 30) -> list[str]:
         """Distinct ``api_logs.provider`` values seen in the last *days* days.
 

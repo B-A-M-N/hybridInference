@@ -426,10 +426,14 @@ class CachedOperationalStore(OperationalStore):
             reason=reason,
             email=email,
         )
+        await self.purge_erased_user_cache(user_id)
+        return counts
+
+    async def purge_erased_user_cache(self, user_id: str) -> None:
+        """Purge erased-identity caches without consulting the user row."""
         await self._cache.delete(self._user_key(user_id))
         await self._cache.delete_pattern("auth:*")
         await self._cache.delete_pattern("auth_light:*")
-        return counts
 
     async def approve_user(self, user_id: str, *, admin_id: str, note: str | None = None) -> None:
         """Delegate then invalidate user + auth caches."""

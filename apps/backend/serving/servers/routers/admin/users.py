@@ -87,6 +87,16 @@ router = APIRouter(prefix="/admin")
 logger = logging.getLogger(__name__)
 
 
+async def _repair_erased_identity_cache(op_store, log_store, user_id: str) -> bool:
+    """Repair caches only when the LogStore proves the identity is erased."""
+    if log_store is None or not await log_store.account_has_erasure_fence(user_id):
+        return False
+    await op_store.purge_erased_user_cache(user_id)
+    # This read is deliberately after purge: it must never return stale cached
+    # identity data or recreate a cache entry for an erased user.
+    return await op_store.get_user_by_id(user_id) is None
+
+
 @router.get("/users", response_model=ListUsersResponse)
 async def list_users(
     request: Request,
@@ -1147,6 +1157,12 @@ async def hard_delete_user(
 
     user_row = await op_store.get_user_by_id(user_id)
     if not user_row:
+        if await _repair_erased_identity_cache(op_store, log_store, user_id):
+            return HardDeleteUserResponse(
+                user_id=user_id,
+                email="",
+                message="User was already permanently deleted; erased-identity caches were purged.",
+            )
         raise HTTPException(404, f"User '{user_id}' not found")
 
     if user_row["status"] != "deleted":
@@ -1188,6 +1204,12 @@ async def hard_delete_user(
                 "Retry if the account is still soft-deleted.",
             ) from None
         else:
+            if await _repair_erased_identity_cache(op_store, log_store, user_id):
+                return HardDeleteUserResponse(
+                    user_id=user_id,
+                    email="",
+                    message="User was already permanently deleted; erased-identity caches were purged.",
+                )
             try:
                 claim = await op_store.begin_hard_delete_user(
                     user_id,
