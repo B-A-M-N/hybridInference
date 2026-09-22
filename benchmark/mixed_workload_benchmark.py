@@ -81,7 +81,7 @@ def _make_router(
     seed: int = 42,
     scale_ms_per_1k: float = 1.0,
     max_penalty_ms: float = 5000.0,
-) -> RouteWiseRouter:
+) -> tuple[RouteWiseRouter, list[Any]]:
     adapters = [
         _FakeAdapter(ep_id, prompt_price, completion_price)
         for ep_id, prompt_price, completion_price in endpoints
@@ -97,14 +97,15 @@ def _make_router(
     )
     router = RouteWiseRouter(route_table=fr, config=config)
 
-    for ep_id, tokens in prefill_backlog.items():
-        router._prefill_load._backlog[ep_id] = tokens
+    leases = [
+        router._prefill_load.acquire(ep_id, tokens) for ep_id, tokens in prefill_backlog.items()
+    ]
 
     now = time.time()
     for ep_id, latency_ms in latency.items():
         router._latency_profiles[ep_id].record(now, latency_ms)
 
-    return router
+    return router, leases
 
 
 # ---------------------------------------------------------------------------
@@ -254,17 +255,27 @@ def run_workload(
     )
 
     start_time = time.perf_counter()
-    active_leases: list[tuple[str, Any]] = []
+    active_decisions: list[Any] = []
 
     for i, req in enumerate(requests):
         # Periodically release oldest lease to simulate completion
-        if i > 0 and i % release_every == 0 and active_leases:
-            _, lease = active_leases.pop(0)
-            router._prefill_load.release(lease, prefill_confirmed=True)
+        if i > 0 and i % release_every == 0 and active_decisions:
+            completed_decision = active_decisions.pop(0)
+            router._prefill_load.release(
+                completed_decision.prefill_lease,
+                prefill_confirmed=True,
+            )
+            completed_decision.release()
 
         decision = router._select_decision(
             "test-model",
-            {"prompt_tokens": req.prompt_tokens, "request_id": req.request_id},
+            {
+                "messages": [{"role": "user", "content": "x" * (req.prompt_tokens * 4)}],
+                "params": {},
+                "prompt_tokens": req.prompt_tokens,
+                "request_id": req.request_id,
+            },
+            reserve_prefill=True,
         )
 
         if decision is None:
@@ -291,7 +302,10 @@ def run_workload(
         base_ttft_ms = base_ttft_sec * 1000.0
 
         # Record backlog BEFORE we add this request's pressure
-        prefill_before = router._prefill_load.backlog(endpoint_id)
+        prefill_before = decision.metadata.get("candidate_outstanding_prefill_tokens", {}).get(
+            endpoint_id,
+            router._prefill_load.backlog(endpoint_id),
+        )
 
         # Compute actual TTFT: base latency + queuing delay from backlog
         # Queuing delay = backlog / prefill_rate
@@ -324,14 +338,14 @@ def run_workload(
             )
         )
 
-        # Use the real execution path: acquire a lease on the selected endpoint
-        # so subsequent requests see this request's prefill pressure.
-        lease = router._prefill_load.acquire(endpoint_id, req.prompt_tokens)
-        active_leases.append((endpoint_id, lease))
+        # Keep the decision-owned reservation active so subsequent requests see
+        # this request's prefill pressure through the real RouteWise lifecycle.
+        active_decisions.append(decision)
 
     # Release remaining leases
-    for _, lease in active_leases:
-        router._prefill_load.release(lease, prefill_confirmed=True)
+    for decision in active_decisions:
+        router._prefill_load.release(decision.prefill_lease, prefill_confirmed=True)
+        decision.release()
 
     end_time = time.perf_counter()
     result.total_time_ms = (end_time - start_time) * 1000.0
@@ -451,13 +465,21 @@ def scenario_mixed_workload() -> tuple[WorkloadResult, WorkloadResult]:
 
     requests = generate_workload(100, mix, sizes, seed=42)
 
-    baseline_router = _make_router(endpoints, prefill_backlog, latency, feature_enabled=False)
+    baseline_router, baseline_leases = _make_router(
+        endpoints, prefill_backlog, latency, feature_enabled=False
+    )
     baseline = run_workload(baseline_router, requests)
+    for lease in baseline_leases:
+        baseline_router._prefill_load.release(lease)
     baseline.scenario = "mixed_baseline"
     print_result(baseline)
 
-    patched_router = _make_router(endpoints, prefill_backlog, latency, feature_enabled=True)
+    patched_router, patched_leases = _make_router(
+        endpoints, prefill_backlog, latency, feature_enabled=True
+    )
     patched = run_workload(patched_router, requests)
+    for lease in patched_leases:
+        patched_router._prefill_load.release(lease)
     patched.scenario = "mixed_patched"
     print_result(patched)
 
@@ -490,13 +512,21 @@ def scenario_heavy_then_interactive() -> tuple[WorkloadResult, WorkloadResult]:
     ]
     all_requests = heavy_requests + interactive_requests
 
-    baseline_router = _make_router(endpoints, prefill_backlog, latency, feature_enabled=False)
+    baseline_router, baseline_leases = _make_router(
+        endpoints, prefill_backlog, latency, feature_enabled=False
+    )
     baseline = run_workload(baseline_router, all_requests, release_every=5)
+    for lease in baseline_leases:
+        baseline_router._prefill_load.release(lease)
     baseline.scenario = "heavy_interactive_baseline"
     print_result(baseline)
 
-    patched_router = _make_router(endpoints, prefill_backlog, latency, feature_enabled=True)
+    patched_router, patched_leases = _make_router(
+        endpoints, prefill_backlog, latency, feature_enabled=True
+    )
     patched = run_workload(patched_router, all_requests, release_every=5)
+    for lease in patched_leases:
+        patched_router._prefill_load.release(lease)
     patched.scenario = "heavy_interactive_patched"
     print_result(patched)
 
@@ -536,13 +566,21 @@ def scenario_small_only() -> tuple[WorkloadResult, WorkloadResult]:
 
     requests = [RequestSpec(f"small-{i}", 2_000, 500, "short") for i in range(100)]
 
-    baseline_router = _make_router(endpoints, prefill_backlog, latency, feature_enabled=False)
+    baseline_router, baseline_leases = _make_router(
+        endpoints, prefill_backlog, latency, feature_enabled=False
+    )
     baseline = run_workload(baseline_router, requests)
+    for lease in baseline_leases:
+        baseline_router._prefill_load.release(lease)
     baseline.scenario = "small_baseline"
     print_result(baseline)
 
-    patched_router = _make_router(endpoints, prefill_backlog, latency, feature_enabled=True)
+    patched_router, patched_leases = _make_router(
+        endpoints, prefill_backlog, latency, feature_enabled=True
+    )
     patched = run_workload(patched_router, requests)
+    for lease in patched_leases:
+        patched_router._prefill_load.release(lease)
     patched.scenario = "small_patched"
     print_result(patched)
 
@@ -583,13 +621,21 @@ def scenario_heavy_only() -> tuple[WorkloadResult, WorkloadResult]:
         for i in range(50)
     ]
 
-    baseline_router = _make_router(endpoints, prefill_backlog, latency, feature_enabled=False)
+    baseline_router, baseline_leases = _make_router(
+        endpoints, prefill_backlog, latency, feature_enabled=False
+    )
     baseline = run_workload(baseline_router, requests, release_every=5)
+    for lease in baseline_leases:
+        baseline_router._prefill_load.release(lease)
     baseline.scenario = "heavy_baseline"
     print_result(baseline)
 
-    patched_router = _make_router(endpoints, prefill_backlog, latency, feature_enabled=True)
+    patched_router, patched_leases = _make_router(
+        endpoints, prefill_backlog, latency, feature_enabled=True
+    )
     patched = run_workload(patched_router, requests, release_every=5)
+    for lease in patched_leases:
+        patched_router._prefill_load.release(lease)
     patched.scenario = "heavy_patched"
     print_result(patched)
 
@@ -624,13 +670,21 @@ def scenario_equal_load() -> tuple[WorkloadResult, WorkloadResult]:
     }
     requests = generate_workload(100, mix, sizes, seed=42)
 
-    baseline_router = _make_router(endpoints, prefill_backlog, latency, feature_enabled=False)
+    baseline_router, baseline_leases = _make_router(
+        endpoints, prefill_backlog, latency, feature_enabled=False
+    )
     baseline = run_workload(baseline_router, requests)
+    for lease in baseline_leases:
+        baseline_router._prefill_load.release(lease)
     baseline.scenario = "equal_baseline"
     print_result(baseline)
 
-    patched_router = _make_router(endpoints, prefill_backlog, latency, feature_enabled=True)
+    patched_router, patched_leases = _make_router(
+        endpoints, prefill_backlog, latency, feature_enabled=True
+    )
     patched = run_workload(patched_router, requests)
+    for lease in patched_leases:
+        patched_router._prefill_load.release(lease)
     patched.scenario = "equal_patched"
     print_result(patched)
 
@@ -674,7 +728,7 @@ def scenario_sensitivity() -> None:
 
     for scale in scales:
         for cap in caps:
-            router = _make_router(
+            router, leases = _make_router(
                 endpoints,
                 prefill_backlog,
                 latency,
@@ -683,6 +737,8 @@ def scenario_sensitivity() -> None:
                 max_penalty_ms=cap,
             )
             result = run_workload(router, requests)
+            for lease in leases:
+                router._prefill_load.release(lease)
             a_pct = result.endpoint_counts.get("test-model:a", 0) / max(result.completed, 1) * 100
             b_pct = result.endpoint_counts.get("test-model:b", 0) / max(result.completed, 1) * 100
             print(

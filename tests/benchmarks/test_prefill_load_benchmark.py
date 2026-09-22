@@ -80,7 +80,7 @@ def _make_router(
     *,
     feature_enabled: bool,
     seed: int = 42,
-) -> RouteWiseRouter:
+) -> tuple[RouteWiseRouter, list[Any]]:
     """Build a router with given endpoints and prefill backlog.
 
     Args:
@@ -102,11 +102,12 @@ def _make_router(
     )
     router = RouteWiseRouter(route_table=fr, config=config)
 
-    # Set prefill backlog
-    for ep_id, tokens in prefill_backlog.items():
-        router._prefill_load._backlog[ep_id] = tokens
-
-    return router
+    # Seed synthetic pressure with real leases so the benchmark exercises the
+    # same accounting and release path as an in-flight request.
+    leases = [
+        router._prefill_load.acquire(ep_id, tokens) for ep_id, tokens in prefill_backlog.items()
+    ]
+    return router, leases
 
 
 def _run_selections(router: RouteWiseRouter, n: int = 100) -> dict[str, int]:
@@ -119,6 +120,7 @@ def _run_selections(router: RouteWiseRouter, n: int = 100) -> dict[str, int]:
         if decision is not None:
             ep_id = decision.adapter.config.endpoint_id
             counts[ep_id] = counts.get(ep_id, 0) + 1
+            decision.release()
     return counts
 
 
@@ -231,7 +233,7 @@ def run_benchmark(
     }
 
     # Baseline: feature disabled
-    baseline_router = _make_router(
+    baseline_router, baseline_leases = _make_router(
         scenario["endpoints"],
         scenario["prefill_backlog"],
         feature_enabled=False,
@@ -249,7 +251,7 @@ def run_benchmark(
     }
 
     # Patched: feature enabled
-    patched_router = _make_router(
+    patched_router, patched_leases = _make_router(
         scenario["endpoints"],
         scenario["prefill_backlog"],
         feature_enabled=True,
@@ -272,6 +274,11 @@ def run_benchmark(
         results["patched_winner"] = patched_winner
         results["expected_preference"] = expected
         results["correct"] = patched_winner == expected
+
+    for lease in baseline_leases:
+        baseline_router._prefill_load.release(lease)
+    for lease in patched_leases:
+        patched_router._prefill_load.release(lease)
 
     return results
 

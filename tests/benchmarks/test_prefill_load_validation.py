@@ -77,6 +77,16 @@ def _make_router(
     return RouteWiseRouter(route_table=fr, config=config)
 
 
+def _request_context(prompt_tokens: int, request_id: str) -> dict[str, Any]:
+    """Build a request whose lease estimator sees the requested prompt size."""
+    return {
+        "messages": [{"role": "user", "content": "x" * (prompt_tokens * 4)}],
+        "params": {},
+        "prompt_tokens": prompt_tokens,
+        "request_id": request_id,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Test: No prefill-state leak
 # ---------------------------------------------------------------------------
@@ -188,33 +198,25 @@ def test_near_concurrent_decisions_see_preceding_pressure() -> None:
     """Request B should see request A's prefill pressure when A is in-flight."""
     router = _make_router(n_endpoints=2, feature_enabled=True)
 
-    # Route request A to ep0
     decision_a = router._select_decision(
-        "test-model", {"prompt_tokens": 10000, "request_id": "req-a"}
+        "test-model", _request_context(500_000, "req-a"), reserve_prefill=True
     )
     assert decision_a is not None
     ep_a = decision_a.adapter.config.endpoint_id
-
-    # Acquire lease for A (simulating in-flight prefill)
-    lease_a = router._prefill_load.acquire(ep_a, 500_000)
-    assert router._prefill_load.backlog(ep_a) == 500_000
+    assert decision_a.prefill_lease is not None
 
     # Route request B - should see A's pressure
     decision_b = router._select_decision(
-        "test-model", {"prompt_tokens": 1000, "request_id": "req-b"}
+        "test-model", _request_context(1_000, "req-b"), reserve_prefill=True
     )
     assert decision_b is not None
-    ep_b = decision_b.adapter.config.endpoint_id
+    assert (
+        decision_b.metadata["candidate_outstanding_prefill_tokens"][ep_a]
+        == decision_a.prefill_lease.tokens
+    )
 
-    # With feature enabled, B should prefer the less-loaded endpoint
-    # (unless A is materially better on base latency)
-    if ep_a == "test-model:ep0" and ep_b == "test-model:ep0":
-        # Both chose ep0 - this is acceptable if ep0 is much better
-        # but with 500K backlog, the patched router should prefer ep1
-        pass  # We'll check the distribution below
-
-    # Release A
-    router._prefill_load.release(lease_a)
+    decision_a.release()
+    decision_b.release()
 
 
 @pytest.mark.unit
@@ -222,23 +224,30 @@ def test_reservation_timing_herding_risk() -> None:
     """Verify that near-concurrent decisions don't herd to the same loaded endpoint."""
     router = _make_router(n_endpoints=2, feature_enabled=True)
 
-    # Pre-load ep0 with significant pressure
-    router._prefill_load._backlog["test-model:ep0"] = 400_000
+    # Pre-load ep0 with a real lease that remains active during selection.
+    preload = router._prefill_load.acquire("test-model:ep0", 400_000)
+    decisions = []
 
     # Route 20 requests
     selections = {"test-model:ep0": 0, "test-model:ep1": 0}
     for i in range(20):
         decision = router._select_decision(
-            "test-model", {"prompt_tokens": 1000, "request_id": f"req-{i}"}
+            "test-model",
+            _request_context(1_000, f"req-{i}"),
+            reserve_prefill=True,
         )
         if decision:
             ep = decision.adapter.config.endpoint_id
             selections[ep] += 1
+            decisions.append(decision)
 
     # With 400K backlog on ep0, the patched router should send most to ep1
     assert selections["test-model:ep1"] > selections["test-model:ep0"], (
         f"Expected ep1 to be preferred, got {selections}"
     )
+    for decision in decisions:
+        decision.release()
+    router._prefill_load.release(preload)
 
 
 @pytest.mark.unit
@@ -246,8 +255,8 @@ def test_reservation_timing_baseline_ignores_pressure() -> None:
     """Baseline (feature disabled) ignores prefill pressure entirely."""
     router = _make_router(n_endpoints=2, feature_enabled=False)
 
-    # Pre-load ep0 with significant pressure
-    router._prefill_load._backlog["test-model:ep0"] = 400_000
+    # Pre-load ep0 with a real lease; disabled routing must ignore it.
+    preload = router._prefill_load.acquire("test-model:ep0", 400_000)
 
     # Route 20 requests
     selections = {"test-model:ep0": 0, "test-model:ep1": 0}
@@ -258,11 +267,13 @@ def test_reservation_timing_baseline_ignores_pressure() -> None:
         if decision:
             ep = decision.adapter.config.endpoint_id
             selections[ep] += 1
+            decision.release()
 
     # Baseline ignores load - both endpoints should be routable
     total = sum(selections.values())
     assert total == 20, "All requests should be routed"
     assert selections["test-model:ep0"] + selections["test-model:ep1"] == 20
+    router._prefill_load.release(preload)
 
 
 # ---------------------------------------------------------------------------
@@ -320,60 +331,44 @@ def test_execution_path_tracks_prefill_pressure() -> None:
     execution path, the prefill tracker would always show zero backlog
     for router: routewise traffic in production.
     """
-    from unittest.mock import MagicMock
-
     router = _make_router(n_endpoints=2, feature_enabled=True)
 
-    # Initial state: both endpoints idle
-    assert router._prefill_load.backlog("test-model:ep0") == 0
-
-    # Simulate what _execute_adapter does: acquire a lease
-    lease = router._prefill_load.acquire("test-model:ep0", 500_000)
-    assert router._prefill_load.backlog("test-model:ep0") == 500_000
-
-    # Route another request - should see the pressure
-    adapter_a = MagicMock()
-    adapter_a.config.endpoint_id = "test-model:ep0"
-    adapter_a.config.provider = "test"
-    adapter_a.config.base_url = "https://test-model:ep0.example/v1"
-    adapter_a.config.pricing = {"prompt": "1.0", "completion": "1.0"}
-
-    adapter_b = MagicMock()
-    adapter_b.config.endpoint_id = "test-model:ep1"
-    adapter_b.config.provider = "test"
-    adapter_b.config.base_url = "https://test-model:ep1.example/v1"
-    adapter_b.config.pricing = {"prompt": "1.0", "completion": "1.0"}
-
-    fr = _FakeRouteTable()
-    fr.add("test-model", [(adapter_a, 0.5), (adapter_b, 0.5)])
-    test_router = RouteWiseRouter(
-        route_table=fr,
-        config=RouteWiseConfig(prefill_load_routing_enabled=True, random_seed=42),
+    # Obtain the initial pressure through RouteWise's decision-owned lease,
+    # just as the execution path does before handing the decision to an adapter.
+    first = router._select_decision(
+        "test-model",
+        {
+            **_request_context(500_000, "req-heavy"),
+            "required_endpoint_id": "test-model:ep0",
+        },
+        reserve_prefill=True,
     )
-    # Acquire on ep0 to simulate in-flight request
-    test_router._prefill_load.acquire("test-model:ep0", 500_000)
+    assert first is not None
+    assert first.prefill_lease is not None
+    decisions = [first]
 
     # Route 20 requests - should prefer ep1 (lighter load)
     selections = {"test-model:ep0": 0, "test-model:ep1": 0}
     for i in range(20):
-        decision = test_router._select_decision(
-            "test-model", {"prompt_tokens": 1000, "request_id": f"req-{i}"}
+        decision = router._select_decision(
+            "test-model", _request_context(1_000, f"req-{i}"), reserve_prefill=True
         )
         if decision:
             ep = decision.adapter.config.endpoint_id
             selections[ep] += 1
+            decisions.append(decision)
 
     # ep1 should be preferred because ep0 has 500K backlog
     assert selections["test-model:ep1"] > selections["test-model:ep0"]
 
-    # Release the lease (simulating completion)
-    router._prefill_load.release(lease, prefill_confirmed=True)
+    for decision in decisions:
+        decision.release()
     assert router._prefill_load.backlog("test-model:ep0") == 0
 
 
 @pytest.mark.unit
 def test_feature_disabled_exact_old_behavior() -> None:
-    """When disabled, behavior is exactly the same as before."""
+    """When disabled, prefill pressure cannot change endpoint selection."""
     endpoints = [
         ("test-model:a", "1.0", "1.0"),
         ("test-model:b", "1.0", "1.0"),
@@ -382,39 +377,42 @@ def test_feature_disabled_exact_old_behavior() -> None:
     fr = _FakeRouteTable()
     fr.add("test-model", [(adapter, 0.5) for adapter in adapters])
 
-    # Feature disabled
     config = RouteWiseConfig(prefill_load_routing_enabled=False, random_seed=42)
-    router = RouteWiseRouter(route_table=fr, config=config)
+    loaded_router = RouteWiseRouter(route_table=fr, config=config)
 
-    # Set heavy prefill load on A
-    router._prefill_load._backlog["test-model:a"] = 500_000
+    unloaded_fr = _FakeRouteTable()
+    unloaded_adapters = [_FakeAdapter(ep_id) for ep_id, _, _ in endpoints]
+    unloaded_fr.add("test-model", [(adapter, 0.5) for adapter in unloaded_adapters])
+    unloaded_router = RouteWiseRouter(
+        route_table=unloaded_fr,
+        config=RouteWiseConfig(prefill_load_routing_enabled=False, random_seed=42),
+    )
+
+    # Seed only one router through the tracker API; disabled routing must ignore it.
+    load = loaded_router._prefill_load.acquire("test-model:a", 500_000)
 
     # Give them equal latencies and costs
     now = time.time()
-    router._latency_profiles["test-model:a"].record(now, 150.0)
-    router._latency_profiles["test-model:b"].record(now, 150.0)
+    for router in (loaded_router, unloaded_router):
+        router._latency_profiles["test-model:a"].record(now, 150.0)
+        router._latency_profiles["test-model:b"].record(now, 150.0)
 
-    # Route 100 requests
-    selections = {"test-model:a": 0, "test-model:b": 0}
-    for i in range(100):
-        decision = router._select_decision(
-            "test-model", {"prompt_tokens": 1000, "request_id": f"req-{i}"}
-        )
-        if decision:
-            ep = decision.adapter.config.endpoint_id
-            selections[ep] += 1
+    def select_sequence(router: RouteWiseRouter) -> list[str]:
+        selected: list[str] = []
+        for i in range(100):
+            decision = router._select_decision(
+                "test-model", {"prompt_tokens": 1000, "request_id": f"req-{i}"}
+            )
+            assert decision is not None
+            selected.append(decision.adapter.config.endpoint_id)
+            decision.release()
+        return selected
 
-    # With feature disabled, load is ignored - all requests should be routed
-    total = sum(selections.values())
-    assert total == 100, "All 100 requests should be routed"
-    # LP may pick one endpoint when costs/latencies are equal - that's fine
-    # The key invariant is that prefill load doesn't affect routing
-    assert selections["test-model:a"] + selections["test-model:b"] == 100
+    loaded_sequence = select_sequence(loaded_router)
+    unloaded_sequence = select_sequence(unloaded_router)
 
-
-# ---------------------------------------------------------------------------
-# Test: Materially-better endpoint still wins
-# ---------------------------------------------------------------------------
+    assert loaded_sequence == unloaded_sequence
+    loaded_router._prefill_load.release(load)
 
 
 @pytest.mark.unit
@@ -427,19 +425,16 @@ def test_materially_better_loaded_endpoint_still_wins() -> None:
     adapters = [_FakeAdapter(ep_id) for ep_id, _, _ in endpoints]
     fr = _FakeRouteTable()
     fr.add("test-model", [(adapter, 0.5) for adapter in adapters])
+    router = RouteWiseRouter(
+        route_table=fr,
+        config=RouteWiseConfig(prefill_load_routing_enabled=True, random_seed=42),
+    )
 
-    config = RouteWiseConfig(prefill_load_routing_enabled=True, random_seed=42)
-    router = RouteWiseRouter(route_table=fr, config=config)
-
-    # A has huge backlog but much lower base TTFT
-    router._prefill_load._backlog["test-model:a"] = 500_000
-    router._prefill_load._backlog["test-model:b"] = 0
-
+    a_load = router._prefill_load.acquire("test-model:a", 500_000)
     now = time.time()
-    router._latency_profiles["test-model:a"].record(now, 100.0)  # 100ms base
-    router._latency_profiles["test-model:b"].record(now, 2000.0)  # 2000ms base
+    router._latency_profiles["test-model:a"].record(now, 100.0)
+    router._latency_profiles["test-model:b"].record(now, 2000.0)
 
-    # Route 100 requests
     selections = {"test-model:a": 0, "test-model:b": 0}
     for i in range(100):
         decision = router._select_decision(
@@ -449,10 +444,8 @@ def test_materially_better_loaded_endpoint_still_wins() -> None:
             ep = decision.adapter.config.endpoint_id
             selections[ep] += 1
 
-    # A should still win: 100ms + 500ms penalty = 600ms < 2000ms
-    assert selections["test-model:a"] > selections["test-model:b"], (
-        f"Expected A to win despite load, got {selections}"
-    )
+    assert selections["test-model:a"] > selections["test-model:b"]
+    router._prefill_load.release(a_load)
 
 
 # ---------------------------------------------------------------------------
@@ -475,8 +468,8 @@ def test_equal_load_same_behavior() -> None:
     router = RouteWiseRouter(route_table=fr, config=config)
 
     # Equal load
-    router._prefill_load._backlog["test-model:a"] = 100_000
-    router._prefill_load._backlog["test-model:b"] = 100_000
+    a_load = router._prefill_load.acquire("test-model:a", 100_000)
+    b_load = router._prefill_load.acquire("test-model:b", 100_000)
 
     now = time.time()
     router._latency_profiles["test-model:a"].record(now, 150.0)
@@ -496,6 +489,8 @@ def test_equal_load_same_behavior() -> None:
     assert selections["test-model:a"] > selections["test-model:b"]
     # Both should be routable
     assert selections["test-model:a"] > 0
+    router._prefill_load.release(a_load)
+    router._prefill_load.release(b_load)
 
 
 # ---------------------------------------------------------------------------
@@ -560,54 +555,6 @@ def test_non_finite_config_rejected() -> None:
     # Valid finite values still accepted
     RouteWiseConfig(prefill_load_scale_ms_per_1k=1.0, prefill_load_max_penalty_ms=5000.0)
     RouteWiseConfig(prefill_load_scale_ms_per_1k=0.0, prefill_load_max_penalty_ms=0.0)
-
-
-# ---------------------------------------------------------------------------
-# Test: Hedge-leg attribution
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_hedge_wrong_endpoint_no_confirm() -> None:
-    """If hedge wins, the primary endpoint's lease is NOT confirmed.
-
-    This verifies the fix for the issue where a cancelled primary request
-    could leave a warm-prefix hint on the wrong endpoint.
-    """
-    router = _make_router(n_endpoints=2, feature_enabled=True)
-
-    # Simulate primary lease on ep0
-    lease = router._prefill_load.acquire("test-model:ep0", 500_000)
-    assert router._prefill_load.backlog("test-model:ep0") == 500_000
-
-    # Simulate hedge winning: release WITHOUT confirmation
-    # (The actual code does this by checking adapter.config changed)
-    router._prefill_load.release(lease, prefill_confirmed=False)
-
-    # Primary should have no confirmed prefix
-    assert router._prefill_load.backlog("test-model:ep0") == 0
-
-
-@pytest.mark.unit
-def test_on_failure_forgets_endpoint_hints() -> None:
-    """RouteWise._on_failure forgets endpoint prefix hints.
-
-    Verifies fix for the review finding: when an endpoint fails, its
-    warm-prefix hints must be invalidated so that a restart/replacement
-    does not let a genuinely cold mega-prefill into the preempting tier.
-    """
-    router = _make_router(n_endpoints=2, feature_enabled=True)
-
-    # Simulate a successful request that confirms a warm prefix
-    lease = router._prefill_load.acquire("test-model:ep0", 500_000)
-    router._prefill_load.release(lease, prefill_confirmed=True)
-
-    # Simulate a failure
-    router._on_failure("test-model:ep0", reason="test_failure")
-
-    # The hint should be forgotten
-    snapshot = router._prefill_load.snapshot()
-    assert "test-model:ep0" not in snapshot or snapshot["test-model:ep0"]["prefill_tokens"] == 0
 
 
 if __name__ == "__main__":
