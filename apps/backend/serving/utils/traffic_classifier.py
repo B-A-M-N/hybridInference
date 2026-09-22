@@ -481,7 +481,7 @@ def compute_request_shape_hash(
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    return hashlib.sha256(shape.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(shape.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
 
 
 def classification_to_metadata(classification: TrafficClassification) -> dict[str, Any]:
