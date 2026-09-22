@@ -477,12 +477,17 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-          # Database configuration for auth tests
+          # Database configuration for auth and integration tests
           DB_HOST: localhost
           DB_PORT: ${{ job.services.postgres.ports['5432'] }}
           DB_NAME: hybridinference_test_db
           DB_USER: postgres
           DB_PASSWORD: postgres
+          TEST_DB_HOST: localhost
+          TEST_DB_PORT: ${{ job.services.postgres.ports['5432'] }}
+          TEST_DB_NAME: hybridinference_test_db
+          TEST_DB_USER: postgres
+          TEST_DB_PASSWORD: postgres
           # Auth system configuration
           JWT_SECRET_KEY: test-secret-key-for-ci-only-do-not-use-in-production
           JWT_ALGORITHM: HS256
@@ -505,12 +510,17 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-          # Database configuration for auth tests
+          # Database configuration for auth and integration tests
           DB_HOST: localhost
           DB_PORT: ${{ job.services.postgres.ports['5432'] }}
           DB_NAME: hybridinference_test_db
           DB_USER: postgres
           DB_PASSWORD: postgres
+          TEST_DB_HOST: localhost
+          TEST_DB_PORT: ${{ job.services.postgres.ports['5432'] }}
+          TEST_DB_NAME: hybridinference_test_db
+          TEST_DB_USER: postgres
+          TEST_DB_PASSWORD: postgres
           # Auth system configuration
           JWT_SECRET_KEY: test-secret-key-for-ci-only-do-not-use-in-production
           JWT_ALGORITHM: HS256
@@ -537,6 +547,41 @@ jobs:
             -v \
             -m "not external" \
             "${pytest_files[@]}"
+
+      - name: Run erasure-fence race tests against PostgreSQL
+        if: matrix.shard == 1
+        env:
+          TEST_DB_HOST: localhost
+          TEST_DB_PORT: ${{ job.services.postgres.ports['5432'] }}
+          TEST_DB_NAME: hybridinference_test_db
+          TEST_DB_USER: postgres
+          TEST_DB_PASSWORD: postgres
+        run: |
+          set -euo pipefail
+          uv run python - <<'PY'
+          import asyncio
+          import os
+
+          import asyncpg
+
+
+          async def main() -> None:
+              connection = await asyncpg.connect(
+                  host=os.environ["TEST_DB_HOST"],
+                  port=int(os.environ["TEST_DB_PORT"]),
+                  database=os.environ["TEST_DB_NAME"],
+                  user=os.environ["TEST_DB_USER"],
+                  password=os.environ["TEST_DB_PASSWORD"],
+              )
+              try:
+                  await connection.execute("SELECT 1")
+              finally:
+                  await connection.close()
+
+
+          asyncio.run(main())
+          PY
+          uv run pytest -q -m dbtest tests/integration/storage/test_erasure_fence_races.py
 
       - name: Upload coverage to Codecov
         if: github.event_name == 'push' && steps.pytest-shard.outputs.has_tests == 'true'
