@@ -2890,6 +2890,7 @@ class RouteWiseRouter:
             affinity_key=affinity_key,
             fingerprint=fingerprint,
             anchor=anchor,
+            messages=messages,
         )
 
     def _dispatch_priority(
