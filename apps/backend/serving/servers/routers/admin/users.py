@@ -545,7 +545,13 @@ async def reject_user(
             f"User is not pending approval (current status: {user_row['status']})",
         )
 
-    await op_store.reject_user(user_id, admin_id=admin_id, reason=payload.reason)
+    try:
+        await op_store.reject_user(user_id, admin_id=admin_id, reason=payload.reason)
+    except HardDeleteStateChanged:
+        raise HTTPException(
+            409,
+            "This account has a hard-delete in progress and cannot be rejected.",
+        ) from None
 
     await log_admin_action(
         op_store,

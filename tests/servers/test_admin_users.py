@@ -219,6 +219,31 @@ async def test_approve_rejects_hard_delete_claim_after_stale_status_read(admin_c
 
 
 @pytest.mark.asyncio
+async def test_reject_rejects_hard_delete_claim_after_stale_status_read(admin_client):
+    """A claim acquired after the route's status read prevents rejection."""
+    client, op_store, _log_store, mock_log_action = admin_client
+    user_row = _user_row(status="pending_approval")
+    op_store.get_user_by_id.return_value = user_row
+    op_store.reject_user.side_effect = HardDeleteStateChanged(
+        "account has a hard-delete in progress"
+    )
+    response = await client.post(
+        "/admin/users/u1/reject",
+        headers=AUTH,
+        json={"reason": "test"},
+    )
+
+    assert response.status_code == 409
+    op_store.reject_user.assert_awaited_once_with(
+        "u1",
+        admin_id="127.0.0.1",
+        reason="test",
+    )
+    mock_log_action.assert_not_awaited()
+    assert user_row["status"] == "pending_approval"
+
+
+@pytest.mark.asyncio
 async def test_list_users_search(admin_client):
     """GET /admin/users?search=alice returns matching users."""
     client, op_store, _log_store, _log = admin_client
