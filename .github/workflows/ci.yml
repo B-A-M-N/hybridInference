@@ -518,11 +518,6 @@ jobs:
           DB_NAME: hybridinference_test_db
           DB_USER: postgres
           DB_PASSWORD: postgres
-          TEST_DB_HOST: localhost
-          TEST_DB_PORT: ${{ job.services.postgres.ports['5432'] }}
-          TEST_DB_NAME: hybridinference_test_db
-          TEST_DB_USER: postgres
-          TEST_DB_PASSWORD: postgres
           # Auth system configuration
           JWT_SECRET_KEY: test-secret-key-for-ci-only-do-not-use-in-production
           JWT_ALGORITHM: HS256
@@ -551,11 +546,6 @@ jobs:
           DB_NAME: hybridinference_test_db
           DB_USER: postgres
           DB_PASSWORD: postgres
-          TEST_DB_HOST: localhost
-          TEST_DB_PORT: ${{ job.services.postgres.ports['5432'] }}
-          TEST_DB_NAME: hybridinference_test_db
-          TEST_DB_USER: postgres
-          TEST_DB_PASSWORD: postgres
           # Auth system configuration
           JWT_SECRET_KEY: test-secret-key-for-ci-only-do-not-use-in-production
           JWT_ALGORITHM: HS256
