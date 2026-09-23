@@ -517,6 +517,7 @@ async def test_db_logger_accepts_routewise_metadata_with_nonfinite_values(
         },
         pricing={"prompt": "0.15", "completion": "1.25"},
         request_payload={"threshold": float("inf")},
+        store_full_content=True,
     )
 
     assert db_logger.pool is not None
