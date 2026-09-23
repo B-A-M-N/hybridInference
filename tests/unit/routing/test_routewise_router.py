@@ -4128,6 +4128,61 @@ class TestUpstreamPriority:
         assert seen == [PRIORITY_ELEPHANT, PRIORITY_ELEPHANT]
 
     @pytest.mark.unit
+    def test_routewise_lease_accounting_matches_strict_priority(self):
+        """RouteWise charges sibling conversations cold, like their priority."""
+        router = RouteWiseRouter(
+            config=RouteWiseConfig(
+                db_bootstrap_enabled=False,
+                prefill_load_routing_enabled=True,
+            )
+        )
+        endpoint_id = "test-model:local-8003"
+        first = [
+            {"role": "system", "content": "shared system"},
+            {"role": "user", "content": "conversation one"},
+        ]
+        continuation = [
+            *first,
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "continue"},
+        ]
+        sibling = [
+            {"role": "system", "content": "shared system"},
+            {"role": "user", "content": "conversation two"},
+        ]
+
+        with (
+            patch.object(
+                routewise_router_module,
+                "estimate_prefill_tokens",
+                side_effect=(300_000, 305_000, 300_000),
+            ),
+            req_ctx.push(affinity_key="caller"),
+        ):
+            first_lease = router._acquire_prefill_lease(endpoint_id, first, {})
+            assert first_lease.tokens == 300_000
+            router._prefill_load.release(first_lease, prefill_confirmed=True)
+
+            warm_lease = router._acquire_prefill_lease(endpoint_id, continuation, {})
+            assert warm_lease.tokens == 5_000
+            assert (
+                router._dispatch_priority(endpoint_id, warm_lease, continuation)
+                == PRIORITY_INTERACTIVE
+            )
+            router._prefill_load.release(warm_lease)
+
+            sibling_lease = router._acquire_prefill_lease(endpoint_id, sibling, {})
+            assert sibling_lease.tokens == 300_000
+            assert sibling_lease.elephant is True
+            assert (
+                router._dispatch_priority(endpoint_id, sibling_lease, sibling) == PRIORITY_ELEPHANT
+            )
+            assert router._prefill_load.backlog(endpoint_id) == 300_000
+            router._prefill_load.release(sibling_lease)
+
+        assert router._prefill_load.backlog(endpoint_id) == 0
+
+    @pytest.mark.unit
     @pytest.mark.asyncio
     @pytest.mark.parametrize("operation", ("chat", "stream"))
     async def test_hedged_dispatch_publishes_no_shared_priority(self, operation):

@@ -775,6 +775,7 @@ class PrefillLoadTracker:
         affinity_key: str | None = None,
         fingerprint: str | None = None,
         anchor: tuple[int, str] | None = None,
+        messages: Sequence[dict[str, Any]] | None = None,
     ) -> PrefillLease:
         """Charge a request's estimated un-cached prefill to an endpoint.
 
@@ -795,31 +796,37 @@ class PrefillLoadTracker:
             affinity_key: Caller identity, when known.
             fingerprint: Conversation identity, carried on the lease and stored
                 with the hint when prefill completes.
+            messages: Current prompt, when the caller needs strict conversation
+                and prefix checks for its load charge. Callers that omit it
+                retain the legacy affinity-only load estimate.
 
         Returns:
             The lease to hand back to :meth:`release`.
         """
         total = max(int(tokens), 0)
-        charged = self.uncached_estimate(endpoint_id, total, affinity_key)
-        # The elephant count is admission, not load, so it is gated on the
-        # conversation matching -- unlike ``charged``, which keeps the loose
-        # caller-scoped discount #1267 shipped for routing.
-        #
-        # ``affinity_key`` is the API-key hash, so it spans every conversation
-        # one key sends, and ``_prefix_hints`` holds a single hint per
-        # (affinity_key, endpoint_id) -- whichever prefill finished last. Under
-        # the loose discount a *different* conversation from the same key was
-        # charged ~0 un-cached tokens and so never counted as an elephant, which
-        # is precisely the traffic ELEPHANT_LIMIT exists to keep off a busy
-        # replica.
-        #
-        # A wrong *load* estimate skews one routing draw and self-corrects; a
-        # wrong admission verdict does not, which is why only this half pays for
-        # the strictness. An unfingerprintable prompt (a pure-image turn) still
-        # takes the loose discount, matching uncached_estimate's own contract:
-        # tightening that would newly stamp genuine warm continuations as
-        # elephants, which is the defect #1271 exists to prevent.
-        gated = self.uncached_estimate(endpoint_id, total, affinity_key, fingerprint=fingerprint)
+        if messages is None:
+            # Preserve the affinity-only accounting contract for callers such as
+            # FixedRouter. Their admission gate remains conversation-aware, but
+            # their selection load estimate is intentionally unchanged.
+            charged = self.uncached_estimate(endpoint_id, total, affinity_key)
+            gated = self.uncached_estimate(
+                endpoint_id,
+                total,
+                affinity_key,
+                fingerprint=fingerprint,
+            )
+        else:
+            # RouteWise uses the same strict evidence for backlog, elephant
+            # accounting, and dispatch priority. A sibling conversation sharing
+            # an API key must not inherit the previous conversation's discount.
+            charged = self.uncached_estimate(
+                endpoint_id,
+                total,
+                affinity_key,
+                fingerprint=fingerprint,
+                messages=messages,
+            )
+            gated = charged
         elephant = self.is_elephant(gated)
         with self._lock:
             self._backlog[endpoint_id] = self._backlog.get(endpoint_id, 0) + charged

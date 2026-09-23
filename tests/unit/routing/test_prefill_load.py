@@ -1121,10 +1121,10 @@ def test_elephant_gate_still_clears_a_real_continuation():
 
 @pytest.mark.unit
 def test_routing_load_estimate_keeps_the_loose_discount():
-    """Only admission pays for the strictness; the backlog charge is unchanged.
+    """Legacy callers without messages keep the affinity-only load estimate.
 
-    A mis-estimated load skews one routing draw and self-corrects, so the
-    caller-scoped discount #1267 shipped stays in place for it.
+    FixedRouter callers still use the caller-scoped discount #1267. RouteWise
+    passes the current messages and uses the strict estimate instead.
     """
     t = PrefillLoadTracker()
     t.release(
