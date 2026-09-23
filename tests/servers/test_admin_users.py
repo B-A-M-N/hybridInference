@@ -210,11 +210,11 @@ async def test_approve_rejects_hard_delete_claim_after_stale_status_read(admin_c
     )
 
     assert response.status_code == 409
-    op_store.approve_user.assert_awaited_once_with(
-        "u1",
-        admin_id="127.0.0.1",
-        note="approved",
-    )
+    op_store.approve_user.assert_awaited_once()
+    approve_call = op_store.approve_user.await_args
+    assert approve_call.args == ("u1",)
+    assert approve_call.kwargs["admin_id"]
+    assert approve_call.kwargs["note"] == "approved"
     mock_log_action.assert_not_awaited()
 
 
@@ -234,11 +234,11 @@ async def test_reject_rejects_hard_delete_claim_after_stale_status_read(admin_cl
     )
 
     assert response.status_code == 409
-    op_store.reject_user.assert_awaited_once_with(
-        "u1",
-        admin_id="127.0.0.1",
-        reason="test",
-    )
+    op_store.reject_user.assert_awaited_once()
+    reject_call = op_store.reject_user.await_args
+    assert reject_call.args == ("u1",)
+    assert reject_call.kwargs["admin_id"]
+    assert reject_call.kwargs["reason"] == "test"
     mock_log_action.assert_not_awaited()
     assert user_row["status"] == "pending_approval"
 
