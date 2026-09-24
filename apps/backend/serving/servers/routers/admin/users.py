@@ -1191,15 +1191,22 @@ async def hard_delete_user(
     # hard-delete workflow — neither response_store nor op_store is touched.
     fence_established = False
     try:
+        # Renew immediately before every destructive store stage. The claim
+        # token is a fencing generation: a worker recovered after the lease
+        # expires may replace it, and an older worker must stop before it can
+        # touch the next store.
+        await op_store.renew_hard_delete_user_claim(user_id, claim.token)
         await log_store.hard_delete_user_data(user_id)
         fence_established = True
 
         # Purge stored Responses API rows (openai_responses).
         if response_store is not None:
+            await op_store.renew_hard_delete_user_claim(user_id, claim.token)
             await response_store.delete_user_responses(user_id)
 
         # Wipe operational rows + write the new hard-delete audit row,
         # atomically.
+        await op_store.renew_hard_delete_user_claim(user_id, claim.token)
         await op_store.hard_delete_user(
             user_id,
             claim_token=claim.token,
@@ -1208,7 +1215,7 @@ async def hard_delete_user(
             reason=payload.reason,
             email=email,
         )
-    except BaseException:
+    except BaseException as exc:
         if (
             claim is not None
             and claim.provenance is HardDeleteClaimProvenance.NEW
@@ -1238,6 +1245,12 @@ async def hard_delete_user(
                         "Could not release pre-fence hard-delete claim for %s",
                         user_id,
                     )
+        if isinstance(exc, HardDeleteStateChanged):
+            raise HTTPException(
+                409,
+                "This hard-delete claim was superseded before the next destructive "
+                "stage. Retry the hard-delete after confirming the prior worker stopped.",
+            ) from None
         raise
 
     return HardDeleteUserResponse(

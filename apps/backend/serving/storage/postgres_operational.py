@@ -284,6 +284,21 @@ class PostgresOperationalStore(OperationalStore):
                 "can serve; refusing deferred startup while its migration is locked"
             ) from exc
 
+        # Claims created before ``hard_delete_claimed_at`` was introduced have
+        # no lease anchor. Give those legacy claims a migration-time anchor so
+        # recovery preserves the full grace period instead of treating NULL as
+        # immediately stale.
+        backfilled_claims = await conn.execute(
+            "UPDATE users SET hard_delete_claimed_at = NOW() "
+            "WHERE hard_delete_pending = TRUE AND hard_delete_claimed_at IS NULL"
+        )
+        backfilled_claim_count = _parse_command_tag_count(backfilled_claims)
+        if backfilled_claim_count:
+            logger.info(
+                "Backfilled hard-delete claim timestamps for %d pending users.",
+                backfilled_claim_count,
+            )
+
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_pending_approval "
             "ON users(created_at DESC) WHERE status = 'pending_approval'"
@@ -1207,6 +1222,27 @@ class PostgresOperationalStore(OperationalStore):
             token=claim_token,
             provenance=HardDeleteClaimProvenance.NEW,
         )
+
+    async def renew_hard_delete_user_claim(self, user_id: str, claim_token: str) -> None:
+        """Renew a claim lease, failing closed if ownership was superseded."""
+        async with self._pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                """
+                UPDATE users
+                SET hard_delete_claimed_at = NOW()
+                WHERE id = $1
+                  AND status = 'deleted'
+                  AND hard_delete_pending = TRUE
+                  AND hard_delete_claim_token = $2
+                RETURNING id
+                """,
+                user_id,
+                claim_token,
+            )
+            if row is None:
+                raise HardDeleteStateChanged(
+                    f"Account {user_id} no longer belongs to hard-delete claim {claim_token}."
+                )
 
     async def release_hard_delete_user_claim(self, user_id: str, claim_token: str) -> None:
         """Release a still-unfenced hard-delete claim for a deleted user."""
