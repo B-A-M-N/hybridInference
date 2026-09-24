@@ -961,6 +961,42 @@ async def test_post_fence_retry_recovers_stale_claim_without_sharing_ownership(f
         )
 
 
+async def test_superseded_worker_cannot_continue_after_fence(fence_store):
+    """A worker paused after fencing fails before its next delete stage."""
+    store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+
+    first_claim = await op_store.begin_hard_delete_user(_OWNER)
+    await store.hard_delete_user_data(_OWNER)
+    assert await store.account_has_erasure_fence(_OWNER) is True
+
+    # Model a worker that stopped heartbeating for longer than the recovery
+    # grace period while another operator takes over the claim.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET hard_delete_claimed_at = NOW() - INTERVAL '2 hours' "
+            "WHERE id = $1",
+            _OWNER,
+        )
+    recovered_claim = await op_store.begin_hard_delete_user(
+        _OWNER,
+        recover_stale_claim=True,
+    )
+    assert recovered_claim.token != first_claim.token
+
+    with pytest.raises(HardDeleteStateChanged, match="no longer belongs"):
+        await op_store.renew_hard_delete_user_claim(_OWNER, first_claim.token)
+    with pytest.raises(HardDeleteStateChanged, match="not claimed"):
+        await op_store.hard_delete_user(
+            _OWNER,
+            claim_token=first_claim.token,
+            admin_ip="127.0.0.1",
+            admin_id="old-worker",
+        )
+
+    await op_store.renew_hard_delete_user_claim(_OWNER, recovered_claim.token)
+
+
 async def test_concurrent_stale_post_fence_recovery_has_one_owner(fence_store):
     """Concurrent stale retries renew ownership instead of sharing a token."""
     store, pool = fence_store
