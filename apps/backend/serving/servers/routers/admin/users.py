@@ -1179,7 +1179,11 @@ async def hard_delete_user(
             email=email,
         )
     except BaseException as exc:
-        if claim.provenance is HardDeleteClaimProvenance.NEW and not fence_established:
+        if (
+            claim is not None
+            and claim.provenance is HardDeleteClaimProvenance.NEW
+            and not fence_established
+        ):
             # A LogStore transaction normally rolls back its fence before
             # raising. Check explicitly so an ambiguous post-commit failure
             # cannot clear a claim that protects an already-erased account.

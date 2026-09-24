@@ -925,6 +925,66 @@ async def test_stale_claim_can_be_explicitly_recovered_without_releasing_safety(
     assert row["hard_delete_claim_recovered"] is True
 
 
+async def test_legacy_pending_claims_get_a_recovery_grace_period(fence_store):
+    """Migration anchors old claims before allowing pre- or post-fence takeover."""
+    store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET hard_delete_pending = TRUE, "
+            "hard_delete_claim_token = 'legacy-owner', "
+            "hard_delete_claim_recovered = FALSE WHERE id = $1",
+            _OWNER,
+        )
+        await conn.execute("ALTER TABLE users DROP COLUMN hard_delete_claimed_at")
+
+    # Re-run the operational migration against the old schema. The newly added
+    # timestamp must be present before the recovery predicate is evaluated.
+    await op_store.initialize()
+
+    async with pool.acquire() as conn:
+        claimed_at = await conn.fetchval(
+            "SELECT hard_delete_claimed_at FROM users WHERE id = $1",
+            _OWNER,
+        )
+    assert claimed_at is not None
+
+    with pytest.raises(HardDeleteStateChanged, match="not yet eligible"):
+        await op_store.begin_hard_delete_user(_OWNER, recover_stale_claim=True)
+
+    # Explicit pre-fence recovery remains available only after the migration
+    # anchor has aged past the normal grace period.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET hard_delete_claimed_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
+            _OWNER,
+        )
+    pre_fence_claim = await op_store.begin_hard_delete_user(
+        _OWNER,
+        recover_stale_claim=True,
+    )
+    assert pre_fence_claim.provenance is HardDeleteClaimProvenance.RECOVERED
+
+    # The same migrated state must remain recoverable after the erasure fence
+    # is durable, but still not before its refreshed lease becomes stale.
+    await store.hard_delete_user_data(_OWNER)
+    with pytest.raises(HardDeleteStateChanged, match="not yet eligible"):
+        await op_store.begin_hard_delete_user(_OWNER, recover_stale_claim=True)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET hard_delete_claimed_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
+            _OWNER,
+        )
+    post_fence_claim = await op_store.begin_hard_delete_user(
+        _OWNER,
+        recover_stale_claim=True,
+    )
+    assert post_fence_claim.provenance is HardDeleteClaimProvenance.RECOVERED
+    assert post_fence_claim.token != pre_fence_claim.token
+
+
 async def test_post_fence_retry_recovers_stale_claim_without_sharing_ownership(fence_store):
     """Only an abandoned post-fence claim can be recovered for completion."""
     store, pool = fence_store

@@ -235,6 +235,10 @@ class OperationalStore(ABC):
         """
 
     @abstractmethod
+    async def renew_hard_delete_user_claim(self, user_id: str, claim_token: str) -> None:
+        """Renew and validate ownership before the next destructive stage."""
+
+    @abstractmethod
     async def release_hard_delete_user_claim(self, user_id: str, claim_token: str) -> None:
         """Release a claim installed by a failed pre-fence hard-delete.
 

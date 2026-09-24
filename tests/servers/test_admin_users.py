@@ -1592,6 +1592,34 @@ async def test_hard_delete_aborts_when_resume_wins_race(admin_client):
 
 
 @pytest.mark.asyncio
+async def test_hard_delete_stops_before_next_stage_when_claim_is_superseded(admin_client):
+    """A recovered worker cannot continue after its claim generation changes."""
+    client, op_store, log_store, _log = admin_client
+    op_store.get_user_by_id.return_value = {
+        "id": "u1",
+        "email": "alice@example.com",
+        "status": "deleted",
+    }
+    op_store.renew_hard_delete_user_claim.side_effect = [
+        None,
+        HardDeleteStateChanged("claim superseded"),
+    ]
+    log_store.hard_delete_user_data.return_value = {"api_logs": 1}
+
+    response = await client.post(
+        "/admin/users/u1/hard-delete",
+        headers=AUTH,
+        json={"confirm": True},
+    )
+
+    assert response.status_code == 409
+    assert log_store.hard_delete_user_data.await_count == 1
+    response_store = client._transport.app.state.services.responses_store
+    response_store.delete_user_responses.assert_not_awaited()
+    op_store.hard_delete_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_hard_delete_releases_claim_when_log_purge_fails(admin_client):
     """A failed pre-fence purge must not strand the operational claim."""
     client, op_store, log_store, _log = admin_client

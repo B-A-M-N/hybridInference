@@ -383,6 +383,10 @@ class CachedOperationalStore(OperationalStore):
             # through the explicit stale-claim path.
             return
 
+    async def renew_hard_delete_user_claim(self, user_id: str, claim_token: str) -> None:
+        """Renew and validate a hard-delete claim in the wrapped store."""
+        await self._store.renew_hard_delete_user_claim(user_id, claim_token)
+
     async def release_hard_delete_user_claim(self, user_id: str, claim_token: str) -> None:
         """Release a failed pre-fence claim and invalidate user caches."""
         await self._store.release_hard_delete_user_claim(user_id, claim_token)
