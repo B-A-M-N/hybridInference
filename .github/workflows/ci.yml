@@ -578,20 +578,8 @@ jobs:
           PG_TEST_DSN: postgresql://postgres:postgres@localhost:${{ job.services.postgres.ports['5432'] }}/hybridinference_test_db
         run: |
           set -euo pipefail
-          database_files=(
-            tests/integration/storage/test_agent_grant_usage_window_postgres.py
-            tests/integration/test_admin_client_disconnect_postgres.py
-            tests/integration/test_admin_request_perf_breakdown_postgres.py
-            tests/integration/test_database_integration.py
-            tests/integration/test_geo_demand_rollup_postgres.py
-            tests/integration/test_growth_series_postgres.py
-            tests/integration/test_provider_stats_rollup.py
-            tests/servers/test_admin_provider_stats.py
-            tests/servers/test_admin_token_usage.py
-            tests/unit/storage/test_login_events.py
-          )
           log_file="${RUNNER_TEMP}/pytest-database.log"
-          uv run pytest -q -m "not external" "${database_files[@]}" 2>&1 | tee "${log_file}"
+          uv run pytest -q -m "not external and dbtest" 2>&1 | tee "${log_file}"
           bash ops/ci/check_pytest_skips.sh \
             'SKIPPED.*(PostgreSQL|database .*does not exist|TEST_PG_DSN|PG_TEST_DSN)' \
             "${log_file}"
@@ -647,9 +635,9 @@ jobs:
           set -euo pipefail
           mapfile -t pytest_files < "${{ steps.pytest-shard.outputs.file }}"
           log_file="${RUNNER_TEMP}/pytest-shard-${{ matrix.shard }}.log"
-          uv run pytest -n "${PYTEST_WORKERS}" --dist=loadfile -v -m "not external" "${pytest_files[@]}" 2>&1 | tee "${log_file}"
+          uv run pytest -n "${PYTEST_WORKERS}" --dist=loadfile -v -m "not external and not dbtest" "${pytest_files[@]}" 2>&1 | tee "${log_file}"
           bash ops/ci/check_pytest_skips.sh \
-            'SKIPPED.*(PostgreSQL .*not available|database .*does not exist)' \
+            'SKIPPED.*(PostgreSQL .*not available|database .*does not exist|TEST_PG_DSN|PG_TEST_DSN)' \
             "${log_file}"
 
       - name: Run tests (push, coverage shard)
@@ -697,10 +685,10 @@ jobs:
             --cov-report=term-missing \
             --cov-report="xml:coverage-${PYTEST_SHARD}.xml" \
             -v \
-            -m "not external" \
+            -m "not external and not dbtest" \
             "${pytest_files[@]}" 2>&1 | tee "${log_file}"
           bash ops/ci/check_pytest_skips.sh \
-            'SKIPPED.*(PostgreSQL .*not available|database .*does not exist)' \
+            'SKIPPED.*(PostgreSQL .*not available|database .*does not exist|TEST_PG_DSN|PG_TEST_DSN)' \
             "${log_file}"
 
       - name: Upload coverage to Codecov
