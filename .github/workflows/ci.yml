@@ -592,11 +592,24 @@ jobs:
           )
           log_file="${RUNNER_TEMP}/pytest-database.log"
           uv run pytest -q -m "not external" "${database_files[@]}" 2>&1 | tee "${log_file}"
-          if rg -n -i \
+          bash ops/ci/check_pytest_skips.sh \
             'SKIPPED.*(PostgreSQL|database .*does not exist|TEST_PG_DSN|PG_TEST_DSN)' \
-            "${log_file}"; then
-            echo "::error::Database integration tests skipped unexpectedly"
+            "${log_file}"
+
+      - name: Verify PostgreSQL skip guard fails closed
+        if: matrix.shard == 'db'
+        run: |
+          set -euo pipefail
+          probe_log="${RUNNER_TEMP}/pytest-skip-guard-probe.log"
+          printf '%s\n' 'SKIPPED test_probe: PostgreSQL database does not exist' > "${probe_log}"
+          if bash ops/ci/check_pytest_skips.sh \
+            'SKIPPED.*(PostgreSQL|database .*does not exist|TEST_PG_DSN|PG_TEST_DSN)' \
+            "${probe_log}"; then
+            echo "::error::The PostgreSQL skip guard accepted a synthetic skip"
             exit 1
+          else
+            scan_rc=$?
+            test "${scan_rc}" -eq 1
           fi
 
       - name: Run tests (PR/manual, sharded, no coverage)
@@ -635,12 +648,9 @@ jobs:
           mapfile -t pytest_files < "${{ steps.pytest-shard.outputs.file }}"
           log_file="${RUNNER_TEMP}/pytest-shard-${{ matrix.shard }}.log"
           uv run pytest -n "${PYTEST_WORKERS}" --dist=loadfile -v -m "not external" "${pytest_files[@]}" 2>&1 | tee "${log_file}"
-          if rg -n -i \
+          bash ops/ci/check_pytest_skips.sh \
             'SKIPPED.*(PostgreSQL .*not available|database .*does not exist)' \
-            "${log_file}"; then
-            echo "::error::Ordinary test shard skipped a PostgreSQL test"
-            exit 1
-          fi
+            "${log_file}"
 
       - name: Run tests (push, coverage shard)
         if: >-
@@ -689,12 +699,9 @@ jobs:
             -v \
             -m "not external" \
             "${pytest_files[@]}" 2>&1 | tee "${log_file}"
-          if rg -n -i \
+          bash ops/ci/check_pytest_skips.sh \
             'SKIPPED.*(PostgreSQL .*not available|database .*does not exist)' \
-            "${log_file}"; then
-            echo "::error::Ordinary test shard skipped a PostgreSQL test"
-            exit 1
-          fi
+            "${log_file}"
 
       - name: Upload coverage to Codecov
         if: github.event_name == 'push' && steps.pytest-shard.outputs.has_tests == 'true'
