@@ -2899,20 +2899,10 @@ class RouteWiseRouter:
 
     def _dispatch_priority(
         self,
-        endpoint_id: str,
         lease: Any,
-        messages: list[dict[str, Any]],
     ) -> int:
-        """Return scheduling priority for the lease's uncached prefill work."""
-        return priority_for_prefill(
-            self._prefill_load.uncached_estimate(
-                endpoint_id,
-                lease.prompt_tokens,
-                lease.affinity_key,
-                fingerprint=lease.fingerprint,
-                messages=messages,
-            )
-        )
+        """Return scheduling priority for the lease's reserved prefill work."""
+        return priority_for_prefill(lease.tokens)
 
     def _stash_prefix_for_commit(
         self,
@@ -3333,9 +3323,7 @@ class RouteWiseRouter:
                 and lease is not None
                 and not isinstance(adapter, HedgedAdapter)
             ):
-                dispatch_context[req_ctx.UPSTREAM_PRIORITY] = self._dispatch_priority(
-                    endpoint_id, lease, messages
-                )
+                dispatch_context[req_ctx.UPSTREAM_PRIORITY] = self._dispatch_priority(lease)
             with req_ctx.push(**dispatch_context):
                 self._ensure_health(endpoint_id)
                 if isinstance(adapter, HedgedAdapter):
@@ -3409,9 +3397,7 @@ class RouteWiseRouter:
                 and lease is not None
                 and not isinstance(adapter, HedgedAdapter)
             ):
-                dispatch_context[req_ctx.UPSTREAM_PRIORITY] = self._dispatch_priority(
-                    endpoint_id, lease, messages
-                )
+                dispatch_context[req_ctx.UPSTREAM_PRIORITY] = self._dispatch_priority(lease)
             with req_ctx.push(**dispatch_context):
                 self._ensure_health(endpoint_id)
                 first = True

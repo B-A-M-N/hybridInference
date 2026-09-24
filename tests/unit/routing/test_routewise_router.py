@@ -3938,6 +3938,43 @@ class TestUpstreamPriority:
     """RouteWise publishes strict uncached-prefill scheduling priority."""
 
     @pytest.mark.unit
+    def test_dispatch_priority_uses_acquired_lease_charge(self):
+        """A changed prefix hint cannot rewrite an already reserved charge."""
+        router = RouteWiseRouter(
+            config=RouteWiseConfig(
+                db_bootstrap_enabled=False,
+                prefill_load_routing_enabled=True,
+            )
+        )
+        endpoint_id = "test-model:local-8003"
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "prompt"},
+        ]
+
+        with (
+            patch.object(routewise_router_module, "estimate_prefill_tokens", return_value=200_000),
+            req_ctx.push(affinity_key="caller"),
+        ):
+            lease = router._acquire_prefill_lease(endpoint_id, messages, {})
+            assert lease.tokens == 200_000
+
+            # Simulate locality evidence changing after admission but before
+            # dispatch. The priority must remain tied to the reserved charge.
+            with router._prefill_load._lock:
+                router._prefill_load._remember_prompt_locked(
+                    "caller",
+                    endpoint_id,
+                    lease.prompt_tokens,
+                    router._prefill_load._clock(),
+                    lease.fingerprint,
+                    lease.anchor,
+                )
+
+            assert router._dispatch_priority(lease) == PRIORITY_ELEPHANT
+            router._prefill_load.release(lease)
+
+    @pytest.mark.unit
     @pytest.mark.asyncio
     @pytest.mark.parametrize("operation", ("chat", "stream"))
     async def test_disabled_dispatch_publishes_no_priority(self, operation):
@@ -4166,7 +4203,7 @@ class TestUpstreamPriority:
             warm_lease = router._acquire_prefill_lease(endpoint_id, continuation, {})
             assert warm_lease.tokens == 5_000
             assert (
-                router._dispatch_priority(endpoint_id, warm_lease, continuation)
+                router._dispatch_priority(warm_lease)
                 == PRIORITY_INTERACTIVE
             )
             router._prefill_load.release(warm_lease)
@@ -4175,7 +4212,7 @@ class TestUpstreamPriority:
             assert sibling_lease.tokens == 300_000
             assert sibling_lease.elephant is True
             assert (
-                router._dispatch_priority(endpoint_id, sibling_lease, sibling) == PRIORITY_ELEPHANT
+                router._dispatch_priority(sibling_lease) == PRIORITY_ELEPHANT
             )
             assert router._prefill_load.backlog(endpoint_id) == 300_000
             router._prefill_load.release(sibling_lease)
