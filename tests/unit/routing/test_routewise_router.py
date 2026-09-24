@@ -4202,18 +4202,13 @@ class TestUpstreamPriority:
 
             warm_lease = router._acquire_prefill_lease(endpoint_id, continuation, {})
             assert warm_lease.tokens == 5_000
-            assert (
-                router._dispatch_priority(warm_lease)
-                == PRIORITY_INTERACTIVE
-            )
+            assert router._dispatch_priority(warm_lease) == PRIORITY_INTERACTIVE
             router._prefill_load.release(warm_lease)
 
             sibling_lease = router._acquire_prefill_lease(endpoint_id, sibling, {})
             assert sibling_lease.tokens == 300_000
             assert sibling_lease.elephant is True
-            assert (
-                router._dispatch_priority(sibling_lease) == PRIORITY_ELEPHANT
-            )
+            assert router._dispatch_priority(sibling_lease) == PRIORITY_ELEPHANT
             assert router._prefill_load.backlog(endpoint_id) == 300_000
             router._prefill_load.release(sibling_lease)
 
