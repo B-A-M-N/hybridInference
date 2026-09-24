@@ -974,8 +974,7 @@ async def test_superseded_worker_cannot_continue_after_fence(fence_store):
     # grace period while another operator takes over the claim.
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE users SET hard_delete_claimed_at = NOW() - INTERVAL '2 hours' "
-            "WHERE id = $1",
+            "UPDATE users SET hard_delete_claimed_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
             _OWNER,
         )
     recovered_claim = await op_store.begin_hard_delete_user(
