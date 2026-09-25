@@ -182,7 +182,21 @@ def auth_test_env():
     for key, value in all_vars.items():
         os.environ[key] = value
 
+    # ``auth_routes`` imports a Settings instance at module load time, before
+    # this session fixture installs its isolated test environment. Refresh
+    # that module-level reference so cookie and verification behavior follows
+    # the values used by the live test app.
+    from serving.config.settings import get_settings
+    from serving.servers.routers import auth_routes
+
+    get_settings.cache_clear()
+    previous_auth_settings = auth_routes.settings
+    auth_routes.settings = get_settings()
+
     yield
+
+    auth_routes.settings = previous_auth_settings
+    get_settings.cache_clear()
 
     # Restore original environment
     for key, original in saved.items():
