@@ -394,10 +394,6 @@ class CachedOperationalStore(OperationalStore):
         await self._cache.delete_pattern("auth:*")
         await self._cache.delete_pattern("auth_light:*")
 
-    async def renew_hard_delete_user_claim(self, user_id: str, claim_token: str) -> None:
-        """Renew and validate a hard-delete claim in the wrapped store."""
-        await self._store.renew_hard_delete_user_claim(user_id, claim_token)
-
     async def resume_user(
         self,
         user_id: str,

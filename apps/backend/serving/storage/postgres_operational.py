@@ -1220,27 +1220,6 @@ class PostgresOperationalStore(OperationalStore):
                 claim_token,
             )
 
-    async def renew_hard_delete_user_claim(self, user_id: str, claim_token: str) -> None:
-        """Renew a claim lease, failing closed if ownership was superseded."""
-        async with self._pool.acquire() as conn, conn.transaction():
-            row = await conn.fetchrow(
-                """
-                UPDATE users
-                SET hard_delete_claimed_at = NOW()
-                WHERE id = $1
-                  AND status = 'deleted'
-                  AND hard_delete_pending = TRUE
-                  AND hard_delete_claim_token = $2
-                RETURNING id
-                """,
-                user_id,
-                claim_token,
-            )
-            if row is None:
-                raise HardDeleteStateChanged(
-                    f"Account {user_id} no longer belongs to hard-delete claim {claim_token}."
-                )
-
     async def resume_user(
         self,
         user_id: str,
