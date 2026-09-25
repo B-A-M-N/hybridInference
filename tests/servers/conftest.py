@@ -182,26 +182,7 @@ def auth_test_env():
     for key, value in all_vars.items():
         os.environ[key] = value
 
-    # ``auth_routes`` imports a Settings instance at module load time, before
-    # this session fixture installs its isolated test environment. Refresh
-    # that module-level reference so cookie and verification behavior follows
-    # the values used by the live test app.
-    from serving.config import settings as settings_module
-    from serving.config.settings import get_settings
-    from serving.servers.routers import auth_routes
-
-    get_settings.cache_clear()
-    previous_module_settings = settings_module.settings
-    previous_auth_settings = auth_routes.settings
-    test_settings = get_settings()
-    settings_module.settings = test_settings
-    auth_routes.settings = test_settings
-
     yield
-
-    settings_module.settings = previous_module_settings
-    auth_routes.settings = previous_auth_settings
-    get_settings.cache_clear()
 
     # Restore original environment
     for key, original in saved.items():
@@ -417,7 +398,7 @@ async def test_client(test_app):
 
 
 @pytest_asyncio.fixture
-async def auth_app(auth_test_env):
+async def auth_app(auth_test_env, monkeypatch):
     """App instance with lifespan context for auth tests.
 
     This fixture creates a fresh app instance and manages its lifespan,
@@ -435,10 +416,15 @@ async def auth_app(auth_test_env):
     await _skip_if_test_db_unavailable(context="auth_app pre-flight connection")
 
     # Clear settings cache to pick up test environment variables
+    from serving.config import settings as settings_module
     from serving.config.settings import get_settings
     from serving.servers.app import create_app
+    from serving.servers.routers import auth_routes
 
     get_settings.cache_clear()
+    test_settings = get_settings()
+    monkeypatch.setattr(settings_module, "settings", test_settings)
+    monkeypatch.setattr(auth_routes, "settings", test_settings)
 
     app = create_app()
 
