@@ -14,6 +14,7 @@ import { getErrorMessage } from '@/lib/utils/errors';
 import { PerformanceTab } from '@/components/features/admin/PerformanceTab';
 import { ProviderKeysTab } from '@/app/dashboard/admin/ProviderKeysTab';
 import { ProviderOverviewTab } from '@/app/dashboard/admin/ProviderOverviewTab';
+import { UpstreamConcurrencyPanel } from '@/app/dashboard/admin/UpstreamConcurrencyPanel';
 
 type SubTab = 'overview' | 'availability' | 'quotas' | 'keys' | 'performance';
 
@@ -266,7 +267,7 @@ function ProviderCard({
 function QuotasSection() {
   // Deployment docs may describe an operator's service, not backend extensions.
   const quotaDocsUrl =
-    'https://github.com/HarvardMadSys/hybridInference/blob/dev/docs/developer/configuration.md#quota-reporting';
+    'https://github.com/HarvardMadSys/hybridInference/blob/dev/docs/developer/distribution-customization.md#quota-reporting';
   const [providerQuotas, setProviderQuotas] = useState<ProviderQuotaResult[]>([]);
   const [providerQuotasLoading, setProviderQuotasLoading] = useState(false);
   const [togglingProvider, setTogglingProvider] = useState<string | null>(null);
@@ -567,10 +568,15 @@ export function ProvidersTab() {
       ) : active === 'quotas' ? (
         <QuotasSection />
       ) : active === 'keys' ? (
-        <ProviderKeysTab
-          initialProvider={selectedProvider}
-          onProviderChange={setSelectedProvider}
-        />
+        <div className="space-y-6">
+          <ProviderKeysTab
+            initialProvider={selectedProvider}
+            onProviderChange={setSelectedProvider}
+          />
+          {/* Not scoped to the selected provider: the limiter buckets by key, so
+              this lists every key the gateway is currently calling. */}
+          <UpstreamConcurrencyPanel />
+        </div>
       ) : (
         <PerformanceTab />
       )}

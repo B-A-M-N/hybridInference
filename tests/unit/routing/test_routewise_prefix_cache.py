@@ -28,6 +28,15 @@ from serving.utils import context as req_ctx
 SECRET = b"unit-test-secret"
 
 
+def _bound_adapter(executor):
+    """Return the adapter a decision's executor is bound to.
+
+    A decision names a leaf that executes one adapter, so tests asserting which
+    endpoint was chosen unwrap it rather than comparing the executor itself.
+    """
+    return getattr(executor, "adapter", executor)
+
+
 def _scope(session: str = "s1", provider: str = "p1") -> CacheScope:
     return CacheScope(
         user_hash="u1",
@@ -409,6 +418,10 @@ class TestRouteWiseRouterPrefixCacheWarm:
         router._stash_prefix_for_commit((blocks, {"scopes": scopes}), request_id)
 
     @staticmethod
+    def _dispatch(router, request_id, endpoint_id):
+        router._reserve_prefix_generation_for_dispatch(request_id, endpoint_id)
+
+    @staticmethod
     def _observe(router, request_id, endpoint_id, *, success=True):
         router._commit_prefix_cache_observation(
             _obs(
@@ -435,6 +448,85 @@ class TestRouteWiseRouterPrefixCacheWarm:
         signal = self._lookup(router, scope_a)
         assert signal.has_history is True
         assert signal.matched_prefix_tokens > 0
+
+    def test_only_dispatched_candidates_reserve_generations(self):
+        router = self._router()
+        scope_a = self._scope(router, "prov-a", "prov-a:h:1")
+        scope_b = self._scope(router, "prov-b", "prov-b:h:1")
+
+        self._stash(router, "r1", {"prov-a:h:1": scope_a, "prov-b:h:1": scope_b})
+        assert router.prefix_cache._scope_generations == {}
+
+        self._dispatch(router, "r1", "prov-b:h:1")
+
+        assert scope_a not in router.prefix_cache._scope_generations
+        assert scope_b in router.prefix_cache._scope_generations
+
+    def test_unrelated_candidate_does_not_supersede_dispatched_generation(self):
+        """A's X observation survives B evaluating X while dispatching Y."""
+        router = self._router()
+        scope_x = self._scope(router, "prov-x", "prov-x:h:1")
+        scope_y = self._scope(router, "prov-y", "prov-y:h:1")
+        blocks_a = router.prefix_cache.build_blocks(_MSGS1)
+        blocks_b = router.prefix_cache.build_blocks(_MSGS2)
+
+        self._stash(
+            router,
+            "request-a",
+            {"prov-x:h:1": scope_x, "prov-y:h:1": scope_y},
+            messages=_MSGS1,
+        )
+        self._dispatch(router, "request-a", "prov-x:h:1")
+        generation_x = router.prefix_cache._scope_generations[scope_x]
+
+        self._stash(
+            router,
+            "request-b",
+            {"prov-x:h:1": scope_x, "prov-y:h:1": scope_y},
+            messages=_MSGS2,
+        )
+        self._dispatch(router, "request-b", "prov-y:h:1")
+
+        assert router.prefix_cache._scope_generations[scope_x] == generation_x
+        router._commit_prefix_cache_observation(_obs("prov-x:h:1", request_id="request-a"))
+        assert router.prefix_cache.memory.current_blocks(scope_x) == blocks_a
+        assert router.prefix_cache.memory.current_blocks(scope_y) is None
+        assert router.pending_prefix_cache.pop("request-b") is not None
+
+        # A newer dispatch to X does supersede the older X generation.
+        self._stash(
+            router,
+            "request-c",
+            {"prov-x:h:1": scope_x},
+            messages=_MSGS2,
+        )
+        self._dispatch(router, "request-c", "prov-x:h:1")
+        router._commit_prefix_cache_observation(_obs("prov-x:h:1", request_id="request-c"))
+        assert router.prefix_cache.memory.current_blocks(scope_x) == blocks_b
+
+    def test_retry_stashes_accumulate_only_actual_dispatch_generations(self):
+        router = self._router()
+        scope_a = self._scope(router, "prov-a", "prov-a:h:1")
+        scope_b = self._scope(router, "prov-b", "prov-b:h:1")
+        scope_c = self._scope(router, "prov-c", "prov-c:h:1")
+
+        self._stash(
+            router,
+            "retry",
+            {"prov-a:h:1": scope_a, "prov-b:h:1": scope_b},
+        )
+        self._dispatch(router, "retry", "prov-a:h:1")
+        self._stash(
+            router,
+            "retry",
+            {"prov-b:h:1": scope_b, "prov-c:h:1": scope_c},
+        )
+        self._dispatch(router, "retry", "prov-b:h:1")
+
+        entry = router.pending_prefix_cache.pop("retry")
+        assert entry is not None
+        assert set(entry.generations) == {"prov-a:h:1", "prov-b:h:1"}
+        assert "prov-c:h:1" in entry.scopes
 
     def test_failed_does_not_warm_and_keeps_stash_for_fallback_winner(self):
         # The logging path emits one failed observation per failed attempt
@@ -551,6 +643,9 @@ class TestRouteWiseRouterPrefixCacheCostAdjustment:
             config=RouteWiseConfig(
                 budget_alpha=0.0,
                 prefix_cache_cost_adjustment_enabled=cost_adjustment,
+                # These assertions read the per-candidate cost breakdown, which
+                # is opt-in detail rather than always-on decision metadata.
+                decision_metadata_candidate_detail=True,
             ),
         )
         router.prefix_cache = PrefixCacheCoordinator(
@@ -574,6 +669,8 @@ class TestRouteWiseRouterPrefixCacheCostAdjustment:
             cache_params="{}",
         )
         router.prefix_cache.remember(scope, blocks)
+        # Record verified reuse evidence so the discount can apply.
+        router.prefix_cache.record_evidence(scope, cached_tokens=800)
 
     @staticmethod
     def _select(router: RouteWiseRouter):
@@ -597,7 +694,7 @@ class TestRouteWiseRouterPrefixCacheCostAdjustment:
         decision = self._select(router)
 
         assert decision is not None
-        assert decision.adapter is cold_cheaper
+        assert _bound_adapter(decision.adapter) is cold_cheaper
         meta = decision.metadata
         assert meta["candidate_cost_reasons"]["prov-b:h:1"] == "cold_api_cost"
         assert meta["candidate_costs_usd"]["prov-b:h:1"] == pytest.approx(
@@ -612,7 +709,7 @@ class TestRouteWiseRouterPrefixCacheCostAdjustment:
         decision = self._select(router)
 
         assert decision is not None
-        assert decision.adapter is warm_slightly_pricier
+        assert _bound_adapter(decision.adapter) is warm_slightly_pricier
         meta = decision.metadata
         assert meta["candidate_cost_reasons"]["prov-b:h:1"] == "prefix_cache_adjusted_api_cost"
         assert meta["candidate_prefix_cache_discounts_usd"]["prov-b:h:1"] > 0
@@ -635,7 +732,7 @@ class TestRouteWiseRouterPrefixCacheCostAdjustment:
         decision = self._select(router)
 
         assert decision is not None
-        assert decision.adapter is cold_cheaper
+        assert _bound_adapter(decision.adapter) is cold_cheaper
         meta = decision.metadata
         assert meta["candidate_cost_reasons"]["prov-b:h:1"] == "cold_api_cost"
         assert "prov-b:h:1" not in meta["candidate_prefix_cache_discounts_usd"]
@@ -662,7 +759,7 @@ class TestRouteWiseRouterPrefixCacheCostAdjustment:
             )
 
         assert decision is not None
-        assert decision.adapter is cold_cheaper
+        assert _bound_adapter(decision.adapter) is cold_cheaper
         assert len(router.pending_prefix_cache) == 0
 
     def test_eligible_scopes_collected_excludes_rotating_pool(self):

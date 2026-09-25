@@ -51,11 +51,13 @@ if TYPE_CHECKING:
     from serving.observability.alert_config import (
         AlertConfig,
         AuthIpBlockedConfig,
+        ClientErrorBurstConfig,
         CountRule,
         LatencyRule,
         PendingPrefixCacheLeakConfig,
         ProviderHourlySpend,
         RateRule,
+        StreamFailureRateConfig,
         TrackedTaskFailureRateConfig,
         UserOverrun,
     )
@@ -645,6 +647,22 @@ class AuthIpBlockedRule:
     With the default ``threshold_count: 1`` a single block is already a breach;
     raising it pages only once a window holds that many. See
     :class:`AuthIpBlockedConfig`.
+
+    No recovery is ever announced (``announce_resolution=False``), because this
+    rule only ever observes *transitions* and its silence is therefore
+    guaranteed rather than informative. ``utils/auth_failure_blocklist.py``
+    emits one ``auth_ip_blocked`` record per new block and then returns early
+    for a bucket that is already blocked ("Already blocked ... Not a fresh
+    transition"), while the block itself stands for
+    ``auth_failure_block_duration_sec`` -- 86400s by default, far longer than
+    this rule's staleness bound of ``window_sec * _STALE_WINDOW_FACTOR`` (600s).
+    So the records stop long before the block does, and every close this rule
+    can produce -- the settling edge as much as the sweep's "Recovered (no
+    recent samples)" card -- is an artifact of the rule going quiet, never
+    evidence that the source was unblocked. Posting it is pure noise on top of
+    reading as though the block had lifted, which is the opposite of the truth
+    while the source is still being refused. The incident still closes silently
+    in the tracker, so the key does not stay firing forever.
     """
 
     name = "auth_ip_blocked"
@@ -704,6 +722,10 @@ class AuthIpBlockedRule:
             cooldown_sec=self._cfg.cooldown_sec,
             stale_after=self._cfg.window_sec * _STALE_WINDOW_FACTOR,
             now=now,
+            # Close the incident, announce nothing: the records stop when the
+            # blocking transitions stop, not when the block lifts. See the
+            # class docstring.
+            announce_resolution=False,
         )
 
 
@@ -822,6 +844,185 @@ class TrackedTaskFailureRateRule:
             breached=pct >= self._cfg.threshold_pct,
             severity=AlertSeverity.ERROR,
             title=f"Tracked-task failure rate exceeded for {task_name}",
+            context=breach_context,
+            cooldown_sec=self._cfg.cooldown_sec,
+            # Its own window, not the longest rule's: a 60-second rule
+            # whose traffic stops should close on its own timescale.
+            stale_after=self._cfg.window_sec * _STALE_WINDOW_FACTOR,
+            now=now,
+        )
+
+
+class ClientErrorBurstRule:
+    """Alert when relayed client errors that bypass the circuit breaker pile up.
+
+    Fires when more than ``threshold_count`` ``client_error_skip_breaker``
+    events arrive within ``window_sec``. ``EndpointHealth.record_failure``
+    (``routing/endpoint_health.py``) emits that event on its way *past* the
+    breaker: a 4xx other than 408/429 says the request was malformed, not that
+    the endpoint is sick, so counting it against the breaker would trip a
+    healthy endpoint on one bad caller.
+
+    That exemption is correct, and it is precisely why this rule is needed --
+    a user-visible 400 storm registers as nothing anywhere else. ``fivexx_rate``
+    cannot see it (not a 5xx), ``failed_request_rate`` cannot reach its
+    percentage threshold on the volume one wedged conversation produces, and
+    ``circuit_open`` is by design never reached. One client replaying a poisoned
+    historical tool call produced 306 failures over 14 days here without a
+    single page.
+
+    **No upstream ``detail`` on the card.** The record carries one, and it is
+    the most tempting field on it, but ``_detail_str`` only truncates and
+    normalizes whitespace -- it does not redact, and a relayed provider error
+    routinely quotes the offending request back (a tool call's arguments, a
+    message body). The endpoint and status are what an operator acts on; the
+    text is one log query away and stays out of Slack.
+    """
+
+    name = "client_error_burst"
+
+    def __init__(self, cfg: ClientErrorBurstConfig) -> None:
+        self._cfg = cfg
+        self._window = _SlidingWindow(cfg.window_sec)
+
+    async def on_record(self, record: logging.LogRecord) -> None:
+        """Track breaker-exempt client errors and alert when they burst in-window."""
+        if not self._cfg.enabled:
+            return
+        # Selects on the structured attribute, never on the formatted message.
+        # The alerting handler is installed on the *root* logger
+        # (``servers/bootstrap.py``), so every record this module and
+        # ``observability/alerts.py`` emit is fed straight back through this
+        # method. None of them attaches an ``extra``, so none carries an
+        # ``event`` attribute at all -- which is what makes a feedback loop
+        # impossible here rather than merely unlikely. A substring match on
+        # ``record.getMessage()`` would not have that property: the alert path
+        # logs failures that quote rule names and keys.
+        if getattr(record, "event", None) != "client_error_skip_breaker":
+            return
+        now = time.time()
+        self._window.add(
+            now,
+            {
+                "endpoint_id": getattr(record, "endpoint_id", None),
+                "status": getattr(record, "status", None),
+            },
+        )
+        items = self._window.items(now)
+
+        def breach_context() -> dict[str, Any]:
+            endpoint_counts: collections.Counter[str] = collections.Counter(
+                str(it["endpoint_id"]) for it in items if it["endpoint_id"]
+            )
+            status_counts: collections.Counter[str] = collections.Counter(
+                str(it["status"]) for it in items if it["status"] is not None
+            )
+            return {
+                "count": len(items),
+                "window_sec": self._cfg.window_sec,
+                "top_endpoints": _top_offenders(endpoint_counts),
+                "top_status_codes": _top_offenders(status_counts),
+                # Spelled out because the absence of a circuit-open page next to
+                # this one is the expected behaviour, not a second fault: these
+                # requests were routed past the breaker on purpose.
+                "note": (
+                    "these are client errors relayed from upstream; they bypass the "
+                    "circuit breaker by design, so no circuit-open alert will follow. "
+                    "A single caller replaying one malformed request can produce all "
+                    "of them -- check the error detail in the logs for "
+                    "client_error_skip_breaker before suspecting the endpoint"
+                ),
+            }
+
+        await alert_on_transition(
+            key="client_error_burst",
+            # Strict ``>``: threshold_count is how many are tolerated, as in
+            # PendingPrefixCacheLeakRule and AuthFailureSpikeRule. (AuthIpBlocked
+            # reads its threshold the other way only because a default of 1 has
+            # to make one block a breach.)
+            breached=len(items) > self._cfg.threshold_count,
+            # WARN, not ERROR: every request counted here was refused for being
+            # malformed, which may be entirely the caller's doing. It needs a
+            # human to look; it is not yet evidence the gateway is broken.
+            severity=AlertSeverity.WARN,
+            title="Client-error burst relayed from upstream",
+            context=breach_context,
+            cooldown_sec=self._cfg.cooldown_sec,
+            # Its own window, not the longest rule's: a 60-second rule
+            # whose traffic stops should close on its own timescale.
+            stale_after=self._cfg.window_sec * _STALE_WINDOW_FACTOR,
+            now=now,
+        )
+
+
+class StreamFailureRateRule:
+    """Alert when one model's streams keep dying mid-flight.
+
+    Fires when more than ``threshold_count`` ``stream_failed`` events arrive for
+    a single model within ``window_sec``. ``servers/routers/completions_stream.py``
+    emits that event from the ``except Exception`` handler that ends a streaming
+    response after the client has already begun receiving it.
+
+    A **count** per model, not a percentage -- see ``StreamFailureRateConfig``:
+    that codepath counts nothing that finished, so there is no denominator to
+    take a percentage of.
+
+    A threshold this low is safe because aborts do not reach the emitting
+    handler. A client disconnect and a ``TimeoutMiddleware`` deadline both
+    surface as ``asyncio.CancelledError`` / ``GeneratorExit``; those derive from
+    ``BaseException``, not ``Exception``, so they fall through to the
+    ``_finalize_cancelled`` handler that follows and log nothing here. Every
+    event this rule counts is a stream that failed on its own.
+    """
+
+    name = "stream_failure_rate"
+
+    def __init__(self, cfg: StreamFailureRateConfig) -> None:
+        self._cfg = cfg
+        self._windows: dict[str, _SlidingWindow] = {}
+
+    async def on_record(self, record: logging.LogRecord) -> None:
+        """Track per-model stream failures and alert when they burst in-window."""
+        if not self._cfg.enabled:
+            return
+        # Structured attribute, not a substring of the message, for the reason
+        # given at length in ClientErrorBurstRule.on_record: the alert engine's
+        # handler sees its own log output, and no record it emits carries an
+        # ``event`` attribute.
+        if getattr(record, "event", None) != "stream_failed":
+            return
+        model = getattr(record, "model", None) or "unknown"
+        # Per model, so one sick model cannot be masked by -- or hidden behind
+        # -- the rest of the deployment's traffic, and so the cooldown is spent
+        # per model rather than on whichever one failed first.
+        win = self._windows.setdefault(str(model), _SlidingWindow(self._cfg.window_sec))
+        now = time.time()
+        win.add(now, {"error_type": getattr(record, "error_type", None)})
+        items = win.items(now)
+
+        def breach_context() -> dict[str, Any]:
+            # Exception class names only. The message is deliberately not
+            # carried: a relayed upstream error can quote the caller's own
+            # request back, and this goes to Slack.
+            type_counts: collections.Counter[str] = collections.Counter(
+                str(it["error_type"]) for it in items if it["error_type"]
+            )
+            return {
+                "model": str(model),
+                "count": len(items),
+                "window_sec": self._cfg.window_sec,
+                "top_error_types": _top_offenders(type_counts),
+            }
+
+        await alert_on_transition(
+            key=f"stream_failure_rate:{model}",
+            # Strict ``>``, as in ClientErrorBurstRule above.
+            breached=len(items) > self._cfg.threshold_count,
+            # ERROR, unlike the client-error burst: the stream was accepted,
+            # started, and then broke in the user's hands. That is the gateway's
+            # fault however it started.
+            severity=AlertSeverity.ERROR,
+            title=f"Streaming failures for model {model}",
             context=breach_context,
             cooldown_sec=self._cfg.cooldown_sec,
             # Its own window, not the longest rule's: a 60-second rule
@@ -1135,6 +1336,12 @@ class AlertEngine:
         # service fault, so it must never page Slack.
         self._rules.append(PendingPrefixCacheLeakRule(self._config.rules.prefix_cache_pending_leak))
         self._rules.append(TrackedTaskFailureRateRule(self._config.rules.tracked_task_failure_rate))
+        # The two symptoms nothing above can see: a relayed-4xx storm that is
+        # routed past the circuit breaker on purpose, and streams that break
+        # after the response has already started. See ClientErrorBurstRule and
+        # StreamFailureRateRule.
+        self._rules.append(ClientErrorBurstRule(self._config.rules.client_error_burst))
+        self._rules.append(StreamFailureRateRule(self._config.rules.stream_failure_rate))
 
     def _schedule_periodic_jobs(self) -> None:
         if self._scheduler is None:

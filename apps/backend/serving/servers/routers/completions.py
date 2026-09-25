@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from routing.endpoints import endpoint_id_for_adapter
 from routing.executor import ProviderPinError
 from routing.protocols import RoutingRequestOptions
-from routing.routers import AllCircuitsOpenError
+from routing.routers import AllCircuitsOpenError, TargetUnavailableError
 from serving.config.runtime_settings import RuntimeSettings, get_runtime_settings
 from serving.config.settings import has_role
 from serving.exceptions import scrub_error_for_user
@@ -1122,6 +1122,17 @@ async def chat_completions(
         # Record routing observation for online learning (RouteWise)
         if not is_synthetic_probe:
             ns_usage = normalize_usage(raw_usage) or {}
+            # Authoritative observed cache usage from the provider.
+            # None means "provider did not report" (NOT equivalent to 0).
+            cached_tokens_raw = ns_usage.get("cache_read_tokens")
+            cached_tokens: int | None = None
+            if cached_tokens_raw is not None:
+                try:
+                    cached_tokens = int(cached_tokens_raw)
+                    if cached_tokens < 0:
+                        cached_tokens = None
+                except (TypeError, ValueError):
+                    cached_tokens = None
             completions_logger.record_routing_observation(
                 active_router,
                 model,
@@ -1132,6 +1143,7 @@ async def chat_completions(
                 prompt_tokens=int(ns_usage.get("prompt_tokens", 0) or 0),
                 completion_tokens=int(ns_usage.get("completion_tokens", 0) or 0),
                 success=True,
+                cached_tokens=cached_tokens,
             )
 
         if is_synthetic_probe and provider != "router":
@@ -1144,7 +1156,7 @@ async def chat_completions(
             detail=scrub_error_for_user(exc, request_id, 400),
         ) from exc
 
-    except AllCircuitsOpenError as exc:
+    except (AllCircuitsOpenError, TargetUnavailableError) as exc:
         # Full provider outage: every circuit breaker for this model is open.
         # Surface this as 503 Service Unavailable so clients can distinguish
         # "we're temporarily overloaded / all upstreams down" from a generic

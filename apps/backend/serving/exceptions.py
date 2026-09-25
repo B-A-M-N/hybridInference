@@ -20,6 +20,18 @@ class HybridInferenceError(Exception):
     pass
 
 
+class HardDeleteStateChanged(Exception):
+    """The target account's state changed during hard-delete.
+
+    Raised when the erasure-fence status revalidation (issue #1421) detects
+    that a concurrent resume reactivated the account after the router-level
+    soft-deleted check. The hard-delete workflow must abort without purging
+    responses or operationally-linked rows, leaving the account active.
+    """
+
+    pass
+
+
 class UserFacingError(HybridInferenceError):
     """Marker base for exceptions whose message is safe to surface verbatim.
 
@@ -135,6 +147,36 @@ class QuotaExceededError(UserFacingError):
         self.quota = quota
         self.spent = spent
         super().__init__(f"Quota exceeded: ${spent:.2f} / ${quota:.2f}")
+
+
+# Upstream streaming faults
+class UpstreamStreamIdleError(aiohttp.ClientError):
+    """An upstream committed to a stream, then stopped sending data mid-generation.
+
+    Deliberately distinct from the end-of-body check in ``openai_compat``
+    (``_INCOMPLETE_STREAM_ERROR``): that one fires when the body *closed* with no
+    terminal marker, which on a local route is what the deployment proxy's own
+    read timeout produces once it gives up. This one fires while the connection
+    is still open and the upstream has simply gone quiet -- the wedge itself,
+    observed before anything downstream notices. Keeping the two apart is what
+    lets an operator tell "the backend stalled" from "the proxy cut us off".
+
+    Subclasses ``aiohttp.ClientError`` on purpose so the streaming consumer's
+    existing mid-stream I/O handling applies unchanged: the leased key is muted,
+    the exception propagates, and the router charges the endpoint a
+    ``stream_exception`` (opening its circuit) instead of capping a truncated
+    answer with a fabricated terminal chunk.
+    """
+
+    def __init__(self, idle_seconds: float, *, endpoint_id: str | None = None, frames: int = 0):
+        self.idle_seconds = idle_seconds
+        self.endpoint_id = endpoint_id
+        self.frames = frames
+        where = f" endpoint={endpoint_id}" if endpoint_id else ""
+        super().__init__(
+            f"Upstream stopped sending stream data for {idle_seconds:.0f}s "
+            f"after {frames} frame(s){where}"
+        )
 
 
 # ----------------------------------------------------------------------

@@ -4,6 +4,7 @@ This module provides type-safe, validated configuration management.
 All environment variables are centralized here for easy tracking and testing.
 """
 
+import ipaddress
 from functools import lru_cache
 from typing import Annotated
 
@@ -74,6 +75,20 @@ class Settings(BaseSettings):
     signup_notify_emails: str = ""
     user_auth_enabled: bool = True
     api_key_secret: str = ""
+
+    # Erasure fence (issue #1421): dedicated, stable secret used to derive
+    # non-reversible erasure-fence digests. MUST NOT be changed after
+    # hard-delete operations have been performed: changing it invalidates
+    # existing fences, which would allow a previously-erased account's logs
+    # to be written again (a privacy regression). Set this to a long-term
+    # stable value; if unset, API_KEY_SECRET is used as a fallback (with a
+    # startup warning) so single-secret deployments still get fence coverage.
+    erasure_fence_secret: str = ""
+    # Keep hard-delete disabled until every api_logs writer in the deployment
+    # participates in the fence protocol. This is intentionally opt-in for
+    # the release that introduces the application-level fence: an older worker
+    # can still insert directly and bypass an advisory-lock convention.
+    erasure_fence_protocol_ready: bool = False
 
     # JWT (required in production)
     jwt_secret_key: str = ""
@@ -176,8 +191,48 @@ class Settings(BaseSettings):
         "https://127.0.0.1:8443",
     ]
 
-    # Trusted proxies (for real IP detection)
-    trusted_proxies: list[str] = []
+    # Trusted proxies (for real IP detection). Comma-separated CIDR ranges
+    # (e.g. "172.16.0.0/12,10.0.0.0/8") authorized to assert forwarding
+    # provenance via X-Forwarded-For / X-Real-IP. When empty (the default),
+    # forwarding headers are never trusted. Invalid CIDRs fail startup.
+    # NoDecode ensures pydantic-settings does NOT JSON-decode this value,
+    # which would fail before our custom parser could split it.
+    trusted_proxies: Annotated[str, NoDecode] = ""
+    # Private client networks may be authorized separately for direct
+    # connections. They are never accepted as forwarded client identities;
+    # this opt-in only covers deployments where the socket peer is the client
+    # on an RFC1918 or ULA network rather than a shared container proxy.
+    trusted_direct_client_networks: Annotated[str, NoDecode] = ""
+    # Master switch for forwarding-header interpretation. This is deliberately
+    # a validated setting rather than a request-time environment lookup so the
+    # trust decision has one immutable configuration source.
+    trust_proxy_headers: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("TRUST_PROXY_HEADERS", "trust_proxy_headers"),
+    )
+    # Networks explicitly authorized to assert Cloudflare-derived provenance
+    # (CF-Connecting-IP). A generic trusted proxy does NOT automatically
+    # make a client-supplied CF-Connecting-IP safe — only operators who
+    # front this service with Cloudflare should populate this. When empty,
+    # CF-Connecting-IP is never trusted regardless of TRUST_CLOUDFLARE_HEADERS.
+    trusted_cloudflare_networks: Annotated[str, NoDecode] = ""
+    # Additional authority for CF-Connecting-* headers. This never overrides
+    # the master trust switch above.
+    trust_cloudflare_headers: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("TRUST_CLOUDFLARE_HEADERS", "trust_cloudflare_headers"),
+    )
+    # X-Real-IP is a separate, opt-in assertion scheme. X-Forwarded-For is
+    # authoritative whenever it is present, even if its chain is unusable.
+    trust_x_real_ip: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("TRUST_X_REAL_IP", "trust_x_real_ip"),
+    )
+    # Parsed forms of the above, validated at startup. Consumers read these
+    # rather than re-parsing on every request.
+    trusted_proxies_parsed: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
+    trusted_direct_client_parsed: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
+    trusted_cloudflare_parsed: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
 
     # Route types the admin console may add per provider, as comma-separated
     # "provider=type[|type]" entries, e.g.
@@ -190,6 +245,22 @@ class Settings(BaseSettings):
 
     # Enable RouteWise online routing subsystem (per-model opt-in via models.yaml)
     enable_routewise: bool = False
+
+    # Adaptive cap on the gateway's own outbound concurrency against one remote
+    # account (serving.adapters.upstream_limiter). One bucket per
+    # (provider label, API key); local inference servers are never limited.
+    # The limit starts at _initial, drops by one on every upstream 429, and
+    # probes upward by one every _probe_success_interval *successful (HTTP 200)
+    # responses*, staying within [1, _max]. Only a 200 advances that counter —
+    # an error is not evidence the provider has headroom. A request that finds
+    # its bucket full waits up to _acquire_timeout_sec for a slot before failing
+    # over to another endpoint, so the value should stay well under the
+    # client-facing request timeout.
+    upstream_concurrency_enabled: bool = True
+    upstream_concurrency_initial_limit: int = Field(default=8, ge=1)
+    upstream_concurrency_max_limit: int = Field(default=64, ge=1)
+    upstream_concurrency_probe_success_interval: int = Field(default=100, ge=1)
+    upstream_concurrency_acquire_timeout_sec: float = Field(default=30.0, gt=0.0)
 
     # Slack alerting (optional). Empty SLACK_WEBHOOK_URL disables the feature
     # entirely — no scheduler job is registered and no errors are raised.
@@ -247,6 +318,60 @@ class Settings(BaseSettings):
         default="config/alerts.yaml",
         validation_alias=AliasChoices("ALERTS_CONFIG_PATH", "alerts_config_path"),
     )
+
+    @model_validator(mode="after")
+    def _parse_trusted_proxies(self) -> "Settings":
+        """Parse trusted client, proxy, and Cloudflare network CIDRs.
+
+        Both fields accept comma-separated CIDR strings. An empty string is
+        valid (means no proxies trusted). Each entry must be a parseable CIDR
+        range. Invalid entries raise ValueError so the operator is notified
+        at startup rather than silently weakening identity resolution.
+        """
+        proxy_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for entry in self.trusted_proxies.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                proxy_networks.append(ipaddress.ip_network(entry, strict=True))
+            except ValueError as exc:
+                raise ValueError(
+                    f"trusted_proxies entry {entry!r} is not a valid CIDR range: {exc}"
+                ) from exc
+        cf_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for entry in self.trusted_cloudflare_networks.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                cf_networks.append(ipaddress.ip_network(entry, strict=True))
+            except ValueError as exc:
+                raise ValueError(
+                    f"trusted_cloudflare_networks entry {entry!r} is not a valid CIDR range: {exc}"
+                ) from exc
+        object.__setattr__(self, "trusted_proxies_parsed", tuple(proxy_networks))
+        direct_networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for entry in self.trusted_direct_client_networks.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                direct_networks.append(ipaddress.ip_network(entry, strict=True))
+            except ValueError as exc:
+                raise ValueError(
+                    "trusted_direct_client_networks entry "
+                    f"{entry!r} is not a valid CIDR range: {exc}"
+                ) from exc
+        object.__setattr__(self, "trusted_direct_client_parsed", tuple(direct_networks))
+        object.__setattr__(self, "trusted_cloudflare_parsed", tuple(cf_networks))
+        if self.trust_cloudflare_headers and not self.trust_proxy_headers:
+            raise ValueError("TRUST_CLOUDFLARE_HEADERS requires TRUST_PROXY_HEADERS")
+        if self.trust_cloudflare_headers and not cf_networks:
+            raise ValueError("TRUST_CLOUDFLARE_HEADERS requires TRUSTED_CLOUDFLARE_NETWORKS")
+        if self.trust_x_real_ip and not self.trust_proxy_headers:
+            raise ValueError("TRUST_X_REAL_IP requires TRUST_PROXY_HEADERS")
+        return self
 
     @model_validator(mode="after")
     def _alerts_webhook_fallback(self) -> "Settings":

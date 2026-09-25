@@ -61,6 +61,11 @@ class RoutingTrace:
     # a deployment error, and a 500 -- from "every provider is busy recovering",
     # which is transient and owes the client a 503 it can retry.
     admission_refused: set[str] = field(default_factory=set)
+    # Endpoints the most recent solve dropped because the resource they draw from
+    # had nothing left to give -- an exhausted concurrency pool, a spent quota.
+    # Separate from ``admission_refused`` because these are capacity, not health:
+    # nothing was sent, so this must not be reported as a provider fault.
+    capacity_refused: set[str] = field(default_factory=set)
     initial_selected_endpoint: str | None = None
     initial_selected_provider_type: str | None = None
     fallback_policy: str | None = None
@@ -124,10 +129,19 @@ class RoutingDecision:
     reservation: ProviderReservation
     metadata: dict[str, Any]
     trace: RoutingTrace
+    # Optional prefill lease owned by this concrete primary attempt.  The
+    # callback is supplied by the tracker owner so this generic decision type
+    # does not know tracker internals.
+    prefill_lease: Any = None
+    prefill_release: Callable[[], None] | None = None
 
     def release(self) -> None:
-        """Release dispatch-owned refundable capacity idempotently."""
+        """Release all dispatch-owned resources idempotently."""
         self.reservation.release()
+        release = self.prefill_release
+        self.prefill_release = None
+        if release is not None:
+            release()
 
 
 __all__ = [

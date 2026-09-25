@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from inspect import isawaitable
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, NoReturn, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
@@ -22,10 +22,11 @@ if TYPE_CHECKING:
     from routing.protocols import RoutingRequestOptions
     from serving.adapters.base import BaseAdapter
 
-from routing.endpoint_health import DispatchClaim, EndpointHealthRegistry
+from routing.backends import LeafBackend
+from routing.dispatch import EndpointBinding, binding_for_adapter, execution_adapter
+from routing.endpoint_health import DispatchClaim, EndpointHealthRegistry, _http_status_of
 from routing.endpoints import endpoint_id_for_adapter
 from routing.prefill_load import (
-    PrefillLease,
     PrefillLoadTracker,
     conversation_fingerprint,
     estimate_prefill_tokens,
@@ -55,12 +56,29 @@ class AllCircuitsOpenError(RuntimeError):
     """Raised when all provider circuits are open (full outage)."""
 
 
+class TargetUnavailableError(RuntimeError):
+    """Raised when a dispatch required an endpoint that cannot be used right now.
+
+    Distinct from a dispatch failure: nothing was sent upstream, so there is no
+    upstream fault to report and no health sample to record. The circuit is open,
+    or a concurrent request holds the endpoint's half-open probe. A caller that
+    planned one candidate per attempt -- the hybrid layer does -- reads this as
+    "skip this candidate and keep going", which is what the single router's own
+    fallback loop does when a claim is refused.
+    """
+
+
 @runtime_checkable
 class ManagedRouter(Protocol):
     """Router with async lifecycle hooks managed by application bootstrap."""
 
-    async def start(self) -> None:
-        """Start router-owned background work."""
+    async def start(self) -> bool:
+        """Start router-owned background work.
+
+        Returns True when this call activated the router and False when it was
+        already running, so a wrapper can tell whether stopping it is its own
+        to do.
+        """
         ...
 
     async def stop(self) -> None:
@@ -106,6 +124,18 @@ class RoutingObservation:
     terminal: bool = True
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cached_tokens: int | None = None
+    """Authoritative observed cache usage from the provider.
+
+    - ``None``: provider did not report cache info, or usage is unavailable
+      (e.g. client disconnect before final usage). No positive or negative
+      evidence should be manufactured from this state.
+    - ``0``: provider explicitly reported no cache reuse for this request.
+    - ``>0``: provider reported cache reuse.
+
+    This value must NOT be synthesized: if the provider did not report usage,
+    leave it as ``None``. ``None`` and ``0`` MUST remain distinct.
+    """
     strategy_metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -136,6 +166,188 @@ AFFINITY_TTL_SECONDS: float = 300.0
 AFFINITY_SWEEP_THRESHOLD: int = 1000
 AFFINITY_ENABLED: bool = os.environ.get("ROUTING_AFFINITY_ENABLED", "1") != "0"
 
+# Why a route's effective weight stops matching the weight its configuration
+# asked for. Reported separately, never merged, because each names a different
+# owner and a different remediation -- see ``FixedRouter.get_route_exclusions``.
+#: A ``provider_weight_overrides`` row set this (model, endpoint) pair's weight.
+EXCLUSION_WEIGHT_OVERRIDE = "weight_override"
+#: A ``disabled_providers`` row zeroes every adapter carrying that provider label.
+EXCLUSION_PROVIDER_DISABLED = "provider_disabled"
+#: ``RoutingManager`` reweighted the route from ``routing.yaml``'s local/remote
+#: split. Only reachable where no weight-override resolver is attached: with one,
+#: selection reads the registration weights and the manager's pass is inert.
+EXCLUSION_ROUTING_YAML = "routing_yaml"
+#: No runtime mechanism is involved: the model registry itself declares weight 0.
+EXCLUSION_CONFIGURED_ZERO = "configured_zero"
+
+#: Tolerance for comparing two weight shares. The configured and effective sides
+#: are normalized by separate divisions, so an unchanged route can land a few
+#: ULPs apart; without a tolerance every even split would be reported as
+#: diverged.
+_WEIGHT_SHARE_EPSILON = 1e-9
+
+
+def _shares_differ(left: float, right: float) -> bool:
+    """Return whether two normalized weight shares differ meaningfully."""
+    return abs(left - right) > _WEIGHT_SHARE_EPSILON
+
+
+def _weight_shares(weights: Sequence[float]) -> list[float]:
+    """Return weights as shares of their own total, or all-zero when it is zero.
+
+    Reporting only. Registration weights and selection weights live on different
+    scales (see ``FixedRouter.describe_route_weights``); this is what makes the
+    two comparable without either side having to be renormalized in place.
+    """
+    total = sum(weights)
+    if total <= 0:
+        return [0.0 for _ in weights]
+    return [float(weight) / total for weight in weights]
+
+
+# HTTP statuses that describe the *request the client sent*, as opposed to the
+# state of whichever route happened to answer it. Only these may displace the
+# primary route's error when a request is reported to the caller — see
+# ``_select_surfaced_error``.
+#
+# Deliberately excluded, though they are all 4xx:
+#   401 / 403 / 407 — a rejected credential is this gateway's own
+#       misconfiguration, not anything in the caller's payload. 403 is also what
+#       several providers return for "you've reached your concurrent request
+#       limit", which clears on its own within seconds.
+#   408 / 429 — upstream slowness and overload.
+# Promoting any of those over a primary transport failure would relabel a
+# recoverable capacity blip on one route as a terminal, non-retryable client
+# error, and would tell users their key was revoked when it was not.
+_REQUEST_DESCRIBING_STATUSES = frozenset({400, 404, 413, 422})
+
+
+@dataclass(frozen=True)
+class _RouteAttempt:
+    """One dispatched route and the exception it raised.
+
+    ``failed_attempt()`` renders an attempt down to a dict of strings and drops
+    the exception object, so the ``failed_attempts`` telemetry list it builds
+    cannot answer "which of these should the caller actually be told about?".
+    This keeps the exceptions themselves, in dispatch order, alongside it.
+    """
+
+    adapter: BaseAdapter
+    error: BaseException
+
+
+def _describes_request(exc: BaseException) -> bool:
+    """Return whether ``exc`` reports something wrong with the request itself.
+
+    Borrows ``endpoint_health``'s status extraction rather than duck-typing the
+    exception again here: the breaker already decides what counts as a client
+    error from the same attributes, and two readers that disagree about where an
+    upstream's status lives would classify the same failure two ways.
+    """
+    return _http_status_of(exc) in _REQUEST_DESCRIBING_STATUSES
+
+
+def describes_request_error(exc: BaseException) -> bool:
+    """Return whether ``exc`` reports something wrong with the request itself.
+
+    Public because the rule now has two callers: the single-router fallback loop
+    below, and the hybrid layer, which drives candidates drawn from more than one
+    execution domain and therefore has to arrive at the same answer about which
+    failure the caller is told.
+    """
+    return _describes_request(exc)
+
+
+def select_surfaced_error(errors: Sequence[BaseException]) -> int:
+    """Return the index of the error the caller should be told about.
+
+    ``errors[0]`` is the primary attempt and stays the default: a request is
+    normally reported the way the route chosen for it reported it. That default
+    is overridden in exactly one case -- the primary's failure says nothing about
+    the request while a later attempt's does. See
+    ``_REQUEST_DESCRIBING_STATUSES`` for why only those statuses qualify.
+    """
+    if _describes_request(errors[0]):
+        return 0
+    for index, error in enumerate(errors[1:], start=1):
+        if _describes_request(error):
+            return index
+    return 0
+
+
+def _select_surfaced_error(attempts: Sequence[_RouteAttempt]) -> _RouteAttempt:
+    """Choose which of several failed attempts the caller is told about.
+
+    ``attempts[0]`` is the primary pick and remains the default: a request is
+    normally reported the way the route chosen for it reported it, and every
+    other attempt is preserved either way as ``failed_attempts`` telemetry.
+
+    That default is overridden in exactly one case — the primary's failure says
+    nothing about the request while some fallback's does. A dead endpoint raises
+    a bare ``ClientConnectorError`` carrying no HTTP status at all, which the
+    classifier in ``completions_stream`` defaults to 500 and renders as
+    "Internal server error": a *retryable* status for a request that can never
+    succeed, hiding the 400 a live route had already returned explaining what is
+    malformed in the payload. Which of the two answers a user got came down to
+    the weighted coin flip at selection time.
+
+    Only request-describing statuses can win that way; see
+    ``_REQUEST_DESCRIBING_STATUSES`` for why a fallback's 403 or 429 must not.
+    """
+    return attempts[select_surfaced_error([attempt.error for attempt in attempts])]
+
+
+def _raise_surfaced_error(
+    attempts: Sequence[_RouteAttempt],
+    failed_attempts: list[dict[str, str]],
+) -> NoReturn:
+    """Raise the error the caller is told about, once every route has failed.
+
+    Guarantees the raised exception carries ``_routing``. The error-log path
+    reads ``exc._routing`` to attribute the failure to a real upstream; with it
+    absent, ``completions_stream`` falls back to the provider it last saw on the
+    wire — the final fallback *attempted*, not the one being reported — or to
+    the ``"router"`` sentinel, which the provider-performance aggregations drop
+    outright, taking cost accounting with them. The primary's error is given a
+    block by its caller before fallback even begins, but a fallback's error has
+    none, so surfacing one without this would reintroduce exactly the
+    misattribution that block exists to prevent.
+
+    Raises rather than returning the exception so the ``raise`` happens inside
+    the caller's ``except`` block: Python then chains implicitly, giving the
+    surfaced fallback error the primary's failure as its ``__context__`` and
+    leaving a re-raised primary error's chain untouched. Returning it and
+    writing ``raise ... from primary_error`` at the call site would instead
+    claim a direct causal link that does not exist (two routes failed
+    independently) and, when the primary is the one selected, make it its own
+    cause.
+    """
+    selected = _select_surfaced_error(attempts)
+    exc = selected.error
+    routing = getattr(exc, "_routing", None)
+    if isinstance(routing, dict):
+        # ``failed_attempts`` is stored by reference, so the primary's block
+        # already reflects every attempt appended after it was built; a block
+        # attached further upstream (a nested router, an adapter) does not.
+        routing.setdefault("failed_attempts", failed_attempts)
+    else:
+        routing = {
+            "provider": selected.adapter.config.provider,
+            "base_url": selected.adapter.config.base_url,
+            "endpoint_id": endpoint_id_for_adapter(selected.adapter),
+            "failed_attempts": failed_attempts,
+        }
+        exc._routing = routing  # type: ignore[attr-defined]
+    if selected is not attempts[0]:
+        # Same marker the success path puts on a response served by a fallback,
+        # and it matters more here: this block's provider is the route that
+        # produced the status being reported, not the route the request was
+        # actually sent to. Without it an ``api_logs`` row reads as if routing
+        # had picked this endpoint. ``setdefault`` so a block built further
+        # upstream keeps whatever it already decided.
+        routing.setdefault("fallback", True)
+    raise exc
+
 
 # ============================================================================
 # FixedRouter
@@ -155,6 +367,21 @@ def adapter_supports_modalities(adapter: BaseAdapter, required: frozenset[str] |
         return True
     supported = set(getattr(adapter.config, "input_modalities", None) or ["text"])
     return required <= supported
+
+
+def adapter_in_endpoint_scope(adapter: BaseAdapter, scope: frozenset[str] | None) -> bool:
+    """Return whether ``adapter`` is inside an explicit endpoint/provider set.
+
+    ``None`` means "no scope declared" and admits everything. An empty set
+    admits nothing, which is the right reading for a backend that was told it
+    owns no endpoint here.
+    """
+    if scope is None:
+        return True
+    return (
+        endpoint_id_for_adapter(adapter) in scope
+        or getattr(adapter.config, "provider", None) in scope
+    )
 
 
 class FixedRouter:
@@ -196,6 +423,10 @@ class FixedRouter:
         # counts, which lets one mega-prefill monopolize a replica while its
         # siblings idle; this is the signal that lets selection see that.
         self._prefill_load = PrefillLoadTracker()
+        # Divergence set last announced by ``log_route_weight_divergence``.
+        # None (not an empty set) means "never reported", which is what lets a
+        # gateway with no overrides boot silently.
+        self._logged_weight_divergence: frozenset[tuple[Any, ...]] | None = None
 
     @property
     def prefill_load(self) -> PrefillLoadTracker:
@@ -272,8 +503,267 @@ class FixedRouter:
             del self._affinity[k]
 
     def get_provider_status(self) -> dict[str, dict[str, Any]]:
-        """Return a snapshot of provider availability and circuit state."""
-        return self._health_registry.snapshot()
+        """Return a snapshot of provider availability, circuit state and exclusions.
+
+        The exclusion half is merged in -- and endpoints that appear *only* as
+        excluded are added to the map -- because a zero-weighted route is never
+        dispatched to, so it never reaches the health registry at all. Without
+        it a model down to its last live route reads here exactly like a model
+        that only ever had one: the health snapshot can only describe endpoints
+        traffic has already been sent to.
+        """
+        status = self._health_registry.snapshot()
+        for fact in self.get_route_exclusions():
+            entry = status.setdefault(fact["endpoint_id"], {})
+            models = entry.setdefault("excluded_from_models", [])
+            if fact["model_id"] not in models:
+                models.append(fact["model_id"])
+            reasons = entry.setdefault("exclusion_reasons", [])
+            for reason in fact["reasons"]:
+                if reason not in reasons:
+                    reasons.append(reason)
+        for entry in status.values():
+            # One endpoint can be excluded from several models for several
+            # reasons; sort so the payload is stable across calls (and so tests
+            # do not depend on dict iteration order).
+            if "excluded_from_models" in entry:
+                entry["excluded_from_models"].sort()
+                entry["exclusion_reasons"].sort()
+        return status
+
+    def describe_route_weights(self) -> list[dict[str, Any]]:
+        """Explain every published route's effective weight and what changed it.
+
+        One entry per (model, endpoint) pair, carrying the weight the model
+        registry asked for, the weight routing actually uses, and the mechanism
+        behind any difference. Both weights are reported as **shares of the
+        model's route table** -- each side normalized over that model's routes --
+        because the two are kept on different scales internally (registration
+        weights before normalization, selection weights after), and a report that
+        mixed the scales would flag every multi-route model as diverged.
+
+        This deliberately *mirrors* ``_get_effective_adapters`` instead of
+        calling it. That method may await an async-only override resolver, which
+        raises when called from inside a running event loop -- and this runs on
+        ``/health/deep``, inside exactly such a loop. A diagnostic must never be
+        the thing that takes the status endpoint down.
+        ``test_describe_route_weights_agrees_with_selection`` pins the mirror
+        against drift.
+
+        Known limit: an override resolver that exposes only the async
+        ``get_for_model`` cannot be read from here, so its overrides are reported
+        as absent. That under-reports rather than raises, which is the right
+        failure for a status surface; every resolver the gateway constructs
+        exposes the sync snapshot.
+        """
+        disabled_resolver = self.disabled_provider_resolver
+        facts: list[dict[str, Any]] = []
+        for model_id, route in self._published_routes_snapshot():
+            overrides = self._weight_override_snapshot(model_id)
+            # What the model registry asked for, before anything at runtime.
+            registered = route.raw_adapters or [
+                (adapter, weight, endpoint_id_for_adapter(adapter))
+                for adapter, weight in route.adapters
+            ]
+            # Where selection starts from, mirroring ``_get_effective_adapters``:
+            # the pre-normalization registration weights when a readable override
+            # resolver can rewrite them, otherwise the live normalized list --
+            # which is also the one ``RoutingManager.apply()`` mutates in place.
+            if overrides is None or not route.raw_adapters:
+                baseline = [
+                    (adapter, weight, endpoint_id_for_adapter(adapter))
+                    for adapter, weight in route.adapters
+                ]
+                overrides = {}
+            else:
+                baseline = list(route.raw_adapters)
+            # Keyed by adapter, not by position: ``RoutingManager.apply()``
+            # rebuilds ``route.adapters`` covered-first, so it can reorder the
+            # list relative to ``raw_adapters``.
+            registered_shares = _weight_shares([weight for _, weight, _ in registered])
+            registered_share = {
+                adapter: share
+                for (adapter, _weight, _endpoint_id), share in zip(
+                    registered, registered_shares, strict=False
+                )
+            }
+            baseline_share = _weight_shares([weight for _, weight, _ in baseline])
+            effective_weights: list[float] = []
+            per_route_reasons: list[list[str]] = []
+            for index, (adapter, base_weight, endpoint_id) in enumerate(baseline):
+                configured = registered_share.get(adapter, 0.0)
+                reasons: list[str] = []
+                # Attribution is by *mechanism*, never by comparing the route's
+                # own configured and effective shares. Zeroing one route raises
+                # every sibling's share, and blaming the survivor for the share
+                # it inherited is how a report turns one operator action into a
+                # line per route.
+                if configured <= 0:
+                    reasons.append(EXCLUSION_CONFIGURED_ZERO)
+                elif _shares_differ(baseline_share[index], configured):
+                    # Selection's starting weights are not the registry's, and
+                    # no runtime override has been applied yet: what rewrote
+                    # them is RoutingManager applying routing.yaml's local/remote
+                    # split. Unreachable with a weight resolver attached, where
+                    # selection reads the registration weights and the manager's
+                    # pass is inert.
+                    reasons.append(EXCLUSION_ROUTING_YAML)
+                weight = float(base_weight)
+                override = overrides.get(endpoint_id)
+                if override is not None and float(override) != weight:
+                    weight = float(override)
+                    reasons.append(EXCLUSION_WEIGHT_OVERRIDE)
+                if disabled_resolver is not None and disabled_resolver.is_disabled(
+                    adapter.config.provider
+                ):
+                    weight = 0.0
+                    reasons.append(EXCLUSION_PROVIDER_DISABLED)
+                effective_weights.append(weight)
+                per_route_reasons.append(reasons)
+            effective_share = _weight_shares(effective_weights)
+            for index, (adapter, _base_weight, endpoint_id) in enumerate(baseline):
+                facts.append(
+                    {
+                        "model_id": model_id,
+                        "endpoint_id": endpoint_id,
+                        "provider": adapter.config.provider,
+                        "base_url": adapter.config.base_url,
+                        "configured_weight": registered_share.get(adapter, 0.0),
+                        "effective_weight": effective_share[index],
+                        "reasons": per_route_reasons[index],
+                    }
+                )
+        return facts
+
+    def get_route_exclusions(self) -> list[dict[str, Any]]:
+        """Return the published routes automatic selection can never pick.
+
+        A zero effective weight is skipped both by weighted selection and by
+        every fallback loop (``if adapter == primary or weight <= 0``), so these
+        routes are configured capacity that does not exist. The cause labels are
+        kept separate rather than merged into one "disabled" flag: a
+        ``provider_weight_overrides`` row is per (model, endpoint) and is undone
+        in the admin console's routing-weights view, a ``disabled_providers``
+        row is a provider-wide kill switch undone in the providers view, a
+        ``routing.yaml`` split is undone in the overlay's routing file, and a
+        weight of 0 in the model registry is undone in its models file.
+        Different owners, different fixes.
+        """
+        return [fact for fact in self.describe_route_weights() if fact["effective_weight"] <= 0]
+
+    def log_route_weight_divergence(self) -> None:
+        """Log every route whose effective weight differs from its configured one.
+
+        Called once at startup and again after each override / disabled-provider
+        reload, so an operator reading the boot log can see the runtime weight
+        table rather than having to query the operational store to discover that
+        a model with six configured routes has one live one.
+
+        Self-deduplicating on the divergence set: the refresh loops call this
+        every time a reload reports a change, and a weight that has been zero
+        for 71 days must not print a line per reload.
+        """
+        # A route the registry itself weights at zero is configuration, not
+        # divergence, so it is reported by ``get_route_exclusions`` but never
+        # announced here -- the boot log would otherwise carry a permanent line
+        # for every deliberately parked route.
+        diverged = [
+            fact
+            for fact in self.describe_route_weights()
+            if set(fact["reasons"]) - {EXCLUSION_CONFIGURED_ZERO}
+        ]
+        signature = frozenset(
+            (
+                fact["model_id"],
+                fact["endpoint_id"],
+                fact["effective_weight"],
+                tuple(fact["reasons"]),
+            )
+            for fact in diverged
+        )
+        with self._lock:
+            previous = self._logged_weight_divergence
+            if signature == previous:
+                return
+            self._logged_weight_divergence = signature
+        if not diverged:
+            # ``previous`` is None on the first call, so a gateway that boots
+            # with no overrides at all stays silent instead of announcing that
+            # nothing changed.
+            if previous:
+                logger.info(
+                    "route_weight_divergence_cleared",
+                    extra={"event": "route_weight_divergence_cleared"},
+                )
+            return
+        for fact in diverged:
+            zeroed = fact["effective_weight"] <= 0
+            # A route zeroed at runtime is removed capacity and is what the
+            # RCA had to find by hand; a route merely re-weighted is still
+            # routable, so it is reported but not as a warning.
+            log = logger.warning if zeroed else logger.info
+            # The verb says what happened to the weight, never which mechanism
+            # did it -- "overridden" is also the name of one of the four causes,
+            # so a provider-disabled route announced as "overridden" would send
+            # an operator to the wrong admin tab. The cause is in the brackets.
+            log(
+                "Route %s at runtime: %s via %s is %.4g (config: %.4g) [%s]",
+                "zeroed" if zeroed else "re-weighted",
+                fact["model_id"],
+                fact["endpoint_id"],
+                fact["effective_weight"],
+                fact["configured_weight"],
+                ", ".join(fact["reasons"]) or "unknown",
+                extra={
+                    "event": "route_weight_zeroed" if zeroed else "route_weight_overridden",
+                    "model_id": fact["model_id"],
+                    "endpoint_id": fact["endpoint_id"],
+                    "provider": fact["provider"],
+                    "configured_weight": fact["configured_weight"],
+                    "effective_weight": fact["effective_weight"],
+                    "reason": ", ".join(fact["reasons"]) or "unknown",
+                },
+            )
+
+    def _published_routes_snapshot(self) -> list[tuple[str, RouteConfig]]:
+        """Return one (canonical model id, route) pair per published route.
+
+        Aliases share a ``RouteConfig`` by reference, so reporting per route key
+        would list the same endpoints once per alias.
+        """
+        with self._lock:
+            items = list(self.routes.items())
+        seen_canonical_ids: set[str] = set()
+        snapshot: list[tuple[str, RouteConfig]] = []
+        for route_key, route in items:
+            if not route.published:
+                continue
+            canonical_model_id = route.canonical_model_id or route_key
+            if canonical_model_id in seen_canonical_ids:
+                continue
+            seen_canonical_ids.add(canonical_model_id)
+            snapshot.append((canonical_model_id, route))
+        return snapshot
+
+    def _weight_override_snapshot(self, model_id: str) -> dict[str, float] | None:
+        """Return the synchronous weight-override snapshot for one model.
+
+        ``None`` means "no overrides are readable from here": either no resolver
+        is attached -- the case ``_get_effective_adapters`` itself falls back to
+        the route's own weights for -- or the one attached offers only the async
+        ``get_for_model`` shape, which a diagnostic must not await (see
+        ``describe_route_weights``). Reporting the second as "no overrides" can
+        understate an override that is in fact set; every resolver the gateway
+        constructs exposes the sync snapshot, and under-reporting beats a status
+        endpoint that raises.
+        """
+        resolver = self.weight_override_resolver
+        if resolver is None:
+            return None
+        get_snapshot = getattr(resolver, "get_snapshot_for_model", None)
+        if get_snapshot is None:
+            return None
+        return dict(get_snapshot(model_id))
 
     def record_observation(self, obs: RoutingObservation) -> None:
         """Ignore observations because fixed routing has no online-learning state."""
@@ -428,7 +918,12 @@ class FixedRouter:
             for alias in aliases or []:
                 self.routes[alias] = route_cfg  # shared reference, not a copy
 
-    def eligible_adapters(self, model_id: str) -> list[tuple[BaseAdapter, float]]:
+    def eligible_adapters(
+        self,
+        model_id: str,
+        *,
+        endpoint_scope: frozenset[str] | None = None,
+    ) -> list[tuple[BaseAdapter, float]]:
         """Return the adapters automatic routing may dispatch to, in route order.
 
         Applies the same two admission rules ``_select_adapter`` uses: an
@@ -451,8 +946,99 @@ class FixedRouter:
         return [
             (adapter, weight)
             for adapter, weight in snapshot
-            if weight > 0 and self._health_registry.allow_request(endpoint_id_for_adapter(adapter))
+            if weight > 0
+            and adapter_in_endpoint_scope(adapter, endpoint_scope)
+            and self._health_registry.allow_request(endpoint_id_for_adapter(adapter))
         ]
+
+    def select_adapter(
+        self,
+        model_id: str,
+        *,
+        required_modalities: frozenset[str] | None = None,
+        prefill_tokens: int = 0,
+        preferred_endpoint_id: str | None = None,
+        endpoint_scope: frozenset[str] | None = None,
+    ) -> BaseAdapter | None:
+        """Return the adapter automatic routing would choose, without dispatching.
+
+        This is the one selection algorithm in the package: the hybrid layer's
+        global policy asks this to learn which endpoint a set of weights picks,
+        and the execution path asks it again -- over a range the policy may have
+        narrowed -- when it commits. Neither copy exists, and no dispatch claim
+        is taken here, so asking is free of side effects.
+
+        Args:
+            model_id: Model identifier.
+            required_modalities: Non-text input modalities the request needs.
+            prefill_tokens: Estimated prompt size, used to steer away from
+                saturated endpoints.
+            preferred_endpoint_id: A target the caller wants honored if this
+                route can serve it. Unlike ``pin_provider`` it does not turn the
+                selection into a single-candidate dispatch: the result is still
+                an ordinary selection subject to the caller's fallback loop.
+
+        Returns:
+            Selected adapter or None if no route configured / no match.
+        """
+        return self._select_adapter(
+            model_id,
+            required_modalities=required_modalities,
+            prefill_tokens=prefill_tokens,
+            preferred_endpoint_id=preferred_endpoint_id,
+            endpoint_scope=endpoint_scope,
+        )
+
+    def preferred_endpoint_for_provider(
+        self,
+        model_id: str,
+        provider: str,
+        *,
+        required_modalities: frozenset[str] | None = None,
+        prefill_tokens: int = 0,
+    ) -> str | None:
+        """Return one admitted endpoint of ``provider``, or None if it has none.
+
+        A provider label can cover several endpoints, so a policy target naming
+        a provider still has to be resolved to one of them before it can be
+        preferred. Resolution runs through the ordinary selection rather than
+        picking the first route entry, so weights, circuit admission and the
+        prefill-aware draw decide among the provider's endpoints exactly as they
+        would have without a target.
+        """
+        route = self.routes.get(model_id)
+        if not route or not route.published or not route.adapters:
+            return None
+        effective = self._get_effective_adapters(model_id, route)
+        candidates = [
+            endpoint_id_for_adapter(adapter)
+            for adapter, _weight in effective
+            if adapter.config.provider == provider
+        ]
+        if not candidates:
+            return None
+        try:
+            for endpoint_id in candidates:
+                selected = self._select_adapter(
+                    model_id,
+                    required_modalities=required_modalities,
+                    prefill_tokens=prefill_tokens,
+                    preferred_endpoint_id=endpoint_id,
+                )
+                if selected is None:
+                    continue
+                # ``_select_adapter`` degrades to an ordinary draw when the
+                # preferred endpoint is not admitted, so it can hand back a
+                # candidate of some other provider. This method promises one of
+                # ``provider``'s own endpoints, so an unhonored preference is
+                # reported as "no admitted candidate" rather than as a target the
+                # caller never named.
+                resolved = endpoint_id_for_adapter(selected)
+                if resolved == endpoint_id:
+                    return resolved
+        except AllCircuitsOpenError:
+            return None
+        return None
 
     def _select_adapter(
         self,
@@ -462,12 +1048,16 @@ class FixedRouter:
         required_modalities: frozenset[str] | None = None,
         prefill_tokens: int = 0,
         exclude: set[str] | None = None,
+        preferred_endpoint_id: str | None = None,
+        endpoint_scope: frozenset[str] | None = None,
+        require_target: bool = False,
     ) -> BaseAdapter | None:
         """Select an adapter using weighted random selection with optional affinity.
 
         Args:
             model_id: Model identifier.
-            pin_provider: Optional provider/endpoint_id to pin to. Overrides affinity.
+            pin_provider: Optional provider/endpoint_id to pin to. Overrides
+                affinity and disables fallback at the call site.
             required_modalities: Non-text input modalities the request needs.
                 Routes that do not declare all of them are excluded so media is
                 never dispatched to a route that cannot handle it.
@@ -478,6 +1068,20 @@ class FixedRouter:
             exclude: Endpoint ids this request has already been refused a
                 dispatch claim for, so a reselection does not hand back the
                 endpoint whose half-open probe another caller is holding.
+            preferred_endpoint_id: Target to honor when this route can serve it.
+                Preferred over affinity (the caller asked for it now), but unlike
+                ``pin_provider`` it stays a normal selection: the caller's
+                fallback loop still applies if this attempt fails, and an
+                out-of-range target degrades to ordinary selection instead of
+                failing the request.
+            endpoint_scope: Candidate range for this dispatch. Narrows the route
+                before modality filtering and before the health/affinity gates,
+                so ``exclude`` and the fallback loop inherit the same range.
+            require_target: When True, ``preferred_endpoint_id`` is the only
+                endpoint this selection may return. An endpoint that is not
+                admissible raises :class:`TargetUnavailableError` instead of
+                being replaced by the ordinary draw, so a caller that planned one
+                candidate per attempt is told which candidate it lost.
 
         Returns:
             Selected adapter or None if no route configured / no match.
@@ -487,6 +1091,14 @@ class FixedRouter:
             return None
 
         effective = self._get_effective_adapters(model_id, route)
+        if endpoint_scope is not None:
+            # A backend that owns one execution domain narrows the route here,
+            # so its fallback candidates are inside the domain too.
+            effective = [
+                (adapter, weight)
+                for adapter, weight in effective
+                if adapter_in_endpoint_scope(adapter, endpoint_scope)
+            ]
         if required_modalities:
             effective = [
                 (adapter, weight)
@@ -498,6 +1110,10 @@ class FixedRouter:
                     f"No route for model {model_id} accepts input modalities "
                     f"{sorted(required_modalities)}"
                 )
+        if endpoint_scope is not None and not effective:
+            raise AllCircuitsOpenError(
+                f"No route for model {model_id} inside the dispatch scope: {sorted(endpoint_scope)}"
+            )
 
         if pin_provider:
             for adapter, weight in effective:
@@ -536,7 +1152,13 @@ class FixedRouter:
         # Set when a pin is dropped for backlog, so selection does not simply
         # hand the caller straight back to the endpoint it was moved off.
         avoid_endpoint_id: str | None = None
-        if affinity_key:
+        # A required target outranks affinity. Affinity remembers what served
+        # this conversation last, and honoring it here would hand back an
+        # endpoint the caller has explicitly ruled out for this dispatch -- the
+        # planned candidate would be silently replaced by the one the plan has
+        # already left behind. The entry is left alone rather than dropped: it is
+        # still the right answer for the next ordinary selection.
+        if affinity_key and not require_target:
             now = time.monotonic()
             with self._lock:
                 entry = self._affinity.get((affinity_key, model_id))
@@ -562,6 +1184,77 @@ class FixedRouter:
                 elif entry is not None:
                     del self._affinity[(affinity_key, model_id)]
 
+        # A caller-supplied target outranks affinity: it was asked for now,
+        # while affinity only remembers what served this conversation last. It
+        # is still an ordinary selection -- the caller's fallback loop applies
+        # if this endpoint fails -- so it differs from ``pin_provider``, which
+        # collapses the route to one candidate and disables fallback.
+        if preferred_endpoint_id:
+            targeted = [
+                (adapter, weight)
+                for adapter, weight in allowed
+                if endpoint_id_for_adapter(adapter) == preferred_endpoint_id
+            ]
+            if targeted:
+                return self._record_affinity_and_return(
+                    model_id,
+                    self._weighted_draw(
+                        model_id,
+                        targeted,
+                        prefill_tokens=prefill_tokens,
+                        affinity_key=affinity_key,
+                        avoid_endpoint_id=None,
+                    ),
+                    affinity_key,
+                )
+            if require_target:
+                # Falling through would hand back a different endpoint: the
+                # caller asked for this one, and a substituted candidate can
+                # reorder a plan that has already tried the substitute.
+                raise TargetUnavailableError(
+                    f"endpoint {preferred_endpoint_id!r} is not admissible for model {model_id}"
+                )
+
+        chosen = self._weighted_draw(
+            model_id,
+            allowed,
+            prefill_tokens=prefill_tokens,
+            affinity_key=affinity_key,
+            avoid_endpoint_id=avoid_endpoint_id,
+        )
+        return self._record_affinity_and_return(model_id, chosen, affinity_key)
+
+    def _record_affinity_and_return(
+        self,
+        model_id: str,
+        chosen: BaseAdapter,
+        affinity_key: str | None,
+    ) -> BaseAdapter:
+        """Remember ``chosen`` for this conversation and return it."""
+        if affinity_key:
+            now = time.monotonic()
+            with self._lock:
+                self._affinity[(affinity_key, model_id)] = _Affinity(
+                    endpoint_id=endpoint_id_for_adapter(chosen),
+                    expires_at=now + AFFINITY_TTL_SECONDS,
+                )
+                self._maybe_sweep_affinity_locked(now)
+        return chosen
+
+    def _weighted_draw(
+        self,
+        model_id: str,
+        allowed: list[tuple[BaseAdapter, float]],
+        *,
+        prefill_tokens: int,
+        affinity_key: str | None,
+        avoid_endpoint_id: str | None,
+    ) -> BaseAdapter:
+        """Draw one adapter from ``allowed`` by weight, prefill-aware.
+
+        Extracted so the preferred-target branch and ordinary selection run the
+        *same* draw, including its degrade-to-weighted-draw guard.
+        """
         total_allowed = sum(w for _, w in allowed)
         pool = (
             [(a, w / total_allowed) for a, w in allowed]
@@ -609,18 +1302,7 @@ class FixedRouter:
                 if sum(fallback_weights) > 0
                 else random.choice(candidates)
             )
-        chosen = pool[index][0]
-
-        if affinity_key:
-            now = time.monotonic()
-            with self._lock:
-                self._affinity[(affinity_key, model_id)] = _Affinity(
-                    endpoint_id=endpoint_id_for_adapter(chosen),
-                    expires_at=now + AFFINITY_TTL_SECONDS,
-                )
-                self._maybe_sweep_affinity_locked(now)
-
-        return chosen
+        return pool[index][0]
 
     def _select_and_claim_adapter(
         self,
@@ -629,6 +1311,9 @@ class FixedRouter:
         pin_provider: str | None = None,
         required_modalities: frozenset[str] | None = None,
         prefill_tokens: int = 0,
+        preferred_endpoint_id: str | None = None,
+        endpoint_scope: frozenset[str] | None = None,
+        require_target: bool = False,
     ) -> tuple[BaseAdapter | None, DispatchClaim | None]:
         """Select an adapter and claim the dispatch slot for its endpoint.
 
@@ -637,7 +1322,8 @@ class FixedRouter:
         handed the same recovering endpoint, which is the stampede the probe
         exists to prevent. The claim is therefore taken here, once, on the single
         adapter selection actually committed to -- covering every path an adapter
-        leaves ``_select_adapter`` by, affinity pin included.
+        leaves ``_select_adapter`` by, affinity and a scheduling policy's
+        preferred target included.
 
         A refused claim means another request holds the probe, not that the
         endpoint is out: drop it for *this* selection only and reselect over the
@@ -653,6 +1339,12 @@ class FixedRouter:
         An explicit pin bypasses admission entirely, as it always has, so it
         neither consults nor spends a probe -- and holds no claim to release,
         which is what keeps pinned traffic from freeing somebody else's.
+
+        ``require_target`` makes the preferred endpoint the only acceptable
+        candidate: when it cannot be admitted, or when its probe is already held,
+        this raises :class:`TargetUnavailableError` rather than reselecting over
+        the rest -- reselecting is how a planned candidate silently becomes a
+        different one.
         """
         if pin_provider:
             return (
@@ -661,19 +1353,56 @@ class FixedRouter:
                     pin_provider=pin_provider,
                     required_modalities=required_modalities,
                     prefill_tokens=prefill_tokens,
+                    endpoint_scope=endpoint_scope,
                 ),
                 None,
             )
 
         route = self.routes.get(model_id)
         attempts = len(route.adapters) if route and route.adapters else 1
+
         exclude: set[str] = set()
+        # A scheduling policy's preferred endpoint is tried first, exactly once,
+        # and as an ordinary dispatch: it takes the same half-open probe claim as
+        # any other automatic pick. Only ``pin_provider`` -- returned above --
+        # overrides admission. Skipping the claim here would let every
+        # concurrent request into an endpoint whose circuit is recovering, which
+        # is the stampede the probe exists to prevent, and the preference is the
+        # normal path rather than an exception: a policy that can name an
+        # endpoint names one on every request.
+        if preferred_endpoint_id and attempts > 0:
+            preferred = self._select_adapter(
+                model_id,
+                required_modalities=required_modalities,
+                prefill_tokens=prefill_tokens,
+                preferred_endpoint_id=preferred_endpoint_id,
+                endpoint_scope=endpoint_scope,
+                require_target=require_target,
+            )
+            if preferred is not None:
+                preferred_endpoint = endpoint_id_for_adapter(preferred)
+                claim = self._health_registry.begin_dispatch(preferred_endpoint)
+                if claim is not None:
+                    return preferred, claim
+                if require_target:
+                    # Another request holds this endpoint's probe. The caller
+                    # named one candidate per attempt, so reselecting here would
+                    # dispatch an endpoint its plan has not reached yet.
+                    raise TargetUnavailableError(
+                        f"endpoint {preferred_endpoint!r} is already probed for model {model_id}"
+                    )
+                # Otherwise drop the preference for this selection only and let
+                # the ordinary loop reselect over the rest, which is what a
+                # refused claim does for every other candidate.
+                exclude.add(preferred_endpoint)
+
         for _ in range(attempts):
             adapter = self._select_adapter(
                 model_id,
                 required_modalities=required_modalities,
                 prefill_tokens=prefill_tokens,
                 exclude=exclude,
+                endpoint_scope=endpoint_scope,
             )
             if adapter is None:
                 return None, None
@@ -687,6 +1416,44 @@ class FixedRouter:
         raise AllCircuitsOpenError(
             f"All provider circuits are open or probing for model {model_id}: {sorted(exclude)}"
         )
+
+    def bind_execution(
+        self,
+        adapter: BaseAdapter,
+        routing_options: RoutingRequestOptions | None,
+        model_id: str,
+        claim: DispatchClaim | None,
+    ) -> LeafBackend:
+        """Return the leaf one attempt executes through, releasing ``claim`` on refusal.
+
+        A binding this router cannot honor is a composition error, so it must not
+        reach the failure accounting -- but the selection already took a dispatch
+        claim for this endpoint, and a claim that is never handed back keeps a
+        recovering endpoint out of rotation until its deadline. Releasing it here
+        is the only unwind this path has.
+        """
+        try:
+            return self._leaf_for(
+                self.binding_for(execution_adapter(adapter, routing_options), model_id)
+            )
+        except BaseException:
+            self._health_registry.end_dispatch(claim)
+            raise
+
+    def binding_for(self, adapter: BaseAdapter, model_id: str) -> EndpointBinding:
+        """Return the execution binding for an adapter this router has committed to.
+
+        Taken after selection and admission, so the binding names the endpoint
+        that is about to run rather than one that might be chosen. It holds the
+        adapter itself: execution then runs exactly that object, and a route edit
+        cannot redirect a request that is already in flight.
+        """
+        return binding_for_adapter(adapter, model_id=model_id)
+
+    @staticmethod
+    def _leaf_for(binding: EndpointBinding) -> LeafBackend:
+        """Return the leaf that executes ``binding``."""
+        return LeafBackend.for_binding(binding)
 
     def _dispatch_priority(
         self,
@@ -753,6 +1520,12 @@ class FixedRouter:
             ValueError: If no route configured for model.
         """
         pin_provider = self._resolve_pin_provider(routing_options, params)
+        preferred_endpoint_id = (
+            routing_options.preferred_endpoint_id if routing_options is not None else None
+        )
+        endpoint_scope = routing_options.endpoint_scope if routing_options is not None else None
+        allow_fallback = routing_options.allow_fallback if routing_options is not None else True
+        require_target = routing_options.require_target if routing_options is not None else False
         required_modalities = (
             routing_options.required_modalities if routing_options is not None else frozenset()
         )
@@ -771,23 +1544,53 @@ class FixedRouter:
         )
         # Proof, for the next turn, that it really contains this prompt.
         anchor = prompt_anchor(messages)
-        primary, primary_claim = self._select_and_claim_adapter(
-            model_id,
-            pin_provider=pin_provider,
-            required_modalities=required_modalities,
-            prefill_tokens=prefill_tokens,
-        )
+        primary = None
+        primary_claim = None
+        lease = None
+        try:
+            with self._prefill_load.routing_transaction():
+                primary, primary_claim = self._select_and_claim_adapter(
+                    model_id,
+                    pin_provider=pin_provider,
+                    required_modalities=required_modalities,
+                    prefill_tokens=prefill_tokens,
+                    preferred_endpoint_id=preferred_endpoint_id,
+                    endpoint_scope=endpoint_scope,
+                    require_target=require_target,
+                )
+                if primary is not None:
+                    lease = self._prefill_load.acquire(
+                        endpoint_id_for_adapter(primary),
+                        prefill_tokens,
+                        affinity_key=affinity_key,
+                        fingerprint=fingerprint,
+                        anchor=anchor,
+                    )
+        except BaseException:
+            if primary_claim is not None:
+                self._health_registry.end_dispatch(primary_claim)
+            raise
         if not primary:
             if pin_provider:
                 raise ProviderPinError(
                     f"Pinned provider '{pin_provider}' not found for model {model_id}"
                 )
             raise ValueError(f"No route configured for model {model_id}")
+        # The adapter this dispatch runs comes from the caller's binding when it
+        # committed to one, and the leaf is built here -- before the attempt --
+        # so a binding that cannot be honored is refused as a composition error
+        # instead of being recorded as a provider failure.
+        try:
+            leaf = self.bind_execution(primary, routing_options, model_id, primary_claim)
+        except BaseException:
+            self._prefill_load.release(lease)
+            raise
+        execution = leaf.adapter
         try:
             endpoint_id = endpoint_id_for_adapter(primary)
             with req_ctx.push(
                 model=model_id,
-                provider=primary.config.provider,
+                provider=execution.config.provider,
                 **{
                     req_ctx.UPSTREAM_PRIORITY: self._dispatch_priority(
                         endpoint_id, prefill_tokens, affinity_key, fingerprint, messages
@@ -795,15 +1598,8 @@ class FixedRouter:
                 },
             ):
                 self._ensure_health(endpoint_id)
-                lease = self._prefill_load.acquire(
-                    endpoint_id,
-                    prefill_tokens,
-                    affinity_key=affinity_key,
-                    fingerprint=fingerprint,
-                    anchor=anchor,
-                )
                 try:
-                    resp = await primary.chat_completion(messages, **params)
+                    resp = await leaf.chat_completion(messages, **params)
                     # A returned response proves this endpoint finished
                     # prefilling this prompt, which is what makes its prefix
                     # safe to remember.
@@ -815,8 +1611,8 @@ class FixedRouter:
             # only set default routing if the adapter didn't provide one.
             if "_routing" not in resp:
                 resp["_routing"] = {
-                    "provider": primary.config.provider,
-                    "base_url": primary.config.base_url,
+                    "provider": execution.config.provider,
+                    "base_url": execution.config.base_url,
                 }
             # Always inject endpoint_id so observation keys match latency profiles.
             resp["_routing"].setdefault("endpoint_id", endpoint_id_for_adapter(primary))
@@ -829,18 +1625,23 @@ class FixedRouter:
                 detail=operator_safe_error(primary_error),
                 exc=primary_error,
             )
-            failed_attempts = [failed_attempt(primary, primary_error)]
+            failed_attempts = [failed_attempt(execution, primary_error)]
+            # Kept in step with ``failed_attempts`` because that list holds only
+            # rendered strings; ``_raise_surfaced_error`` below needs the exception
+            # objects to decide which failure the caller is told about.
+            attempts = [_RouteAttempt(primary, primary_error)]
             # Attach routing to the surfaced error so the error-log path can
             # attribute the failure to the real upstream instead of the "router"
             # sentinel — mirrors the success-path resp["_routing"] injection.
-            # The outer error handler covers both re-raise points below
-            # (pin mode and all-providers-failed); ``failed_attempts`` is stored
-            # by reference so it reflects any fallback attempts appended before
-            # ``primary_error`` is finally re-raised.
+            # Covers the pin-mode re-raise below; the all-providers-failed exit
+            # may surface a fallback's error instead, and ``_raise_surfaced_error``
+            # attaches that one's block. ``failed_attempts`` is stored by
+            # reference either way, so whichever block is surfaced reflects every
+            # fallback attempt appended after this point.
             if not hasattr(primary_error, "_routing"):
                 primary_error._routing = {  # type: ignore[attr-defined]
-                    "provider": primary.config.provider,
-                    "base_url": primary.config.base_url,
+                    "provider": execution.config.provider,
+                    "base_url": execution.config.base_url,
                     "endpoint_id": endpoint_id_for_adapter(primary),
                     "failed_attempts": failed_attempts,
                 }
@@ -848,14 +1649,30 @@ class FixedRouter:
             # provider, so a silent switch would produce misleading results.
             if pin_provider:
                 raise primary_error
+            if not allow_fallback:
+                # The caller owns the candidate order and dispatches one attempt
+                # per candidate, so walking the rest of the route here would try
+                # candidates out of the order it planned -- and would try the
+                # same candidate twice, once here and once from the caller.
+                raise primary_error
             self._drop_affinity(model_id)
             route = self.routes[model_id]
             for adapter, weight in self._get_effective_adapters(model_id, route):
                 if adapter == primary or weight <= 0:
                     continue
+                if not adapter_in_endpoint_scope(adapter, endpoint_scope):
+                    # The dispatch scope bounds fallback too: a backend that owns
+                    # one execution domain must not walk out of it when its
+                    # preferred attempt fails. Selection is already narrowed;
+                    # this loop reads the raw route, so it needs the same gate.
+                    continue
                 endpoint_id = endpoint_id_for_adapter(adapter)
                 if not adapter_supports_modalities(adapter, required_modalities):
                     continue
+                # Resolved before the claim so a binding this router cannot honor
+                # costs no admission slot.
+                execution = execution_adapter(adapter, routing_options)
+                leaf = self._leaf_for(self.binding_for(execution, model_id))
                 # Fallback is still automatic routing, so it must honor the
                 # same shared circuit eligibility as the initial selection.
                 # Explicit pinning returned above and remains the sole circuit
@@ -868,7 +1685,7 @@ class FixedRouter:
                 try:
                     with req_ctx.push(
                         model=model_id,
-                        provider=adapter.config.provider,
+                        provider=execution.config.provider,
                         **{
                             req_ctx.UPSTREAM_PRIORITY: self._dispatch_priority(
                                 endpoint_id, prefill_tokens, affinity_key, fingerprint, messages
@@ -884,15 +1701,15 @@ class FixedRouter:
                             anchor=anchor,
                         )
                         try:
-                            resp = await adapter.chat_completion(messages, **params)
+                            resp = await leaf.chat_completion(messages, **params)
                             self._prefill_load.release(lease, prefill_confirmed=True)
                         finally:
                             self._prefill_load.release(lease)
                         self._on_success(endpoint_id)
                     if "_routing" not in resp:
                         resp["_routing"] = {
-                            "provider": adapter.config.provider,
-                            "base_url": adapter.config.base_url,
+                            "provider": execution.config.provider,
+                            "base_url": execution.config.base_url,
                             "fallback": True,
                         }
                     resp["_routing"].setdefault("endpoint_id", endpoint_id_for_adapter(adapter))
@@ -905,11 +1722,12 @@ class FixedRouter:
                         detail=operator_safe_error(fallback_error),
                         exc=fallback_error,
                     )
-                    failed_attempts.append(failed_attempt(adapter, fallback_error))
+                    failed_attempts.append(failed_attempt(execution, fallback_error))
+                    attempts.append(_RouteAttempt(execution, fallback_error))
                     continue
                 finally:
                     self._health_registry.end_dispatch(fallback_claim)
-            raise primary_error
+            _raise_surfaced_error(attempts, failed_attempts)
         finally:
             # Every exit, cancellation included: a claim the request keeps is a
             # cooldown the endpoint spends invisible to selection. Released after
@@ -943,6 +1761,12 @@ class FixedRouter:
             ValueError: If no route configured for model.
         """
         pin_provider = self._resolve_pin_provider(routing_options, params)
+        preferred_endpoint_id = (
+            routing_options.preferred_endpoint_id if routing_options is not None else None
+        )
+        endpoint_scope = routing_options.endpoint_scope if routing_options is not None else None
+        allow_fallback = routing_options.allow_fallback if routing_options is not None else True
+        require_target = routing_options.require_target if routing_options is not None else False
         required_modalities = (
             routing_options.required_modalities if routing_options is not None else frozenset()
         )
@@ -961,25 +1785,50 @@ class FixedRouter:
         )
         # Proof, for the next turn, that it really contains this prompt.
         anchor = prompt_anchor(messages)
-        primary, primary_claim = self._select_and_claim_adapter(
-            model_id,
-            pin_provider=pin_provider,
-            required_modalities=required_modalities,
-            prefill_tokens=prefill_tokens,
-        )
+        primary = None
+        primary_claim = None
+        lease = None
+        try:
+            with self._prefill_load.routing_transaction():
+                primary, primary_claim = self._select_and_claim_adapter(
+                    model_id,
+                    pin_provider=pin_provider,
+                    required_modalities=required_modalities,
+                    prefill_tokens=prefill_tokens,
+                    preferred_endpoint_id=preferred_endpoint_id,
+                    endpoint_scope=endpoint_scope,
+                    require_target=require_target,
+                )
+                if primary is not None:
+                    lease = self._prefill_load.acquire(
+                        endpoint_id_for_adapter(primary),
+                        prefill_tokens,
+                        affinity_key=affinity_key,
+                        fingerprint=fingerprint,
+                        anchor=anchor,
+                    )
+        except BaseException:
+            if primary_claim is not None:
+                self._health_registry.end_dispatch(primary_claim)
+            raise
         if not primary:
             if pin_provider:
                 raise ProviderPinError(
                     f"Pinned provider '{pin_provider}' not found for model {model_id}"
                 )
             raise ValueError(f"No route configured for model {model_id}")
+        try:
+            leaf = self.bind_execution(primary, routing_options, model_id, primary_claim)
+        except BaseException:
+            self._prefill_load.release(lease)
+            raise
+        execution = leaf.adapter
         chunks_yielded = False
-        lease: PrefillLease | None = None
         try:
             primary_endpoint_id = endpoint_id_for_adapter(primary)
             with req_ctx.push(
                 model=model_id,
-                provider=primary.config.provider,
+                provider=execution.config.provider,
                 **{
                     req_ctx.UPSTREAM_PRIORITY: self._dispatch_priority(
                         primary_endpoint_id, prefill_tokens, affinity_key, fingerprint, messages
@@ -996,15 +1845,8 @@ class FixedRouter:
                 # Charged before the first yield so the lease brackets the whole
                 # upstream interaction: a generator abandoned after the routing
                 # chunk still unwinds through this method's finally.
-                lease = self._prefill_load.acquire(
-                    primary_endpoint_id,
-                    prefill_tokens,
-                    affinity_key=affinity_key,
-                    fingerprint=fingerprint,
-                    anchor=anchor,
-                )
-                yield routing_chunk(primary)
-                async for chunk in primary.stream_chat_completion(messages, **params):
+                yield routing_chunk(execution)
+                async for chunk in leaf.stream_chat_completion(messages, **params):
                     if first and has_non_empty_content(chunk):
                         # Providers may emit keep-alives or empty terminal chunks.
                         first = False
@@ -1029,7 +1871,11 @@ class FixedRouter:
                 detail=operator_safe_error(primary_error),
                 exc=primary_error,
             )
-            failed_attempts = [failed_attempt(primary, primary_error)]
+            failed_attempts = [failed_attempt(execution, primary_error)]
+            # Kept in step with ``failed_attempts`` because that list holds only
+            # rendered strings; ``_raise_surfaced_error`` below needs the exception
+            # objects to decide which failure the caller is told about.
+            attempts = [_RouteAttempt(primary, primary_error)]
             # Attach routing to the surfaced error so the error-log path can
             # attribute the failure to the real upstream. Unlike the
             # non-streaming twin below, this generator never gets a chance to
@@ -1040,22 +1886,31 @@ class FixedRouter:
             # the consumer keeps overwriting its provider with the latest one
             # seen. When every attempt fails without yielding content, that
             # leaves the last (lowest-priority) fallback attributed instead
-            # of primary, whose error is what's actually re-raised below.
+            # of the attempt whose error is what's actually surfaced below.
             # Setting exc._routing here mirrors chat_completion's pattern and
-            # takes priority over the consumer's SSE-derived guess. Covers
-            # all three re-raise points below (pin mode, a stream already
-            # committed to primary, and all-providers-failed); failed_attempts
-            # is stored by reference so it reflects any fallback attempts
-            # appended before primary_error is finally re-raised.
+            # takes priority over the consumer's SSE-derived guess. Covers the
+            # two re-raise points below that are pinned to primary (pin mode,
+            # and a stream already committed to primary); the all-providers-
+            # failed exit may surface a fallback's error instead, and
+            # ``_raise_surfaced_error`` attaches that one's block.
+            # failed_attempts is stored by reference either way, so whichever
+            # block is surfaced reflects every fallback attempt appended after
+            # this point.
             if not hasattr(primary_error, "_routing"):
                 primary_error._routing = {  # type: ignore[attr-defined]
-                    "provider": primary.config.provider,
-                    "base_url": primary.config.base_url,
+                    "provider": execution.config.provider,
+                    "base_url": execution.config.base_url,
                     "endpoint_id": endpoint_id_for_adapter(primary),
                     "failed_attempts": failed_attempts,
                 }
             # Pin mode: never fallback — re-raise immediately.
             if pin_provider:
+                raise primary_error
+            if not allow_fallback:
+                # The caller owns the candidate order and dispatches one attempt
+                # per candidate, so walking the rest of the route here would try
+                # candidates out of the order it planned -- and would try the
+                # same candidate twice, once here and once from the caller.
                 raise primary_error
             self._drop_affinity(model_id)
             # Once any chunk has been yielded to the client the SSE stream
@@ -1070,9 +1925,17 @@ class FixedRouter:
             for adapter, weight in self._get_effective_adapters(model_id, route):
                 if adapter == primary or weight <= 0:
                     continue
+                if not adapter_in_endpoint_scope(adapter, endpoint_scope):
+                    # Same domain bound as the non-streaming fallback loop: a
+                    # scoped dispatch must not leave its domain on failure.
+                    continue
                 adapter_endpoint_id = endpoint_id_for_adapter(adapter)
                 if not adapter_supports_modalities(adapter, required_modalities):
                     continue
+                # Resolved before the claim, for the same reason as the
+                # non-streaming loop: an unusable binding costs no probe slot.
+                execution = execution_adapter(adapter, routing_options)
+                leaf = self._leaf_for(self.binding_for(execution, model_id))
                 # Synthetic routing chunks are emitted only after circuit
                 # admission so an open automatic fallback is never exposed as
                 # an attempted upstream. Explicit pinning returned above. The
@@ -1085,7 +1948,7 @@ class FixedRouter:
                 try:
                     with req_ctx.push(
                         model=model_id,
-                        provider=adapter.config.provider,
+                        provider=execution.config.provider,
                         **{
                             req_ctx.UPSTREAM_PRIORITY: self._dispatch_priority(
                                 adapter_endpoint_id,
@@ -1097,7 +1960,7 @@ class FixedRouter:
                         },
                     ):
                         yield routing_chunk(
-                            adapter,
+                            execution,
                             fallback=True,
                             failed_attempts=failed_attempts,
                         )
@@ -1109,7 +1972,7 @@ class FixedRouter:
                             fingerprint=fingerprint,
                             anchor=anchor,
                         )
-                        async for chunk in adapter.stream_chat_completion(messages, **params):
+                        async for chunk in leaf.stream_chat_completion(messages, **params):
                             if first and has_non_empty_content(chunk):
                                 first = False
                                 self._on_success(adapter_endpoint_id)
@@ -1124,7 +1987,8 @@ class FixedRouter:
                         detail=operator_safe_error(fallback_error),
                         exc=fallback_error,
                     )
-                    failed_attempts.append(failed_attempt(adapter, fallback_error))
+                    failed_attempts.append(failed_attempt(execution, fallback_error))
+                    attempts.append(_RouteAttempt(execution, fallback_error))
                     # Once this fallback provider's bytes reached the client the
                     # SSE stream has committed to it (same invariant as the
                     # primary path above). Re-raise instead of splicing yet
@@ -1140,7 +2004,7 @@ class FixedRouter:
                     # the outer unwind would be the last one only, and every
                     # earlier attempt's probe would sit out its whole deadline.
                     self._health_registry.end_dispatch(fallback_claim)
-            raise primary_error
+            _raise_surfaced_error(attempts, failed_attempts)
         finally:
             # Backstop for every exit this generator has: an upstream error
             # before the first token, and — the case that actually leaks in

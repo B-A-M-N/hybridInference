@@ -6,6 +6,7 @@ unified effective cost plus a cost-budgeted mean-TTFT LP.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -71,6 +72,16 @@ class RouteWiseConfig:
     envelope_lower_percentile: float = 10.0
     envelope_upper_percentile: float = 90.0
     envelope_min_samples: int = 1
+    # Cap on samples retained per pool inside the envelope window, mirroring
+    # latency_max_samples_per_profile. The window is otherwise one sample per
+    # request for envelope_window_hours, so both its memory and the cost of the
+    # percentile sort grow with traffic. 0 restores the unbounded window.
+    envelope_max_samples: int = 20_000
+    # Seconds an L/U snapshot is reused before it is recomputed. The envelope
+    # describes hours of workload, so a snapshot a second old is the same
+    # snapshot; recomputing it per request is what made routing cost scale with
+    # traffic. 0 recomputes on every decision.
+    envelope_cache_ttl_sec: float = 1.0
     # DB-bootstrap-only donor models: replay these models' historical rows
     # into THIS model's envelope (priced with this model's routes) so a model
     # with no traffic of its own can cold-start from a sibling serving the
@@ -98,6 +109,13 @@ class RouteWiseConfig:
 
     # Optional active probing for cold or idle RouteWise endpoints. Probes
     # request one token and feed the same latency profiles used by live traffic.
+    # `routewise_probe_max_concurrency` caps probes in flight across the whole
+    # gateway process, not per model: every RouteWise model owns a router and a
+    # probe loop, so a per-router cap would let models sharing one provider
+    # subscription probe it simultaneously and trip the provider's own
+    # concurrency limit. Where models configure different values the lowest one
+    # wins, process-wide, and each router registers its value when it is built
+    # so the whole set is known before the first probe goes out.
     routewise_probe_enabled: bool = False
     routewise_probe_interval_sec: float = 300.0
     routewise_probe_timeout_sec: float = 30.0
@@ -105,11 +123,31 @@ class RouteWiseConfig:
     routewise_probe_idle_threshold_sec: float = 900.0
     routewise_probe_max_concurrency: int = 1
 
+    # Per-candidate detail in the decision metadata persisted to
+    # api_logs.metadata->'routewise'. The per-request fields nothing reads back
+    # (each candidate's request cost, cost reason, prefix-cache discount and
+    # quota use) are worth roughly a third of the blob, so they are opt-in for
+    # studying a deployment's decisions rather than always-on storage.
+    decision_metadata_candidate_detail: bool = False
+
     # Guarded cache-aware cost adjustment. When enabled, on-demand candidates
     # can use the prefix-cache estimate as an effective-cost discount before the LP.
     # Default off; rotating key-pool endpoints are skipped until key_slot is
     # available in the cache scope.
     prefix_cache_cost_adjustment_enabled: bool = False
+
+    # Prefill-load-aware routing. When enabled, RouteWise reads the existing
+    # PrefillLoadTracker (per-endpoint outstanding uncached prefill tokens) and
+    # adds a bounded soft TTFT penalty to loaded endpoints in the LP. This is a
+    # soft signal only: it never makes an endpoint infeasible. Default off.
+    prefill_load_routing_enabled: bool = False
+    # Scale factor converting outstanding prefill tokens to an additive TTFT
+    # penalty in ms. 1.0 = 1ms per 1000 tokens. Calibrated so that a 200K
+    # backlog adds ~200ms of adjusted TTFT — meaningful but not dominant.
+    prefill_load_scale_ms_per_1k: float = 1.0
+    # Cap on the prefill-load TTFT penalty in ms. Prevents extreme backlogs
+    # from completely dominating the LP objective. 5000ms = 5s.
+    prefill_load_max_penalty_ms: float = 5000.0
 
     def __post_init__(self) -> None:
         if self.latency_hedge_mode not in VALID_LATENCY_HEDGE_MODES:
@@ -122,4 +160,16 @@ class RouteWiseConfig:
             allowed = ", ".join(sorted(VALID_FALLBACK_MODES))
             raise ValueError(
                 f"Unsupported fallback_mode {self.fallback_mode!r}; expected one of: {allowed}"
+            )
+        if self.prefill_load_scale_ms_per_1k < 0 or not math.isfinite(
+            self.prefill_load_scale_ms_per_1k
+        ):
+            raise ValueError(
+                f"prefill_load_scale_ms_per_1k must be finite and >= 0, got {self.prefill_load_scale_ms_per_1k}"
+            )
+        if self.prefill_load_max_penalty_ms < 0 or not math.isfinite(
+            self.prefill_load_max_penalty_ms
+        ):
+            raise ValueError(
+                f"prefill_load_max_penalty_ms must be finite and >= 0, got {self.prefill_load_max_penalty_ms}"
             )
