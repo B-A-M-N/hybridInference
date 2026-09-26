@@ -80,11 +80,11 @@ async def check_and_record_signup(request) -> tuple[bool, str | None]:
                 _unresolved_attempts.popleft()
             day_count = len(_unresolved_attempts)
             hour_count = sum(1 for t in _unresolved_attempts if t >= hour_cutoff)
+            if day_count >= day_limit:
+                return False, "unresolved_day"
+            if hour_count >= hour_limit:
+                return False, "unresolved_hour"
             _unresolved_attempts.append(now)
-        if day_count >= day_limit:
-            return False, "unresolved_day"
-        if hour_count >= hour_limit:
-            return False, "unresolved_hour"
         return True, None
 
     ip_key = f"client:{normalize_ip_bucket(ip_info.client_ip)}"
@@ -101,23 +101,26 @@ async def check_and_record_signup(request) -> tuple[bool, str | None]:
             _sweep_inactive(day_cutoff)
 
         bucket = _attempts.get(ip_key)
+        if bucket is not None:
+            while bucket and bucket[0] < day_cutoff:
+                bucket.popleft()
+            if not bucket:
+                del _attempts[ip_key]
+                bucket = None
+
+        hour_count = sum(1 for t in bucket if t >= hour_cutoff) if bucket else 0
+        day_count = len(bucket) if bucket else 0
+        # Prefer the longer window when both trip so Retry-After reflects the
+        # real wait (telling a 24h-blocked client to retry in 1h is wrong).
+        if day_count >= per_day:
+            return False, "day"
+        if hour_count >= per_hour:
+            return False, "hour"
         if bucket is None:
             bucket = deque()
             _attempts[ip_key] = bucket
-
-        while bucket and bucket[0] < day_cutoff:
-            bucket.popleft()
-
-        hour_count = sum(1 for t in bucket if t >= hour_cutoff)
-        day_count = len(bucket)
         bucket.append(now)
 
-    # Prefer the longer window when both trip so Retry-After reflects the
-    # real wait (telling a 24h-blocked client to retry in 1h is wrong).
-    if day_count >= per_day:
-        return False, "day"
-    if hour_count >= per_hour:
-        return False, "hour"
     return True, None
 
 
