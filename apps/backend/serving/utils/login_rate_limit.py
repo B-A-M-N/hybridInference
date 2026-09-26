@@ -95,25 +95,26 @@ async def check_and_record_login(email: str, request) -> tuple[bool, str | None]
                 _sweep_inactive(_ip_attempts, ip_cutoff)
 
         email_bucket = _email_attempts.get(email_key)
-        if email_bucket is None:
-            email_bucket = deque()
-            _email_attempts[email_key] = email_bucket
-        while email_bucket and email_bucket[0] < email_cutoff:
-            email_bucket.popleft()
+        if email_bucket is not None:
+            while email_bucket and email_bucket[0] < email_cutoff:
+                email_bucket.popleft()
+            if not email_bucket:
+                del _email_attempts[email_key]
+                email_bucket = None
 
-        email_count = len(email_bucket)
-        email_bucket.append(now)
+        email_count = len(email_bucket) if email_bucket else 0
 
+        ip_bucket = None
         if ip_key is not None:
             ip_bucket = _ip_attempts.get(ip_key)
-            if ip_bucket is None:
-                ip_bucket = deque()
-                _ip_attempts[ip_key] = ip_bucket
-            while ip_bucket and ip_bucket[0] < ip_cutoff:
-                ip_bucket.popleft()
+            if ip_bucket is not None:
+                while ip_bucket and ip_bucket[0] < ip_cutoff:
+                    ip_bucket.popleft()
+                if not ip_bucket:
+                    del _ip_attempts[ip_key]
+                    ip_bucket = None
 
-            ip_count = len(ip_bucket)
-            ip_bucket.append(now)
+            ip_count = len(ip_bucket) if ip_bucket else 0
         else:
             ip_count = 0  # No per-IP limiting when unresolved
 
@@ -121,16 +122,25 @@ async def check_and_record_login(email: str, request) -> tuple[bool, str | None]
             while _unresolved_attempts and _unresolved_attempts[0] < ip_cutoff:
                 _unresolved_attempts.popleft()
             unresolved_count = len(_unresolved_attempts)
-            _unresolved_attempts.append(now)
+        if unresolved and unresolved_count >= settings.unresolved_login_rate_limit_per_hour:
+            return False, "unresolved"
+        if ip_count >= per_ip:
+            return False, "ip"
+        if email_count >= per_email:
+            return False, "email"
 
-    # Prefer the longer window when both trip so Retry-After reflects a
-    # real wait (telling a 24h-blocked client to retry in 15m is wrong).
-    if unresolved and unresolved_count >= settings.unresolved_login_rate_limit_per_hour:
-        return False, "unresolved"
-    if ip_count >= per_ip:
-        return False, "ip"
-    if email_count >= per_email:
-        return False, "email"
+        if email_bucket is None:
+            email_bucket = deque()
+            _email_attempts[email_key] = email_bucket
+        email_bucket.append(now)
+        if ip_bucket is not None:
+            ip_bucket.append(now)
+        elif ip_key is not None:
+            ip_bucket = deque()
+            _ip_attempts[ip_key] = ip_bucket
+            ip_bucket.append(now)
+        if unresolved:
+            _unresolved_attempts.append(now)
     return True, None
 
 

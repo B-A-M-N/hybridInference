@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
+import serving.utils.login_rate_limit as login_rate_limit
+import serving.utils.signup_rate_limit as signup_rate_limit
 from serving.config.settings import Settings
 from serving.utils.login_rate_limit import (
     check_and_record_login,
@@ -151,3 +154,72 @@ async def test_login_unresolved_skips_ip_limit(_live_settings):
             assert allowed is True
             assert reason is None
         assert await check_and_record_login("user3@example.com", request) == (False, "unresolved")
+
+
+@pytest.mark.asyncio
+async def test_signup_rejected_attempts_do_not_grow_or_delay_recovery(_live_settings, monkeypatch):
+    """Rejected attempts remain outside both the queue and its expiry window."""
+    request = SimpleNamespace(headers={}, client=SimpleNamespace(host="172.19.0.1"))
+    _live_settings.unresolved_signup_rate_limit_per_hour = 2
+    _live_settings.unresolved_signup_rate_limit_per_day = 10
+    now = 1_000.0
+
+    with patch("serving.utils.signup_rate_limit.settings", _live_settings):
+        monkeypatch.setattr(signup_rate_limit, "_now", lambda: now)
+        assert await check_and_record_signup(request) == (True, None)
+        assert await check_and_record_signup(request) == (True, None)
+        for _ in range(500):
+            assert await check_and_record_signup(request) == (False, "unresolved_hour")
+        assert len(signup_rate_limit._unresolved_attempts) == 2
+
+        now += 3_601
+        assert await check_and_record_signup(request) == (True, None)
+
+
+@pytest.mark.asyncio
+async def test_signup_per_ip_rejections_do_not_grow_bucket(_live_settings, monkeypatch):
+    """A saturated resolved-client bucket stores only permitted attempts."""
+    request = _request("8.8.8.20")
+    _live_settings.signup_rate_limit_per_hour = 2
+    _live_settings.signup_rate_limit_per_day = 10
+    now = 2_000.0
+
+    with patch("serving.utils.signup_rate_limit.settings", _live_settings):
+        monkeypatch.setattr(signup_rate_limit, "_now", lambda: now)
+        assert await check_and_record_signup(request) == (True, None)
+        assert await check_and_record_signup(request) == (True, None)
+        for _ in range(500):
+            assert await check_and_record_signup(request) == (False, "hour")
+        assert len(signup_rate_limit._attempts["client:8.8.8.20"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_login_rejected_attempts_do_not_grow_any_bucket(_live_settings, monkeypatch):
+    """Email, IP, and unresolved queues retain only admitted attempts."""
+    _live_settings.login_rate_limit_per_15min = 2
+    _live_settings.login_rate_limit_per_hour_per_ip = 2
+    _live_settings.unresolved_login_rate_limit_per_hour = 2
+    now = 3_000.0
+
+    with patch("serving.utils.login_rate_limit.settings", _live_settings):
+        monkeypatch.setattr(login_rate_limit, "_now", lambda: now)
+        request = _request("8.8.8.20")
+        assert await check_and_record_login("user@example.com", request) == (True, None)
+        assert await check_and_record_login("user@example.com", request) == (True, None)
+        for _ in range(500):
+            assert await check_and_record_login("user@example.com", request) == (False, "ip")
+        assert len(login_rate_limit._email_attempts["user@example.com"]) == 2
+        assert len(login_rate_limit._ip_attempts["client:8.8.8.20"]) == 2
+
+        unresolved_request = SimpleNamespace(headers={}, client=SimpleNamespace(host="172.19.0.1"))
+        _live_settings.login_rate_limit_per_15min = 10
+        for index in range(2):
+            assert await check_and_record_login(
+                f"unresolved-{index}@example.com", unresolved_request
+            ) == (True, None)
+        for index in range(500):
+            assert await check_and_record_login(
+                f"rejected-{index}@example.com", unresolved_request
+            ) == (False, "unresolved")
+        assert len(login_rate_limit._unresolved_attempts) == 2
+        assert len(login_rate_limit._email_attempts) == 3
