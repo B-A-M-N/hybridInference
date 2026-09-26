@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -78,6 +79,27 @@ def _unreserved_decision(
         metadata=metadata if metadata is not None else {},
         trace=RoutingTrace(),
     )
+
+
+class _ObservedPrefillLoad(PrefillLoadTracker):
+    """Expose when a second router reaches the shared routing transaction."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.other_thread_entered = threading.Event()
+        self._owner_thread: int | None = None
+        self._owner_lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def routing_transaction(self):
+        thread_id = threading.get_ident()
+        with self._owner_lock:
+            if self._owner_thread is None:
+                self._owner_thread = thread_id
+            elif thread_id != self._owner_thread:
+                self.other_thread_entered.set()
+        with super().routing_transaction():
+            yield
 
 
 def _make_model_config(
@@ -4067,6 +4089,78 @@ class TestUpstreamPriority:
                     pass
 
         assert seen == [expected_priority]
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_direct_fallback_waits_for_shared_selection_transaction(self):
+        """A fallback lease cannot race a paused selection on another router."""
+        adapter = _make_adapter(endpoint_id="test-model:shared-prefill")
+        adapter.reports_leg_outcomes = False
+
+        async def _chat(messages, **params):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        adapter.chat_completion = _chat
+        route_table = _FakeRouteTable()
+        route_table.add("test-model", [(adapter, 1.0)])
+        shared_prefill = _ObservedPrefillLoad()
+        config = RouteWiseConfig(
+            db_bootstrap_enabled=False,
+            prefill_load_routing_enabled=True,
+        )
+        selecting_router = RouteWiseRouter(
+            route_table=route_table,
+            config=config,
+            prefill_load=shared_prefill,
+        )
+        fallback_router = RouteWiseRouter(config=config, prefill_load=shared_prefill)
+        selection_started = threading.Event()
+        selection_release = threading.Event()
+        original_select = selecting_router._select_decision_locked
+
+        def _paused_select(*args, **kwargs):
+            selection_started.set()
+            assert selection_release.wait(2.0)
+            return original_select(*args, **kwargs)
+
+        selecting_router._select_decision_locked = _paused_select
+        messages = [{"role": "user", "content": "cold prompt"}]
+
+        with (
+            patch.object(
+                routewise_router_module, "estimate_prefill_tokens", return_value=200_000
+            ),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+                selection_future = pool.submit(
+                    selecting_router._select_decision,
+                    "test-model",
+                    {"messages": messages, "request_id": "paused-selection"},
+                    reserve_prefill=True,
+                )
+                assert selection_started.wait(2.0)
+                dispatch_future = pool.submit(
+                    asyncio.run,
+                    fallback_router._execute_adapter(
+                        _unreserved_decision(adapter), "test-model", messages
+                    ),
+                )
+                try:
+                    assert shared_prefill.other_thread_entered.wait(2.0)
+                    assert not dispatch_future.done()
+                    assert shared_prefill.backlog("test-model:shared-prefill") == 0
+                finally:
+                    selection_release.set()
+
+                selected = selection_future.result(timeout=2.0)
+                assert selected is not None
+                assert shared_prefill.backlog("test-model:shared-prefill") == 200_000
+                selected.release()
+                assert dispatch_future.result(timeout=2.0) == {
+                    "choices": [{"message": {"content": "ok"}}]
+                }
+
+        assert shared_prefill.backlog("test-model:shared-prefill") == 0
 
     @pytest.mark.unit
     @pytest.mark.asyncio

@@ -3310,7 +3310,8 @@ class RouteWiseRouter:
             endpoint_id = endpoint_id_for_adapter(adapter)
             self._reserve_prefix_generation_for_dispatch(decision.trace.request_id, endpoint_id)
             if lease is None and self.config.prefill_load_routing_enabled:
-                lease = self._acquire_prefill_lease(endpoint_id, messages, params)
+                with self._prefill_load.routing_transaction():
+                    lease = self._acquire_prefill_lease(endpoint_id, messages, params)
             dispatch_context: dict[str, Any] = {
                 "model": model_id,
                 "provider": adapter.config.provider,
@@ -3384,7 +3385,8 @@ class RouteWiseRouter:
             endpoint_id = endpoint_id_for_adapter(adapter)
             self._reserve_prefix_generation_for_dispatch(decision.trace.request_id, endpoint_id)
             if lease is None and self.config.prefill_load_routing_enabled:
-                lease = self._acquire_prefill_lease(endpoint_id, messages, params)
+                with self._prefill_load.routing_transaction():
+                    lease = self._acquire_prefill_lease(endpoint_id, messages, params)
             dispatch_context: dict[str, Any] = {
                 "model": model_id,
                 "provider": adapter.config.provider,
