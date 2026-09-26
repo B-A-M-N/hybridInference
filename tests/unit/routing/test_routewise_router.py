@@ -4127,38 +4127,36 @@ class TestUpstreamPriority:
         messages = [{"role": "user", "content": "cold prompt"}]
 
         with (
-            patch.object(
-                routewise_router_module, "estimate_prefill_tokens", return_value=200_000
-            ),
+            patch.object(routewise_router_module, "estimate_prefill_tokens", return_value=200_000),
             ThreadPoolExecutor(max_workers=2) as pool,
         ):
-                selection_future = pool.submit(
-                    selecting_router._select_decision,
-                    "test-model",
-                    {"messages": messages, "request_id": "paused-selection"},
-                    reserve_prefill=True,
-                )
-                assert selection_started.wait(2.0)
-                dispatch_future = pool.submit(
-                    asyncio.run,
-                    fallback_router._execute_adapter(
-                        _unreserved_decision(adapter), "test-model", messages
-                    ),
-                )
-                try:
-                    assert shared_prefill.other_thread_entered.wait(2.0)
-                    assert not dispatch_future.done()
-                    assert shared_prefill.backlog("test-model:shared-prefill") == 0
-                finally:
-                    selection_release.set()
+            selection_future = pool.submit(
+                selecting_router._select_decision,
+                "test-model",
+                {"messages": messages, "request_id": "paused-selection"},
+                reserve_prefill=True,
+            )
+            assert selection_started.wait(2.0)
+            dispatch_future = pool.submit(
+                asyncio.run,
+                fallback_router._execute_adapter(
+                    _unreserved_decision(adapter), "test-model", messages
+                ),
+            )
+            try:
+                assert shared_prefill.other_thread_entered.wait(2.0)
+                assert not dispatch_future.done()
+                assert shared_prefill.backlog("test-model:shared-prefill") == 0
+            finally:
+                selection_release.set()
 
-                selected = selection_future.result(timeout=2.0)
-                assert selected is not None
-                assert shared_prefill.backlog("test-model:shared-prefill") == 200_000
-                selected.release()
-                assert dispatch_future.result(timeout=2.0) == {
-                    "choices": [{"message": {"content": "ok"}}]
-                }
+            selected = selection_future.result(timeout=2.0)
+            assert selected is not None
+            assert shared_prefill.backlog("test-model:shared-prefill") == 200_000
+            selected.release()
+            assert dispatch_future.result(timeout=2.0) == {
+                "choices": [{"message": {"content": "ok"}}]
+            }
 
         assert shared_prefill.backlog("test-model:shared-prefill") == 0
 
