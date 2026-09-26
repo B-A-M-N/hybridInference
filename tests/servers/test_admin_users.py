@@ -1527,9 +1527,7 @@ async def test_hard_delete_renews_claim_during_long_stage(admin_client, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_hard_delete_cancels_stage_after_stale_recovery(
-    admin_client, monkeypatch
-):
+async def test_hard_delete_cancels_stage_after_stale_recovery(admin_client, monkeypatch):
     """A recovered claim cancels the superseded worker's active stage."""
     client, op_store, log_store, _log = admin_client
     op_store.get_user_by_id.return_value = {
