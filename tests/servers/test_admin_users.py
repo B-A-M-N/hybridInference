@@ -17,6 +17,7 @@ from serving.adapters.base import BaseAdapter, ModelConfig
 from serving.exceptions import HardDeleteStateChanged
 from serving.servers.deps import AppServices
 from serving.servers.routers import admin as admin_router
+from serving.servers.routers.admin import users as admin_users
 from serving.storage.base import HardDeleteClaim, HardDeleteClaimProvenance
 
 # ---------------------------------------------------------------------------
@@ -1455,6 +1456,151 @@ async def test_hard_delete_stops_before_next_stage_when_claim_is_superseded(admi
     assert log_store.hard_delete_user_data.await_count == 1
     response_store = client._transport.app.state.services.responses_store
     response_store.delete_user_responses.assert_not_awaited()
+    op_store.hard_delete_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_renews_claim_during_long_stage(admin_client, monkeypatch):
+    """A slow stage remains owned and rejects a concurrent stale recovery."""
+    client, op_store, log_store, _log = admin_client
+    op_store.get_user_by_id.return_value = {
+        "id": "u1",
+        "email": "alice@example.com",
+        "status": "deleted",
+    }
+
+    claim = HardDeleteClaim("claim-token", HardDeleteClaimProvenance.NEW)
+    begin_calls = 0
+    renew_calls = 0
+    stage_started = asyncio.Event()
+    heartbeat_seen = asyncio.Event()
+    release_stage = asyncio.Event()
+
+    async def begin_claim(_user_id, **_kwargs):
+        nonlocal begin_calls
+        begin_calls += 1
+        if begin_calls == 1:
+            return claim
+        assert renew_calls >= 2
+        raise HardDeleteStateChanged("claim is still active")
+
+    async def renew_claim(_user_id, _claim_token):
+        nonlocal renew_calls
+        renew_calls += 1
+        if renew_calls >= 2:
+            heartbeat_seen.set()
+
+    async def slow_log_wipe(_user_id):
+        stage_started.set()
+        await release_stage.wait()
+        return {"api_logs": 1}
+
+    monkeypatch.setattr(admin_users, "_HARD_DELETE_CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.001)
+    op_store.begin_hard_delete_user.side_effect = begin_claim
+    op_store.renew_hard_delete_user_claim.side_effect = renew_claim
+    log_store.hard_delete_user_data.side_effect = slow_log_wipe
+
+    first_request = asyncio.create_task(
+        client.post(
+            "/admin/users/u1/hard-delete",
+            headers=AUTH,
+            json={"confirm": True},
+        )
+    )
+    try:
+        await asyncio.wait_for(stage_started.wait(), timeout=5)
+        await asyncio.wait_for(heartbeat_seen.wait(), timeout=5)
+
+        recovery = await client.post(
+            "/admin/users/u1/hard-delete",
+            headers=AUTH,
+            json={"confirm": True, "recover_stale_claim": True},
+        )
+        assert recovery.status_code == 409
+        assert log_store.hard_delete_user_data.await_count == 1
+    finally:
+        release_stage.set()
+
+    response = await first_request
+    assert response.status_code == 200
+    assert renew_calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_cancels_stage_after_stale_recovery(
+    admin_client, monkeypatch
+):
+    """A recovered claim cancels the superseded worker's active stage."""
+    client, op_store, log_store, _log = admin_client
+    op_store.get_user_by_id.return_value = {
+        "id": "u1",
+        "email": "alice@example.com",
+        "status": "deleted",
+    }
+
+    owner_claim = HardDeleteClaim("owner-token", HardDeleteClaimProvenance.NEW)
+    recovered_claim = HardDeleteClaim("recovered-token", HardDeleteClaimProvenance.RECOVERED)
+    begin_calls = 0
+    stage_started = asyncio.Event()
+    recovery_attempted = asyncio.Event()
+    stage_cancelled = asyncio.Event()
+
+    async def begin_claim(_user_id, **kwargs):
+        nonlocal begin_calls
+        begin_calls += 1
+        if begin_calls == 1:
+            return owner_claim
+        if begin_calls == 2:
+            raise HardDeleteStateChanged("owner claim expired")
+        assert kwargs == {"recover_stale_claim": True}
+        recovery_attempted.set()
+        return recovered_claim
+
+    async def renew_claim(_user_id, claim_token):
+        if claim_token == owner_claim.token:
+            if not recovery_attempted.is_set():
+                return
+            raise HardDeleteStateChanged("owner claim was recovered")
+        raise HardDeleteStateChanged("recovered worker stopped before its stage")
+
+    async def slow_log_wipe(_user_id):
+        stage_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            stage_cancelled.set()
+            raise
+
+    monkeypatch.setattr(admin_users, "_HARD_DELETE_CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.001)
+    op_store.begin_hard_delete_user.side_effect = begin_claim
+    op_store.renew_hard_delete_user_claim.side_effect = renew_claim
+    log_store.hard_delete_user_data.side_effect = slow_log_wipe
+
+    owner_request = asyncio.create_task(
+        client.post(
+            "/admin/users/u1/hard-delete",
+            headers=AUTH,
+            json={"confirm": True},
+        )
+    )
+    owner_response = None
+    try:
+        await asyncio.wait_for(stage_started.wait(), timeout=5)
+        recovery = await client.post(
+            "/admin/users/u1/hard-delete",
+            headers=AUTH,
+            json={"confirm": True, "recover_stale_claim": True},
+        )
+        assert recovery.status_code == 409
+        await asyncio.wait_for(stage_cancelled.wait(), timeout=5)
+        owner_response = await owner_request
+    finally:
+        if not owner_request.done():
+            owner_request.cancel()
+
+    assert owner_response is not None
+    assert owner_response.status_code == 409
+    assert log_store.hard_delete_user_data.await_count == 1
     op_store.hard_delete_user.assert_not_awaited()
 
 

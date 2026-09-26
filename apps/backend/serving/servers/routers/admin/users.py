@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import logging
 from decimal import Decimal
-from typing import Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
@@ -69,6 +70,55 @@ from serving.utils.request_ip import get_client_ip
 
 router = APIRouter(prefix="/admin")
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
+# The claim recovery grace period is one hour. Renew substantially sooner so
+# a slow destructive store operation cannot outlive its ownership lease.
+_HARD_DELETE_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 300.0
+
+
+async def _run_hard_delete_stage_with_heartbeat(
+    stage: Awaitable[Any],
+    *,
+    op_store,
+    user_id: str,
+    claim_token: str,
+) -> Any:
+    """Run one destructive stage while retaining the durable claim.
+
+    A stage can use a different database or service and therefore cannot share
+    the claim transaction. The heartbeat keeps recovery from treating a slow,
+    healthy worker as abandoned. If ownership is superseded, cancel the stage
+    before surfacing the fencing error.
+    """
+
+    async def _heartbeat() -> None:
+        while True:
+            await asyncio.sleep(_HARD_DELETE_CLAIM_HEARTBEAT_INTERVAL_SECONDS)
+            await op_store.renew_hard_delete_user_claim(user_id, claim_token)
+
+    stage_task = asyncio.create_task(stage)
+    heartbeat_task = asyncio.create_task(_heartbeat())
+    try:
+        done, _ = await asyncio.wait(
+            (stage_task, heartbeat_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if heartbeat_task in done:
+            heartbeat_task.result()
+            raise RuntimeError("hard-delete claim heartbeat stopped unexpectedly")
+        return await stage_task
+    except BaseException:
+        if not stage_task.done():
+            stage_task.cancel()
+        await asyncio.gather(stage_task, return_exceptions=True)
+        raise
+    finally:
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
 
 
 @router.get("/users", response_model=ListUsersResponse)
@@ -1159,24 +1209,39 @@ async def hard_delete_user(
         # expires may replace it, and an older worker must stop before it can
         # touch the next store.
         await op_store.renew_hard_delete_user_claim(user_id, claim.token)
-        await log_store.hard_delete_user_data(user_id)
+        await _run_hard_delete_stage_with_heartbeat(
+            log_store.hard_delete_user_data(user_id),
+            op_store=op_store,
+            user_id=user_id,
+            claim_token=claim.token,
+        )
         fence_established = True
 
         # Purge stored Responses API rows (openai_responses).
         if response_store is not None:
             await op_store.renew_hard_delete_user_claim(user_id, claim.token)
-            await response_store.delete_user_responses(user_id)
+            await _run_hard_delete_stage_with_heartbeat(
+                response_store.delete_user_responses(user_id),
+                op_store=op_store,
+                user_id=user_id,
+                claim_token=claim.token,
+            )
 
         # Wipe operational rows + write the new hard-delete audit row,
         # atomically.
         await op_store.renew_hard_delete_user_claim(user_id, claim.token)
-        await op_store.hard_delete_user(
-            user_id,
+        await _run_hard_delete_stage_with_heartbeat(
+            op_store.hard_delete_user(
+                user_id,
+                claim_token=claim.token,
+                admin_ip=get_client_ip(request),
+                admin_id=admin_id,
+                reason=payload.reason,
+                email=email,
+            ),
+            op_store=op_store,
+            user_id=user_id,
             claim_token=claim.token,
-            admin_ip=get_client_ip(request),
-            admin_id=admin_id,
-            reason=payload.reason,
-            email=email,
         )
     except BaseException as exc:
         if (
