@@ -17,6 +17,7 @@ import aiohttp
 import pytest
 
 from serving.adapters.base import ModelConfig
+from serving.adapters.key_pool import KeyPoolExhausted
 from serving.adapters.openai_compat import OpenAICompatAdapter
 from serving.adapters.upstream_limiter import (
     UpstreamConcurrencyLimiter,
@@ -730,6 +731,60 @@ async def test_traffic_admission_callback_waits_for_outbound_slot(stream):
                 await adapter.chat_completion([{"role": "user", "content": "x"}])
 
     assert admitted == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_traffic_admission_callback_waits_for_key_pool_gate(stream):
+    adapter = _adapter(api_keys=[KEY_A])
+    assert adapter._key_pool is not None
+    adapter._key_pool.remove_key(KEY_A)
+    admitted: list[bool] = []
+
+    with req_ctx.push(**{req_ctx.TRAFFIC_ADMISSION_CALLBACK: lambda: admitted.append(True)}):
+        if stream:
+            with pytest.raises(KeyPoolExhausted, match="No active API keys"):
+                async for _chunk in adapter.stream_chat_completion(
+                    [{"role": "user", "content": "x"}]
+                ):
+                    pass
+        else:
+            with pytest.raises(KeyPoolExhausted, match="No active API keys"):
+                await adapter.chat_completion([{"role": "user", "content": "x"}])
+
+    assert admitted == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_admitted_timeout_records_callback_and_releases_outbound_slot(
+    installed_limiter, stream
+):
+    adapter = _adapter()
+    admitted: list[bool] = []
+
+    async def timeout_post(**_kwargs):
+        raise asyncio.TimeoutError
+
+    async def timeout_stream(**_kwargs):
+        if False:  # pragma: no cover - turn this into an async iterator
+            yield ""
+        raise asyncio.TimeoutError
+
+    adapter.http.json_post_with_retry = timeout_post
+    adapter.http.stream_post = timeout_stream
+
+    with req_ctx.push(**{req_ctx.TRAFFIC_ADMISSION_CALLBACK: lambda: admitted.append(True)}):
+        if stream:
+            with pytest.raises(asyncio.TimeoutError):
+                async for _chunk in adapter.stream_chat_completion(
+                    [{"role": "user", "content": "x"}]
+                ):
+                    pass
+        else:
+            with pytest.raises(asyncio.TimeoutError):
+                await adapter.chat_completion([{"role": "user", "content": "x"}])
+
+    assert admitted == [True]
+    assert _state(installed_limiter)["in_flight"] == 0
 
 
 @pytest.mark.parametrize("stream", [False, True])

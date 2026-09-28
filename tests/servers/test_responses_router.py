@@ -19,9 +19,22 @@ from routing.executor import RouteExecutor
 from serving.adapters.base import BaseAdapter, ModelConfig
 from serving.servers.auth import verify_api_key
 from serving.servers.concurrency import enforce_user_concurrency
-from serving.servers.deps import AppServices
+from serving.servers.deps import (
+    AppServices,
+    get_completions_logger,
+    get_cost_tracker,
+    get_log_store,
+    get_model_router_registry,
+    get_model_visibility_resolver,
+    get_pricing_lookup,
+    get_response_store,
+    get_router,
+)
 from serving.servers.middleware.error import install_error_handlers
+from serving.servers.middleware.request_id import RequestIdMiddleware
 from serving.servers.routers import responses
+from serving.servers.routers.completions_cost import CostTracker, PricingLookup
+from serving.servers.routers.completions_logging import CompletionsLogger
 from serving.stream import done_sentinel, make_final_usage_chunk
 
 RESPONSES_TEST_API_KEY = "hyi-responses-test"
@@ -231,6 +244,15 @@ async def responses_app(responses_store, mock_db_logger, mock_operational_store,
         responses_store=responses_store,
         routing_manager=None,
     )
+    services.completions_logger = CompletionsLogger(
+        log_store=mock_log_store,
+        model_router_registry=None,
+    )
+    services.pricing_lookup = PricingLookup(router=router)
+    services.cost_tracker = CostTracker(
+        op_store=services.operational_store,
+        pricing=services.pricing_lookup,
+    )
 
     app = FastAPI(title="Responses Compat Test App")
     app.state.services = services
@@ -249,10 +271,51 @@ async def responses_app(responses_store, mock_db_logger, mock_operational_store,
         return {"authenticated": True, "user_id": "test-user", "role": "internal"}
 
     app.dependency_overrides[verify_api_key] = fake_verify
-    app.dependency_overrides[enforce_user_concurrency] = lambda: None
+
+    async def _get_router():
+        return services.router
+
+    async def _get_log_store():
+        return services.log_store
+
+    async def _get_model_router_registry():
+        return services.model_router_registry
+
+    async def _get_model_visibility_resolver():
+        return services.model_visibility_resolver
+
+    async def _get_completions_logger():
+        return services.completions_logger
+
+    async def _get_pricing_lookup():
+        return services.pricing_lookup
+
+    async def _get_cost_tracker():
+        return services.cost_tracker
+
+    async def _get_response_store():
+        return responses_store
+
+    async def _pass_concurrency_gate():
+        return None
+
+    app.dependency_overrides.update(
+        {
+            get_router: _get_router,
+            get_log_store: _get_log_store,
+            get_model_router_registry: _get_model_router_registry,
+            get_model_visibility_resolver: _get_model_visibility_resolver,
+            get_completions_logger: _get_completions_logger,
+            get_pricing_lookup: _get_pricing_lookup,
+            get_cost_tracker: _get_cost_tracker,
+            get_response_store: _get_response_store,
+            enforce_user_concurrency: _pass_concurrency_gate,
+        }
+    )
 
     install_error_handlers(app)
     app.include_router(responses.router)
+    app.add_middleware(RequestIdMiddleware)
     return app
 
 
@@ -295,7 +358,10 @@ async def test_responses_delegate_forwards_admitted_concurrency(
     stream: bool,
 ):
     """Responses delegation preserves the admitted count for classification."""
-    responses_app.dependency_overrides[enforce_user_concurrency] = lambda: 5
+    async def admitted_concurrency():
+        return 5
+
+    responses_app.dependency_overrides[enforce_user_concurrency] = admitted_concurrency
     body = {"model": TEXT_MODEL, "input": "hello", "stream": stream}
 
     if stream:
@@ -312,6 +378,62 @@ async def test_responses_delegate_forwards_admitted_concurrency(
     assert options is not None
     assert options.traffic_confidence is not None
     assert options.traffic_confidence > 0
+
+
+@pytest.mark.asyncio
+async def test_responses_delegation_keeps_boundary_arrival_for_traffic_history(
+    responses_client,
+    responses_app,
+    monkeypatch,
+):
+    """Translation and dispatch use the ASGI arrival time, not handler time."""
+    from types import SimpleNamespace
+
+    from serving.servers.middleware import request_id
+    from serving.utils.context import notify_traffic_admitted
+    from serving.utils.traffic_state import get_traffic_observation_state
+
+    arrival_timestamp = 1234.5
+    monkeypatch.setattr(
+        request_id,
+        "time",
+        SimpleNamespace(monotonic=lambda: arrival_timestamp),
+    )
+
+    state = get_traffic_observation_state()
+    preview_times: list[float | None] = []
+    commit_times: list[float | None] = []
+    original_preview = state.preview_request
+    original_record = state.record_request
+
+    def capture_preview(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        preview_times.append(kwargs.get("observed_at"))
+        return original_preview(*args, **kwargs)
+
+    def capture_record(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        commit_times.append(kwargs.get("observed_at"))
+        return original_record(*args, **kwargs)
+
+    monkeypatch.setattr(state, "preview_request", capture_preview)
+    monkeypatch.setattr(state, "record_request", capture_record)
+
+    adapter, _weight = responses_app.state.services.router.routes[TEXT_MODEL].adapters[0]
+    original_completion = adapter.chat_completion
+
+    async def admitted_completion(messages: list[dict[str, Any]], **params: Any):
+        notify_traffic_admitted()
+        return await original_completion(messages, **params)
+
+    monkeypatch.setattr(adapter, "chat_completion", admitted_completion)
+    response = await responses_client.post(
+        "/v1/responses",
+        json={"model": TEXT_MODEL, "input": "hello", "store": False},
+        headers=_auth(),
+    )
+
+    assert response.status_code == 200
+    assert preview_times == [arrival_timestamp]
+    assert commit_times == [arrival_timestamp]
 
 
 @pytest.mark.asyncio

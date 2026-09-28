@@ -321,13 +321,13 @@ class AnthropicAdapter(BaseAdapter):
                             except json.JSONDecodeError:
                                 continue
 
-                        # Before the handler keeps a tool call's JSON back: a
-                        # router waiting on a first token must hear it now.
-                        if not saw_output and is_output_event(evt):
-                            saw_output = True
-                            report_first_token()
+                            # Before the handler keeps a tool call's JSON back: a
+                            # router waiting on a first token must hear it now.
+                            if not saw_output and is_output_event(evt):
+                                saw_output = True
+                                report_first_token()
 
-                        result = handle_stream_event(evt, accum)
+                            result = handle_stream_event(evt, accum)
 
                             if result.input_tokens:
                                 input_tokens = result.input_tokens
