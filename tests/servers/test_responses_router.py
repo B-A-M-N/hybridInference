@@ -358,6 +358,7 @@ async def test_responses_delegate_forwards_admitted_concurrency(
     stream: bool,
 ):
     """Responses delegation preserves the admitted count for classification."""
+
     async def admitted_concurrency():
         return 5
 

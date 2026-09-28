@@ -177,11 +177,6 @@ _PINNED_REQUEST_SCOPED_KEYS = frozenset(
         # middleware demotes probe lines from it, so a leftover True would
         # demote the next request on the task to DEBUG.
         "synthetic_probe",
-        "traffic_admission_callback",
-        "traffic_automation_score",
-        "traffic_classification",
-        "traffic_confidence",
-        "traffic_reasons",
     }
 )
 
