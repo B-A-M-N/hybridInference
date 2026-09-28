@@ -4187,6 +4187,95 @@ class TestUpstreamPriority:
         assert seen == [PRIORITY_ELEPHANT, PRIORITY_ELEPHANT]
 
     @pytest.mark.unit
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ("chat", "stream"))
+    async def test_fallback_gets_a_fresh_endpoint_lease_and_priority(self, operation):
+        seen: list[tuple[str, Any, int, int]] = []
+        primary_endpoint = "test-model:priority-primary"
+        fallback_endpoint = "test-model:priority-fallback"
+        primary = _make_adapter(provider="sglang", endpoint_id=primary_endpoint)
+        fallback = _make_adapter(provider="sglang", endpoint_id=fallback_endpoint)
+        primary.reports_leg_outcomes = False
+        fallback.reports_leg_outcomes = False
+        route_table = _FakeRouteTable()
+        route_table.add("test-model", [(primary, 0.5), (fallback, 0.5)])
+        router = RouteWiseRouter(
+            route_table=route_table,
+            config=RouteWiseConfig(
+                db_bootstrap_enabled=False,
+                fallback_mode="policy",
+                prefill_load_routing_enabled=True,
+            ),
+        )
+
+        def record_dispatch(endpoint_id: str) -> None:
+            seen.append(
+                (
+                    endpoint_id,
+                    req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY),
+                    router._prefill_load.backlog(endpoint_id),
+                    router._prefill_load.elephants(endpoint_id),
+                )
+            )
+
+        async def primary_chat(*_args: Any, **_kwargs: Any):
+            record_dispatch(primary_endpoint)
+            raise ConnectionError("primary failed before a response")
+
+        async def fallback_chat(*_args: Any, **_kwargs: Any):
+            record_dispatch(fallback_endpoint)
+            return {"choices": [{"message": {"content": "fallback"}}]}
+
+        async def primary_stream(*_args: Any, **_kwargs: Any):
+            record_dispatch(primary_endpoint)
+            raise ConnectionError("primary failed before a response")
+            yield "unreachable"
+
+        async def fallback_stream(*_args: Any, **_kwargs: Any):
+            record_dispatch(fallback_endpoint)
+            yield 'data: {"choices":[{"delta":{"content":"fallback"}}]}\n\n'
+
+        primary.chat_completion = primary_chat
+        fallback.chat_completion = fallback_chat
+        primary.stream_chat_completion = primary_stream
+        fallback.stream_chat_completion = fallback_stream
+
+        def choose_candidate(candidates: list[Any], _solution: Any):
+            endpoints = {candidate.endpoint_id for candidate in candidates}
+            wanted = primary_endpoint if primary_endpoint in endpoints else fallback_endpoint
+            return next(candidate for candidate in candidates if candidate.endpoint_id == wanted)
+
+        router._sample_solution = choose_candidate  # type: ignore[method-assign]
+        messages = [{"role": "user", "content": "large prompt"}]
+
+        with (
+            patch.object(
+                routewise_router_module,
+                "estimate_prefill_tokens",
+                return_value=250_000,
+            ),
+            req_ctx.push(affinity_key="caller"),
+        ):
+            if operation == "chat":
+                response = await router.chat_completion("test-model", messages)
+                assert response["_routing"]["fallback"] is True
+            else:
+                chunks = [
+                    chunk async for chunk in router.stream_chat_completion("test-model", messages)
+                ]
+                assert any("fallback" in chunk for chunk in chunks)
+
+            assert req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY) is None
+
+        assert seen == [
+            (primary_endpoint, PRIORITY_ELEPHANT, 250_000, 1),
+            (fallback_endpoint, PRIORITY_ELEPHANT, 250_000, 1),
+        ]
+        for endpoint_id in (primary_endpoint, fallback_endpoint):
+            assert router._prefill_load.backlog(endpoint_id) == 0
+            assert router._prefill_load.elephants(endpoint_id) == 0
+
+    @pytest.mark.unit
     def test_routewise_lease_accounting_matches_strict_priority(self):
         """RouteWise charges sibling conversations cold, like their priority."""
         router = RouteWiseRouter(
@@ -4415,6 +4504,89 @@ async def test_start_reports_whether_this_call_activated_the_router():
 @pytest.mark.unit
 class TestPrefillLoadPenalty:
     """Tests for the _prefill_load_penalty_ms helper."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_while_waiting_for_upstream_slot_releases_prefill_lease(self, monkeypatch):
+        """Cancellation in the outbound queue returns backlog and elephant state."""
+        from serving.adapters.upstream_limiter import UpstreamConcurrencyLimiter
+
+        endpoint_id = "test-model:queued-prefill"
+        adapter = _make_adapter(endpoint_id=endpoint_id)
+        route_table = _FakeRouteTable()
+        route_table.add("test-model", [(adapter, 1.0)])
+        router = RouteWiseRouter(
+            route_table=route_table,
+            config=RouteWiseConfig(
+                db_bootstrap_enabled=False,
+                prefill_load_routing_enabled=True,
+            ),
+        )
+        limiter = UpstreamConcurrencyLimiter(
+            initial_limit=1,
+            max_limit=1,
+            acquire_timeout=5.0,
+        )
+        provider_key = "test-provider-key"
+        base_url = "https://provider.example/v1"
+        held_slot = await limiter.acquire("test-provider", provider_key, base_url=base_url)
+        waiting_for_slot = asyncio.Event()
+        seen_priorities: list[Any] = []
+
+        async def wait_for_upstream_slot(*_args: Any, **_kwargs: Any):
+            seen_priorities.append(req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY))
+            waiting_for_slot.set()
+            slot = await limiter.acquire("test-provider", provider_key, base_url=base_url)
+            try:
+                return {"choices": [{"message": {"content": "unused"}}]}
+            finally:
+                slot.release(status_code=200)
+
+        adapter.chat_completion = wait_for_upstream_slot
+        tracker = router._prefill_load
+        real_release = tracker.release
+        released_leases: list[Any] = []
+
+        def record_release(lease: Any, *, prefill_confirmed: bool = False) -> None:
+            was_released = lease.released if lease is not None else True
+            real_release(lease, prefill_confirmed=prefill_confirmed)
+            if lease is not None and not was_released and lease.released:
+                released_leases.append(lease)
+
+        monkeypatch.setattr(tracker, "release", record_release)
+        messages = [{"role": "user", "content": "large request"}]
+        dispatch: asyncio.Task[dict[str, Any]] | None = None
+
+        try:
+            with patch.object(
+                routewise_router_module,
+                "estimate_prefill_tokens",
+                return_value=250_000,
+            ):
+                dispatch = asyncio.create_task(router.chat_completion("test-model", messages))
+                await asyncio.wait_for(waiting_for_slot.wait(), timeout=1)
+                await asyncio.sleep(0)
+
+                assert next(iter(limiter.snapshot().values()))["waiting"] == 1
+                assert tracker.backlog(endpoint_id) == 250_000
+                assert tracker.elephants(endpoint_id) == 1
+
+                dispatch.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await dispatch
+
+            assert next(iter(limiter.snapshot().values()))["waiting"] == 0
+            assert seen_priorities == [PRIORITY_ELEPHANT]
+            assert req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY) is None
+            assert len(released_leases) == 1
+            assert released_leases[0].released is True
+            assert tracker.backlog(endpoint_id) == 0
+            assert tracker.elephants(endpoint_id) == 0
+        finally:
+            if dispatch is not None and not dispatch.done():
+                dispatch.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await dispatch
+            held_slot.release(status_code=200)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("operation", ("chat", "stream"))
