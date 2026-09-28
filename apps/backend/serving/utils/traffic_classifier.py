@@ -139,14 +139,14 @@ def _clamp(value: float, min_val: float = 0.0, max_val: float = 1.0) -> float:
     return max(min_val, min(max_val, value))
 
 
-def _positive_finite(value: object) -> TypeGuard[float | int]:
-    """Return whether *value* is a usable positive duration."""
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        and value > 0
-    )
+def _nonnegative_finite(value: object) -> TypeGuard[float | int]:
+    """Return whether *value* is a usable nonnegative duration."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
 
 
 def _greater_than_one(value: object) -> TypeGuard[int]:
@@ -259,7 +259,7 @@ def classify_traffic(evidence: TrafficEvidence) -> TrafficClassification:
     # Collect present signals with their scores and weights
     signals: list[tuple[str, float, float]] = []  # (name, score, weight)
 
-    if _positive_finite(evidence.inter_arrival_ms):
+    if _nonnegative_finite(evidence.inter_arrival_ms):
         score = _score_cadence(evidence.inter_arrival_ms)
         signals.append(("cadence", score, WEIGHT_CADENCE))
 
@@ -318,7 +318,7 @@ def classify_traffic(evidence: TrafficEvidence) -> TrafficClassification:
     # not a multiplier: sequential interactive traffic needs a path to the
     # routing gate even when each request is single-threaded and changes shape.
     num_signals = len(signals)
-    has_temporal = _positive_finite(evidence.inter_arrival_ms)
+    has_temporal = _nonnegative_finite(evidence.inter_arrival_ms)
     has_volume = _greater_than_one(evidence.concurrent_requests) or _greater_than_one(
         evidence.shape_repeat_count
     )
@@ -402,7 +402,7 @@ def _generate_reasons(
 
     if class_hint == TrafficClass.UNKNOWN:
         if (
-            not _positive_finite(evidence.inter_arrival_ms)
+            not _nonnegative_finite(evidence.inter_arrival_ms)
             and not _greater_than_one(evidence.concurrent_requests)
             and not _greater_than_one(evidence.shape_repeat_count)
         ):
