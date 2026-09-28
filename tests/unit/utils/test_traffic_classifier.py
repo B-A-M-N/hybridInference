@@ -376,19 +376,25 @@ def test_score_bounded():
     assert 0.0 <= classification.confidence <= 1.0
 
 
-def test_invalid_inter_arrival():
-    """Zero or negative inter-arrival is treated as missing."""
+def test_zero_inter_arrival_contributes_rapid_cadence_evidence():
+    """Simultaneous arrivals count as the fastest observed cadence."""
     evidence = TrafficEvidence(inter_arrival_ms=0)
     classification = classify_traffic(evidence)
-    # Should not crash, should treat as missing
     assert classification.class_hint == TrafficClass.UNKNOWN
+    assert classification.confidence > 0
+    assert "rapid_cadence" in classification.reasons
 
 
-def test_negative_inter_arrival():
-    """Negative inter-arrival is treated as missing."""
-    evidence = TrafficEvidence(inter_arrival_ms=-100)
+@pytest.mark.parametrize(
+    "inter_arrival_ms",
+    [-100, float("inf"), float("-inf"), float("nan")],
+)
+def test_invalid_inter_arrival_is_missing(inter_arrival_ms: float):
+    """Negative and non-finite inter-arrival values are not cadence evidence."""
+    evidence = TrafficEvidence(inter_arrival_ms=inter_arrival_ms)
     classification = classify_traffic(evidence)
     assert classification.class_hint == TrafficClass.UNKNOWN
+    assert "rapid_cadence" not in classification.reasons
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +490,36 @@ def test_traffic_state_inter_arrival():
     result2 = state.record_request(user_id="user_1")
     assert result2["inter_arrival_ms"] is not None
     assert result2["inter_arrival_ms"] == pytest.approx(50.0)
+
+
+def test_simultaneous_arrivals_keep_zero_inter_arrival_in_preview_and_commit():
+    """Equal original arrival timestamps produce a real zero interval."""
+    now = [100.0]
+    state = TrafficObservationState(clock=lambda: now[0])
+
+    first = state.record_request(user_id="user_1", observed_at=100.0)
+    preview = state.preview_request(user_id="user_1", observed_at=100.0)
+    committed = state.record_request(user_id="user_1", observed_at=100.0)
+
+    assert first["inter_arrival_ms"] is None
+    assert preview["inter_arrival_ms"] == 0.0
+    assert committed["inter_arrival_ms"] == 0.0
+
+
+def test_out_of_order_commit_does_not_manufacture_zero_inter_arrival():
+    """A late commit with an older arrival time is not simultaneous traffic."""
+    now = [101.0]
+    state = TrafficObservationState(clock=lambda: now[0])
+    state.record_request(user_id="user_1", observed_at=101.0)
+
+    now[0] = 102.0
+    preview = state.preview_request(user_id="user_1", observed_at=100.0)
+    committed = state.record_request(user_id="user_1", observed_at=100.0)
+    latest = state.preview_request(user_id="user_1", observed_at=101.0)
+
+    assert preview["inter_arrival_ms"] is None
+    assert committed["inter_arrival_ms"] is None
+    assert latest["inter_arrival_ms"] == 0.0
 
 
 def test_traffic_state_shape_repetition():

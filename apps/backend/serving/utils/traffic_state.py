@@ -157,7 +157,9 @@ class TrafficObservationState:
         # Calculate inter-arrival
         inter_arrival_ms: float | None = None
         if entry.last_request_ts is not None:
-            inter_arrival_ms = max(0.0, (request_time - entry.last_request_ts) * 1000)
+            elapsed = request_time - entry.last_request_ts
+            if elapsed >= 0:
+                inter_arrival_ms = elapsed * 1000
 
         # Update last request timestamp
         is_latest_observation = (
@@ -255,7 +257,9 @@ class TrafficObservationState:
 
         inter_arrival_ms: float | None = None
         if entry.last_request_ts is not None:
-            inter_arrival_ms = max(0.0, (request_time - entry.last_request_ts) * 1000)
+            elapsed = request_time - entry.last_request_ts
+            if elapsed >= 0:
+                inter_arrival_ms = elapsed * 1000
 
         shape_repeat_count: int | None = None
         if shape_hash:
