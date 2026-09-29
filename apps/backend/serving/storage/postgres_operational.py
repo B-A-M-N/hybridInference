@@ -1058,7 +1058,9 @@ class PostgresOperationalStore(OperationalStore):
                     "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
                     user_id,
                 )
-                if row is not None and row["hard_delete_pending"]:
+                if row is None:
+                    raise HardDeleteStateChanged(f"Account {user_id} no longer exists.")
+                if row["hard_delete_pending"]:
                     raise HardDeleteStateChanged(
                         f"Account {user_id} has a hard-delete in progress."
                     )
@@ -1249,7 +1251,9 @@ class PostgresOperationalStore(OperationalStore):
                 "SELECT status, hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
                 user_id,
             )
-            if row is not None and row["hard_delete_pending"]:
+            if row is None or row["status"] != "deleted":
+                raise HardDeleteStateChanged(f"Account {user_id} is no longer soft-deleted.")
+            if row["hard_delete_pending"]:
                 raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
             await conn.execute("UPDATE users SET status = 'active' WHERE id = $1", user_id)
             await conn.execute(
@@ -1825,21 +1829,19 @@ class PostgresOperationalStore(OperationalStore):
     ) -> None:
         """Set status='active', record reviewer and note."""
         async with self._pool.acquire() as conn, conn.transaction():
-            # Lock the row and re-check the durable claim before any approval
-            # path can activate an account under erasure.
             row = await conn.fetchrow(
-                "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
-                user_id,
-            )
-            if row is not None and row["hard_delete_pending"]:
-                raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
-            await conn.execute(
                 "UPDATE users SET status = 'active', approval_note = $1, "
-                "reviewed_at = NOW(), reviewed_by = $2 WHERE id = $3",
+                "reviewed_at = NOW(), reviewed_by = $2 "
+                "WHERE id = $3 AND status = 'pending_approval' "
+                "AND hard_delete_pending = FALSE RETURNING id",
                 note,
                 admin_id,
                 user_id,
             )
+            if row is None:
+                raise HardDeleteStateChanged(
+                    f"Account {user_id} no longer exists or is not pending approval."
+                )
 
     async def reject_user(
         self,
@@ -1850,21 +1852,19 @@ class PostgresOperationalStore(OperationalStore):
     ) -> None:
         """Set status='rejected', record reviewer and reason."""
         async with self._pool.acquire() as conn, conn.transaction():
-            # Rejection also mutates a concrete user status and must share the
-            # same row-lock guard as approval and generic status updates.
             row = await conn.fetchrow(
-                "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
-                user_id,
-            )
-            if row is not None and row["hard_delete_pending"]:
-                raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
-            await conn.execute(
                 "UPDATE users SET status = 'rejected', approval_note = $1, "
-                "reviewed_at = NOW(), reviewed_by = $2 WHERE id = $3",
+                "reviewed_at = NOW(), reviewed_by = $2 "
+                "WHERE id = $3 AND status = 'pending_approval' "
+                "AND hard_delete_pending = FALSE RETURNING id",
                 reason,
                 admin_id,
                 user_id,
             )
+            if row is None:
+                raise HardDeleteStateChanged(
+                    f"Account {user_id} no longer exists or is not pending approval."
+                )
 
     async def get_user_counts_by_status(self) -> dict[str, int]:
         """Return ``{status_value: count}`` for all statuses."""

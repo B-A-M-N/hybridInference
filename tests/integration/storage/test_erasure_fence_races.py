@@ -763,6 +763,157 @@ async def test_resume_race_hard_delete_wins(fence_store):
         await conn.execute("DELETE FROM users WHERE id = $1", _OWNER)
 
 
+async def test_resume_endpoint_delete_wins_after_preflight_returns_conflict(
+    fence_store, monkeypatch
+):
+    """A completed delete between route preflight and store mutation returns 409."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    import serving.servers.routers.admin.users as admin_users
+    from serving.schemas_admin import HardDeleteUserRequest, ResumeUserRequest
+
+    log_store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    resume_ready = asyncio.Event()
+    allow_resume = asyncio.Event()
+
+    class PausingResumeStore:
+        def __getattr__(self, name: str):
+            return getattr(op_store, name)
+
+        async def resume_user(self, *args, **kwargs):
+            # The route has already read the soft-deleted user and checked
+            # that no erasure fence exists before reaching this boundary.
+            resume_ready.set()
+            await allow_resume.wait()
+            return await op_store.resume_user(*args, **kwargs)
+
+    class ResponseStore:
+        async def delete_user_responses(self, user_id: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        admin_users,
+        "get_settings",
+        lambda: SimpleNamespace(erasure_fence_protocol_ready=True),
+    )
+    request_scope = {
+        "type": "http",
+        "headers": [],
+        "client": ("127.0.0.1", 12345),
+        "server": ("test", 80),
+        "scheme": "http",
+    }
+    resume = asyncio.create_task(
+        admin_users.resume_user(
+            Request(request_scope),
+            _OWNER,
+            ResumeUserRequest(reason="raced with hard delete"),
+            admin_id="admin",
+            op_store=PausingResumeStore(),
+            log_store=log_store,
+        )
+    )
+
+    try:
+        await asyncio.wait_for(resume_ready.wait(), timeout=5)
+        assert await log_store.account_has_erasure_fence(_OWNER) is False
+
+        await admin_users.hard_delete_user(
+            Request(request_scope),
+            _OWNER,
+            HardDeleteUserRequest(confirm=True),
+            admin_id="delete-admin",
+            op_store=op_store,
+            log_store=log_store,
+            response_store=ResponseStore(),
+        )
+        allow_resume.set()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await resume
+
+        assert exc_info.value.status_code == 409
+        async with pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT id FROM users WHERE id = $1", _OWNER)
+            resume_audits = await conn.fetchval(
+                "SELECT COUNT(*) FROM admin_audit_log "
+                "WHERE target_user_id = $1 AND action = 'resume_user'",
+                _OWNER,
+            )
+        assert user is None
+        assert resume_audits == 0
+    finally:
+        allow_resume.set()
+        if not resume.done():
+            resume.cancel()
+        with contextlib.suppress(BaseException):
+            await resume
+
+
+async def test_missing_user_mutations_fail_without_resume_audit(fence_store):
+    """Status mutations fail closed when hard-delete already removed the row."""
+    _store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    user_id = "u-fence-missing-status"
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (id, email, password_hash, status) "
+            "VALUES ($1, $1 || '@example.com', 'x', 'active')",
+            user_id,
+        )
+        await conn.execute("DELETE FROM users WHERE id = $1", user_id)
+
+    with pytest.raises(HardDeleteStateChanged):
+        await op_store.update_user_fields(user_id, status="suspended")
+    with pytest.raises(HardDeleteStateChanged):
+        await op_store.resume_user(
+            user_id,
+            admin_ip="127.0.0.1",
+            admin_id="admin",
+            reason="test",
+        )
+    with pytest.raises(HardDeleteStateChanged):
+        await op_store.approve_user(user_id, admin_id="admin")
+    with pytest.raises(HardDeleteStateChanged):
+        await op_store.reject_user(user_id, admin_id="admin", reason="test")
+
+    async with pool.acquire() as conn:
+        audit_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM admin_audit_log "
+            "WHERE target_user_id = $1 AND action = 'resume_user'",
+            user_id,
+        )
+    assert audit_count == 0
+
+
+async def test_approval_mutations_require_pending_approval(fence_store):
+    """Approve/reject cannot overwrite a status changed after the route read."""
+    _store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    user_id = "u-fence-no-longer-pending"
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (id, email, password_hash, status) "
+            "VALUES ($1, $1 || '@example.com', 'x', 'active')",
+            user_id,
+        )
+
+    with pytest.raises(HardDeleteStateChanged):
+        await op_store.approve_user(user_id, admin_id="admin")
+    with pytest.raises(HardDeleteStateChanged):
+        await op_store.reject_user(user_id, admin_id="admin", reason="test")
+
+    async with pool.acquire() as conn:
+        status = await conn.fetchval("SELECT status FROM users WHERE id = $1", user_id)
+    assert status == "active"
+
+
 async def test_failed_hard_delete_claim_can_be_released(fence_store):
     """Concurrent claims are rejected and released claims can be retried."""
     _store, pool = fence_store
