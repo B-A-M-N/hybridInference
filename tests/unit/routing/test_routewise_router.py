@@ -4364,6 +4364,78 @@ class TestPrefillLoadRoutingDecision:
         assert decision is not None
         assert probe_acquired == [True]
 
+    def test_prefill_release_updates_during_candidate_computation(self, monkeypatch):
+        """A release can update tracker accounting while selection is paused."""
+        endpoint_id = "test-model:shared-prefill"
+        adapter = _make_adapter(endpoint_id=endpoint_id)
+        route_table = _FakeRouteTable()
+        route_table.add("test-model", [(adapter, 1.0)])
+        tracker = PrefillLoadTracker(elephant_tokens=1_000_000)
+        router = RouteWiseRouter(
+            route_table=route_table,
+            config=RouteWiseConfig(prefill_load_routing_enabled=True),
+            prefill_load=tracker,
+        )
+        earlier_lease = tracker.acquire(endpoint_id, 250)
+        build_entered = threading.Event()
+        continue_build = threading.Event()
+        release_finished = threading.Event()
+        original_build_candidates = router._build_candidates
+
+        def pause_candidate_build(*args: Any, **kwargs: Any):
+            build_entered.set()
+            assert continue_build.wait(timeout=2)
+            return original_build_candidates(*args, **kwargs)
+
+        monkeypatch.setattr(router, "_build_candidates", pause_candidate_build)
+        context = {
+            "messages": [{"role": "user", "content": "x" * 4000}],
+            "params": {},
+            "request_id": "req-prefill-release-during-select",
+        }
+        selections: dict[str, RoutingDecision | None] = {}
+        errors: list[Exception] = []
+
+        def select() -> None:
+            try:
+                selections["decision"] = router._select_decision(
+                    "test-model", context, reserve_prefill=True
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        def release() -> None:
+            tracker.release(earlier_lease)
+            release_finished.set()
+
+        selection_thread = threading.Thread(target=select, daemon=True)
+        release_thread = threading.Thread(target=release, daemon=True)
+        selection_thread.start()
+        released_during_selection = False
+        try:
+            assert build_entered.wait(timeout=1)
+            release_thread.start()
+            released_during_selection = release_finished.wait(timeout=1)
+        finally:
+            continue_build.set()
+            selection_thread.join(timeout=2)
+            if release_thread.ident is not None:
+                release_thread.join(timeout=2)
+
+        assert released_during_selection
+        assert not selection_thread.is_alive()
+        assert not release_thread.is_alive()
+        assert errors == []
+
+        decision = selections["decision"]
+        assert decision is not None
+        expected_tokens = router._tracked_prefill_tokens(context["messages"], context["params"])
+        assert tracker.backlog(endpoint_id) == expected_tokens
+        assert tracker.elephants(endpoint_id) == 0
+        decision.release()
+        assert tracker.backlog(endpoint_id) == 0
+        assert tracker.elephants(endpoint_id) == 0
+
     def test_shared_tracker_serializes_snapshot_selection_and_reservation(self, monkeypatch):
         """Routers sharing load state cannot select from the same stale snapshot."""
         adapter = _make_adapter(endpoint_id="test-model:shared-prefill")
