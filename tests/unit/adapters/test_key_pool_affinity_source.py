@@ -108,7 +108,7 @@ async def test_unresolved_callers_do_not_create_a_shared_entry():
 
 @pytest.mark.unit
 async def test_unresolved_identity_stays_nonsticky_across_key_rotation():
-    """A credential hash cannot replace explicitly unresolved provenance."""
+    """Unresolved callers avoid affinity and retain a failure-aware cursor."""
     adapter = _make_adapter(["k1", "k2"])
     used_keys: list[str] = []
 
@@ -135,7 +135,9 @@ async def test_unresolved_identity_stays_nonsticky_across_key_rotation():
 
     pool = adapter._key_pool
     assert pool is not None
-    assert used_keys == ["Bearer k1", "Bearer k2", "Bearer k1", "Bearer k2"]
+    # The first failure rotates this role's non-affine cursor to k2, so the
+    # next unresolved request does not repeat the same failing k1 attempt.
+    assert used_keys == ["Bearer k1", "Bearer k2", "Bearer k2"]
     assert pool.affinity_count() == 0
     assert "auth-hash-must-not-fallback" not in pool._affinity
 

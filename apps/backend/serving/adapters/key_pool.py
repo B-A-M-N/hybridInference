@@ -4,10 +4,15 @@ Each adapter that opts into multi-key holds a KeyPool. The pool exposes
 ``acquire(affinity_key)`` and ``release(lease, outcome)``. State is
 in-process, behind a single ``threading.Lock``.
 
-Selection is **sequential**: the pool always hands out the earliest usable
-key and only advances to a later key once an earlier one is muted or has
-already been tried by this request. Upstream failures that are key-specific
-or transient — rate limit/quota (429), auth/permission (401/402/403),
+Selection is **sequential** for callers with a stable affinity key: the pool
+hands out the earliest usable key and only advances once an earlier key is
+muted or already tried by this request. Explicitly non-affine callers
+(``affinity_key=None``) use no caller binding; after a failure, a role-scoped
+pool cursor moves new requests off that key and a timed single-flight probe
+gives the original preferred key a chance to recover. Fresh non-affine
+selection still honors reservation tiers, while failure-aware failover may
+cross into lower eligible tiers. Upstream failures that are key-specific or
+transient — rate limit/quota (429), auth/permission (401/402/403),
 request-timeout / too-early (408/425), any 5xx, and non-HTTP failures such as
 timeouts and connection errors — move the request onto another key.
 Request-scoped client errors (other 4xx like 400/404/422) do *not*: they fail
@@ -20,11 +25,12 @@ has nowhere left to rotate to — every other key this caller may use is muted,
 removed, or already tried in this request. While an untried usable key
 remains, ``release`` reports ``ROTATED``: the request moves on and the failing
 key stays selectable, so a one-off blip never costs a key its place in the
-pool. The trade is deliberate: a persistently dead key (revoked credential,
-exhausted quota) is re-tried by each request that has not yet rotated past it,
-one wasted upstream round trip each, until the last-resort path finally mutes
-it. Rotation repoints the caller's affinity binding onto the key that worked,
-so a repeat caller pays that round trip once rather than every request.
+pool. A persistently dead key (revoked credential, exhausted quota) can be
+re-tried by each affine caller until the last-resort path mutes it. Rotation
+repoints that caller's affinity binding onto the key that worked, so a repeat
+caller pays that round trip once rather than every request. Non-affine callers
+instead share only the pool-level failure cursor and recovery-probe state;
+key topology changes clear that state, and stale leases cannot restore it.
 
 Once there *is* nothing to rotate to, the key is muted for ``MUTE_SECONDS``
 (20 seconds) — long enough to move traffic off a key that is failing right
