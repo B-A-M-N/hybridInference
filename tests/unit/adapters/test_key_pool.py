@@ -23,6 +23,8 @@ adapter's loop does.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -207,21 +209,30 @@ def test_non_affine_failover_reprobes_failed_preferred_key_on_bounded_cadence():
     assert pool.acquire(None)[0] == "preferred"
 
 
-def test_non_affine_recovery_probe_is_claimed_once():
-    """Concurrent unresolved callers do not all retry one due probe."""
+def test_non_affine_recovery_probe_is_claimed_once_under_concurrency():
+    """A burst of due callers claims one recovery probe, not one per request."""
     pool = KeyPool(keys=["preferred", "fallback"], provider_label="test")
 
     _, failed = pool.acquire(None)
     pool.release(failed, status_code=503, tried={0})
     pool._non_affine_reprobe_at[None] = time.monotonic()
 
-    probe_key, probe = pool.acquire(None)
-    assert probe_key == "preferred"
-    fallback_key, fallback = pool.acquire(None)
-    assert fallback_key == "fallback"
+    caller_count = 24
+    deadline = Barrier(caller_count)
 
-    pool.release(probe, status_code=200)
-    pool.release(fallback, status_code=200)
+    def acquire_after_deadline():
+        deadline.wait(timeout=10)
+        return pool.acquire(None)
+
+    with ThreadPoolExecutor(max_workers=caller_count) as callers:
+        leases = list(callers.map(lambda _index: acquire_after_deadline(), range(caller_count)))
+
+    keys = [key for key, _lease in leases]
+    assert keys.count("preferred") == 1
+    assert keys.count("fallback") == caller_count - 1
+
+    for _key, lease in leases:
+        pool.release(lease, status_code=200)
 
 
 def test_non_affine_reprobe_preserves_original_failed_preference():
@@ -255,19 +266,32 @@ def test_key_pool_change_resets_non_affine_priority_state():
     assert selected == "reserved"
 
 
-def test_stale_non_affine_release_cannot_restore_cleared_state():
-    """A lease acquired before a topology change cannot recreate its cursor."""
+@pytest.mark.parametrize("mutation", ["add", "remove", "retier"])
+def test_stale_non_affine_release_cannot_restore_cleared_state(mutation):
+    """A lease from before any topology change cannot recreate recovery state."""
     pool = KeyPool(keys=["preferred", "fallback"], provider_label="test")
 
+    _, failed = pool.acquire(None, role="pro")
+    pool.release(failed, status_code=503, tried={0})
+    pool._non_affine_reprobe_at["pro"] = 0
     _, stale_lease = pool.acquire(None, role="pro")
-    pool.add_key("reserved", min_role="pro")
+    generation = stale_lease.topology_generation
 
+    if mutation == "add":
+        pool.add_key("reserved", min_role="pro")
+    elif mutation == "remove":
+        pool.remove_key("fallback")
+    else:
+        pool.set_key_min_role("fallback", "pro")
+
+    assert pool._topology_generation == generation + 1
     assert pool.release(stale_lease, status_code=503, tried={0}) is ReleaseOutcome.PROPAGATE
     assert pool._non_affine_cursor == {}
     assert pool._non_affine_reprobe_index == {}
     assert pool._non_affine_reprobe_at == {}
     assert pool._non_affine_reprobe_in_flight == {}
-    assert pool.acquire(None, role="pro")[0] == "reserved"
+    expected_key = {"add": "reserved", "remove": "preferred", "retier": "fallback"}[mutation]
+    assert pool.acquire(None, role="pro")[0] == expected_key
 
 
 def test_non_affine_probe_success_only_resets_its_role():
