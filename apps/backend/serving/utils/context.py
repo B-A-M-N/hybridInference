@@ -39,9 +39,9 @@ TRAFFIC_REASONS = "traffic_reasons"
 # avoids forwarding router-only controls through provider adapter kwargs.
 TRAFFIC_ADMISSION_CALLBACK = "traffic_admission_callback"
 
-# Reserved Request.state key for the original ASGI arrival time used by the
-# admission-integration successor. RequestIdMiddleware does not currently set
-# it, so consumers must not assume the value is present.
+# Request.state key for the monotonic time captured by RequestIdMiddleware at
+# the initial HTTP ASGI edge, before FastAPI dependencies or delegated handlers
+# run. It may be absent in direct handler calls that bypass the middleware.
 REQUEST_ARRIVAL_TIMESTAMP = "request_arrival_timestamp"
 
 # UTC datetime captured once at the HTTP request boundary. Scheduled pricing
