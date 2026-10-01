@@ -3285,15 +3285,12 @@ class RouteWiseRouter:
             # No req_ctx.UPSTREAM_PRIORITY here, deliberately: see the note on
             # _execute_stream_adapter.
             if lease is None and self.config.prefill_load_routing_enabled:
-                # Use the prefill tracker's whole-request estimator to capture
-                # tools, response_format, tool_calls, etc. — not just message content.
-                tracked_tokens = self._tracked_prefill_tokens(messages, params)
-                # Track this request's prefill pressure so subsequent RouteWise decisions
-                # see it in the LP. Mirrors FixedRouter's acquire/release pattern.
-                lease = self._prefill_load.acquire(
-                    endpoint_id,
-                    tracked_tokens,
-                )
+                # Serialize fallback lease acquisition with candidate selection so
+                # the two cannot both reserve from the same stale load snapshot.
+                with self._prefill_load.routing_transaction():
+                    # Use the whole-request estimator, not just message content.
+                    tracked_tokens = self._tracked_prefill_tokens(messages, params)
+                    lease = self._prefill_load.acquire(endpoint_id, tracked_tokens)
             with req_ctx.push(model=model_id, provider=adapter.config.provider):
                 self._ensure_health(endpoint_id)
                 if isinstance(adapter, HedgedAdapter):
@@ -3371,15 +3368,12 @@ class RouteWiseRouter:
             # whole-request estimation cost. Only the fallback path estimates and
             # acquires here (for direct/internal callers without that lease).
             if lease is None and self.config.prefill_load_routing_enabled:
-                # Use the prefill tracker's whole-request estimator to capture
-                # tools, response_format, tool_calls, etc. — not just message content.
-                tracked_tokens = self._tracked_prefill_tokens(messages, params)
-                # Track this request's prefill pressure so subsequent RouteWise decisions
-                # see it in the LP. Mirrors FixedRouter's acquire/release pattern.
-                lease = self._prefill_load.acquire(
-                    endpoint_id,
-                    tracked_tokens,
-                )
+                # Serialize fallback lease acquisition with candidate selection so
+                # the two cannot both reserve from the same stale load snapshot.
+                with self._prefill_load.routing_transaction():
+                    # Use the whole-request estimator, not just message content.
+                    tracked_tokens = self._tracked_prefill_tokens(messages, params)
+                    lease = self._prefill_load.acquire(endpoint_id, tracked_tokens)
             with req_ctx.push(model=model_id, provider=adapter.config.provider):
                 self._ensure_health(endpoint_id)
                 first = True
