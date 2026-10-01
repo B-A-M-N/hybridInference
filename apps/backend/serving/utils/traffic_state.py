@@ -217,11 +217,9 @@ class TrafficObservationState:
     ) -> dict[str, float | int | bool | None]:
         """Return prospective evidence without mutating tracker state.
 
-        Routers need the current request's classification before dispatch so
-        they can apply routing policy, but a request that fails admission must
-        not become behavioral history. Callers should use this method to build
-        that pre-dispatch classification and call :meth:`record_request` only
-        after dispatch admission succeeds.
+        This read-only operation lets callers inspect prospective evidence
+        without changing the tracker's history. It performs no dispatch,
+        admission, or persistence work.
         """
         now = self._clock()
         request_time = now if observed_at is None else observed_at
