@@ -54,8 +54,7 @@ class CompletionOutcome(str, Enum):
 
     @property
     def admits_real_work(self) -> bool:
-        """
-        Whether this outcome may be used as evidence that real work happened.
+        """Whether this outcome may be used as evidence that real work happened.
 
         Only ``PROGRESS`` and ``COMPLETE`` qualify. Everything else -- including
         ``UNKNOWN`` -- must leave positive evidence untouched, because an
@@ -73,8 +72,7 @@ class CompletionOutcome(str, Enum):
         http_status: int | None,
         terminal: bool,
     ) -> CompletionOutcome:
-        """
-        Classify a single response.
+        """Classify a single response.
 
         ``usage`` is the provider's own reported usage mapping, when available.
         ``http_status`` of None means no HTTP response was obtained.
@@ -137,8 +135,7 @@ def classify_completion_outcome(
     http_status: int | None = None,
     terminal: bool = True,
 ) -> CompletionOutcome:
-    """
-    Decide what a response represents.
+    """Decide what a response represents.
 
     Order matters: a structured provider signal outranks text, and text
     outranks the mere presence of output tokens. A response that says "the model
