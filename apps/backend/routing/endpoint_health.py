@@ -975,8 +975,36 @@ class EndpointHealthRegistry:
         if circuit is not None:
             circuit.end_dispatch(claim.probe_token)
 
-    def record_success(self, endpoint_id: str) -> None:
-        """Record a successful endpoint request."""
+    def record_success(
+        self,
+        endpoint_id: str,
+        *,
+        outcome: Any = None,
+    ) -> None:
+        """Record a request that produced evidence of useful serving progress.
+
+        ``outcome`` is a :class:`routing.completion_outcome.CompletionOutcome`.
+        When it is supplied and does NOT admit real work, this call is a no-op.
+
+        Why this lives here and not at the call sites: a provider can answer
+        HTTP 200 with a well-formed body whose only content is a warmup notice.
+        Every existing caller treats that as success, and a success clears
+        ``consecutive_failures``, closes an OPEN or HALF_OPEN breaker, and ends a
+        credential-rejection run. During a cold-start or model-loading stall that
+        response repeats, so each one re-closes a breaker the previous failures
+        had opened -- the endpoint looks healthy while producing no work at all.
+
+        Scattering a conditional across the callers would leave every future
+        caller free to forget it. Making the authority itself require evidence of
+        progress keeps process liveness (the process answered, the socket was
+        fine, readiness still passes) strictly separate from model-serving
+        progress (this response did inference work).
+
+        ``outcome=None`` preserves the historical behavior for callers that have
+        not been classified yet.
+        """
+        if outcome is not None and not getattr(outcome, "admits_real_work", True):
+            return
         with self._lock:
             self.ensure(endpoint_id)
             auth_run_ended = self._health[endpoint_id].record(True)
