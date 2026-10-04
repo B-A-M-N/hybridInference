@@ -20,13 +20,13 @@ from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, Protocol, runtime_c
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Sequence
 
+    from routing.completion_outcome import CompletionOutcome
     from routing.protocols import RoutingRequestOptions
     from serving.adapters.base import BaseAdapter
 
 from routing.backends import LeafBackend
 from routing.dispatch import EndpointBinding, binding_for_adapter, execution_adapter
 from routing.endpoint_health import DispatchClaim, EndpointHealthRegistry, _http_status_of
-from routing.completion_outcome import CompletionOutcome
 from routing.endpoints import endpoint_id_for_adapter, route_id_for_adapter
 from routing.engine_wait import EngineWaitExpired, FirstTokenWatch
 from routing.offload import (
@@ -150,7 +150,7 @@ class RoutingObservation:
     """
     strategy_metadata: dict[str, Any] = field(default_factory=dict)
 
-    outcome: "CompletionOutcome | None" = None
+    outcome: CompletionOutcome | None = None
     """Typed semantic result of the completed request.
 
     Defaults to ``None`` so every existing construction site keeps working and

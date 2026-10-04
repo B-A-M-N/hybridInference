@@ -2923,6 +2923,36 @@ class RouteWiseRouter:
         if generation is not None:
             self.pending_prefix_cache.set_generation(request_key, endpoint_key, generation)
 
+    def _emit_prefix_evidence(
+        self,
+        obs: RoutingObservation,
+        scope: Any,
+        *,
+        outcome: Any,
+        admits_real_work: bool = False,
+    ) -> None:
+        """Publish the expected-versus-observed locality record for one request.
+
+        This is the diagnostic that made the incident expensive to triage:
+        ``PrefixCacheCostRecord`` already computed matched and expected tokens
+        and then discarded them, so "router expected warm, provider reported
+        cold" was invisible from outside.
+        """
+        if not self.prefix_cache.enabled:
+            return
+        signal = self.prefix_cache.last_signal(scope)
+        if signal is None:
+            return
+        self.prefix_cache._emit_evidence_event(
+            self.prefix_cache.build_evidence_event(
+                scope=scope,
+                signal=signal,
+                observed_cached_tokens=getattr(obs, "cached_tokens", None),
+                outcome=outcome,
+                remember_written=admits_real_work,
+            )
+        )
+
     def _commit_prefix_cache_observation(self, obs: RoutingObservation) -> None:
         """On a selected observation, update prefix memory and cache evidence.
 
@@ -3008,6 +3038,12 @@ class RouteWiseRouter:
         # hiccup cannot age strong existing evidence out through the TTL, but it
         # must not overwrite what the entry asserts.
         admits_real_work = bool(getattr(obs, "admits_real_work", obs.success))
+        self._emit_prefix_evidence(
+            obs,
+            scope,
+            outcome=obs.outcome,
+            admits_real_work=admits_real_work,
+        )
         if not admits_real_work:
             self.prefix_cache.memory.refresh_liveness(
                 scope,

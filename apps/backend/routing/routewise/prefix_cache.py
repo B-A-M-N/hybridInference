@@ -771,6 +771,8 @@ class PrefixCacheCoordinator:
     ) -> None:
         self.enabled = bool(enabled)
         self._memory = memory if memory is not None else SessionProviderPrefixMemory()
+        self._evidence_sink: Callable[[dict[str, Any]], None] | None = None
+        self._signals: dict[CacheScope, CacheSignal] = {}
         self._estimator = estimator if estimator is not None else CacheAwareCostEstimator()
         self._block_size = int(block_size)
         self._secret = secret if secret is not None else _PROCESS_SECRET
@@ -844,6 +846,16 @@ class PrefixCacheCoordinator:
             cache_affecting_params_hash=self._hash(cache_params),
         )
 
+    def last_signal(self, scope: CacheScope) -> CacheSignal | None:
+        """Return the most recent routing-time signal for ``scope``, if any.
+
+        Retained so a completed request can report what the router *expected*
+        against what the provider *actually* reported. Signals are recorded at
+        decision time and read once at observation time; a scope that was never
+        evaluated simply has none.
+        """
+        return self._signals.get(scope)
+
     def evaluate(
         self,
         scope: CacheScope,
@@ -865,6 +877,9 @@ class PrefixCacheCoordinator:
         state. POSSIBLY_WARMED, NEGATIVE, and UNKNOWN yield 0 (no strong discount).
         """
         signal = self._memory.lookup(scope, blocks, now=now)
+        # Retain the decision-time signal so the completed request can report
+        # what the router expected against what the provider actually reported.
+        self._signals[scope] = signal
         matched = signal.matched_prefix_tokens
         meets = signal.meets_threshold and signal.has_history
 
@@ -968,10 +983,58 @@ class PrefixCacheCoordinator:
                 self._track_generation(scope, generation)
             return dict.fromkeys(unique_scopes, generation)
 
-    @property
-    def memory(self) -> SessionProviderPrefixMemory:
-        """The prefix memory holding remembered blocks, for liveness refreshes."""
-        return self._memory
+    def set_evidence_sink(self, sink: Callable[[dict[str, Any]], None] | None) -> None:
+        """Install a callable receiving one structured record per completed request.
+
+        The record exists to make one ambiguity directly observable: the router
+        *expected* a warm prefix and the provider *reported* a cold one. Those are
+        different failures with different fixes, and until both numbers were
+        recorded they were indistinguishable from outside.
+        """
+        self._evidence_sink = sink
+
+    def build_evidence_event(
+        self,
+        *,
+        scope: CacheScope,
+        signal: Any,
+        observed_cached_tokens: int | None,
+        outcome: Any,
+        remember_written: bool,
+    ) -> dict[str, Any]:
+        """Build the structured per-request cache/routing observation.
+
+        ``None`` and ``0`` are deliberately distinct and must stay that way:
+        ``None`` means the provider reported no cached-token evidence at all,
+        while ``0`` means it explicitly reported zero reuse. Only an explicit
+        number can establish or refute a mismatch.
+
+        Contains no prompt text and no credentials.
+        """
+        expected = float(getattr(signal, "expected_cached_tokens", 0.0) or 0.0)
+        observed = observed_cached_tokens
+        mismatch = expected > 0.0 and observed is not None and float(observed) < expected
+        return {
+            "scope_endpoint_id": scope.endpoint_id,
+            "scope_model_profile": scope.model_profile,
+            "scope_session_hash": scope.session_hash,
+            "outcome": getattr(outcome, "value", None if outcome is None else str(outcome)),
+            "admits_real_work": bool(getattr(outcome, "admits_real_work", False)),
+            "matched_prefix_tokens": int(getattr(signal, "matched_prefix_tokens", 0) or 0),
+            "expected_cached_tokens": expected,
+            "observed_cached_tokens": observed,
+            "cache_prediction_mismatch": bool(mismatch),
+            "remember_written": bool(remember_written),
+        }
+
+    def _emit_evidence_event(self, event: dict[str, Any]) -> None:
+        sink = getattr(self, "_evidence_sink", None)
+        if sink is None:
+            return
+        try:
+            sink(event)
+        except Exception:  # pragma: no cover - telemetry must never break routing
+            logger.warning("routewise_prefix_evidence_emit_failed", exc_info=True)
 
     def _claim_generation(self, scope: CacheScope, generation: int | None) -> int | None:
         if generation is None:
