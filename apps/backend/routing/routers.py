@@ -803,8 +803,10 @@ class FixedRouter:
     def _ensure_health(self, endpoint_id: str) -> None:
         self._health_registry.ensure(endpoint_id)
 
-    def _on_success(self, endpoint_id: str) -> None:
-        self._health_registry.record_success(endpoint_id)
+    def _on_success(self, endpoint_id: str, *, outcome: Any = None) -> None:
+        # Forward the typed outcome so the registry, not this call site, decides
+        # whether a response is evidence of useful serving progress.
+        self._health_registry.record_success(endpoint_id, outcome=outcome)
 
     def _on_failure(
         self,

@@ -178,3 +178,63 @@ def test_serving_health_correction_does_not_disturb_locality_evidence():
     coordinator.record_evidence(scope, 4096, blocks=conversation)
 
     assert coordinator.lookup_state(scope).verified is True
+
+
+# ---------------------------------------------------------------------------
+# Router-level integration
+#
+# The registry tests above pin the authority rule directly. These prove both
+# routers route through that authority, so the rule holds for real traffic and
+# not merely for callers that pass an outcome by hand.
+# ---------------------------------------------------------------------------
+
+
+def _routers():
+    from routing.routers import FixedRouter
+    from routing.routewise.config import RouteWiseConfig
+    from routing.routewise.router import RouteWiseRouter
+
+    return (
+        FixedRouter(health_registry=EndpointHealthRegistry()),
+        RouteWiseRouter(config=RouteWiseConfig(), health_registry=EndpointHealthRegistry()),
+    )
+
+
+def test_both_routers_route_serving_health_through_the_outcome_gate(monkeypatch):
+    """FixedRouter and RouteWise must behave identically on a warmup response."""
+    monkeypatch.setenv(_THRESHOLD_ENV, "3")
+    for router in _routers():
+        name = type(router).__name__
+        registry = router._health_registry
+        _trip(monkeypatch, registry)
+
+        router._on_success(_ENDPOINT, outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS)
+
+        assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.OPEN, name
+        assert registry._circuits[_ENDPOINT].consecutive_failures == 3, name
+
+
+def test_both_routers_recover_on_genuine_progress(monkeypatch):
+    """Real work must still close the breaker on both routers."""
+    monkeypatch.setenv(_THRESHOLD_ENV, "3")
+    for router in _routers():
+        name = type(router).__name__
+        registry = router._health_registry
+        _trip(monkeypatch, registry)
+
+        router._on_success(_ENDPOINT, outcome=CompletionOutcome.COMPLETE)
+
+        assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED, name
+
+
+def test_router_on_success_still_defaults_to_transport_success(monkeypatch):
+    """A router call without an outcome keeps the historical contract."""
+    monkeypatch.setenv(_THRESHOLD_ENV, "3")
+    for router in _routers():
+        name = type(router).__name__
+        registry = router._health_registry
+        _trip(monkeypatch, registry)
+
+        router._on_success(_ENDPOINT)
+
+        assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED, name
