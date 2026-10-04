@@ -2997,6 +2997,25 @@ class RouteWiseRouter:
         if scope is None:
             return
         generation = stashed.generations.get(obs.endpoint_id)
+
+        # Gate prefix WARMING on evidence that real work happened, not on
+        # transport success. A provider warmup notice is a well-formed HTTP 200
+        # containing text, so ``obs.success`` is True for it; treating that as
+        # warming replaced the stored blocks with the stub's own few blocks and
+        # collapsed every later estimate to zero for the rest of the session.
+        #
+        # A non-progressing outcome still refreshes liveness, so a transient
+        # hiccup cannot age strong existing evidence out through the TTL, but it
+        # must not overwrite what the entry asserts.
+        admits_real_work = bool(getattr(obs, "admits_real_work", obs.success))
+        if not admits_real_work:
+            self.prefix_cache.memory.refresh_liveness(
+                scope,
+                now=None,
+                generation=generation,
+            )
+            return
+
         if not self.prefix_cache.remember(
             scope,
             stashed.blocks,

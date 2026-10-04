@@ -550,6 +550,42 @@ class SessionProviderPrefixMemory:
                 last_seen_at=entry.last_seen_at,
             )
 
+    def refresh_liveness(
+        self,
+        scope: CacheScope,
+        *,
+        now: float | None = None,
+        generation: int | None = None,
+    ) -> bool:
+        """Refresh an existing entry's recency WITHOUT replacing its blocks.
+
+        A response that completed but produced no useful work still proves the
+        scope is live: the provider answered. Aging the entry out through the TTL
+        on the strength of a warmup notice would discard strong locality evidence
+        that a transient hiccup never actually contradicted.
+
+        Crucially this does not overwrite what the entry asserts. The original
+        defect was that a short transient response replaced the blocks describing
+        a warm conversation, so every later request matched almost nothing and
+        the estimate stayed at zero. Here the stored blocks are left untouched
+        and only ``last_seen_at`` moves forward.
+
+        Returns ``True`` when a current entry was refreshed, ``False`` when
+        there is nothing to refresh (no entry, or the generation is stale).
+        """
+        ts = self._time() if now is None else now
+        del generation  # accepted for call-site symmetry; not used by the memory
+        with self._lock:
+            entry = self._entries.get(scope)
+            if entry is None:
+                return False
+            if self._ttl_sec > 0 and (ts - entry.last_seen_at) > self._ttl_sec:
+                # Already aged out; nothing strong is left to protect.
+                return False
+            entry.last_seen_at = ts
+            self._entries.move_to_end(scope)
+            return True
+
     def observe(
         self,
         scope: CacheScope,
@@ -931,6 +967,11 @@ class PrefixCacheCoordinator:
             for scope in unique_scopes:
                 self._track_generation(scope, generation)
             return dict.fromkeys(unique_scopes, generation)
+
+    @property
+    def memory(self) -> SessionProviderPrefixMemory:
+        """The prefix memory holding remembered blocks, for liveness refreshes."""
+        return self._memory
 
     def _claim_generation(self, scope: CacheScope, generation: int | None) -> int | None:
         if generation is None:
