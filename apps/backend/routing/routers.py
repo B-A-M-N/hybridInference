@@ -192,11 +192,7 @@ class RoutingObservation:
         """
         if self.outcome is not None:
             return self.outcome
-        return (
-            CompletionOutcome.PROGRESS
-            if self.success
-            else CompletionOutcome.PROVIDER_ERROR
-        )
+        return CompletionOutcome.PROGRESS if self.success else CompletionOutcome.PROVIDER_ERROR
 
     def __post_init__(self) -> None:
         """Classify an unset outcome from transport success.
@@ -209,9 +205,7 @@ class RoutingObservation:
         """
         if self.outcome is None:
             self.outcome = (
-                CompletionOutcome.PROGRESS
-                if self.success
-                else CompletionOutcome.PROVIDER_ERROR
+                CompletionOutcome.PROGRESS if self.success else CompletionOutcome.PROVIDER_ERROR
             )
 
 

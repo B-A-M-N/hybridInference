@@ -3073,6 +3073,7 @@ class RouteWiseRouter:
             ),
             generation=generation,
         )
+
     @staticmethod
     def _cache_affecting_params(params: Any) -> str:
         """Return a stable string of the request params that bust prefix cache."""

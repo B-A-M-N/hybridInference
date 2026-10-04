@@ -125,8 +125,8 @@ def _router_with_cache(**kw) -> SimpleNamespace:
     )
     # The commit path publishes telemetry through this helper; bind it the same
     # way so the harness exercises the real emission path.
-    router._emit_prefix_evidence = lambda obs, scope, **kw: (
-        RouteWiseRouter._emit_prefix_evidence(router, obs, scope, **kw)
+    router._emit_prefix_evidence = lambda obs, scope, **kw: RouteWiseRouter._emit_prefix_evidence(
+        router, obs, scope, **kw
     )
     router.warm_scope = lambda: router.prefix_cache.scope_for(
         session="s", provider_id="p", endpoint_id=_ENDPOINT, model_profile="m"
