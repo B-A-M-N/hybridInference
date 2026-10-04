@@ -30,6 +30,7 @@ import uuid
 import weakref
 from collections import deque
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 
 import aiohttp
@@ -2942,7 +2943,14 @@ class RouteWiseRouter:
             return
         signal = self.prefix_cache.last_signal(scope)
         if signal is None:
-            return
+            # No decision-time signal was retained for this scope (a failure may
+            # never have been routed). Report what we can rather than staying
+            # silent: the provider's observed value is still worth recording, and
+            # expected stays 0 so no mismatch can be claimed from nothing.
+            signal = SimpleNamespace(
+                expected_cached_tokens=0.0,
+                matched_prefix_tokens=0,
+            )
         self.prefix_cache._emit_evidence_event(
             self.prefix_cache.build_evidence_event(
                 scope=scope,
@@ -2972,6 +2980,12 @@ class RouteWiseRouter:
         request_id = str(getattr(obs, "request_id", None) or "")
         if not request_id:
             return
+
+        # Emit the expected-versus-observed record up front so it is published on
+        # every path, including terminal failures where no scope is resolved and
+        # nothing is committed. Diagnosing this incident required knowing what
+        # the router expected even for requests that changed no state.
+        self._emit_prefix_evidence(obs, None, outcome=obs.outcome)
 
         # Record authoritative cache evidence BEFORE the success/warming gate
         # so that a streamed empty-completion path (success=False) still
@@ -3044,34 +3058,21 @@ class RouteWiseRouter:
             outcome=obs.outcome,
             admits_real_work=admits_real_work,
         )
-        if not admits_real_work:
-            self.prefix_cache.memory.refresh_liveness(
-                scope,
-                now=None,
-                generation=generation,
-            )
-            return
-
-        if not self.prefix_cache.remember(
-            scope,
-            stashed.blocks,
+        # record_outcome re-derives the gate from the outcome itself, so the
+        # invariant holds even if this router-level check is bypassed. It
+        # performs the warming write and the authoritative evidence recording in
+        # the one place that owns the outcome gate.
+        self.prefix_cache.record_outcome(
+            scope=scope,
+            blocks=stashed.blocks,
+            outcome=obs.outcome,
+            observed_cached_tokens=(
+                cached_tokens
+                if cached_tokens is not None
+                else getattr(obs, "observed_cached_tokens", None)
+            ),
             generation=generation,
-        ):
-            return
-        # Record authoritative observed cache usage as evidence.
-        if cached_tokens is not None:
-            self.prefix_cache.record_evidence(
-                scope,
-                cached_tokens,
-                generation=generation,
-                blocks=stashed.blocks,
-                materialization_candidate=True,
-            )
-        else:
-            # No authoritative observation: successful dispatch may still
-            # establish potential warming.
-            self.prefix_cache.record_dispatch(scope, generation=generation)
-
+        )
     @staticmethod
     def _cache_affecting_params(params: Any) -> str:
         """Return a stable string of the request params that bust prefix cache."""

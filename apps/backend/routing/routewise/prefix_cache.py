@@ -33,6 +33,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from serving.utils.logging import get_logger
@@ -854,6 +855,8 @@ class PrefixCacheCoordinator:
         decision time and read once at observation time; a scope that was never
         evaluated simply has none.
         """
+        if scope is None:
+            return None
         return self._signals.get(scope)
 
     def evaluate(
@@ -983,6 +986,79 @@ class PrefixCacheCoordinator:
                 self._track_generation(scope, generation)
             return dict.fromkeys(unique_scopes, generation)
 
+    def record_outcome(
+        self,
+        *,
+        scope: CacheScope,
+        blocks: Sequence[Block],
+        outcome: Any,
+        observed_cached_tokens: int | None = None,
+        generation: int | None = None,
+    ) -> bool:
+        """Apply one completed request's result to remembered prefix state.
+
+        Defense in depth for the incident invariant: the gate is re-derived from
+        ``outcome`` here rather than trusting the caller, so the guarantee holds
+        even if the router-level check is bypassed.
+
+        * An outcome that admits real work replaces the remembered blocks and
+          records authoritative observed cache usage when the provider supplied
+          it.
+        * Any other outcome refreshes liveness only. The stored blocks are left
+          exactly as they are, so a warmup notice or an indeterminate result can
+          neither overwrite nor age out strong locality evidence.
+        """
+        admits = bool(getattr(outcome, "admits_real_work", False))
+        if not admits:
+            self._memory.refresh_liveness(scope)
+            return False
+        # Claim a generation first and thread it through both calls. remember()
+        # validates the claimed generation and silently returns False without
+        # one, which would drop an older completion's blocks on the floor.
+        if generation is None:
+            generation = self._claim_generation(scope, None)
+        if generation is None:
+            return False
+        if not self.remember(scope, tuple(blocks), generation=generation):
+            return False
+        if observed_cached_tokens is not None:
+            self.record_evidence(
+                scope,
+                observed_cached_tokens,
+                generation=generation,
+                blocks=tuple(blocks),
+                materialization_candidate=True,
+            )
+        else:
+            self.record_dispatch(scope, generation=generation)
+        return True
+
+    def lookup_state(self, scope: CacheScope) -> Any:
+        """Return the remembered blocks plus their evidence state for ``scope``.
+
+        Lets tests and diagnostics assert on what is actually believed -- both
+        the blocks and whether they are backed by verified reuse evidence --
+        rather than inferring it from a cost estimate.
+        """
+        blocks = self._memory.current_blocks(scope)
+        state = CacheLocalityEvidenceState.UNKNOWN
+        confidence = 0.0
+        with self._evidence._lock:
+            found = self._evidence._evidence.get(scope)
+        if found is not None:
+            state = found.state
+            confidence = found.confidence
+        return SimpleNamespace(
+            blocks=blocks,
+            # ``present`` is the honest question for "is anything remembered
+            # here at all": a scope with no entry must report False so callers
+            # never read ``None`` blocks as a remembered-but-empty prefix.
+            present=blocks is not None,
+            verified=state == CacheLocalityEvidenceState.VERIFIED_REUSABLE,
+            evidence=state,
+            confidence=confidence,
+        )
+
     def set_evidence_sink(self, sink: Callable[[dict[str, Any]], None] | None) -> None:
         """Install a callable receiving one structured record per completed request.
 
@@ -1015,9 +1091,9 @@ class PrefixCacheCoordinator:
         observed = observed_cached_tokens
         mismatch = expected > 0.0 and observed is not None and float(observed) < expected
         return {
-            "scope_endpoint_id": scope.endpoint_id,
-            "scope_model_profile": scope.model_profile,
-            "scope_session_hash": scope.session_hash,
+            "scope_endpoint_id": getattr(scope, "endpoint_id", None),
+            "scope_model_profile": getattr(scope, "model_profile", None),
+            "scope_session_hash": getattr(scope, "session_hash", None),
             "outcome": getattr(outcome, "value", None if outcome is None else str(outcome)),
             "admits_real_work": bool(getattr(outcome, "admits_real_work", False)),
             "matched_prefix_tokens": int(getattr(signal, "matched_prefix_tokens", 0) or 0),
