@@ -334,13 +334,7 @@ class TestEvidenceIsNotWholesaleReplaced:
         )
         assert coordinator.lookup_state(scope).blocks == conversation
 
-    def test_unclassified_outcome_still_warms(self):
-        """UNKNOWN is not evidence that nothing was served.
-
-        Callers that have not been wired to classify yet must keep the
-        long-standing behavior, or adding this type would silently disable
-        prefix warming for them.
-        """
+    def test_unclassified_outcome_does_not_warm(self):
         coordinator = _coordinator(min_match_tokens=1)
         scope = _scope()
         conversation = _blocks(("a", 4096), ("b", 4096))
@@ -350,9 +344,9 @@ class TestEvidenceIsNotWholesaleReplaced:
                 blocks=conversation,
                 outcome=CompletionOutcome.UNKNOWN,
             )
-            is True
+            is False
         )
-        assert coordinator.lookup_state(scope).blocks == conversation
+        assert coordinator.lookup_state(scope).blocks is None
 
 
 class TestRouterCommitPath:

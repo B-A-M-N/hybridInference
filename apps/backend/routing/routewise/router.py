@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from .config import RouteWiseConfig
 
 from routing.backends import LeafBackend
+from routing.completion_outcome import classify_completion_outcome
 from routing.dispatch import DispatchMismatchError, binding_for_adapter, execution_adapter
 from routing.endpoint_health import EndpointHealthRegistry
 from routing.endpoints import endpoint_id_for_adapter
@@ -70,7 +71,6 @@ from serving.pricing import effective_pricing
 from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
 from serving.utils.tokens import estimate_prompt_tokens
-from serving.utils.workers import configured_worker_count
 
 from .candidates import (
     CandidatePricing,
@@ -119,6 +119,11 @@ _AIOHTTP_RETRYABLE_ERRORS = (
     aiohttp.ServerConnectionError,
     aiohttp.ServerDisconnectedError,
     aiohttp.ClientError,
+)
+_WORKER_COUNT_ENV_KEYS = (
+    "WEB_CONCURRENCY",
+    "UVICORN_WORKERS",
+    "GUNICORN_WORKERS",
 )
 
 
@@ -381,6 +386,37 @@ def _is_routewise_retryable_error(exc: BaseException) -> bool:
     )
 
 
+def _configured_worker_count() -> int | None:
+    """Best-effort detection for common ASGI worker-count environment vars."""
+    for key in _WORKER_COUNT_ENV_KEYS:
+        raw = os.getenv(key)
+        if raw is None:
+            continue
+        try:
+            count = int(raw)
+        except ValueError:
+            continue
+        if count > 0:
+            return count
+    return None
+
+
+def _response_text(response):
+    if not isinstance(response, dict):
+        return None
+    choices = response.get("choices") or [{}]
+    message = (choices[0] or {}).get("message") or {}
+    content = message.get("content") or message.get("reasoning_content")
+    return content if isinstance(content, str) else None
+
+
+def _response_usage(response):
+    if not isinstance(response, dict):
+        return None
+    usage = response.get("usage")
+    return usage if isinstance(usage, dict) else None
+
+
 class RouteWiseRouter:
     """RouteWise router.
 
@@ -503,10 +539,33 @@ class RouteWiseRouter:
     def _ensure_health(self, endpoint_id: str) -> None:
         self._health_registry.ensure(endpoint_id)
 
+<<<<<<< HEAD
     def _on_success(self, endpoint_id: str, *, outcome: Any = None) -> None:
         # Forward the typed outcome so the registry, not this call site, decides
         # whether a response is evidence of useful serving progress.
         self._health_registry.record_success(endpoint_id, outcome=outcome)
+=======
+    def _on_success(self, endpoint_id: str, response=None) -> None:
+        """Record a semantic serving success, which requires a real response.
+
+        A transport-level 200 is not sufficient. The response is classified here
+        so endpoint health and prefix locality judge it by the same rule; with no
+        response to classify there is no evidence of useful work, so this records
+        liveness only and leaves serving state alone.
+        """
+        if response is None:
+            self._health_registry.record_liveness(endpoint_id)
+            return
+        self._health_registry.record_success(
+            endpoint_id,
+            outcome=classify_completion_outcome(
+                content=_response_text(response),
+                usage=_response_usage(response),
+                http_status=200,
+                terminal=True,
+            ),
+        )
+>>>>>>> 8d4d3ea6 (fix(routing): wire the classified outcome through the production path)
 
     def _on_failure(
         self,
@@ -1339,7 +1398,7 @@ class RouteWiseRouter:
             self._validate_stateful_provider_worker_scope()
 
     def _validate_stateful_provider_worker_scope(self) -> None:
-        worker_count = configured_worker_count()
+        worker_count = _configured_worker_count()
         if worker_count is not None and worker_count > 1:
             if self.config.stateful_providers_single_worker_only:
                 raise RuntimeError(
@@ -3296,7 +3355,7 @@ class RouteWiseRouter:
                 if not getattr(adapter, "reports_leg_outcomes", False):
                     # A composite adapter may replace its config with the leg
                     # that actually served, so resolve the endpoint after the call.
-                    self._on_success(endpoint_id_for_adapter(adapter))
+                    self._on_success(endpoint_id_for_adapter(adapter), result)
             if getattr(adapter, "config", None) is not original_config:
                 # Backup won: primary did not complete prefill. Release the
                 # primary lease without confirmation rather than confirming a

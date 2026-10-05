@@ -126,6 +126,12 @@ class CompletionsLogger:
             choices = response_body.get("choices") or [{}]
             message = (choices[0] or {}).get("message") or {}
             content = message.get("content") or message.get("reasoning_content") or ""
+            if not content and message.get("tool_calls"):
+                # A tool call is real work even with no prose and no reported
+                # usage: the model produced a structured call for the caller to
+                # run. Without this a legitimate tool-only completion from a
+                # provider that omits usage would read as empty.
+                content = "[tool_call]"
 
         return classify_completion_outcome(
             content=content if isinstance(content, str) else None,
