@@ -36,7 +36,6 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-from routing.completion_outcome import CompletionOutcome
 from serving.utils.logging import get_logger
 from serving.utils.tokens import tokenize_text
 
@@ -576,7 +575,13 @@ class SessionProviderPrefixMemory:
         there is nothing to refresh (no entry, or the generation is stale).
         """
         ts = self._time() if now is None else now
-        del generation  # accepted for call-site symmetry; not used by the memory
+        if generation is not None:
+            # Honor the parameter the docstring promises to check: a completion
+            # whose generation was superseded must not extend the lifetime of a
+            # newer prefix entry.
+            with self._generation_lock:
+                if self._scope_generations.get(scope) != generation:
+                    return False
         with self._lock:
             entry = self._entries.get(scope)
             if entry is None:
@@ -741,18 +746,6 @@ class PrefixCacheCostRecord:
     """The evidence state backing this estimate (UNKNOWN/POSSIBLY_WARMED/VERIFIED_REUSABLE/NEGATIVE)."""
     evidence_confidence: float = 0.0
     """Confidence in the evidence (0..1)."""
-
-
-# Outcomes that must never warm prefix memory. UNKNOWN is deliberately absent: an
-# unclassified observation is not evidence that nothing was served.
-_NON_WARMING_OUTCOMES = frozenset(
-    {
-        CompletionOutcome.TRANSIENT_NO_PROGRESS,
-        CompletionOutcome.EMPTY,
-        CompletionOutcome.REPEATED_NOOP,
-        CompletionOutcome.ABORTED,
-    }
-)
 
 
 class PrefixCacheCoordinator:
@@ -1004,26 +997,26 @@ class PrefixCacheCoordinator:
           exactly as they are, so a warmup notice or an indeterminate result can
           neither overwrite nor age out strong locality evidence.
         """
-        # Claim a generation first and thread it through both calls. remember()
-        # validates the claimed generation and silently returns False without
-        # one, which would drop an older completion's blocks on the floor.
-        if generation is None:
-            generation = self._claim_generation(scope, None)
+        # Resolve and validate the generation BEFORE touching memory, on both the
+        # positive and the negative path. Claiming it outside _generation_lock
+        # races a concurrent completion, and letting a stale generation reach the
+        # liveness refresh would let an older request extend the lifetime of a
+        # newer prefix entry.
+        # Resolve the generation BEFORE touching memory, on the negative path as
+        # well as the positive one. A stale completion reaching the liveness
+        # refresh would extend the lifetime of a newer prefix entry, so it is
+        # validated up front: _claim_generation returns None for a supplied
+        # generation whose guard was evicted or superseded.
+        with self._generation_lock:
+            generation = self._claim_generation(scope, generation)
         if generation is None:
             return False
 
-        # Only a *known-negative* outcome suppresses warming. An unclassified
-        # observation (UNKNOWN) is not evidence that nothing was served, so it
-        # must keep the long-standing behavior of warming on a plain success --
-        # otherwise adding this type would silently disable prefix warming for
-        # every caller that has not been wired to classify yet.
-        #
-        # A warmup notice, the incident that motivated all this, classifies as
-        # TRANSIENT_NO_PROGRESS: a known negative. That is the case worth
-        # suppressing, and it is the case the production path now actually
-        # produces.
-        suppresses_warming = outcome in _NON_WARMING_OUTCOMES
-        if suppresses_warming:
+        # Warming requires positive evidence that work happened. Admitting on the
+        # absence of a negative -- admitting UNKNOWN because it is not on a
+        # blacklist -- would make a caller that forgot to classify silently
+        # restore the incident, so the test is admits_real_work and nothing else.
+        if not bool(getattr(outcome, "admits_real_work", False)):
             # The provider answered, so the scope is provably live and a
             # transient hiccup must not age strong evidence out through the TTL.
             # But the stored blocks are left exactly as they are: a short

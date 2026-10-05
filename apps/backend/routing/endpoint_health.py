@@ -1019,6 +1019,22 @@ class EndpointHealthRegistry:
             # holding the lock every other endpoint's health accounting needs.
             self._resolve_auth_misconfig(endpoint_id)
 
+    def record_liveness(self, endpoint_id: str) -> None:
+        """Record that an endpoint emitted bytes, without claiming it served.
+
+        A streaming attempt proves the process and connection are alive as soon as
+        the first chunk arrives. It does not prove the model did useful work, so
+        this must not clear serving failures or close a serving breaker. Streaming
+        paths call this early and record semantic success once the accumulated
+        response can be classified.
+        """
+        with self._lock:
+            circuit = self._circuits.get(endpoint_id)
+            if circuit is not None and circuit.state == _CircuitState.HALF_OPEN:
+                circuit.on_success()
+            self.ensure(endpoint_id)
+            self._health[endpoint_id].record(True)
+
     def record_failure(
         self,
         endpoint_id: str,
