@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from serving.adapters.base import BaseAdapter
 
 from routing.backends import LeafBackend
-from routing.completion_outcome import CompletionOutcome, classify_completion_outcome
+from routing.completion_outcome import CompletionOutcome
 from routing.dispatch import EndpointBinding, binding_for_adapter, execution_adapter
 from routing.endpoint_health import DispatchClaim, EndpointHealthRegistry, _http_status_of
 from routing.endpoints import endpoint_id_for_adapter, route_id_for_adapter
@@ -113,24 +113,6 @@ class RouteConfig:
     admin_only: bool = False
     required_role: str = "free"
     published: bool = True
-
-
-def _response_text(response: Any) -> str | None:
-    """Best-effort assistant text from an OpenAI-shaped response body."""
-    if not isinstance(response, dict):
-        return None
-    choices = response.get("choices") or [{}]
-    message = (choices[0] or {}).get("message") or {}
-    content = message.get("content") or message.get("reasoning_content")
-    return content if isinstance(content, str) else None
-
-
-def _response_usage(response: Any) -> dict[str, Any] | None:
-    """Best-effort usage mapping from an OpenAI-shaped response body."""
-    if not isinstance(response, dict):
-        return None
-    usage = response.get("usage")
-    return usage if isinstance(usage, dict) else None
 
 
 @dataclass(kw_only=True)
@@ -791,32 +773,8 @@ class FixedRouter:
     def _ensure_health(self, endpoint_id: str) -> None:
         self._health_registry.ensure(endpoint_id)
 
-    def _on_success(self, endpoint_id: str, response: Any = None) -> None:
-        """Record that an endpoint served a request.
-
-        The response is classified here rather than reconstructed downstream, so
-        endpoint health and prefix locality judge the same response by the same
-        rule. A transport-level 200 is not sufficient: a warmup notice is a
-        well-formed 200 whose only content is text, and counting it as a healthy
-        serve would re-close a breaker the failures had just opened.
-        """
-        if response is None:
-            # Streaming paths fire this on the first non-empty chunk, which is a
-            # liveness signal rather than a completed body. There is nothing to
-            # classify, so the historical behavior stands.
-            self._health_registry.record_success(endpoint_id)
-            return
-        self._health_registry.record_success(
-            endpoint_id,
-            outcome=classify_completion_outcome(
-                content=_response_text(response),
-                usage=_response_usage(response),
-                http_status=200,
-                terminal=True,
-            ),
-        )
-
-    # DEBUG MARKER
+    def _on_success(self, endpoint_id: str) -> None:
+        self._health_registry.record_success(endpoint_id)
 
     def _on_failure(
         self,
@@ -2365,7 +2323,7 @@ class FixedRouter:
                     self._prefill_load.release(lease, prefill_confirmed=True)
                 finally:
                     self._prefill_load.release(lease)
-                self._on_success(endpoint_id, resp)
+                self._on_success(endpoint_id)
             # Preserve adapter-set _routing if present;
             # only set default routing if the adapter didn't provide one.
             if "_routing" not in resp:
@@ -2503,7 +2461,7 @@ class FixedRouter:
                             self._prefill_load.release(lease, prefill_confirmed=True)
                         finally:
                             self._prefill_load.release(lease)
-                        self._on_success(endpoint_id, resp)
+                        self._on_success(endpoint_id)
                     if "_routing" not in resp:
                         resp["_routing"] = {
                             "provider": execution.config.provider,
