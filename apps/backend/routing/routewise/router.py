@@ -30,7 +30,6 @@ import uuid
 import weakref
 from collections import deque
 from dataclasses import dataclass, replace
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 
 import aiohttp
@@ -54,6 +53,7 @@ if TYPE_CHECKING:
     from .config import RouteWiseConfig
 
 from routing.backends import LeafBackend
+from routing.completion_outcome import classify_completion_outcome
 from routing.dispatch import DispatchMismatchError, binding_for_adapter, execution_adapter
 from routing.endpoint_health import EndpointHealthRegistry
 from routing.endpoints import endpoint_id_for_adapter
@@ -401,6 +401,24 @@ def _configured_worker_count() -> int | None:
     return None
 
 
+def _response_text(response: Any) -> str | None:
+    """Best-effort assistant text from an OpenAI-shaped response body."""
+    if not isinstance(response, dict):
+        return None
+    choices = response.get("choices") or [{}]
+    message = (choices[0] or {}).get("message") or {}
+    content = message.get("content") or message.get("reasoning_content")
+    return content if isinstance(content, str) else None
+
+
+def _response_usage(response: Any) -> dict[str, Any] | None:
+    """Best-effort usage mapping from an OpenAI-shaped response body."""
+    if not isinstance(response, dict):
+        return None
+    usage = response.get("usage")
+    return usage if isinstance(usage, dict) else None
+
+
 class RouteWiseRouter:
     """RouteWise router.
 
@@ -523,8 +541,28 @@ class RouteWiseRouter:
     def _ensure_health(self, endpoint_id: str) -> None:
         self._health_registry.ensure(endpoint_id)
 
-    def _on_success(self, endpoint_id: str) -> None:
-        self._health_registry.record_success(endpoint_id)
+    def _on_success(self, endpoint_id: str, response: Any = None) -> None:
+        """Record that an endpoint served a request.
+
+        Classifies the same response the locality path classifies, so endpoint
+        health and prefix locality never disagree about whether a response was
+        useful work. A transport-level 200 is not sufficient: a warmup notice is
+        a well-formed 200 whose only content is text.
+        """
+        if response is None:
+            # Streaming paths fire this on the first non-empty chunk, which is a
+            # liveness signal rather than a completed body. Nothing to classify.
+            self._health_registry.record_success(endpoint_id)
+            return
+        self._health_registry.record_success(
+            endpoint_id,
+            outcome=classify_completion_outcome(
+                content=_response_text(response),
+                usage=_response_usage(response),
+                http_status=200,
+                terminal=True,
+            ),
+        )
 
     def _on_failure(
         self,
@@ -2924,43 +2962,6 @@ class RouteWiseRouter:
         if generation is not None:
             self.pending_prefix_cache.set_generation(request_key, endpoint_key, generation)
 
-    def _emit_prefix_evidence(
-        self,
-        obs: RoutingObservation,
-        scope: Any,
-        *,
-        outcome: Any,
-        admits_real_work: bool = False,
-    ) -> None:
-        """Publish the expected-versus-observed locality record for one request.
-
-        This is the diagnostic that made the incident expensive to triage:
-        ``PrefixCacheCostRecord`` already computed matched and expected tokens
-        and then discarded them, so "router expected warm, provider reported
-        cold" was invisible from outside.
-        """
-        if not self.prefix_cache.enabled:
-            return
-        signal = self.prefix_cache.last_signal(scope)
-        if signal is None:
-            # No decision-time signal was retained for this scope (a failure may
-            # never have been routed). Report what we can rather than staying
-            # silent: the provider's observed value is still worth recording, and
-            # expected stays 0 so no mismatch can be claimed from nothing.
-            signal = SimpleNamespace(
-                expected_cached_tokens=0.0,
-                matched_prefix_tokens=0,
-            )
-        self.prefix_cache._emit_evidence_event(
-            self.prefix_cache.build_evidence_event(
-                scope=scope,
-                signal=signal,
-                observed_cached_tokens=getattr(obs, "cached_tokens", None),
-                outcome=outcome,
-                remember_written=admits_real_work,
-            )
-        )
-
     def _commit_prefix_cache_observation(self, obs: RoutingObservation) -> None:
         """On a selected observation, update prefix memory and cache evidence.
 
@@ -2980,12 +2981,6 @@ class RouteWiseRouter:
         request_id = str(getattr(obs, "request_id", None) or "")
         if not request_id:
             return
-
-        # Emit the expected-versus-observed record up front so it is published on
-        # every path, including terminal failures where no scope is resolved and
-        # nothing is committed. Diagnosing this incident required knowing what
-        # the router expected even for requests that changed no state.
-        self._emit_prefix_evidence(obs, None, outcome=obs.outcome)
 
         # Record authoritative cache evidence BEFORE the success/warming gate
         # so that a streamed empty-completion path (success=False) still
@@ -3051,13 +3046,6 @@ class RouteWiseRouter:
         # A non-progressing outcome still refreshes liveness, so a transient
         # hiccup cannot age strong existing evidence out through the TTL, but it
         # must not overwrite what the entry asserts.
-        admits_real_work = bool(getattr(obs, "admits_real_work", obs.success))
-        self._emit_prefix_evidence(
-            obs,
-            scope,
-            outcome=obs.outcome,
-            admits_real_work=admits_real_work,
-        )
         # record_outcome re-derives the gate from the outcome itself, so the
         # invariant holds even if this router-level check is bypassed. It
         # performs the warming write and the authoritative evidence recording in
@@ -3066,11 +3054,7 @@ class RouteWiseRouter:
             scope=scope,
             blocks=stashed.blocks,
             outcome=obs.outcome,
-            observed_cached_tokens=(
-                cached_tokens
-                if cached_tokens is not None
-                else getattr(obs, "observed_cached_tokens", None)
-            ),
+            observed_cached_tokens=cached_tokens,
             generation=generation,
         )
 
@@ -3363,7 +3347,7 @@ class RouteWiseRouter:
                 if not getattr(adapter, "reports_leg_outcomes", False):
                     # A composite adapter may replace its config with the leg
                     # that actually served, so resolve the endpoint after the call.
-                    self._on_success(endpoint_id_for_adapter(adapter))
+                    self._on_success(endpoint_id_for_adapter(adapter), result)
             if getattr(adapter, "config", None) is not original_config:
                 # Backup won: primary did not complete prefill. Release the
                 # primary lease without confirmation rather than confirming a
