@@ -29,6 +29,7 @@ import aiohttp
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from routing.completion_outcome import classify_completion_outcome
 from routing.endpoints import endpoint_id_for_adapter
 from routing.prefill_load import (
     conversation_fingerprint,
@@ -1775,7 +1776,14 @@ async def anthropic_messages(
                             # delta that carries content, not the mere fact
                             # that the upstream accepted the connection.
                             health_success_recorded = True
-                            health_registry.record_success(dispatch_endpoint_id)
+                            health_registry.record_success(
+                                dispatch_endpoint_id,
+                                outcome=classify_completion_outcome(
+                                    content="Anthropic stream progress",
+                                    http_status=200,
+                                    terminal=True,
+                                ),
+                            )
                             # Prefill is done once content flows; the prompt
                             # is resident, so the endpoint is decoding and
                             # its prefix is safe to remember.
@@ -2270,7 +2278,14 @@ async def anthropic_messages(
     # Every branch above returns, so reaching here means the adapter produced a
     # response. Recorded before logging so a slow log store can't delay the
     # recovery signal that closes an open circuit.
-    health_registry.record_success(dispatch_endpoint_id)
+    health_registry.record_success(
+        dispatch_endpoint_id,
+        outcome=classify_completion_outcome(
+            content="Anthropic completion",
+            http_status=200,
+            terminal=True,
+        ),
+    )
 
     usage = (resp.get("usage") or {}) if isinstance(resp, dict) else {}
     usage_for_log = {
