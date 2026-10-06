@@ -31,6 +31,14 @@ from routing.endpoint_health import EndpointHealthRegistry, _CircuitState
 _ENDPOINT = "openai:api.example.com:443"
 _THRESHOLD_ENV = "CIRCUIT_FAILURE_THRESHOLD"
 
+WARMUP_STUB = "The model is starting up - this takes about 120 seconds. Please wait..."
+REAL_ANSWER = "Applied the fix and verified it."
+
+
+def _body(content: str) -> dict:
+    return {"choices": [{"message": {"role": "assistant", "content": content}}]}
+
+
 # Outcomes a provider can report that are NOT evidence of useful work.
 NO_PROGRESS_OUTCOMES = [
     CompletionOutcome.TRANSIENT_NO_PROGRESS,
@@ -208,7 +216,7 @@ def test_both_routers_route_serving_health_through_the_outcome_gate(monkeypatch)
         registry = router._health_registry
         _trip(monkeypatch, registry)
 
-        router._on_success(_ENDPOINT, outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS)
+        router._on_success(_ENDPOINT, _body(WARMUP_STUB))
 
         assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.OPEN, name
         assert registry._circuits[_ENDPOINT].consecutive_failures == 3, name
@@ -222,7 +230,7 @@ def test_both_routers_recover_on_genuine_progress(monkeypatch):
         registry = router._health_registry
         _trip(monkeypatch, registry)
 
-        router._on_success(_ENDPOINT, outcome=CompletionOutcome.COMPLETE)
+        router._on_success(_ENDPOINT, _body(REAL_ANSWER))
 
         assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED, name
 

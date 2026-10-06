@@ -115,7 +115,7 @@ class RouteConfig:
     published: bool = True
 
 
-def _response_text(response):
+def _response_text(response: Any) -> str | None:
     if not isinstance(response, dict):
         return None
     choices = response.get("choices") or [{}]
@@ -124,7 +124,7 @@ def _response_text(response):
     return content if isinstance(content, str) else None
 
 
-def _response_usage(response):
+def _response_usage(response: Any) -> dict[str, Any] | None:
     if not isinstance(response, dict):
         return None
     usage = response.get("usage")
@@ -789,13 +789,7 @@ class FixedRouter:
     def _ensure_health(self, endpoint_id: str) -> None:
         self._health_registry.ensure(endpoint_id)
 
-<<<<<<< HEAD
-    def _on_success(self, endpoint_id: str, *, outcome: Any = None) -> None:
-        # Forward the typed outcome so the registry, not this call site, decides
-        # whether a response is evidence of useful serving progress.
-        self._health_registry.record_success(endpoint_id, outcome=outcome)
-=======
-    def _on_success(self, endpoint_id: str, response=None) -> None:
+    def _on_success(self, endpoint_id: str, response: Any = None) -> None:
         """Record a semantic serving success, which requires a real response.
 
         A transport-level 200 is not sufficient. The response is classified here
@@ -815,7 +809,6 @@ class FixedRouter:
                 terminal=True,
             ),
         )
->>>>>>> 8d4d3ea6 (fix(routing): wire the classified outcome through the production path)
 
     def _on_failure(
         self,
