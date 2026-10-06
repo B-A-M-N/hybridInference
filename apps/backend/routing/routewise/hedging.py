@@ -44,6 +44,10 @@ class ProviderEventSink(Protocol):
     checks against the registry's canonical outcome API.
     """
 
+    def record_liveness(self, endpoint_id: str) -> None:
+        """Record that *endpoint_id* emitted bytes, without claiming it served."""
+        ...
+
     def record_success(self, endpoint_id: str) -> None:
         """Record a successful request for *endpoint_id*."""
         ...
@@ -843,7 +847,7 @@ class HedgedAdapter(BaseAdapter):
                 raise primary_error  # type: ignore[misc]
 
             # Return primary's buffer (even if empty -- no content from either).
-            self.event_sink.record_success(primary_endpoint)
+            self.event_sink.record_liveness(primary_endpoint)
             _cancel_task(race_deadline_task)
             return primary_gen, backup_gen, primary_buffer
 
