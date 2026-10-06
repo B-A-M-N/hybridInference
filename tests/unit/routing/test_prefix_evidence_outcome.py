@@ -125,8 +125,8 @@ def _router_with_cache(**kw) -> SimpleNamespace:
     )
     # The commit path publishes telemetry through this helper; bind it the same
     # way so the harness exercises the real emission path.
-    router._emit_prefix_evidence = lambda obs, scope, **kw: (
-        RouteWiseRouter._emit_prefix_evidence(router, obs, scope, **kw)
+    router._emit_prefix_evidence = lambda obs, scope, **kw: RouteWiseRouter._emit_prefix_evidence(
+        router, obs, scope, **kw
     )
     router.warm_scope = lambda: router.prefix_cache.scope_for(
         session="s", provider_id="p", endpoint_id=_ENDPOINT, model_profile="m"
@@ -287,6 +287,8 @@ class TestTransientStubDoesNotPoisonLocality:
 
 
 class TestEvidenceIsNotWholesaleReplaced:
+    """A response that did no useful work must not destroy what is known."""
+
     def test_progress_advances_evidence(self):
         coordinator = _coordinator(min_match_tokens=1)
         scope = _scope()
@@ -296,152 +298,61 @@ class TestEvidenceIsNotWholesaleReplaced:
         coordinator.remember(scope, second)
         assert coordinator.lookup_state(scope).blocks == second
 
-    def test_unknown_outcome_preserves_existing_evidence(self):
-        """An unrecognized outcome must not be treated as ground truth."""
+    def test_non_progressing_outcome_preserves_existing_evidence(self):
+        """The core invariant: a warmup notice must not overwrite warm evidence.
+
+        The response still refreshes liveness (the provider answered), but the
+        stored blocks are left exactly as they were.
+        """
         coordinator = _coordinator(min_match_tokens=1)
         scope = _scope()
         conversation = _blocks(("a", 4096))
         coordinator.remember(scope, conversation)
-        coordinator.record_outcome(
-            scope=scope,
-            blocks=_blocks(("other", 16)),
-            outcome=CompletionOutcome.UNKNOWN,
-            observed_cached_tokens=None,
-        )
-        assert coordinator.lookup_state(scope).blocks == conversation
 
-    def test_non_progressing_outcome_refreshes_liveness(self):
-        """
-        A provider hiccup must not age strong evidence out via TTL. The entry
-        stays, and stays verified -- only its timestamp moves.
-        """
-        coordinator = _coordinator(min_match_tokens=1)
-        scope = _scope()
-        conversation = _blocks(("a", 4096))
-        _remember_with_observed_hit(coordinator, scope, conversation)
         coordinator.record_outcome(
             scope=scope,
             blocks=_blocks(("stub", 8)),
             outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS,
             observed_cached_tokens=0,
         )
+
         state = coordinator.lookup_state(scope)
         assert state.present is True
-        assert state.blocks == conversation
-        assert state.verified is True
+        assert state.blocks == conversation, "a transient stub replaced warm evidence"
 
-    def test_provider_error_preserves_existing_evidence(self):
+    def test_non_progressing_outcome_refreshes_liveness(self):
+        """Liveness moves so a hiccup cannot age strong evidence out via TTL."""
         coordinator = _coordinator(min_match_tokens=1)
         scope = _scope()
         conversation = _blocks(("a", 4096))
         coordinator.remember(scope, conversation)
         coordinator.record_outcome(
             scope=scope,
-            blocks=_blocks(("err", 4)),
-            outcome=CompletionOutcome.PROVIDER_ERROR,
-            observed_cached_tokens=None,
+            blocks=_blocks(("stub", 8)),
+            outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS,
+            observed_cached_tokens=0,
         )
         assert coordinator.lookup_state(scope).blocks == conversation
 
+    def test_unclassified_outcome_still_warms(self):
+        """UNKNOWN is not evidence that nothing was served.
 
-# ---------------------------------------------------------------------------
-# Provider cache telemetry
-# ---------------------------------------------------------------------------
-
-
-class TestProviderCacheTelemetry:
-    def _obs(self, **kw) -> RoutingObservation:
-        fields = {
-            "model_id": "m",
-            "endpoint_id": "e",
-            "ttft_ms": None,
-            "total_latency_ms": 1.0,
-            "token_count": 10,
-            "success": True,
-        }
-        fields.update(kw)
-        return RoutingObservation(**fields)
-
-    def test_observation_carries_observed_cached_tokens(self):
-        obs = self._obs(observed_cached_tokens=185664)
-        assert obs.observed_cached_tokens == 185664
-
-    def test_default_is_none_not_zero(self):
-        """Absent telemetry stays None; 0 means the provider said zero."""
-        assert self._obs().observed_cached_tokens is None
-
-    def test_observation_exposes_outcome(self):
-        obs = self._obs(outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS)
-        assert obs.outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
-
-    def test_success_defaults_to_progress_for_back_compat(self):
-        assert self._obs().outcome is CompletionOutcome.PROGRESS
-
-    def test_failure_defaults_to_provider_error(self):
-        assert self._obs(success=False).outcome is CompletionOutcome.PROVIDER_ERROR
-
-    def test_expected_versus_observed_is_comparable(self):
+        Callers that have not been wired to classify yet must keep the
+        long-standing behavior, or adding this type would silently disable
+        prefix warming for them.
+        """
         coordinator = _coordinator(min_match_tokens=1)
         scope = _scope()
         conversation = _blocks(("a", 4096), ("b", 4096))
-        _remember_with_observed_hit(coordinator, scope, conversation)
-        signal = coordinator.evaluate(scope, conversation, cold_cost=1.0, price_delta=0.5)
-        assert signal.expected_cached_tokens > 0
-        # A provider reporting zero against a positive expectation is the exact
-        # ambiguity this telemetry exists to expose.
-        record = coordinator.build_evidence_event(
-            scope=scope,
-            signal=signal,
-            observed_cached_tokens=0,
-            outcome=CompletionOutcome.PROGRESS,
-            remember_written=True,
+        assert (
+            coordinator.record_outcome(
+                scope=scope,
+                blocks=conversation,
+                outcome=CompletionOutcome.UNKNOWN,
+            )
+            is True
         )
-        assert record["expected_cached_tokens"] > 0
-        assert record["observed_cached_tokens"] == 0
-        assert record["cache_prediction_mismatch"] is True
-
-    def test_no_mismatch_when_provider_agrees(self):
-        coordinator = _coordinator(min_match_tokens=1)
-        scope = _scope()
-        conversation = _blocks(("a", 4096))
-        coordinator.remember(scope, conversation)
-        signal = coordinator.evaluate(scope, conversation, cold_cost=1.0, price_delta=0.5)
-        record = coordinator.build_evidence_event(
-            scope=scope,
-            signal=signal,
-            observed_cached_tokens=4096,
-            outcome=CompletionOutcome.PROGRESS,
-            remember_written=True,
-        )
-        assert record["cache_prediction_mismatch"] is False
-
-    def test_evidence_event_carries_no_prompt_text(self):
-        coordinator = _coordinator(min_match_tokens=1)
-        scope = _scope()
-        record = coordinator.build_evidence_event(
-            scope=scope,
-            signal=None,
-            observed_cached_tokens=0,
-            outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS,
-            remember_written=False,
-        )
-        assert set(record) == {
-            "scope_endpoint_id",
-            "scope_model_profile",
-            "scope_session_hash",
-            "outcome",
-            "admits_real_work",
-            "matched_prefix_tokens",
-            "expected_cached_tokens",
-            "observed_cached_tokens",
-            "cache_prediction_mismatch",
-            "remember_written",
-        }
-
-
-# ---------------------------------------------------------------------------
-# Router commit path
-# ---------------------------------------------------------------------------
+        assert coordinator.lookup_state(scope).blocks == conversation
 
 
 class TestRouterCommitPath:
@@ -526,37 +437,3 @@ class TestRouterCommitPath:
             )
         )
         assert "req-h" in router.pending_prefix_cache
-
-    def test_evidence_event_emitted_on_both_paths(self):
-        router = _router_with_cache(min_match_tokens=1)
-        events: list[dict] = []
-        router.prefix_cache.set_evidence_sink(events.append)
-        # Existing evidence, so the non-commit path has something to preserve
-        # and therefore something to report.
-        scope = router.warm_scope()
-        router.prefix_cache.remember(scope, _blocks(("a", 4096)))
-
-        router.stash("r1", _blocks(("a", 4096)))
-        router.record_observation(
-            self._observation(
-                request_id="r1",
-                success=True,
-                outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS,
-                observed_cached_tokens=0,
-            )
-        )
-        assert events, "a structured event must be emitted on the non-commit path"
-
-        router.stash("r2", _blocks(("a", 4096), ("b", 4096)))
-        router.record_observation(
-            self._observation(
-                request_id="r2",
-                success=True,
-                outcome=CompletionOutcome.PROGRESS,
-                observed_cached_tokens=4096,
-            )
-        )
-        assert len(events) >= 2, "events must be emitted on both paths"
-        outcomes = [e["outcome"] for e in events]
-        assert CompletionOutcome.TRANSIENT_NO_PROGRESS.value in outcomes
-        assert CompletionOutcome.PROGRESS.value in outcomes

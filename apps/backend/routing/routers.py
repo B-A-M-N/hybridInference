@@ -150,14 +150,6 @@ class RoutingObservation:
     """
     strategy_metadata: dict[str, Any] = field(default_factory=dict)
 
-    observed_cached_tokens: int | None = None
-    """Provider-reported cache reuse for this request, kept distinct from ``cached_tokens``.
-
-    ``None`` means the provider reported no cached-token evidence at all; an
-    explicit ``0`` means it reported zero reuse. Collapsing the two would let an
-    absent observation masquerade as a measured miss.
-    """
-
     outcome: CompletionOutcome | None = field(default=None)
     """Typed semantic result of the completed request.
 
@@ -174,45 +166,23 @@ class RoutingObservation:
         Transport success (``success=True``) is not sufficient: a provider warmup
         notice is a well-formed HTTP 200 containing text, so it scores
         ``success=True`` while being no work at all. Only an outcome that admits
-        real work qualifies. When no outcome was classified we fall back to
-        ``success`` so pre-existing behavior is unchanged.
+        real work qualifies. ``__post_init__`` guarantees ``outcome`` is never
+        ``None``, so an unclassified observation reads as ``UNKNOWN`` and does
+        not admit.
         """
-        if self.outcome is None:
-            return bool(self.success)
         return bool(self.outcome.admits_real_work)
 
-    def resolved_outcome(self) -> CompletionOutcome:
-        """Return the typed outcome, deriving a back-compatible default if unset.
-
-        An observation constructed without an explicit outcome is classified from
-        transport success alone: a success is assumed to be real work, and a
-        failure is assumed to be a provider error. That reproduces the
-        pre-incident behavior for every existing construction site while letting
-        callers that know better state so explicitly.
-        """
-        if self.outcome is not None:
-            return self.outcome
-        return (
-            CompletionOutcome.PROGRESS
-            if self.success
-            else CompletionOutcome.PROVIDER_ERROR
-        )
-
     def __post_init__(self) -> None:
-        """Classify an unset outcome from transport success.
+        """Default an unset outcome to ``UNKNOWN``, never to a positive claim.
 
-        Doing this at construction keeps ``obs.outcome`` meaningful for every
-        reader -- including code that never asks for the property -- while
-        leaving an explicitly supplied outcome untouched. A success is assumed
-        to be real work and a failure a provider error, which is exactly the
-        pre-incident behavior for every existing construction site.
+        An observation that was not classified carries no evidence that work
+        happened, so it must not admit real work. Defaulting to ``PROGRESS``
+        whenever ``success`` is true would reintroduce the exact defect this
+        type exists to prevent: a warmup notice is a 200 with text, and would be
+        read as evidence of useful serving.
         """
         if self.outcome is None:
-            self.outcome = (
-                CompletionOutcome.PROGRESS
-                if self.success
-                else CompletionOutcome.PROVIDER_ERROR
-            )
+            self.outcome = CompletionOutcome.UNKNOWN
 
 
 @dataclass

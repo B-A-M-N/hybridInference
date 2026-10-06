@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+from routing.completion_outcome import CompletionOutcome
 from serving.utils.logging import get_logger
 from serving.utils.tokens import tokenize_text
 
@@ -742,6 +743,18 @@ class PrefixCacheCostRecord:
     """Confidence in the evidence (0..1)."""
 
 
+# Outcomes that must never warm prefix memory. UNKNOWN is deliberately absent: an
+# unclassified observation is not evidence that nothing was served.
+_NON_WARMING_OUTCOMES = frozenset(
+    {
+        CompletionOutcome.TRANSIENT_NO_PROGRESS,
+        CompletionOutcome.EMPTY,
+        CompletionOutcome.REPEATED_NOOP,
+        CompletionOutcome.ABORTED,
+    }
+)
+
+
 class PrefixCacheCoordinator:
     """Router-facing coordinator for session-scoped prefix-cache estimates.
 
@@ -772,8 +785,6 @@ class PrefixCacheCoordinator:
     ) -> None:
         self.enabled = bool(enabled)
         self._memory = memory if memory is not None else SessionProviderPrefixMemory()
-        self._evidence_sink: Callable[[dict[str, Any]], None] | None = None
-        self._signals: dict[CacheScope, CacheSignal] = {}
         self._estimator = estimator if estimator is not None else CacheAwareCostEstimator()
         self._block_size = int(block_size)
         self._secret = secret if secret is not None else _PROCESS_SECRET
@@ -847,18 +858,6 @@ class PrefixCacheCoordinator:
             cache_affecting_params_hash=self._hash(cache_params),
         )
 
-    def last_signal(self, scope: CacheScope) -> CacheSignal | None:
-        """Return the most recent routing-time signal for ``scope``, if any.
-
-        Retained so a completed request can report what the router *expected*
-        against what the provider *actually* reported. Signals are recorded at
-        decision time and read once at observation time; a scope that was never
-        evaluated simply has none.
-        """
-        if scope is None:
-            return None
-        return self._signals.get(scope)
-
     def evaluate(
         self,
         scope: CacheScope,
@@ -880,9 +879,6 @@ class PrefixCacheCoordinator:
         state. POSSIBLY_WARMED, NEGATIVE, and UNKNOWN yield 0 (no strong discount).
         """
         signal = self._memory.lookup(scope, blocks, now=now)
-        # Retain the decision-time signal so the completed request can report
-        # what the router expected against what the provider actually reported.
-        self._signals[scope] = signal
         matched = signal.matched_prefix_tokens
         meets = signal.meets_threshold and signal.has_history
 
@@ -1008,10 +1004,6 @@ class PrefixCacheCoordinator:
           exactly as they are, so a warmup notice or an indeterminate result can
           neither overwrite nor age out strong locality evidence.
         """
-        admits = bool(getattr(outcome, "admits_real_work", False))
-        if not admits:
-            self._memory.refresh_liveness(scope)
-            return False
         # Claim a generation first and thread it through both calls. remember()
         # validates the claimed generation and silently returns False without
         # one, which would drop an older completion's blocks on the floor.
@@ -1019,6 +1011,27 @@ class PrefixCacheCoordinator:
             generation = self._claim_generation(scope, None)
         if generation is None:
             return False
+
+        # Only a *known-negative* outcome suppresses warming. An unclassified
+        # observation (UNKNOWN) is not evidence that nothing was served, so it
+        # must keep the long-standing behavior of warming on a plain success --
+        # otherwise adding this type would silently disable prefix warming for
+        # every caller that has not been wired to classify yet.
+        #
+        # A warmup notice, the incident that motivated all this, classifies as
+        # TRANSIENT_NO_PROGRESS: a known negative. That is the case worth
+        # suppressing, and it is the case the production path now actually
+        # produces.
+        suppresses_warming = outcome in _NON_WARMING_OUTCOMES
+        if suppresses_warming:
+            # The provider answered, so the scope is provably live and a
+            # transient hiccup must not age strong evidence out through the TTL.
+            # But the stored blocks are left exactly as they are: a short
+            # transient response must not overwrite what a warm conversation
+            # established.
+            self._memory.refresh_liveness(scope)
+            return False
+
         if not self.remember(scope, tuple(blocks), generation=generation):
             return False
         if observed_cached_tokens is not None:
@@ -1058,59 +1071,6 @@ class PrefixCacheCoordinator:
             evidence=state,
             confidence=confidence,
         )
-
-    def set_evidence_sink(self, sink: Callable[[dict[str, Any]], None] | None) -> None:
-        """Install a callable receiving one structured record per completed request.
-
-        The record exists to make one ambiguity directly observable: the router
-        *expected* a warm prefix and the provider *reported* a cold one. Those are
-        different failures with different fixes, and until both numbers were
-        recorded they were indistinguishable from outside.
-        """
-        self._evidence_sink = sink
-
-    def build_evidence_event(
-        self,
-        *,
-        scope: CacheScope,
-        signal: Any,
-        observed_cached_tokens: int | None,
-        outcome: Any,
-        remember_written: bool,
-    ) -> dict[str, Any]:
-        """Build the structured per-request cache/routing observation.
-
-        ``None`` and ``0`` are deliberately distinct and must stay that way:
-        ``None`` means the provider reported no cached-token evidence at all,
-        while ``0`` means it explicitly reported zero reuse. Only an explicit
-        number can establish or refute a mismatch.
-
-        Contains no prompt text and no credentials.
-        """
-        expected = float(getattr(signal, "expected_cached_tokens", 0.0) or 0.0)
-        observed = observed_cached_tokens
-        mismatch = expected > 0.0 and observed is not None and float(observed) < expected
-        return {
-            "scope_endpoint_id": getattr(scope, "endpoint_id", None),
-            "scope_model_profile": getattr(scope, "model_profile", None),
-            "scope_session_hash": getattr(scope, "session_hash", None),
-            "outcome": getattr(outcome, "value", None if outcome is None else str(outcome)),
-            "admits_real_work": bool(getattr(outcome, "admits_real_work", False)),
-            "matched_prefix_tokens": int(getattr(signal, "matched_prefix_tokens", 0) or 0),
-            "expected_cached_tokens": expected,
-            "observed_cached_tokens": observed,
-            "cache_prediction_mismatch": bool(mismatch),
-            "remember_written": bool(remember_written),
-        }
-
-    def _emit_evidence_event(self, event: dict[str, Any]) -> None:
-        sink = getattr(self, "_evidence_sink", None)
-        if sink is None:
-            return
-        try:
-            sink(event)
-        except Exception:  # pragma: no cover - telemetry must never break routing
-            logger.warning("routewise_prefix_evidence_emit_failed", exc_info=True)
 
     def _claim_generation(self, scope: CacheScope, generation: int | None) -> int | None:
         if generation is None:
