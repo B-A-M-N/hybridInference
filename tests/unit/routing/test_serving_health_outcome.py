@@ -25,6 +25,8 @@ useful *serving*.
 
 from __future__ import annotations
 
+import pytest
+
 from routing.completion_outcome import CompletionOutcome
 from routing.endpoint_health import EndpointHealthRegistry, _CircuitState
 
@@ -113,19 +115,33 @@ def test_non_progress_does_not_force_close_half_open(monkeypatch):
     assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED
 
 
-def test_unclassified_success_preserves_historical_behavior(monkeypatch):
-    """outcome=None keeps the pre-incident contract for callers not yet classified.
-
-    Without this, wiring the typed outcome through every call site would silently
-    change routing for traffic that never reports one.
-    """
+def test_liveness_never_recovers_a_half_open_breaker(monkeypatch):
+    """Transport liveness cannot close a breaker; only serving progress can."""
     monkeypatch.setenv(_THRESHOLD_ENV, "3")
+    monkeypatch.setenv("CIRCUIT_COOLDOWN_SECONDS", "0")
     registry = EndpointHealthRegistry()
     _trip(monkeypatch, registry)
 
-    registry.record_success(_ENDPOINT)
+    assert registry.begin_dispatch(_ENDPOINT) is not None
+    assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.HALF_OPEN
 
+    for _ in range(5):
+        registry.record_liveness(_ENDPOINT)
+        assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.HALF_OPEN
+
+    registry.record_success(_ENDPOINT, outcome=CompletionOutcome.COMPLETE)
     assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED
+
+
+def test_unclassified_success_is_rejected_not_counted(monkeypatch):
+    """Silence is never positive evidence; callers must use liveness instead."""
+    registry = EndpointHealthRegistry()
+    _trip(monkeypatch, registry)
+
+    with pytest.raises(TypeError):
+        registry.record_success(_ENDPOINT)
+
+    assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.OPEN
 
 
 def test_process_liveness_is_not_serving_progress(monkeypatch):

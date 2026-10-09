@@ -499,6 +499,7 @@ class _Entry:
 
     blocks: tuple[Block, ...]
     last_seen_at: float
+    generation: int = 0
 
 
 class SessionProviderPrefixMemory:
@@ -556,7 +557,6 @@ class SessionProviderPrefixMemory:
         scope: CacheScope,
         *,
         now: float | None = None,
-        generation: int | None = None,
     ) -> bool:
         """Refresh an existing entry's recency WITHOUT replacing its blocks.
 
@@ -572,16 +572,9 @@ class SessionProviderPrefixMemory:
         and only ``last_seen_at`` moves forward.
 
         Returns ``True`` when a current entry was refreshed, ``False`` when
-        there is nothing to refresh (no entry, or the generation is stale).
+        there is nothing to refresh.
         """
         ts = self._time() if now is None else now
-        if generation is not None:
-            # Honor the parameter the docstring promises to check: a completion
-            # whose generation was superseded must not extend the lifetime of a
-            # newer prefix entry.
-            with self._generation_lock:
-                if self._scope_generations.get(scope) != generation:
-                    return False
         with self._lock:
             entry = self._entries.get(scope)
             if entry is None:
@@ -593,12 +586,40 @@ class SessionProviderPrefixMemory:
             self._entries.move_to_end(scope)
             return True
 
+    def refresh_liveness_for_generation(
+        self,
+        scope: CacheScope,
+        *,
+        generation: int,
+        now: float | None = None,
+    ) -> bool:
+        """Atomically validate a generation and refresh the associated entry.
+
+        The coordinator validates the dispatch generation while holding the
+        generation guard, then this method rechecks it under the memory lock. This
+        keeps a stale completion from extending a newer entry's lifetime even when
+        the newer entry is installed between generation validation and mutation.
+        """
+        ts = self._time() if now is None else now
+        with self._lock:
+            entry = self._entries.get(scope)
+            if entry is None:
+                return False
+            if entry.generation != generation:
+                return False
+            if self._ttl_sec > 0 and (ts - entry.last_seen_at) > self._ttl_sec:
+                return False
+            entry.last_seen_at = ts
+            self._entries.move_to_end(scope)
+            return True
+
     def observe(
         self,
         scope: CacheScope,
         blocks: Sequence[Block],
         *,
         now: float | None = None,
+        generation: int = 0,
     ) -> None:
         """Store a selected-success request for future prefix matches."""
         ts = self._time() if now is None else now
@@ -611,6 +632,7 @@ class SessionProviderPrefixMemory:
             self._entries[scope] = _Entry(
                 blocks=new_blocks,
                 last_seen_at=ts,
+                generation=generation,
             )
             self._entries.move_to_end(scope)
             self._evict_locked()
@@ -998,15 +1020,8 @@ class PrefixCacheCoordinator:
           neither overwrite nor age out strong locality evidence.
         """
         # Resolve and validate the generation BEFORE touching memory, on both the
-        # positive and the negative path. Claiming it outside _generation_lock
-        # races a concurrent completion, and letting a stale generation reach the
-        # liveness refresh would let an older request extend the lifetime of a
-        # newer prefix entry.
-        # Resolve the generation BEFORE touching memory, on the negative path as
-        # well as the positive one. A stale completion reaching the liveness
-        # refresh would extend the lifetime of a newer prefix entry, so it is
-        # validated up front: _claim_generation returns None for a supplied
-        # generation whose guard was evicted or superseded.
+        # positive and the negative path. _claim_generation returns None for a
+        # supplied generation whose guard was evicted or superseded.
         with self._generation_lock:
             generation = self._claim_generation(scope, generation)
         if generation is None:
@@ -1022,7 +1037,10 @@ class PrefixCacheCoordinator:
             # But the stored blocks are left exactly as they are: a short
             # transient response must not overwrite what a warm conversation
             # established.
-            self._memory.refresh_liveness(scope)
+            self._memory.refresh_liveness_for_generation(
+                scope,
+                generation=generation,
+            )
             return False
 
         if not self.remember(scope, tuple(blocks), generation=generation):
