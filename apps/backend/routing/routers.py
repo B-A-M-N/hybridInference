@@ -810,6 +810,9 @@ class FixedRouter:
             ),
         )
 
+    def _on_liveness(self, endpoint_id: str) -> None:
+        self._health_registry.record_liveness(endpoint_id)
+
     def _on_failure(
         self,
         endpoint_id: str,
@@ -2668,7 +2671,7 @@ class FixedRouter:
                         # The loop below's first-token bookkeeping, for a
                         # first token that arrived while it was being awaited.
                         first = False
-                        self._on_success(primary_endpoint_id)
+                        self._on_liveness(primary_endpoint_id)
                         self._prefill_load.release(lease, prefill_confirmed=True)
                     for chunk in held:
                         yield chunk
@@ -2678,7 +2681,7 @@ class FixedRouter:
                         # Providers may emit keep-alives or empty terminal chunks.
                         first = False
                         # Consider first non-empty token as a success signal for availability.
-                        self._on_success(primary_endpoint_id)
+                        self._on_liveness(primary_endpoint_id)
                         # First token means the prompt is resident and this
                         # endpoint is decoding, not prefilling. Holding the
                         # lease for the whole stream would let a long cheap
@@ -2845,7 +2848,7 @@ class FixedRouter:
                             held = await self._await_first_token(stream, fallback_watch)
                             if held and has_non_empty_content(held[-1]):
                                 first = False
-                                self._on_success(adapter_endpoint_id)
+                                self._on_liveness(adapter_endpoint_id)
                                 self._prefill_load.release(lease, prefill_confirmed=True)
                             for chunk in held:
                                 yield chunk
@@ -2853,7 +2856,7 @@ class FixedRouter:
                         async for chunk in stream:
                             if first and has_non_empty_content(chunk):
                                 first = False
-                                self._on_success(adapter_endpoint_id)
+                                self._on_liveness(adapter_endpoint_id)
                                 self._prefill_load.release(lease, prefill_confirmed=True)
                             yield chunk
                             chunks_yielded = True

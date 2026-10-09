@@ -560,6 +560,9 @@ class RouteWiseRouter:
             ),
         )
 
+    def _on_liveness(self, endpoint_id: str) -> None:
+        self._health_registry.record_liveness(endpoint_id)
+
     def _on_failure(
         self,
         endpoint_id: str,
@@ -3444,7 +3447,7 @@ class RouteWiseRouter:
                             # other adapters, resolve the endpoint after first output
                             # in case the adapter swapped its serving config.
                             if not getattr(adapter, "reports_leg_outcomes", False):
-                                self._on_success(endpoint_id_for_adapter(adapter))
+                                self._on_liveness(endpoint_id_for_adapter(adapter))
                         yield chunk
                 else:
                     async for chunk in adapter.stream_chat_completion(messages, **params):
@@ -3465,7 +3468,7 @@ class RouteWiseRouter:
                             # other adapters, resolve the endpoint after first output
                             # in case the adapter swapped its serving config.
                             if not getattr(adapter, "reports_leg_outcomes", False):
-                                self._on_success(endpoint_id_for_adapter(adapter))
+                                self._on_liveness(endpoint_id_for_adapter(adapter))
                         yield chunk
         finally:
             # Release prefill lease if it was acquired. Idempotent: no-op if

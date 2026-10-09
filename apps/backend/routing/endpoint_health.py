@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from routing.completion_outcome import CompletionOutcome
 from routing.engine_wait import EngineWaitExpired
 from routing.usage_limit import MIN_ALERT_GAP, detect_usage_limit
 from serving.adapters.key_pool import KeyPoolRoleRestricted
@@ -979,12 +980,12 @@ class EndpointHealthRegistry:
         self,
         endpoint_id: str,
         *,
-        outcome: Any = None,
+        outcome: CompletionOutcome,
     ) -> None:
         """Record a request that produced evidence of useful serving progress.
 
         ``outcome`` is a :class:`routing.completion_outcome.CompletionOutcome`.
-        When it is supplied and does NOT admit real work, this call is a no-op.
+        When it does NOT admit real work, this call is a no-op.
 
         Why this lives here and not at the call sites: a provider can answer
         HTTP 200 with a well-formed body whose only content is a warmup notice.
@@ -1000,10 +1001,11 @@ class EndpointHealthRegistry:
         fine, readiness still passes) strictly separate from model-serving
         progress (this response did inference work).
 
-        ``outcome=None`` preserves the historical behavior for callers that have
-        not been classified yet.
+        A valid :class:`CompletionOutcome` is mandatory. A caller that cannot
+        classify a response must call :meth:`record_liveness` instead; silence is
+        never positive evidence.
         """
-        if outcome is not None and not getattr(outcome, "admits_real_work", True):
+        if not isinstance(outcome, CompletionOutcome) or not outcome.admits_real_work:
             return
         with self._lock:
             self.ensure(endpoint_id)
@@ -1020,18 +1022,15 @@ class EndpointHealthRegistry:
             self._resolve_auth_misconfig(endpoint_id)
 
     def record_liveness(self, endpoint_id: str) -> None:
-        """Record that an endpoint emitted bytes, without claiming it served.
+        """Record that an endpoint emitted bytes, without claiming serving recovery.
 
         A streaming attempt proves the process and connection are alive as soon as
         the first chunk arrives. It does not prove the model did useful work, so
-        this must not clear serving failures or close a serving breaker. Streaming
+        this must not clear serving failures or transition a breaker. Streaming
         paths call this early and record semantic success once the accumulated
         response can be classified.
         """
         with self._lock:
-            circuit = self._circuits.get(endpoint_id)
-            if circuit is not None and circuit.state == _CircuitState.HALF_OPEN:
-                circuit.on_success()
             self.ensure(endpoint_id)
             self._health[endpoint_id].record(True)
 
