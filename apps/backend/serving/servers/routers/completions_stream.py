@@ -44,7 +44,11 @@ from serving.stream import make_role_chunk, new_completion_id, stamp_completion_
 from serving.utils import context as req_ctx
 from serving.utils.errors import format_exception_for_db
 from serving.utils.logging import get_logger
-from serving.utils.token_utils import normalize_usage, sanitize_usage
+from serving.utils.token_utils import (
+    normalize_usage,
+    optional_token_count,
+    sanitize_usage,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -918,8 +922,8 @@ class StreamSession:
                 total_tokens=(
                     int(_usage["total_tokens"]) if _usage.get("total_tokens") is not None else None
                 ),
-                cache_read_tokens=int(_usage.get("cache_read_tokens", 0) or 0),
-                cache_write_tokens=int(_usage.get("cache_write_tokens", 0) or 0),
+                cache_read_tokens=optional_token_count(_usage.get("cache_read_tokens")),
+                cache_write_tokens=optional_token_count(_usage.get("cache_write_tokens")),
                 reasoning_tokens=int(_usage.get("reasoning_tokens", 0) or 0),
             )
 
