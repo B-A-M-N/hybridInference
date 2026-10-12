@@ -41,6 +41,17 @@ class _Pool:
 
 
 def _dsn() -> str:
+    # The CI test job supplies DB_* for its dynamically mapped Postgres service.
+    # Prefer that job-scoped connection over a TEST_PG_DSN inherited from a
+    # runner environment, which may point at a different port or database.
+    if os.getenv("CI") and (os.getenv("DB_HOST") or os.getenv("DB_PORT")):
+        host = os.getenv("DB_HOST", "localhost")
+        port = os.getenv("DB_PORT", "5432")
+        name = os.getenv("DB_NAME", "hybridinference_test_db")
+        user = os.getenv("DB_USER", "postgres")
+        password = os.getenv("DB_PASSWORD", "postgres")
+        return f"postgresql://{user}:{password}@{host}:{port}/{name}"
+
     dsn = os.getenv("TEST_PG_DSN")
     if dsn:
         return dsn
@@ -78,7 +89,10 @@ def pg_dsn() -> str:
     finally:
         loop.close()
     if failure is not None:
-        pytest.skip(f"PostgreSQL test database not available: {failure}")
+        message = f"PostgreSQL test database not available: {failure}"
+        if os.getenv("CI"):
+            pytest.fail(message, pytrace=False)
+        pytest.skip(message)
     return dsn
 
 
