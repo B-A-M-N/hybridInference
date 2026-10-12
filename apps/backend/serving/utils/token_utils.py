@@ -329,8 +329,9 @@ def optional_token_count(value: Any) -> int | None:
 def normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
     """Normalize usage dict by extracting and flattening token fields.
 
-    Extracts reasoning_tokens and cache tokens from various nested provider
-    formats and places them at the top level for consistent downstream access.
+    Extracts reasoning and cache tokens from provider formats, flattens cache
+    fields to the top level, and removes invalid direct cache counts before
+    cost and persistence consumers read them.
 
     Args:
         usage: Raw usage dictionary from model response
@@ -344,14 +345,23 @@ def normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     usage = sanitize_usage(usage)
 
+    # Start from a copy so canonical cache fields can be validated before the
+    # normalized value is shared by cost tracking and persistence.
+    normalized = dict(usage)
+    for field in ("cache_read_tokens", "cache_write_tokens"):
+        if field not in normalized:
+            continue
+        count = optional_token_count(normalized[field])
+        if count is None:
+            normalized.pop(field)
+        else:
+            normalized[field] = count
+
     # Extract reasoning tokens from nested locations
     reasoning_tokens = extract_reasoning_tokens(usage)
 
     # Extract cache tokens from nested locations
-    cache_read, cache_write = extract_cache_tokens(usage)
-
-    # Create normalized usage dict
-    normalized = dict(usage)  # Copy to avoid modifying original
+    cache_read, cache_write = extract_cache_tokens(normalized)
 
     # Add reasoning_tokens at top level if found
     if reasoning_tokens is not None:

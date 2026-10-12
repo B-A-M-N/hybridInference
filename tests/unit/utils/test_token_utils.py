@@ -327,6 +327,20 @@ class TestNormalizeUsageCacheTokens:
         result = normalize_usage(usage)
         assert result["cache_read_tokens"] == 0
 
+    def test_invalid_direct_cache_counts_are_removed(self):
+        """Invalid canonical counts must not reach cost or persistence."""
+        usage = {
+            "prompt_tokens": 1000,
+            "cache_read_tokens": -100,
+            "cache_write_tokens": 1.5,
+        }
+
+        result = normalize_usage(usage)
+
+        assert "cache_read_tokens" not in result
+        assert "cache_write_tokens" not in result
+        assert usage["cache_read_tokens"] == -100  # the raw response is untouched
+
     def test_provider_without_cache_reporting_stays_absent(self):
         """A provider that sends no cache key at all is unknown, not a miss."""
         usage = {"prompt_tokens": 415, "completion_tokens": 64, "total_tokens": 479}
