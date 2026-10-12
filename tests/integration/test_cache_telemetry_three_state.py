@@ -41,6 +41,14 @@ class _Pool:
 
 
 def _dsn() -> str:
+    cache_test_port = os.getenv("CACHE_TELEMETRY_TEST_DB_PORT")
+    if cache_test_port:
+        host = os.getenv("DB_HOST", "localhost")
+        name = os.getenv("CACHE_TELEMETRY_TEST_DB_NAME", "hybridinference_test_db")
+        user = os.getenv("DB_USER", "postgres")
+        password = os.getenv("DB_PASSWORD", "postgres")
+        return f"postgresql://{user}:{password}@{host}:{cache_test_port}/{name}"
+
     # Prefer an explicit DB_* connection over TEST_PG_DSN when both are set.
     # CI uses DB_PORT for the dynamically mapped Postgres service; a runner's
     # TEST_PG_DSN can point at a different port or database.
