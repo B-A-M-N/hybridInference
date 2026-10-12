@@ -14,8 +14,8 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
 
+import asyncpg
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
@@ -25,9 +25,6 @@ from serving.servers.deps import AppServices, get_db_logger, verify_admin_access
 from serving.servers.routers import admin as admin_router
 from serving.storage.database import DatabaseLogger
 from tests.fixtures.auth_helpers import assert_test_db_name
-
-if TYPE_CHECKING:
-    import asyncpg
 
 pytestmark = [pytest.mark.integration, pytest.mark.dbtest]
 
@@ -43,12 +40,51 @@ class _Pool:
         self.pool = pool
 
 
-@pytest_asyncio.fixture
-async def pool():
+def _dsn() -> str:
     dsn = os.getenv("TEST_PG_DSN")
-    if not dsn:
-        pytest.skip("TEST_PG_DSN is not set; skipping database integration tests")
-    logger = DatabaseLogger({"dsn": dsn}, store_full_prompts=False)
+    if dsn:
+        return dsn
+    host = os.getenv("DB_HOST", "localhost")
+    port = os.getenv("DB_PORT", "5432")
+    name = os.getenv("DB_NAME", "hybridinference_test_db")
+    user = os.getenv("DB_USER", "postgres")
+    password = os.getenv("DB_PASSWORD", "postgres")
+    return f"postgresql://{user}:{password}@{host}:{port}/{name}"
+
+
+@pytest.fixture(scope="session")
+def pg_dsn() -> str:
+    """A reachable dedicated test database, or skip when Postgres is absent."""
+    import asyncio
+
+    dsn = _dsn()
+
+    async def _probe() -> str | None:
+        try:
+            conn = await asyncpg.connect(dsn, timeout=2)
+        except Exception as exc:
+            return str(exc)
+        try:
+            assert_test_db_name(
+                await conn.fetchval("SELECT current_database()"), "cache three-state"
+            )
+        finally:
+            await conn.close()
+        return None
+
+    loop = asyncio.new_event_loop()
+    try:
+        failure = loop.run_until_complete(_probe())
+    finally:
+        loop.close()
+    if failure is not None:
+        pytest.skip(f"PostgreSQL test database not available: {failure}")
+    return dsn
+
+
+@pytest_asyncio.fixture
+async def pool(pg_dsn: str):
+    logger = DatabaseLogger({"dsn": pg_dsn}, store_full_prompts=False)
     await logger.initialize()
     assert logger.pool is not None
     # Refuse a non-test database before touching anything: the cleanup below
