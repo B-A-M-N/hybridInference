@@ -2097,15 +2097,6 @@ async def anthropic_messages(
     try:
         resp = await adapter.messages(body, request_id=request_id, extra_headers=forwarded_headers)
         prefill_load.release(prefill_lease, prefill_confirmed=True)
-        health_registry.record_success(
-            dispatch_endpoint_id,
-            outcome=classify_completion_outcome(
-                content=_anthropic_completion_text(resp),
-                usage=resp.get("usage") if isinstance(resp, dict) else None,
-                http_status=200,
-                terminal=True,
-            ),
-        )
     except HTTPException as exc:
         # Not str(exc.detail): unlike the router's own HTTPExceptions (static
         # contract text), one raised from inside adapter.messages() is an
