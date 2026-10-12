@@ -41,10 +41,10 @@ class _Pool:
 
 
 def _dsn() -> str:
-    # The CI test job supplies DB_* for its dynamically mapped Postgres service.
-    # Prefer that job-scoped connection over a TEST_PG_DSN inherited from a
-    # runner environment, which may point at a different port or database.
-    if os.getenv("CI") and (os.getenv("DB_HOST") or os.getenv("DB_PORT")):
+    # Prefer an explicit DB_* connection over TEST_PG_DSN when both are set.
+    # CI uses DB_PORT for the dynamically mapped Postgres service; a runner's
+    # TEST_PG_DSN can point at a different port or database.
+    if os.getenv("DB_HOST") or os.getenv("DB_PORT"):
         host = os.getenv("DB_HOST", "localhost")
         port = os.getenv("DB_PORT", "5432")
         name = os.getenv("DB_NAME", "hybridinference_test_db")
