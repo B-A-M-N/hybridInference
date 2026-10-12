@@ -12,6 +12,7 @@ States (identical positive prompt tokens): NULL = unknown, 0 = measured miss,
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -23,11 +24,12 @@ from httpx import ASGITransport, AsyncClient
 from serving.servers.deps import AppServices, get_db_logger, verify_admin_access
 from serving.servers.routers import admin as admin_router
 from serving.storage.database import DatabaseLogger
+from tests.fixtures.auth_helpers import assert_test_db_name
 
 if TYPE_CHECKING:
     import asyncpg
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.dbtest]
 
 _PROVIDER = "sglang"
 _MODEL = "deepseek-v4.1-flash"
@@ -49,17 +51,24 @@ async def pool():
     logger = DatabaseLogger({"dsn": dsn}, store_full_prompts=False)
     await logger.initialize()
     assert logger.pool is not None
+    # Refuse a non-test database before touching anything: the cleanup below
+    # deletes rows, and a stray staging/production DSN must not be destroyed.
+    async with logger.pool.acquire() as conn:
+        assert_test_db_name(await conn.fetchval("SELECT current_database()"), "cache three-state")
+    # Unique per fixture instance so cleanup deletes only this file's rows and
+    # never another database-backed test's rows under concurrent runs.
+    prefix = f"cache3s-{uuid.uuid4().hex[:12]}"
     try:
-        yield logger.pool
+        yield logger.pool, prefix
     finally:
-        await logger.pool.execute("TRUNCATE TABLE api_logs")
+        await logger.pool.execute("DELETE FROM api_logs WHERE request_id LIKE $1", f"{prefix}%")
         await logger.cleanup()
 
 
-async def _seed(pool: asyncpg.Pool, cache_read_tokens: list[int | None]) -> None:
+async def _seed(pool: asyncpg.Pool, prefix: str, cache_read_tokens: list[int | None]) -> None:
     """Insert one successful api_logs row per entry, all with 1000 prompt tokens."""
     rows = [
-        (f"r{i}", _MODEL, _PROVIDER, _BASE + timedelta(minutes=i), 1000, cached)
+        (f"{prefix}-{i}", _MODEL, _PROVIDER, _BASE + timedelta(minutes=i), 1000, cached)
         for i, cached in enumerate(cache_read_tokens)
     ]
     await pool.executemany(
@@ -93,7 +102,8 @@ async def _totals(pool: asyncpg.Pool) -> dict:
 @pytest.mark.asyncio
 async def test_null_zero_and_hit_are_three_states(pool):
     """Only reported values are eligible; NULL is neither a hit nor a miss."""
-    await _seed(pool, [None, 0, 900])
+    pool, prefix = pool
+    await _seed(pool, prefix, [None, 0, 900])
     totals = await _totals(pool)
 
     assert totals["request_count"] == 3
@@ -104,7 +114,8 @@ async def test_null_zero_and_hit_are_three_states(pool):
 @pytest.mark.asyncio
 async def test_all_unknown_is_not_a_zero_percent_rate(pool):
     """An all-unknown provider has no measurable rate -- not 0%."""
-    await _seed(pool, [None, None, None, None])
+    pool, prefix = pool
+    await _seed(pool, prefix, [None, None, None, None])
     totals = await _totals(pool)
 
     assert totals["request_count"] == 4
@@ -115,7 +126,8 @@ async def test_all_unknown_is_not_a_zero_percent_rate(pool):
 @pytest.mark.asyncio
 async def test_reported_zero_stays_eligible(pool):
     """A measured miss must stay in the denominator, or it vanishes from the rate."""
-    await _seed(pool, [0, 0, 0])
+    pool, prefix = pool
+    await _seed(pool, prefix, [0, 0, 0])
     totals = await _totals(pool)
 
     assert totals["cache_eligible_count"] == 3
