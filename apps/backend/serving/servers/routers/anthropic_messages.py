@@ -21,7 +21,6 @@ import asyncio
 import contextlib
 import copy
 import json
-import os
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -40,6 +39,7 @@ from serving.adapters.anthropic_aliases import resolve_anthropic_alias
 from serving.adapters.anthropic_translator import normalize_inline_system
 from serving.adapters.key_pool import KeyPool, KeyPoolExhausted
 from serving.adapters.upstream_limiter import UpstreamSaturated
+from serving.config.app_config import config_value, on_change
 from serving.config.settings import has_role
 from serving.exceptions import (
     generic_message_for_status,
@@ -64,6 +64,7 @@ from serving.servers.deps import (
     get_operational_store,
     get_router,
 )
+from serving.servers.model_availability import model_not_found_detail
 from serving.storage.utils import calculate_cost
 from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
@@ -72,6 +73,8 @@ from serving.utils.session_identity import consume_session_fields, session_ident
 from serving.utils.tokens import estimate_prompt_tokens, estimate_text_tokens
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from fastapi.exceptions import RequestValidationError
 
 logger = get_logger(__name__)
@@ -89,6 +92,7 @@ router = APIRouter()
 # legitimately slow -- a full 1M-token prompt measures 138s on the local sglang
 # replicas -- so _MAX_FIRST_FRAME_IDLE stays at the historical 300s. After the
 # first frame the upstream is decoding, and _MAX_STREAM_IDLE applies instead.
+# Both are re-read whenever the configuration changes (_load_stream_limits).
 #
 # The idle timer only resets on a frame the adapter actually yields, but a
 # provider can be actively streaming while producing no forwardable frame for a
@@ -114,18 +118,30 @@ _KEEPALIVE_INTERVAL = 15
 # before any surrounding validation can matter. Far above any real message: heavy
 # tool use runs to dozens of blocks, not thousands.
 _MAX_CONTENT_BLOCKS = 1024
-try:
-    _MAX_STREAM_IDLE = int(os.environ.get("STREAM_MAX_IDLE_S", "240"))
-except (TypeError, ValueError):
-    _MAX_STREAM_IDLE = 240
-try:
-    _MAX_FIRST_FRAME_IDLE = int(os.environ.get("STREAM_MAX_FIRST_FRAME_IDLE_S", "300"))
-except (TypeError, ValueError):
-    _MAX_FIRST_FRAME_IDLE = 300
-# An operator who raised STREAM_MAX_IDLE_S did so to stop a slow model being cut
-# off, and before the split that value covered prefill too. Never give them less
-# head room for the first frame than they asked for overall.
-_MAX_FIRST_FRAME_IDLE = max(_MAX_FIRST_FRAME_IDLE, _MAX_STREAM_IDLE)
+_MAX_STREAM_IDLE = 240
+_MAX_FIRST_FRAME_IDLE = 300
+
+
+def _load_stream_limits() -> None:
+    """Read ``STREAM_MAX_IDLE_S`` and ``STREAM_MAX_FIRST_FRAME_IDLE_S``."""
+    global _MAX_STREAM_IDLE, _MAX_FIRST_FRAME_IDLE
+    try:
+        max_stream_idle = int(config_value("STREAM_MAX_IDLE_S", "240") or "")
+    except (TypeError, ValueError):
+        max_stream_idle = 240
+    try:
+        max_first_frame_idle = int(config_value("STREAM_MAX_FIRST_FRAME_IDLE_S", "300") or "")
+    except (TypeError, ValueError):
+        max_first_frame_idle = 300
+    _MAX_STREAM_IDLE = max_stream_idle
+    # An operator who raised STREAM_MAX_IDLE_S did so to stop a slow model being
+    # cut off, and before the split that value covered prefill too. Never give
+    # them less head room for the first frame than they asked for overall.
+    _MAX_FIRST_FRAME_IDLE = max(max_first_frame_idle, max_stream_idle)
+
+
+_load_stream_limits()
+on_change(_load_stream_limits)
 _STREAM_SENTINEL: Any = object()
 
 
@@ -406,10 +422,32 @@ def _prefill_inputs(body: dict[str, Any]) -> tuple[list[dict[str, Any]], Any]:
     return messages, body.get("tools")
 
 
+def _prompt_tokens(body: dict[str, Any], adapter) -> int:
+    """Return the estimated prompt tokens ``adapter`` would be sent for an Anthropic body.
+
+    The inputs prefill accounting sizes (``_prefill_inputs``), plus the
+    structured-output schema in ``output_config.format`` for a native Anthropic
+    adapter, which is forwarded the body as it is. An OpenAI-backed one never
+    sees the schema: ``_sanitize_for_openai_backend`` drops ``output_config``.
+    """
+    messages, tools = _prefill_inputs(body)
+    output_format = None
+    output_config = body.get("output_config")
+    if adapter.native_format != "openai" and isinstance(output_config, dict):
+        output_format = output_config.get("format")
+    return estimate_prefill_tokens(messages, tools=tools, response_format=output_format)
+
+
 # --- Model resolution ------------------------------------------------------
 
 
-def _pick_dispatch_adapter(model_id: str, canonical: str, router_exec, user_role: str):
+def _pick_dispatch_adapter(
+    model_id: str,
+    canonical: str,
+    router_exec,
+    user_role: str,
+    size_prompt: Callable[[Any], int] | None = None,
+):
     """Return the route adapter this request may actually be dispatched to.
 
     This surface forwards an Anthropic-native body, which FixedRouter has no
@@ -435,8 +473,11 @@ def _pick_dispatch_adapter(model_id: str, canonical: str, router_exec, user_role
     the same reason -- the reroute below this can resolve a different model and
     discard this adapter, and a probe spent on an endpoint nothing is sent to is
     a recovery window burned for nothing.
+
+    ``size_prompt`` sizes the request for the model's offload route, which a
+    prompt over its max input may not be sent (``eligible_adapters``).
     """
-    eligible = router_exec.eligible_adapters(canonical)
+    eligible = router_exec.eligible_adapters(canonical, size_prompt=size_prompt)
     if not eligible:
         # Every provider for this model is admin-disabled, has an open circuit,
         # or is already being probed. Same disposition the chat path gives
@@ -455,6 +496,7 @@ async def _resolve(
     model_visibility_resolver=None,
     *,
     for_dispatch: bool = True,
+    size_prompt: Callable[[Any], int] | None = None,
 ):
     """Return (canonical_model_id, route, adapter).
 
@@ -463,19 +505,22 @@ async def _resolve(
     skipped, and a 503 is raised once none are left. Callers that only need the
     visibility check pass ``for_dispatch=False`` -- count_tokens answers locally
     and never reaches an upstream, so a provider outage must not stop it.
+    ``size_prompt`` returns the request's estimated prompt tokens as a given
+    adapter would be sent them, for an offload route with a max input
+    (``_pick_dispatch_adapter``).
     """
     canonical = resolve_anthropic_alias(model_id)
     route = router_exec.routes.get(canonical)
     if route is None or not route.published:
         req_ctx.mark_model_not_found()
-        raise HTTPException(404, f"Model '{model_id}' not found")
+        raise HTTPException(404, model_not_found_detail(model_id, canonical, user_ctx=user_ctx))
     required = route.required_role or ("admin" if route.admin_only else "free")
     user_role = (user_ctx or {}).get("role", "free")
     if model_visibility_resolver is not None:
         required = await model_visibility_resolver.get_effective_required_role(canonical, required)
     if not has_role(user_role, required):
         req_ctx.mark_model_not_found()
-        raise HTTPException(404, f"Model '{model_id}' not found")
+        raise HTTPException(404, model_not_found_detail(model_id, canonical, user_ctx=user_ctx))
     # Same answer for "the owner disabled it" and "your grant does not name
     # it". Checked on the canonical id, which the alias resolution above has
     # already produced — a grant stores canonical ids, so scoping on the
@@ -484,13 +529,17 @@ async def _resolve(
         canonical, user_ctx
     ):
         req_ctx.mark_model_not_found()
-        raise HTTPException(404, f"Model '{model_id}' not found")
+        raise HTTPException(404, model_not_found_detail(model_id, canonical, user_ctx=user_ctx))
     if not route.adapters:
         raise HTTPException(404, f"Model '{model_id}' has no adapters")
     if not for_dispatch:
         adapter, _ = route.adapters[0]
         return canonical, route, adapter
-    return canonical, route, _pick_dispatch_adapter(model_id, canonical, router_exec, user_role)
+    return (
+        canonical,
+        route,
+        _pick_dispatch_adapter(model_id, canonical, router_exec, user_role, size_prompt),
+    )
 
 
 def _pick_adapter_for_role(adapters, user_role: str):
@@ -534,11 +583,28 @@ def _pick_adapter_for_role(adapters, user_role: str):
 # These calls are rerouted to a fast non-reasoning model with an output budget
 # large enough to actually answer. The reroute is best-effort: if the target is
 # unavailable (not configured, or not visible to the caller) the request is left
-# on its original model rather than failed. Set the threshold env var to 0 to
+# on its original model rather than failed. Set the threshold setting to 0 to
 # disable entirely.
-_SMALL_MAXTOK_REROUTE_TARGET = os.environ.get("SMALL_MAXTOK_REASONING_TARGET", "qwen3.6-35b")
-_SMALL_MAXTOK_THRESHOLD = int(os.environ.get("SMALL_MAXTOK_REASONING_THRESHOLD", "64"))
-_SMALL_MAXTOK_FLOOR = int(os.environ.get("SMALL_MAXTOK_REASONING_FLOOR", "512"))
+_SMALL_MAXTOK_REROUTE_TARGET: str | None = "qwen3.6-35b"
+_SMALL_MAXTOK_THRESHOLD = 64
+_SMALL_MAXTOK_FLOOR = 512
+
+
+def _load_small_call_reroute() -> None:
+    """Read the ``SMALL_MAXTOK_REASONING_*`` settings."""
+    global _SMALL_MAXTOK_REROUTE_TARGET, _SMALL_MAXTOK_THRESHOLD, _SMALL_MAXTOK_FLOOR
+    target = config_value("SMALL_MAXTOK_REASONING_TARGET", "qwen3.6-35b")
+    threshold = int(config_value("SMALL_MAXTOK_REASONING_THRESHOLD", "64") or "")
+    floor = int(config_value("SMALL_MAXTOK_REASONING_FLOOR", "512") or "")
+    _SMALL_MAXTOK_REROUTE_TARGET, _SMALL_MAXTOK_THRESHOLD, _SMALL_MAXTOK_FLOOR = (
+        target,
+        threshold,
+        floor,
+    )
+
+
+_load_small_call_reroute()
+on_change(_load_small_call_reroute)
 # A model is treated as "reasoning" when it advertises a thinking/reasoning knob.
 _REASONING_PARAMS = ("thinking", "reasoning_effort")
 
@@ -648,7 +714,11 @@ async def _maybe_reroute_small_reasoning_call(
         return canonical, route, adapter
     try:
         new_canonical, new_route, new_adapter = await _resolve(
-            _SMALL_MAXTOK_REROUTE_TARGET, router_exec, user_ctx, model_visibility_resolver
+            _SMALL_MAXTOK_REROUTE_TARGET,
+            router_exec,
+            user_ctx,
+            model_visibility_resolver,
+            size_prompt=lambda adapter: _prompt_tokens(body, adapter),
         )
     except HTTPException:
         # Target not configured, not visible to this caller, or currently
@@ -1394,6 +1464,10 @@ async def anthropic_messages(
             router_exec,
             user_ctx,
             model_visibility_resolver,
+            # Sized before dispatch rewrites the body, which only strips
+            # Anthropic-only fields from it, and only when the model's offload
+            # route has a max input to hold it to.
+            size_prompt=lambda adapter: _prompt_tokens(body, adapter),
         )
     except HTTPException as exc:
         asyncio.create_task(  # noqa: RUF006 — fire-and-forget rejection log

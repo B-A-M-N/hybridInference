@@ -1,15 +1,16 @@
 # Database
 
-The gateway uses PostgreSQL for request logs, user accounts, API keys, and every
-admin/runtime setting that outlives a restart. This page covers what is stored,
-how the schema comes into existence, and how to back it up, restore it, and reset
-it.
+The gateway uses PostgreSQL for request logs, user accounts, API keys, its
+settings, and every admin/runtime change that outlives a restart. This page
+covers what is stored, how the schema comes into existence, and how to back it
+up, restore it, and reset it.
 
 ## Is a database required?
 
 No. `DB_ENABLED` defaults to `true`, but a gateway started with `DB_ENABLED=false`
 routes requests normally — it simply has no request history, no user accounts, no
-API-key issuance, and no admin surfaces backed by stored settings.
+API-key issuance, and no admin surfaces backed by stored settings. It reads
+every setting from the environment instead.
 
 The distinction matters when reading `/health`, because the two "no database"
 states are not the same answer:
@@ -26,7 +27,8 @@ rotation.
 ## Connection settings
 
 Read by `Settings` in `apps/backend/serving/config/settings.py`, from `.env` or
-the process environment.
+the process environment. They are the settings that stay in the environment,
+because the backend needs them before it can read anything from the database.
 
 | Variable | Default | Notes |
 |---|---|---|
@@ -36,9 +38,15 @@ the process environment.
 | `DB_NAME` | `hybridinference` | Required by Compose (`DB_NAME must be set in .env file`). |
 | `DB_USER` | `postgres` | Required by Compose. |
 | `DB_PASSWORD` | *(empty)* | Required by Compose. |
-| `DB_STORE_FULL_CONTENT` | `false` | Whether prompts and responses are stored verbatim. See [Request logging and privacy](#request-logging-and-privacy). |
-| `ERASURE_FENCE_SECRET` | *(empty; legacy fallback)* | Dedicated stable secret for erasure-fence tombstones. Provision it before the first upgraded worker starts; the first accepted namespace is pinned before serving and a mismatch fails startup validation. |
-| `ERASURE_FENCE_PROTOCOL_READY` | `false` | Enables hard-delete only after every `api_logs` writer has been upgraded to use the erasure-fence protocol. |
+
+Three more settings govern what the database keeps. They are stored in it,
+under **Privacy** on the admin console's **Configuration** tab:
+
+| Setting | Default | Notes |
+|---|---|---|
+| `DB_STORE_FULL_CONTENT` | `false` | Whether prompts and responses are stored verbatim; applies after a backend restart. See [Request logging and privacy](#request-logging-and-privacy). |
+| `ERASURE_FENCE_SECRET` | *(empty)* | Secret for the records that keep deleted accounts deleted. It cannot be changed once set; see [Secrets for deleting accounts](#secrets-for-deleting-accounts). |
+| `ERASURE_FENCE_PROTOCOL_READY` | `false` | Turns on permanent account deletion. See [Secrets for deleting accounts](#secrets-for-deleting-accounts). |
 
 The bundled stack (`deploy/docker/docker-compose.yml`) runs `postgres:16`,
 initialised with `-E UTF8 --locale=C.UTF-8`, and publishes it on
@@ -47,13 +55,14 @@ an SSH tunnel, not by widening that binding.
 
 ## How the schema is created
 
-There is no migration tool in this repository — no Alembic, no SQL migration
-directory. The schema is created and migrated **by the application at startup**,
-idempotently. Every statement is `CREATE TABLE IF NOT EXISTS`, so the builders
+The application creates and migrates its own schema **at startup**, and a
+restart leaves in place whatever already exists; there is no separate
+migration tool to run. Every statement is `CREATE TABLE IF NOT EXISTS`, so the builders
 below overlap harmlessly where two of them define the same table:
 
 | Code | Creates |
 |---|---|
+| `AppConfigStore.ensure_schema` in `apps/backend/serving/config/app_config_store.py` | `app_config`, first of all, because the rest of startup reads its settings |
 | `ensure_api_logs_schema` in `apps/backend/serving/storage/log_schema.py` | `api_logs` and `api_stats_hourly`, with their columns and indexes |
 | `DatabaseLogger._create_tables` in `apps/backend/serving/storage/database.py` | Calls the above, then the auth/admin tables |
 | `PostgresOperationalStore.initialize` in `apps/backend/serving/storage/postgres_operational.py` | The operational tables (settings, overrides, provider registry) |
@@ -61,14 +70,14 @@ below overlap harmlessly where two of them define the same table:
 | `apps/backend/serving/grants.py` and `apps/backend/serving/admin/geo_demand_rollup.py` | `agent_grants`; the `geo_hourly_*` rollup tables |
 
 Pointing a gateway at an empty database is therefore all the "migration" there
-is: start it and the tables appear. Booting this revision against a blank
-`postgres:16` database creates 33 tables in `public`.
+is: start it and the tables appear.
 
 Two properties are worth knowing before you operate this:
 
-**Schema DDL is gated on the Postgres system catalogs.** Each startup reads `pg_attribute` / `pg_indexes`
-first and issues only the `ALTER`/`CREATE INDEX` statements that are actually
-missing, so a steady-state restart takes no strong table locks. This matters
+**A restart only changes what is missing.** Each startup first checks which
+columns and indexes already exist and issues only the `ALTER`/`CREATE INDEX`
+statements that are actually missing, so a steady-state restart takes no
+strong table locks. This matters
 because `ALTER TABLE` acquires `ACCESS EXCLUSIVE` *before* Postgres evaluates
 `IF NOT EXISTS`, and a queued exclusive lock parks every reader behind it.
 
@@ -79,42 +88,75 @@ usual lock holder is a long-running `pg_dump`, which can hold `ACCESS SHARE` ove
 `api_logs` for hours. If you take backups on a schedule, expect an occasional
 deferred-migration line in the log after a deploy that adds a column.
 
-Before the first upgraded worker starts, provision `ERASURE_FENCE_SECRET` with a
-dedicated stable value and keep it available across restarts and replicas. The
-legacy `API_KEY_SECRET` fallback is retained for existing deployments only; using
-it for a new rollout couples ordinary API-key rotation to the permanent erasure
-tombstone namespace. If that fallback becomes the pinned namespace, changing
-`API_KEY_SECRET` causes startup/fence validation to fail; restore the original
-pinned value. Do not delete erasure tombstones or fingerprint metadata to work
-around the mismatch. Deliberate migration to a new namespace requires a
-separate migration procedure that preserves every existing fence.
+If you are contributing a column to `api_logs`, add it in `log_schema.py` only;
+that is the one place the request log's schema is defined.
 
-If you are contributing a column to `api_logs`, add it in `log_schema.py` only.
-That module exists because the DDL was once duplicated across two builders, they
-drifted, and the builder that actually runs at boot never created the new
-columns.
+### Secrets for deleting accounts
+
+When an admin permanently deletes a user, the gateway also records a keyed
+fingerprint of that account in the `erasure_fence` table, so a request-log
+write that was already on its way cannot put the user's rows back. Two
+settings govern this:
+
+- `ERASURE_FENCE_SECRET` is the key for those fingerprints. The first time
+  the gateway starts against a database, it records a fingerprint of this
+  secret — even before anything has been deleted — and from then on it refuses
+  to start if the secret differs. Left empty, it uses `API_KEY_SECRET` instead,
+  which the backend generates into the database at that first start unless the
+  environment supplies one, and that value is the one recorded. To give the
+  fence its own secret, set `ERASURE_FENCE_SECRET` to a random value in `.env`
+  before the first start; the backend copies it into the database then. After
+  that neither secret can be changed: the **Configuration** tab refuses both.
+  If you hit a mismatch — say, after restoring a backup next to different
+  secrets — restore the original value; never delete fence rows or their
+  metadata to get past it.
+- `ERASURE_FENCE_PROTOCOL_READY=true` turns permanent deletion on. Leave it
+  `false` until every process that writes `api_logs` runs a version that checks
+  the fence.
 
 ## What the tables hold
 
 | Group | Tables | Holds |
 |---|---|---|
 | Request history | `api_logs`, `api_stats_hourly`, `provider_hourly_stats` | One row per request (model, provider, tokens, latency, TTFT, status, cost) plus hourly rollups used by the dashboards |
+| Settings | `app_config` | The settings on the admin console's Configuration tab, secrets included; see [Settings and first-run setup](#settings-and-first-run-setup) |
 | Accounts and auth | `users`, `api_keys`, `auth_sessions`, `login_events`, `email_verification_tokens`, `password_reset_tokens`, `identity_auth_codes` | User records, hashed API keys and their quotas, refresh sessions, sign-in history |
-| Admin actions | `admin_audit_log`, `signup_allowed_domains`, `site_settings`, `site_updates`, `email_broadcasts`, `email_broadcast_recipients` | Audited admin changes, signup policy, runtime settings, announcements, broadcast delivery state |
+| Admin actions | `admin_audit_log`, `signup_allowed_domains`, `site_settings`, `site_updates`, `email_broadcasts`, `email_broadcast_recipients` | Audited admin changes, signup policy, runtime settings and the first-run setup marker, announcements, broadcast delivery state |
 | Runtime routing overrides | `provider_definitions`, `provider_api_keys`, `provider_route_configs`, `provider_route_candidates`, `provider_weight_overrides`, `disabled_providers`, `disabled_provider_env_keys`, `provider_env_key_min_roles`, `model_visibility_overrides`, `model_concurrency_exemptions` | Everything the admin console can change about routing without editing YAML — see [Runtime configuration from the admin console](configuration.md#runtime-configuration-from-the-admin-console) |
 | Cost and quota | `user_daily_cost` | Per-user daily spend used for quota enforcement |
 | RouteWise | `routewise_probe_samples`, `routewise_probe_leases` | Latency probe samples and the lease that stops two workers probing at once |
 | Responses API | `openai_responses` | Stored `/v1/responses` state, when content storage is enabled |
 | Geo analytics | `geo_hourly_coverage`, `geo_hourly_demand` | Hourly per-country request and token counts; aggregate only, no IP addresses stored |
 | Agent grants | `agent_grants` | Short-lived, model-scoped capabilities this gateway mints for an external agent control plane |
+| Account deletion | `erasure_fence` | Keyed fingerprints of permanently deleted accounts; see [Secrets for deleting accounts](#secrets-for-deleting-accounts) |
 
-`\dt` on a live database is the authoritative list; the code paths above are the
-authoritative definition.
+`\dt` on a live database lists every table.
+
+### Settings and first-run setup
+
+- `app_config` holds one row per stored setting: `key` (the
+  environment-variable name), `value` (in the string form that variable
+  takes, such as `true`, `8` or `a,b,c`), `secret`, `source` — `admin`,
+  `setup`, `env_import` or `generated` — and `updated_at`/`updated_by`. Secret
+  values are stored in plaintext; the admin API never returns them. A row wins
+  over the environment even when its value is empty. See
+  [Settings stored in the database](configuration.md#settings-stored-in-the-database).
+- `site_settings` holds the runtime switches of the admin Settings tab and,
+  once the first administrator exists, the row `setup_completed_at`, which
+  marks first-run setup as done. The application never clears it. While setup
+  is pending, the row `setup_code` holds the one-time code the backend prints
+  in its log, so read access to the database is enough to create the first
+  administrator; completing setup deletes it.
+- `users.email` is empty for the administrator that first-run setup creates;
+  that account signs in with `users.login_name`, which is unique regardless of
+  case. Every account from signup has an email address.
 
 ## Request logging and privacy
 
 `DB_STORE_FULL_CONTENT` defaults to `false`, and that default is not a redaction
-of the stored text — the text is never written. With it off, `api_logs.prompt`,
+of the stored text — the text is never written. It is a setting under
+**Privacy** on the admin console's Configuration tab, and a change applies
+after a backend restart. With it off, `api_logs.prompt`,
 `api_logs.response` and `api_logs.request_payload` are inserted as `NULL`, and
 `/v1/responses` state is not persisted.
 
@@ -129,12 +171,10 @@ expectations before you do.
 
 ### Which session a request belongs to
 
-`api_logs.session_id` is what groups one conversation's requests together, and
-it is indexed for exactly that lookup. A client sets it with the gateway's own
-`X-Session-ID` header — but no coding agent sends that header, so the traffic
-the column is most useful on used to arrive unlabelled. Each agent does carry a
-session of its own, in its own idiom, and the gateway reads whichever one the
-request used:
+`api_logs.session_id` groups one conversation's requests together. A client can
+set it with the gateway's `X-Session-ID` header, but coding agents do not send
+that header. Each carries a session id of its own instead, and the gateway
+reads whichever one the request has:
 
 | Read from | Sent by |
 |---|---|
@@ -142,46 +182,24 @@ request used:
 | `session-id` / `thread-id` headers (the `session_id` / `conversation_id` spellings too) | Codex CLI, which stamps its run on every request |
 | `x-session-affinity` / `x-opencode-session` headers | OpenCode and its Kilo Code fork, which send the affinity header beside `X-Session-ID` on any provider they do not recognise as their own, and `x-opencode-session` on one they do |
 | `metadata.session_id` or `client_metadata.session_id` in the request body | a client that labels the session where it labels everything else; Codex uses `client_metadata` |
-| `x-claude-code-session-id` header | Claude Code's own header, a bare UUID on every request — purpose-built for this, so it needs no inference |
+| `x-claude-code-session-id` header | Claude Code, on every request |
 | `metadata.user_id` in the request body | Claude Code, which packs the device, account and run into Anthropic's one `user_id` field. Two shapes — see below |
 
-Claude Code changed that field's shape in **2.1.78** (2026-03-17). Current
-clients send a JSON object — `{"device_id": …, "account_uuid": …, "session_id":
-…}` — whose `session_id` member is the run; older ones sent the underscore
-composite `user_<hash>_account_<uuid>_session_<uuid>`. Both are read, and the
-recorded source distinguishes them (`metadata.user_id.session_id` versus
-`metadata.user_id`). The JSON is read by member name rather than position,
-because an operator's `CLAUDE_CODE_EXTRA_METADATA` keys are serialized ahead of
-the canonical ones. `parent_session_id`, present on a subagent run, is
-deliberately not read — it names the session that spawned this one.
+Since version 2.1.78, Claude Code sends `metadata.user_id` as a JSON object —
+`{"device_id": …, "account_uuid": …, "session_id": …}` — and before that as a
+`user_<hash>_account_<uuid>_session_<uuid>` string. The gateway reads both.
+It does not use `parent_session_id`, which a subagent run carries: that names
+the session that started the subagent, not this one.
 
-A gateway that only understood the retired composite logged no session for any
-current Claude Code request, silently: a parser anchored at `^user_` cannot
-match a value whose first character is `{`.
-
-Those clients have two request paths, and only one of them sends the headers.
-The older `packages/opencode` path builds them directly; the newer
-`packages/core/src/session/runner/llm.ts` runner lost them and got them back
-upstream in `sst/opencode#43188` (2026-08-18). Kilo Code forked before that
-restore, so its core runner — the one `location-services.ts` registers — still
-sends nothing, and nothing else on the wire names the session. The gateway
-records none rather than inferring one from a field that was not meant to carry
-it.
-
-There is no client-side workaround for that path, and it is worth being exact
-about why: the `chat.headers` plugin hook exists only on the older path, which
-already sends the headers. Where the hook exists the fix is unnecessary, and
-where the headers are missing there is no hook to add them with. Upgrading
-OpenCode past the restore fixes OpenCode; Kilo needs the same change ported into
-its fork.
+Some OpenCode versions and the Kilo Code fork send no session id on their newer
+request path. OpenCode fixed this upstream (`sst/opencode#43188`); until Kilo
+Code takes the same fix, its requests are recorded without a session.
 
 The admin console's Recent Requests view shows the session under each row's
-client, and clicking it filters the list to that one conversation — an exact
-match against the indexed column, so it stays a lookup rather than a scan.
+client, and clicking it filters the list to that one conversation.
 
-`metadata.session_id_source` on the same row names which of those it came from,
-so a value read out of a composite id is never mistaken for one a client
-declared under the documented header. Every source is client-supplied, and
+`metadata.session_id_source` on the same row names which of those sources the
+session came from. Every source is client-supplied, and
 nothing is authorized, billed or rate-limited by a session id; a declaration
 over 128 characters, or one carrying control characters, is dropped rather than
 recorded. Like the derived columns above, the session is recorded whether or not
@@ -206,10 +224,15 @@ docker exec -i hybridinference-postgres \
   pg_restore -U "$DB_USER" -d "$DB_NAME" --clean --if-exists < hybridinference-2026-01-01.dump
 ```
 
-Stop the backend (`make down`, or `docker stop hybridinference-backend`) before
-restoring over a live database, and remember that the backup contains hashed API
-keys and — if `DB_STORE_FULL_CONTENT` was ever on — user prompt content. Store it
-accordingly.
+Stop the backend with `docker stop hybridinference-backend` before restoring
+over a live database; `make down` would stop Postgres too.
+
+The backup contains every stored setting in plaintext — provider keys, the
+SMTP password, and the `JWT_SECRET_KEY` and `API_KEY_SECRET` that sign
+sessions and protect API keys — as well as hashed API keys and, if
+`DB_STORE_FULL_CONTENT` was ever on, user prompt content. Whoever holds it can
+use your provider keys, decrypt users' stored API keys and sign administrator
+tokens, so store it as carefully as the credentials themselves.
 
 ## Reset
 
@@ -235,8 +258,10 @@ make up                                           # recreates an empty volume
 
 `make up` depends on the `docker-volumes` target, which recreates the named
 volume if it is missing, so the stack comes back on an empty database and the
-startup initialisers rebuild the schema. Take a dump first if there is any chance
-you want the data back.
+startup initialisers rebuild the schema. The backend then generates new secrets
+unless the environment supplies them, and prints a setup code for a new
+administrator. Take a dump first if there is any chance you want the data
+back.
 
 The runnable example (`make demo-reset DISTRIBUTION=example`) uses its own,
 example-scoped volume and cannot delete `hybridinference_postgres_data`.
@@ -275,7 +300,7 @@ around it (Compose then reports the network as still in use). Pass
 
 ### Authentication
 
-Two independent gates, and by default neither is pgAdmin's own login:
+Two separate gates can protect pgAdmin, and by default only the console's is on:
 
 - `PGADMIN_CONFIG_SERVER_MODE` defaults to `False`, which serves pgAdmin with **no
   login of its own**. Set it to `True` in `.env` and pgAdmin asks for

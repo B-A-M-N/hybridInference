@@ -2,7 +2,10 @@
 
 An admin designates one route of a fixed-routed model as its *offload route*
 and sets how long a request may wait -- for an outbound concurrency slot, then
-for its engine's first token -- before it is sent there. The offload route then
+for its engine's first token -- before it is sent there, and optionally how many
+streaming requests a local engine may have without a first token before the
+gateway holds the rest in its own queue, and how long a prompt may be offloaded
+at all. The offload route then
 takes no ordinary traffic: ``FixedRouter`` reserves it for requests whose
 selected route kept them waiting past the wait, and for requests no other route
 could serve. Each request is judged on its own wait (``routing.engine_wait``):
@@ -166,6 +169,8 @@ def _offload_item(services: Any, model_id: str, record: OffloadRouteRecord) -> O
         model_id=model_id,
         route_id=policy.route_id,
         wait_seconds=policy.wait_seconds,
+        engine_queue_limit=policy.engine_queue_limit,
+        max_input_tokens=policy.max_input_tokens,
         endpoint_id=endpoint_id,
         active=reason is None,
         inactive_reason=reason,
@@ -270,7 +275,12 @@ async def set_offload_route(
                 ),
             )
         _adapter, _weight, endpoint_id = matches[0]
-        policy = OffloadPolicy(route_id=payload.route_id, wait_seconds=payload.wait_seconds)
+        policy = OffloadPolicy(
+            route_id=payload.route_id,
+            wait_seconds=payload.wait_seconds,
+            engine_queue_limit=payload.engine_queue_limit,
+            max_input_tokens=payload.max_input_tokens,
+        )
         previous = resolver.get_record(model_id)
         try:
             await op_store.set_setting(
@@ -301,9 +311,17 @@ async def set_offload_route(
                 "route_id": policy.route_id,
                 "endpoint_id": endpoint_id,
                 "wait_seconds": policy.wait_seconds,
+                "engine_queue_limit": policy.engine_queue_limit,
+                "max_input_tokens": policy.max_input_tokens,
                 "old_route_id": previous.policy.route_id if previous is not None else None,
                 "old_wait_seconds": (
                     previous.policy.wait_seconds if previous is not None else None
+                ),
+                "old_engine_queue_limit": (
+                    previous.policy.engine_queue_limit if previous is not None else None
+                ),
+                "old_max_input_tokens": (
+                    previous.policy.max_input_tokens if previous is not None else None
                 ),
             },
         )
@@ -349,6 +367,12 @@ async def clear_offload_route(
                     "old_route_id": previous.policy.route_id if previous is not None else None,
                     "old_wait_seconds": (
                         previous.policy.wait_seconds if previous is not None else None
+                    ),
+                    "old_engine_queue_limit": (
+                        previous.policy.engine_queue_limit if previous is not None else None
+                    ),
+                    "old_max_input_tokens": (
+                        previous.policy.max_input_tokens if previous is not None else None
                     ),
                 },
             )

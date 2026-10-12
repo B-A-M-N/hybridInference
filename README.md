@@ -27,7 +27,9 @@ APIs, or both.
 
 Admins can approve or suspend accounts, set daily quotas and per-user
 concurrency limits, and restrict model access. Provider credentials, model
-routes, routing weights, and RouteWise settings are editable in the console.
+routes, routing weights, RouteWise settings, and the gateway's own settings
+(SMTP, proxy trust, alerting and the rest) are editable in the console, so a
+deployment's environment holds little more than its database connection.
 
 Provider pages show availability, latency, and generation speed, with endpoint
 probes for troubleshooting. Request logs include the user, provider, errors,
@@ -51,11 +53,20 @@ make smoke DISTRIBUTION=example
 make demo DISTRIBUTION=example
 ```
 
-Open [localhost:13001/signup](http://localhost:13001/signup). Sign up as
-`admin@local.dev` with a demo-only password (at least eight characters,
-including uppercase, lowercase, and a number), then sign in. From the
-dashboard, create an API key, open the API Playground, or enter the Admin
-Console. The example model returns the fixed reply `RUNNABLE_EXAMPLE_OK`.
+Open [localhost:13001/setup](http://localhost:13001/setup). The new database
+has no account yet, so the console asks for the one-time setup code the
+backend printed in its log (`make logs s=backend DISTRIBUTION=example` shows it
+too):
+
+```bash
+docker logs hybridinference-example-backend 2>&1 | grep 'setup code'
+```
+
+Enter the code and create the administrator with a username and a demo-only
+password (at least eight characters, including uppercase, lowercase, and a
+number). From the dashboard, create an API key, open the API Playground,
+or enter the Admin Console, whose Configuration tab holds the gateway's
+settings. The example model returns the fixed reply `RUNNABLE_EXAMPLE_OK`.
 
 When you are done, stop the stack. Its database volume is kept for the next
 run:
@@ -67,7 +78,7 @@ make demo-down DISTRIBUTION=example
 To connect real models, add a provider, credentials, and model routes through
 the [admin console](docs/developer/configuration.md#runtime-configuration-from-the-admin-console),
 or follow the [local server setup](docs/developer/router-tutorial.md#stage-3-replace-the-fake-provider-with-local-inference).
-The [Router Tutorial](docs/developer/router-tutorial.md) covers prerequisites,
+The [Quickstart](docs/developer/router-tutorial.md) covers prerequisites,
 API calls, request-history checks, and how to resume or reset the example.
 
 ### Backend with an OpenRouter Key
@@ -106,7 +117,7 @@ row describes you:
 
 | If you want to | Start here |
 |---|---|
-| Follow the tutorial through to a local vLLM, SGLang, or Ollama server | [Router Tutorial](docs/developer/router-tutorial.md) |
+| Follow the tutorial through to a local vLLM, SGLang, or Ollama server | [Quickstart](docs/developer/router-tutorial.md) |
 | Run your own gateway against real providers | [Installation](docs/developer/installation.md) |
 | Understand how a request becomes a routing decision | [Architecture](docs/developer/architecture.md) |
 | Add a model, a local server, or a new provider | [Adding a New Model](docs/developer/adding-models.md) |

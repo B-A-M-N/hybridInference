@@ -1,9 +1,10 @@
 'use client';
 
 import { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import { login as loginApi, logout as logoutApi } from '@/lib/api/auth';
-import { AUTH_EXPIRED_EVENT } from '@/lib/api/client';
+import { endAgentSession, login as loginApi, logout as logoutApi } from '@/lib/api/auth';
+import { AUTH_EXPIRED_EVENT, setAccessToken } from '@/lib/api/client';
 import { getMe } from '@/lib/api/user';
+import { useSiteConfig } from './SiteConfigProvider';
 
 /**
  * Exported because the host facade re-exports them: a distribution's UI reads
@@ -12,7 +13,13 @@ import { getMe } from '@/lib/api/user';
  */
 export interface AuthUser {
   id: string;
-  email: string;
+  /**
+   * `null` for an account that signs in with a login name instead — the
+   * first-run administrator. Display a user through `userDisplayName` /
+   * `userAccountLabel` (`@/lib/utils/userLabel`) rather than this field.
+   */
+  email: string | null;
+  login_name?: string | null;
   user_name?: string | null;
   role: string;
   is_admin: boolean;
@@ -26,7 +33,14 @@ export interface AuthState {
 
 interface AuthContextValue {
   state: AuthState;
-  login: (email: string, password: string) => Promise<void>;
+  /** `identifier` is an email address or a login name; see `LoginRequest`. */
+  login: (identifier: string, password: string) => Promise<void>;
+  /**
+   * Take over a session the backend issued outside `login()`: first-run setup
+   * answers with the same body and refresh cookie as a login, so the new
+   * administrator is signed in by the request that created the account.
+   */
+  adoptSession: (accessToken: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshUser: () => Promise<void>;
 }
@@ -46,6 +60,7 @@ export function hasRole(userRole: string | undefined, required: string): boolean
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const { agentsUrl } = useSiteConfig();
   const [state, setState] = useState<AuthState>({
     isAuthenticated: false,
     loading: true,
@@ -60,7 +75,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         loading: false,
         user: {
           id: me.id,
-          email: me.email,
+          email: me.email ?? null,
+          login_name: me.login_name ?? null,
           user_name: me.user_name,
           role: me.role || 'free',
           is_admin: me.is_admin,
@@ -85,25 +101,40 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
   }, []);
 
+  // Sign out from cloud agent
   const login = useCallback(
-    async (email: string, password: string) => {
-      await loginApi({ email, password });
+    async (identifier: string, password: string) => {
+      await loginApi({ email: identifier, password });
+      await endAgentSession(agentsUrl);
       await refreshUser();
     },
-    [refreshUser],
+    [agentsUrl, refreshUser],
+  );
+
+  // The same steps as a login after its request: a new session ends any agent
+  // session, which belonged to whoever was signed in before.
+  const adoptSession = useCallback(
+    async (accessToken: string) => {
+      setAccessToken(accessToken);
+      await endAgentSession(agentsUrl);
+      await refreshUser();
+    },
+    [agentsUrl, refreshUser],
   );
 
   const logout = useCallback(async () => {
     try {
       await logoutApi();
     } finally {
+      await endAgentSession(agentsUrl);
       setState({ isAuthenticated: false, loading: false, user: null });
     }
-  }, []);
+  }, [agentsUrl]);
 
   const value: AuthContextValue = {
     state,
     login,
+    adoptSession,
     logout,
     refreshUser,
   };

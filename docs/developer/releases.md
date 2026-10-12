@@ -7,17 +7,17 @@ service commands are in [Deployment](deployment.md).
 
 ## Release identity and support
 
-The manually dispatched `Sync dev to main` workflow fast-forwards `main` to the
-fetched `dev` tip and creates a
-[GitHub release](https://github.com/HarvardMadSys/hybridInference/releases)
-with generated change notes. Tags use the UTC date, `YYYYMMDD`; another release
-on the same date gets `.1`, `.2`, and so on. These are date-based releases,
-not semantic-version compatibility promises.
+Releases are [GitHub releases](https://github.com/HarvardMadSys/hybridInference/releases)
+tagged with the UTC date, `YYYYMMDD`; another release on the same date gets
+`.1`, `.2`, and so on. They are dated snapshots, not semantic-version
+compatibility promises. A maintainer cuts one by moving `main` up to a commit
+on `dev`; the `Release` workflow then publishes the release with generated
+change notes.
 
 | Identifier | What it tells you |
 |---|---|
 | A published date tag | A fixed source snapshot with GitHub release notes |
-| `main` | The branch advanced by the release workflow; it moves over time |
+| `main` | The branch maintainers move up to `dev` for each release; it moves over time |
 | `dev` or a feature branch | Development work that may be newer than the latest release |
 | A full commit SHA | The exact source revision; include local modifications separately |
 | An image digest, `image@sha256:…` | The exact container artifact, which may differ from the host checkout |
@@ -85,12 +85,21 @@ commit summaries alone do not explain how an operator should upgrade.
    artifacts available so rollback does not depend on rebuilding them.
 2. Read the target's configuration requirements. Preserve the deployment's
    existing `.env`, overlay and secrets; merge required changes instead of
-   replacing them with fresh example files. Keep `JWT_SECRET_KEY` and
-   `API_KEY_SECRET` stable across replicas and upgrades. Changing the former
-   invalidates access tokens; changing the latter makes existing API-key
-   hashes unverifiable. An upgrade is not a secret-rotation procedure.
+   replacing them with fresh example files. Keep `JWT_SECRET_KEY`,
+   `API_KEY_SECRET` and `ERASURE_FENCE_SECRET` stable across replicas and
+   upgrades. Changing the first invalidates access tokens, changing the second
+   makes existing API-key hashes unverifiable, and changing the third — or the
+   second, while it stands in for the third — stops the backend from starting.
+   An upgrade is not a secret-rotation procedure. These secrets and the other
+   settings live in the database, copied there from the environment at the
+   first start; keep the `.env` you upgraded from until rollback is no longer
+   an option, because a release from before that move reads them only from
+   the environment. See
+   [Upgrading a deployment that kept its settings in `.env`](deployment.md#upgrading-a-deployment-that-kept-its-settings-in-env).
 3. Back up each configured database and check that the backup restores into a
-   separate database. Protect a matching copy of the configuration and secrets.
+   separate database. The backup holds the stored settings and secrets in
+   plaintext, so protect it, and a matching copy of the configuration, like
+   the secrets themselves.
    See [Database backup](database.md#backup) for the standard Postgres commands;
    use the storage provider's backup procedure for other deployments.
 4. Rehearse on an isolated local or staging deployment, using separate storage

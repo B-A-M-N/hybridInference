@@ -11,29 +11,27 @@ For distribution manifests, branding, UI modules and backend extensions, see
 
 ## What the gateway reads at startup
 
-| Kind | Holds | Read by |
-|---|---|---|
-| `models` | The model registry: every model id the gateway serves and the upstream routes behind it | `register_from_models_yaml` in `apps/backend/serving/servers/registry.py` |
-| `routing` | Deployment-wide routing behaviour: local/remote split, health probing | `RoutingManager` in `apps/backend/routing/manager.py` |
-| `alerts` | Alert rules and thresholds | `load_alert_config` in `apps/backend/serving/observability/alert_config.py` |
-| Environment | Everything secret or host-specific: credentials, database connection, feature switches | `Settings` in `apps/backend/serving/config/settings.py` |
+| Kind | Holds |
+|---|---|
+| `models` | The model registry: every model id the gateway serves and the upstream routes behind it |
+| `routing` | Optional deployment-wide settings: health probing and a local/remote weight split |
+| `alerts` | Alert rules and thresholds |
+| Settings | Credentials, SMTP, proxy trust, logging, routing tuning and every other application setting, stored in the database and edited in the admin console |
+| Environment | The database connection, the paths to the files above, and how the containers are wired |
 
-Only the model registry is load-bearing. Without it the gateway starts, serves
-`/health`, and answers `GET /v1/models` with an empty list. Without a routing
-file the registry's own per-route weights stand — which is also what a fresh
-clone gets, because the built-in default `config/examples/routing.minimal.yaml`
-declares empty endpoint pools rather than overriding anything. Without an alerts
-file the built-in thresholds apply.
-
-A fourth kind, `mcp`, is accepted by the resolver and by the distribution
-manifest schema, but nothing at this revision reads it.
+Only the model registry is required to serve traffic. Without it the gateway
+starts, serves `/health`, and answers `GET /v1/models` with an empty list.
+Without a routing file each route keeps the weight the registry gives it, and
+without an alerts file the built-in thresholds apply.
 
 The files are not the whole story once a database is configured. The admin
 console writes providers, keys, routes, weights and per-model overrides to the
 operational store, and the gateway re-applies that state on top of the loaded
 registry at every start.
 [Runtime configuration from the admin console](#runtime-configuration-from-the-admin-console)
-covers that layer.
+covers that layer, and
+[Settings stored in the database](#settings-stored-in-the-database) covers the
+settings.
 
 ## Where configuration lives
 
@@ -53,30 +51,28 @@ while the gateway runs. That state lives in Postgres and is described
 
 Precedence is environment, then manifest, then built-in default.
 
-`resolve_config_path()` in `apps/backend/serving/config/distribution.py` resolves
-each config kind independently, in this order:
+Each kind of file is looked up on its own, in this order:
 
 1. **An explicit environment variable.** `MODELS_CONFIG_PATH`,
    `ROUTING_CONFIG_PATH`, `ALERTS_CONFIG_PATH`. (The older names `MODELS_CONFIG`
    and `ROUTING_CONFIG` are still accepted; the canonical `*_CONFIG_PATH` name
-   wins when both are set.) `ALERTS_CONFIG_PATH` counts as an override only when
-   you actually set it: it has a non-empty built-in default, so the resolver
-   tracks whether you supplied the value rather than testing it against `""`.
+   wins when both are set.)
 2. **The distribution manifest's `paths:` section** — only when
-   `DISTRIBUTION_CONFIG_MODE=active`; see the
-   [manifest reference](distribution-customization.md#the-distribution-manifest).
+   `DISTRIBUTION_CONFIG_MODE=active`. By default a manifest is only checked,
+   not applied; see
+   [Activating a manifest](distribution-customization.md#activating-a-manifest).
 3. **The built-in default**, which points at the reference examples:
    `config/examples/models.openrouter.yaml` and
    `config/examples/routing.minimal.yaml`. The `alerts` default is
-   `config/alerts.yaml`, a path this repository deliberately does not ship — a
+   `config/alerts.yaml`, a path this repository does not ship — a
    missing alerts file means "use the built-in thresholds".
 
-Two consequences worth internalising:
+Two things follow:
 
 - An environment variable **beats the manifest**. If you set `MODELS_CONFIG_PATH`
-  in a deployment that also has a manifest, the manifest's `models:` path becomes
-  decorative. The gateway logs this rather than hiding it
-  (`explicit env override ... wins over manifest value ...`). Pick one mechanism.
+  in a deployment that also has a manifest, the manifest's `models:` path is
+  ignored, and the gateway logs
+  `explicit env override ... wins over manifest value ...`. Pick one mechanism.
 - Paths that come from the environment are resolved relative to the **working
   directory** of the process. Relative paths inside a manifest are resolved
   against **the manifest file's own directory**.
@@ -104,9 +100,13 @@ key expands to empty — and the gateway says so before serving anything:
 
 ```text
 No models are available: every model in config/examples/models.openrouter.yaml was
-skipped because its credential is unset. Set OPENROUTER_API_KEY and restart.
-/v1/models will stay empty until then, and requests will report the model as not found.
+skipped because its credential is unset. Set OPENROUTER_API_KEY (Admin > Configuration)
+and restart. /v1/models will stay empty until then, and requests will report the
+model as not found.
 ```
+
+With a database, set it on the admin console's **Configuration** tab instead,
+which lists it as missing, and restart the backend.
 
 This is the fastest way to a gateway that routes real traffic. Replace the file
 with your own registry once you know what you want to serve.
@@ -118,16 +118,14 @@ here because they are properties of *configuration loading* rather than of any
 one field:
 
 **A route's `kind:` picks the adapter; the model's `provider:` is its default.**
-Each entry under `route:` names a `kind:`, and `kind` is what
-`registry._make_adapter` dispatches on. When a route omits `kind:`, the model's
-top-level `provider:` is used; when a model omits `route:` entirely, a single
-route is synthesised from the top-level `provider:`, `base_url` and `api_key`.
-`provider` is also the label written to `api_logs.provider` and shown in metrics,
-which is why a route may override it independently with `provider:`.
+When a route omits `kind:`, the model's top-level `provider:` is used; when a
+model omits `route:` entirely, a single route is built from the top-level
+`provider:`, `base_url` and `api_key`. `provider` is also the label written to
+`api_logs.provider` and shown in metrics, which is why a route may override it
+independently with `provider:`.
 
-**Adapter construction is centralized.** `_make_adapter`
-(`apps/backend/serving/servers/registry.py`) checks registered extension factories
-first, then dispatches these built-in kinds:
+**These are the built-in kinds.** A deployment can add more with a
+[backend extension](backend-extensions.md); those are checked first.
 
 | Kind | Adapter |
 |---|---|
@@ -139,26 +137,15 @@ first, then dispatches these built-in kinds:
 
 Local inference servers have no dedicated adapter: `vllm`, `sglang` and `ollama`
 are OpenAI-compatible kinds that differ only in their provider label and usage
-handling. A kind that is neither built-in nor explicitly registered by an
-extension raises `ValueError: Unknown adapter kind: <kind>` during registry
-loading. To re-derive the built-in list from the code:
+handling. Any other kind fails registry loading with
+`ValueError: Unknown adapter kind: <kind>`.
 
-```bash
-sed -n '/def _make_adapter/,/Unknown adapter kind/p' apps/backend/serving/servers/registry.py
-```
-
-A `grep` for `if kind` misses most of it: the OpenAI-compat arm is a single
-`if kind in (` followed by the names on their own lines, so none of them
-appear in the output.
-
-The neighbouring `RESERVED_PROVIDER_LABELS` set in the same module is a
-different, larger list — the labels a route may not borrow as a custom
-`provider:` — and includes registered extension kinds and names such as `openai`
-and `router` that are *not* adapter kinds.
-
-**Environment interpolation in the registry is whole-value only.** In
-`models.yaml`, a value is expanded only when the entire string is exactly
-`${VAR}`. There is no `${VAR:-default}` and no embedded substitution:
+**`${VAR}` interpolation in the registry is whole-value only.** In
+`models.yaml`, only `base_url`, `api_key`, `api_keys`, `provider_model_id` and a
+route's `embeddings_path` are expanded, and only when the entire value is
+exactly `${VAR}`. The value is the [setting](#settings-stored-in-the-database)
+of that name: its database value, else the environment variable. There is no
+`${VAR:-default}` and no embedded substitution:
 
 ```yaml
 base_url: ${LOCAL_BASE_URL}                  # expanded
@@ -169,18 +156,23 @@ base_url: http://${LOCAL_HOST}/v1            # NOT expanded — the literal stri
                                              #   including "${LOCAL_HOST}", is used
 ```
 
-The routing file uses a different, more capable expander (see below). Do not
-carry habits from one file to the other.
+The routing and alerts files are more permissive (see below), so do not carry
+habits from one file to the other.
 
 ## The routing file
 
-`routing.yaml` is optional. It configures the deployment-wide weight strategy and
-the health probe loop. The schema is `RoutingConfig` in
-`apps/backend/routing/config.py`; every key with its real default:
+`routing.yaml` is optional, and most deployments can leave it out. Read this
+section before relying on it: on a gateway with a database, which includes the
+standard Docker stack, its weight split has no effect, and its health probe
+never changes routing. Where traffic goes is decided by the weights in the
+model registry, any weight overrides set in the admin console, and the router
+described in [Routing](routing.md).
+
+Every key, with its default:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `default_router` | `fixed` | Deployment-wide weight strategy. Only `fixed` does anything: `RoutingManager.apply()` returns without touching weights for any other value. |
+| `default_router` | `fixed` | The router for models that do not name one with `router:`. The weight split below also runs only when this is `fixed`. |
 | `timeout` | `2` | Seconds a health probe waits for a connection. |
 | `health_check` | `0` | Seconds between health probes; `0` disables probing. |
 | `local_deployment` | `[]` | Endpoints treated as local. |
@@ -209,32 +201,27 @@ remote_deployment:
     models: [<model-id>]
 ```
 
-How it is applied: `RoutingManager` groups each model's registered adapters into
-local and remote — an adapter joins a group when its `base_url` matches that
-entry's `endpoint:` exactly *and* the model is named in that entry's `models:`.
-It then splits traffic
-between the two groups (`FixedRatioStrategy`, 50/50 unless the deprecated
-`routing_parameter.local_fraction` block sets otherwise), spreads weight evenly
-within each group, and renormalises so the weights of a model's routes sum to
-1.0. When one group is empty for a given model, the whole weight goes to the
-other. A model that matches nothing here keeps the weights from its `route:`
-list.
+**The weight split applies only to a gateway without a database.** At startup,
+the gateway sorts each model's routes into local and remote: a route joins a
+group when its `base_url` matches that entry's `endpoint:` exactly *and* the
+model is named in that entry's `models:`. It then gives each group half the
+traffic (unless the deprecated `routing_parameter.local_fraction` sets another
+share), spreads that evenly within the group, and scales a model's weights to
+sum to 1.0. When one group is empty for a model, the other gets everything. A
+model that matches nothing keeps the weights from its `route:` list. On a
+gateway with a database, routing reads the registry's weights plus any admin
+overrides and never sees this split.
 
 Health probing covers `local_deployment` endpoints only — remote providers do not
 serve the gateway's `/health` path and would be marked unhealthy for it. Each
 probe is a `GET` to the endpoint's origin root plus `/health`.
 
-**The probe is advisory: it does not change routing.** `RoutingManager.apply()`
-is the only reader of its verdicts and it runs once, during bootstrap,
-synchronously — before the prober task it just started has had a chance to run a
-single probe. So grouping always sees every endpoint as healthy, and an endpoint
-that fails every probe keeps its weight and keeps taking traffic. What the probe
-does do is report: each transition (healthy → unhealthy and back) is logged at
-`WARNING`, and `GET /routing` publishes the current verdicts under
-`manager_status.endpoint_health`, alongside `endpoint_health_enforced: false` as
-a standing reminder that the map is observation, not admission control. Removing
-a wedged endpoint from rotation is the circuit breaker's job
-([Routing](routing.md)).
+**The probe only reports; it never changes routing.** An endpoint that fails
+every probe keeps its weight and keeps receiving traffic. Each change of state
+is logged at `WARNING`, and `GET /routing` shows the latest results under
+`manager_status.endpoint_health`, next to `endpoint_health_enforced: false`.
+The [circuit breaker](routing.md#endpoint-health-and-circuit-breaking) is what
+takes a failing endpoint out of rotation.
 
 Unlike the model registry, this file's expander handles `${VAR}`,
 `${VAR:-default}`, and variables embedded in longer strings, at any depth.
@@ -244,6 +231,22 @@ Unlike the model registry, this file's expander handles `${VAR}`,
 deprecation warning. Per-model router selection (`router:` / `router_params:` in
 the model registry) overrides `default_router` and is documented in
 [Routing](routing.md).
+
+## Settings that currently have no effect
+
+The gateway accepts these when it loads its configuration, so setting them
+does not stop it from starting, but today they do nothing — or, in the case of
+the routing file's weight split, nothing on a gateway with a database.
+
+| Setting | Where | What happens |
+|---|---|---|
+| `local_deployment` / `remote_deployment` weight split | routing file | Applied only on a gateway without a database; see [The routing file](#the-routing-file) |
+| `health_check` probe results | routing file | Logged and reported on `GET /routing`, never used for routing |
+| `router_params.local_fraction` | model registry, `router: fixed` | Accepted and validated, not read |
+| `features.routers` | distribution manifest | Published in `/site-config`, does not select or restrict a router |
+| `paths.mcp` | distribution manifest | Accepted, not read by any component |
+| `site.terms_document`, `site.privacy_document` | distribution manifest | Accepted, not loaded into the terms page; use a [Site UI module](site-ui-modules.md) |
+| `deployment.target` | distribution manifest | A label only; does not select a host or build anything |
 
 ## Runtime configuration from the admin console
 
@@ -278,12 +281,15 @@ label a route declares — is read-only in this table, and a stored definition
 that reuses one of those slugs is skipped at boot rather than allowed to shadow
 it. Custom providers are `openai_compat` only; a protocol the generic adapter
 cannot speak needs an adapter, which is a code change
-([Adding a New Provider](adding-models.md#adding-a-new-provider)).
+([Writing a Provider Adapter](provider-adapters.md)).
 
 A key added here joins the same pool as the keys the registry names through
-`${VAR}` and rotates with them. An environment key has no row of its own, so
-the console can disable it or reserve it for a tier but cannot delete it; unset
-the variable and restart for that.
+`${VAR}` and rotates with them. A key the registry names — an *environment
+key* on this tab, whose value comes from the
+[settings](#settings-stored-in-the-database) — has no row in this table, so
+this tab can disable it or reserve it for a tier but cannot delete it. To
+remove it, clear the variable on the **Configuration** tab and restart the
+backend.
 
 ### Routing tab
 
@@ -301,13 +307,12 @@ the variable and restart for that.
 the gateway is serving, each tagged `source: yaml`, `override` or `runtime`,
 and is the quickest way to see what the two layers add up to.
 
-The provider selector on this tab is derived from the deployment, not from a
-list in the code: a built-in vendor kind is offered once the registry, the live
-route table or a configured credential names it, alongside every custom
-provider. Which route types a provider may be added as — `on_demand`,
+The provider selector on this tab offers every custom provider, plus each
+built-in kind that the registry, the live route table or a configured
+credential already names. Which route types a provider may be added as — `on_demand`,
 `quota` or `concurrency` — is the deployment's contract with that vendor and
-is declared with `PROVIDER_ROUTE_TYPES` (see
-[Environment variables](#environment-variables)); an unlisted provider may
+is declared with the `PROVIDER_ROUTE_TYPES` setting (see
+[Environment variables](installation.md#environment-variables)); an unlisted provider may
 use any of the three.
 
 A model created here is a **runtime model**: it exists only in the database,
@@ -336,10 +341,10 @@ moment it is saved.
 2. Stored provider keys, seeded into each provider's pool beside the
    environment keys.
 3. Per-model router strategy overrides.
-4. Runtime route candidates. A runtime *model* is resurrected only when its
-   commit marker is present; a candidate whose model is no longer in the
-   registry is quarantined with a warning rather than registered, so removing
-   a model from YAML does not bring it back through a leftover row.
+4. Runtime routes. A runtime model is restored only if its creation finished;
+   a stored route whose model is no longer in the registry is skipped with a
+   warning, so removing a model from YAML does not bring it back through a
+   leftover row.
 5. Route overrides, retargeting the registry routes they name.
 6. Key tier reservations, re-read now that every provider is known; then
    weight overrides, disabled providers, offload routes and model visibility,
@@ -352,13 +357,192 @@ than replacing them. And the file still wins for anything the store has no row
 for, so a registry edit plus restart is how catalog metadata, aliases and new
 adapter kinds change.
 
+## Settings stored in the database
+
+Everything the gateway reads that is not one of the files above, the database
+connection or container wiring is a *setting*: provider keys, SMTP, Slack
+webhooks, proxy trust, browser origins, logging, routing and timeout tuning,
+the cloud-agent contract, and the secrets that sign sessions and protect API
+keys. A gateway with a database keeps them in its `app_config` table, and an
+administrator edits them on the admin console's **Configuration** tab. A
+gateway with `DB_ENABLED=false` has no stored settings and reads the
+environment and the built-in defaults only.
+
+### Where a value comes from
+
+Each setting resolves in this order:
+
+1. its row in the database — even an empty one, which is how a setting is
+   cleared;
+2. the environment variable of the same name;
+3. the built-in default.
+
+The environment is a starting point. At every start, a setting that has a
+non-empty value in the environment and no row in the database is copied into
+the database, and from then on the row wins. That is how an existing `.env`
+carries over on an upgrade, and why editing the variable afterwards changes
+nothing: the tab marks it **Environment ignored**. Change the value on the tab
+instead, or **Reset** it, so that the environment, and then the default,
+applies again. A reset lasts: the database remembers it, so the next start does
+not copy the variable in again, and later edits to it take effect. The
+switches on the **Settings** tab —
+`USER_AUTH_ENABLED`, `SIGNUP_ENABLED` and the others — are copied from the
+environment the same way.
+
+An environment value that is not valid on its own — a CIDR range that does not
+parse, a number that is not one — is not copied in. The backend then starts
+only if the database holds a valid value for that setting, which applies, with
+a warning in the log; otherwise it stops and names the variable. Fix or remove
+the variable, or store a valid value with `python -m serving.config.manage set`
+(see *Without the console* below), which works while the environment is
+invalid. The database connection settings (`DB_HOST`, `DB_PORT` and the
+others) are the exception: they are needed to read the database, so an invalid
+one always stops the backend.
+
+Settings that depend on each other — `TRUST_X_REAL_IP` needs
+`TRUST_PROXY_HEADERS` — are judged together, the database's values over the
+environment's. A variable whose partner is already stored is copied in like any
+other, so it survives the variable's removal. When the two sources together
+still break such a rule, neither side is copied in and the backend stops,
+naming the rule, until one side is corrected.
+
+On the first start against an empty database the backend also generates the
+two secrets it cannot run without, `JWT_SECRET_KEY` and `API_KEY_SECRET`,
+unless the environment supplies them. `API_KEY_SECRET` and
+`ERASURE_FENCE_SECRET` cannot be changed once set, because records depend on
+them; see [Database](database.md#secrets-for-deleting-accounts). The backend
+refuses to start rather than generate `API_KEY_SECRET` for a database that
+already holds API keys, since a new secret would invalidate every one of them.
+
+### The Configuration tab
+
+The tab groups the settings by category, describes each one and shows where
+its value comes from. Besides every setting the gateway reads itself, it lists:
+
+- every `${VAR}` the active model registry and routing file name, under
+  **Providers**, with the models that use it, and those of the alert rules
+  under **Alerts**;
+- numbered extra keys for a provider's key pool, such as `MINIMAX_API_KEY2`,
+  once one is set;
+- variables added with **Add variable**, for a `${VAR}` reference the gateway
+  cannot see yet, such as one in a registry you are about to switch to.
+
+Secrets are write-only: the tab shows whether one is set, never its value, and
+the admin audit log records only that it changed. A save is checked as a
+whole, against everything it leaves in force, so settings that depend on each
+other — `TRUST_CLOUDFLARE_HEADERS` needs `TRUST_PROXY_HEADERS` — can change
+together. A save or a **Reset** that would leave another setting unable to
+apply is refused and names it: turning `TRUST_PROXY_HEADERS` off while
+`TRUST_X_REAL_IP` is on, for example, or clearing the Cloudflare networks while
+`TRUST_CLOUDFLARE_HEADERS` is on. Change both in one save. A **Reset** is also
+refused when the environment value it would fall back to is not valid. A
+setting that was already invalid never blocks an unrelated change. The names that stay in the
+environment, such as `DB_PASSWORD` or `MODELS_CONFIG_PATH`, cannot be set here.
+Behind the tab are `GET` and `PATCH /admin/config` and
+`DELETE /admin/config/{key}`.
+
+### When a change applies
+
+Most settings apply as soon as they are saved: at once in the backend process
+that served the save, and within ten seconds in every other one. A setting
+marked **Restart required** is read only at startup, and the process keeps the
+value it started with until it restarts. Provider credentials and every
+variable the registry names are among them, as are the circuit-breaker and
+outbound-concurrency tuning, alerting and `DB_STORE_FULL_CONTENT`.
+
+While such a change is waiting, the tab shows a **Restart pending** notice with
+a **Restart backend** button. The button (`POST /admin/system/restart`) makes
+the backend exit so that its supervisor starts it again: Docker, through the
+bundled Compose file's `restart: unless-stopped`, or systemd, through the
+bundled units' `Restart=on-failure`. Nothing inside the process can see that
+policy, so the deployment declares it: the bundled Compose file and units set
+`SUPERVISOR_RESTARTS_BACKEND=1` next to it, and a deployment that starts the
+backend some other way sets it only if its supervisor restarts the process
+when it exits. Without it, and whenever several worker processes serve the
+backend (`WEB_CONCURRENCY` or `UVICORN_WORKERS` above 1, or
+`uvicorn --workers`, where the button would restart only one of them), the tab
+shows a command to run yourself instead, such as
+`docker restart hybridinference-backend`. A restart cuts off requests in
+flight, streams included. The console knows the restart is over once `/health`
+names a different process in its `instance` field, however quickly the backend
+came back.
+
+### Without the console
+
+A setting can break the console that edits it — a value that stops sign-in
+from working, say. `python -m serving.config.manage` changes stored settings
+from the command line instead, with the console's own validation:
+
+```bash
+docker exec -it hybridinference-backend python -m serving.config.manage list
+docker exec -it hybridinference-backend python -m serving.config.manage reset JWT_ALGORITHM
+```
+
+`list` shows every setting, `get KEY` one of them, `set KEY VALUE` stores a
+value — add `--secret` when it creates a custom variable that holds one — and
+`reset KEY` resets it as the tab's **Reset** does, so that the environment or
+the default applies again. It talks to the database directly with the `DB_*`
+connection settings alone, so it needs no sign-in and still runs when another
+setting in the environment is invalid, and it never prints a secret's value. When
+the backend container is not running, run it in the repository root of a
+source checkout instead (`uv run python -m serving.config.manage ...`), where
+`.env` reaches Postgres on `127.0.0.1:5432`. A running backend picks the
+change up within about ten seconds, or at its next restart for a setting
+marked **Restart required**. The command that resets an administrator's
+password works the same way; see
+[The first admin account](deployment.md#the-first-admin-account).
+
+### Missing settings
+
+Some settings are required: the two generated secrets, every variable a model
+route needs to load (unless the route is `optional: true`), and `SMTP_USER`
+and `SMTP_PASSWORD` while public signup requires email verification. When one
+of them has no value, the console shows a banner to signed-in users.
+Administrators get a link to the Configuration tab, where **Missing only**
+lists what to fill in; everyone else is told that some features may not work
+and to contact the administrator. A model whose credential is missing is not
+loaded, and a request for it is answered with a `404`. When an administrator
+sends it with their own API key, the `404` says the deployment's configuration
+is incomplete; anyone else gets the same "not found" as for a model the
+deployment does not define, so the difference reveals nothing beyond what
+they may use.
+
+A deployment that leaves a model's credential unset on purpose — a route it
+does not use yet, or a canary it enables elsewhere — should mark that route
+`optional: true` in the model registry. The route is then skipped quietly,
+and its variable is not reported as missing.
+
+```{warning}
+Settings are stored in plaintext. Anyone who can read the database — a
+`pg_dump`, a backup, a `psql` or pgAdmin session — can read every provider
+key, decrypt users' stored API keys and sign administrator tokens. Protect
+database access and backups as you would the credentials themselves.
+```
+
 ## Environment variables
 
-`Settings` (`apps/backend/serving/config/settings.py`) reads a `.env` file from
-the working directory and the process environment, case-insensitively; the
-process environment wins. `.env.example` in the repository root is the annotated
-list — copy it to `.env` and edit. Secrets belong here and only here: not in the
-model registry (reference them as `${VAR}`), not in the manifest.
+The environment keeps what the backend needs before it can reach its database
+and what describes the containers rather than the application:
+
+- the database connection: `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`,
+  `DB_PASSWORD`, `DB_ENABLED`;
+- the configuration files: `MODELS_CONFIG_PATH`, `ROUTING_CONFIG_PATH`,
+  `ALERTS_CONFIG_PATH`, `DISTRIBUTION_CONFIG_PATH`,
+  `DISTRIBUTION_CONFIG_MODE`;
+- the backend process: `LOG_FILE`, `BACKEND_EXTENSIONS`, `GEOIP_COUNTRY_DB`,
+  `GEOIP_COUNTRY_PROVIDER`, `WEB_CONCURRENCY`, `SUPERVISOR_RESTARTS_BACKEND`,
+  and `REFRESH_TOKEN_COOKIE_NAME`, which the console reads too;
+- Compose and the console: host ports and bind addresses, the console's build
+  values and its runtime ones such as `AGENT_WEB_INTERNAL_URL`.
+
+The gateway reads a `.env` file from its working directory and the process
+environment; the process environment wins. `.env.example` in the repository
+root is the annotated list — copy it to `.env` and edit.
+[Installation](installation.md#environment-variables) lists the settings you
+are most likely to set. A value in the environment for any other setting is
+imported into the database at startup, as described above. Never write a
+secret into the model registry or the manifest: reference it there as
+`${VAR}`.
 
 ## Running with your configuration
 
@@ -373,10 +557,10 @@ curl -s localhost:8080/health           # includes routes_configured
 curl -s localhost:8080/v1/models        # generated from the registered adapters
 ```
 
-The startup log is the authority on resolution. `Registered N routes from <path>`
-names the file that won; `[distribution dark mode] ...` lines show what a manifest
-would have changed; `Skipping model '<id>' ... after env expansion` names each
-model whose credentials were unset.
+The startup log says what was loaded. `Registered N routes from <path>` names
+the registry file that was used; `[distribution dark mode] ...` lines show what
+a manifest would change once activated; `Skipping model '<id>' ... after env
+expansion` names each model whose credentials were unset.
 
 ```{warning}
 `GET /routing` requires no credentials and returns, for every published route,

@@ -5,6 +5,12 @@ from the active manifest (``serving.config.distribution``), while public site
 fields use the shared environment-over-manifest identity resolver. Local file
 paths remain private; only the branding document's explicitly public fields
 are returned.
+
+Two deployment-state flags ride along at the top level, where an older
+console's parser ignores them: ``setup.required`` (first-run setup is pending,
+so the console sends every route to ``/setup``) and
+``configuration.incomplete`` (a required setting has no value). Neither names
+a setting.
 """
 
 from __future__ import annotations
@@ -14,8 +20,10 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 
 from serving.auth.signup_policy import is_public_signup_enabled
+from serving.config.app_config import get_config_health
 from serving.config.distribution import DistributionConfigError, get_active_distribution_config
 from serving.config.site_identity import get_site_identity
+from serving.setup_state import refresh_setup_state
 
 router = APIRouter()
 
@@ -28,6 +36,27 @@ _NEUTRAL: dict[str, Any] = {
 }
 
 
+async def _deployment_state() -> dict[str, Any]:
+    """Return the top-level ``setup`` and ``configuration`` flags."""
+    return {
+        "setup": {"required": await refresh_setup_state()},
+        "configuration": {"incomplete": get_config_health().incomplete},
+    }
+
+
+def _public_features(features: dict[str, Any]) -> dict[str, Any]:
+    """Drop ``public_stats`` unless it is enabled.
+
+    Consoles parse ``features`` strictly, so an older console would reject the
+    whole document over a key it does not know. Omitting the opt-in flag while
+    it is off keeps such a console working; it only ever sees the key on a
+    deployment that turned the feature on, which needs this release anyway.
+    """
+    if features.get("public_stats") is not True:
+        features = {k: v for k, v in features.items() if k != "public_stats"}
+    return features
+
+
 @router.get("/site-config")
 async def get_site_config() -> dict[str, Any]:
     """Return the active distribution and its resolved public site identity.
@@ -36,7 +65,8 @@ async def get_site_config() -> dict[str, Any]:
     site renders. Falls back to a neutral document of identical shape when
     no distribution manifest is configured, so clients never need to
     special-case its absence. Public signup always reports the effective
-    backend policy, including environment and runtime settings.
+    backend policy, including environment and runtime settings. ``setup``
+    and ``configuration`` are always present, manifest or not.
     """
     try:
         config = get_active_distribution_config()
@@ -46,10 +76,12 @@ async def get_site_config() -> dict[str, Any]:
             detail="Site configuration is unavailable. Check the distribution manifest and mode.",
         ) from None
     public_signup = await is_public_signup_enabled()
+    deployment_state = await _deployment_state()
     if config is None:
         return {
             **_NEUTRAL,
             "features": {**_NEUTRAL["features"], "public_signup": public_signup},
+            **deployment_state,
         }
     site_identity = get_site_identity()
     branding = config.branding_config
@@ -60,10 +92,14 @@ async def get_site_config() -> dict[str, Any]:
             "public_base_url": site_identity.public_base_url,
             "support_email": site_identity.support_email,
         },
-        "features": {**config.features.model_dump(), "public_signup": public_signup},
+        "features": {
+            **_public_features(config.features.model_dump()),
+            "public_signup": public_signup,
+        },
         "branding": (
             branding.public_payload(docs_url=site_identity.docs_url)
             if branding is not None
             else None
         ),
+        **deployment_state,
     }

@@ -8,7 +8,6 @@ Provides:
 from __future__ import annotations
 
 import asyncio
-import os
 import random
 import re
 import threading
@@ -18,7 +17,7 @@ from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Callable, Sequence
 
     from routing.protocols import RoutingRequestOptions
     from serving.adapters.base import BaseAdapter
@@ -32,10 +31,12 @@ from routing.offload import (
     OFFLOAD_LAST_RESORT,
     FallbackOrder,
     OffloadPolicy,
+    abandoned_for_offload,
     offload_reason_for,
 )
 from routing.prefill_load import (
     PrefillLoadTracker,
+    _env_int,
     conversation_fingerprint,
     estimate_prefill_tokens,
     priority_for_prefill,
@@ -44,6 +45,8 @@ from routing.prefill_load import (
 from routing.route_table import EffectiveRoute, RouteTableSnapshot
 from routing.streaming import has_non_empty_content
 from routing.telemetry import failed_attempt, routing_chunk
+from serving.adapters.upstream_limiter import EngineHold
+from serving.config.app_config import config_value, on_change
 from serving.exceptions import operator_safe_error
 from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
@@ -149,10 +152,15 @@ class RoutingObservation:
 
 @dataclass
 class _Affinity:
-    """Per-user provider pin for one model. TTL is monotonic time."""
+    """Per-user provider pin for one model. Times are monotonic.
+
+    ``expires_at`` slides forward on every honored request, but never past
+    ``created_at + AFFINITY_MAX_AGE_SECONDS`` (see ``_affinity_expiry``).
+    """
 
     endpoint_id: str
     expires_at: float
+    created_at: float = field(default_factory=time.monotonic)
 
 
 # ============================================================================
@@ -172,7 +180,51 @@ def current_affinity_key() -> str | None:
 
 AFFINITY_TTL_SECONDS: float = 300.0
 AFFINITY_SWEEP_THRESHOLD: int = 1000
-AFFINITY_ENABLED: bool = os.environ.get("ROUTING_AFFINITY_ENABLED", "1") != "0"
+AFFINITY_ENABLED: bool = True
+
+# Longest a pin may live, however busy its caller. The sliding TTL alone lets a
+# caller that never goes five minutes without a request keep its endpoint
+# indefinitely, so route weights -- an admin override included -- govern only
+# fresh draws: a caller moved by a failover or a backlog re-pick stays where it
+# landed. In production an endpoint overridden to 1% was still serving a third
+# of its model's traffic two days after the last restart. A day bounds how long
+# a pin can outlive the weights that chose it, at the cost of one re-draw per
+# busy caller per day, and a cold prefix only when the draw moves it. Pins age
+# from when they were made, so the re-draws spread across the day instead of
+# landing together. 0 turns the cap off.
+AFFINITY_MAX_AGE_SECONDS: float = float(24 * 60 * 60)
+
+
+def _load_affinity_settings() -> None:
+    """Read ``ROUTING_AFFINITY_ENABLED`` and ``ROUTING_AFFINITY_MAX_AGE_SEC``.
+
+    Run at import and again after every configuration change, so both apply
+    to the next routing decision.
+    """
+    global AFFINITY_ENABLED, AFFINITY_MAX_AGE_SECONDS
+    AFFINITY_ENABLED = config_value("ROUTING_AFFINITY_ENABLED", "1") != "0"
+    AFFINITY_MAX_AGE_SECONDS = float(_env_int("ROUTING_AFFINITY_MAX_AGE_SEC", 24 * 60 * 60))
+
+
+_load_affinity_settings()
+on_change(_load_affinity_settings)
+
+
+def _affinity_expiry(created_at: float, now: float) -> float:
+    """Return when a pin made at ``created_at`` and used at ``now`` expires.
+
+    Args:
+        created_at: Monotonic time the pin was made.
+        now: Monotonic time of the request that made or renewed it.
+
+    Returns:
+        ``now`` plus the sliding TTL, capped at the pin's maximum age.
+    """
+    expires_at = now + AFFINITY_TTL_SECONDS
+    if AFFINITY_MAX_AGE_SECONDS > 0:
+        expires_at = min(expires_at, created_at + AFFINITY_MAX_AGE_SECONDS)
+    return expires_at
+
 
 # Why a route's effective weight stops matching the weight its configuration
 # asked for. Reported separately, never merged, because each names a different
@@ -238,10 +290,21 @@ class _RouteAttempt:
     the exception object, so the ``failed_attempts`` telemetry list it builds
     cannot answer "which of these should the caller actually be told about?".
     This keeps the exceptions themselves, in dispatch order, alongside it.
+
+    ``offload`` is why the attempt went to the model's offload route (the
+    success path's ``_routing["offload"]``), ``None`` for any other route.
+
+    ``route`` is the route adapter the attempt was dispatched as: the primary,
+    or the candidate ``FallbackOrder`` handed out. A retry shares it with the
+    attempt it retries. ``adapter`` can be a binding's adapter instead, and an
+    admin edit can put a new adapter behind the same endpoint id mid-request,
+    so neither of those identifies a retry.
     """
 
     adapter: BaseAdapter
     error: BaseException
+    offload: str | None = None
+    route: BaseAdapter | None = None
 
 
 def _describes_request(exc: BaseException) -> bool:
@@ -305,6 +368,66 @@ def _select_surfaced_error(attempts: Sequence[_RouteAttempt]) -> _RouteAttempt:
     return attempts[select_surfaced_error([attempt.error for attempt in attempts])]
 
 
+def _reported_attempts(attempts: Sequence[_RouteAttempt]) -> list[_RouteAttempt]:
+    """Return ``attempts`` with each one cut short for the offload route replaced by its retry.
+
+    The router abandons an attempt for the offload route (``abandoned_for_offload``)
+    before its route has answered. If the offload route then fails, the fallback
+    loop sends the request back to that route (``FallbackOrder``). That retry is
+    the route's answer, so it takes the abandoned attempt's place in dispatch
+    order. A primary that was cut short and then failed on its retry therefore
+    stays the default error surfaced, with its own error instead of the router's
+    deadline. An abandoned attempt with no retry is left where it is.
+
+    A retry is matched by the route adapter both attempts were dispatched as
+    (``_RouteAttempt.route``), not by endpoint id. A route an admin edit puts in
+    the original's place mid-request can share the endpoint id, and the loop
+    tries it as an ordinary fallback before the retry.
+    """
+    reported: list[_RouteAttempt] = []
+    later = list(attempts)
+    while later:
+        attempt = later.pop(0)
+        if attempt.route is not None and abandoned_for_offload(attempt.error):
+            for position, retry in enumerate(later):
+                if retry.route is attempt.route:
+                    attempt = later.pop(position)
+                    break
+        reported.append(attempt)
+    return reported
+
+
+def _offload_marker(attempts: Sequence[_RouteAttempt]) -> tuple[str | None, str | None]:
+    """Return ``(offload, offload_endpoint_id)`` for an attempt sent to the offload route.
+
+    ``(None, None)`` when no attempt went there. See :func:`_mark_offload`.
+    """
+    for attempt in attempts:
+        if attempt.offload is not None:
+            return attempt.offload, endpoint_id_for_adapter(attempt.adapter)
+    return None, None
+
+
+def _mark_offload(routing: dict[str, Any], attempts: Sequence[_RouteAttempt]) -> None:
+    """Mark a routing block if its request was sent to the offload route.
+
+    A request sent to its offload route was offloaded, whichever route answers
+    it. A response the offload route served says so on its own block. When the
+    offload route failed, the block the request ends with describes another
+    route: the one that served it next, or the one whose error is reported,
+    usually the primary's (``_select_surfaced_error``). So the block gets the
+    attempt's ``offload`` reason, and names the offload route as
+    ``offload_endpoint_id``. Without them the request log reads as if the
+    offload route was never tried, and the admin count of offloaded requests
+    misses the request. ``setdefault``, so a block built further upstream keeps
+    what it already says.
+    """
+    reason, endpoint_id = _offload_marker(attempts)
+    if reason is not None:
+        routing.setdefault("offload", reason)
+        routing.setdefault("offload_endpoint_id", endpoint_id)
+
+
 def _raise_surfaced_error(
     attempts: Sequence[_RouteAttempt],
     failed_attempts: list[dict[str, str]],
@@ -329,8 +452,12 @@ def _raise_surfaced_error(
     claim a direct causal link that does not exist (two routes failed
     independently) and, when the primary is the one selected, make it its own
     cause.
+
+    An attempt cut short for the offload route is represented by its retry, if
+    it had one (``_reported_attempts``).
     """
-    selected = _select_surfaced_error(attempts)
+    reported = _reported_attempts(attempts)
+    selected = _select_surfaced_error(reported)
     exc = selected.error
     routing = getattr(exc, "_routing", None)
     if isinstance(routing, dict):
@@ -346,7 +473,7 @@ def _raise_surfaced_error(
             "failed_attempts": failed_attempts,
         }
         exc._routing = routing  # type: ignore[attr-defined]
-    if selected is not attempts[0]:
+    if selected is not reported[0]:
         # Same marker the success path puts on a response served by a fallback,
         # and it matters more here: this block's provider is the route that
         # produced the status being reported, not the route the request was
@@ -354,6 +481,7 @@ def _raise_surfaced_error(
         # had picked this endpoint. ``setdefault`` so a block built further
         # upstream keeps whatever it already decided.
         routing.setdefault("fallback", True)
+    _mark_offload(routing, attempts)
     raise exc
 
 
@@ -436,6 +564,22 @@ def _window_cannot_fit(adapter: BaseAdapter, refused_window: int | None) -> bool
         return False
     window = _configured_context_window(adapter)
     return window is not None and window <= refused_window
+
+
+def _serves_caller(adapter: BaseAdapter) -> bool:
+    """Return whether ``adapter`` holds a key the current caller may spend right now.
+
+    Asked of the adapter itself (``has_capacity_for_role``), with the role its key
+    pool reads when the request is sent (``req_ctx.USER_ROLE``; absent for an
+    unrestricted internal caller), so the answer is the one ``KeyPool.acquire``
+    will give: a key reserved above the caller's tier does not count, and neither
+    does one in cooldown. An adapter without the method reserves nothing.
+    """
+    has_capacity = getattr(adapter, "has_capacity_for_role", None)
+    if not callable(has_capacity):
+        return True
+    role = req_ctx.get().get(req_ctx.USER_ROLE)
+    return bool(has_capacity(role if isinstance(role, str) and role else None))
 
 
 def _skips_for_context_window(
@@ -724,18 +868,20 @@ class FixedRouter:
         pin_provider: str | None,
         endpoint_scope: frozenset[str] | None,
         required_modalities: frozenset[str] | None,
+        prefill_tokens: int,
     ) -> tuple[BaseAdapter, OffloadPolicy] | None:
         """Return the offload target visible to one request's dispatch range.
 
         A pinned request has no offload: the caller named one endpoint and a
         silent switch would be the same misleading result a fallback would be.
+        Nor does a prompt over the route's max input (``OffloadPolicy.takes_input``).
         """
         if pin_provider or self.offload_policy_resolver is None:
             return None
         route = self.routes.get(model_id)
         if route is None:
             return None
-        return self._offload_target(
+        target = self._offload_target(
             model_id,
             route,
             self._dispatch_range(
@@ -745,6 +891,9 @@ class FixedRouter:
                 required_modalities=required_modalities,
             ),
         )
+        if target is None or not target[1].takes_input(prefill_tokens):
+            return None
+        return target
 
     def _queue_deadline(
         self,
@@ -757,7 +906,8 @@ class FixedRouter:
 
         ``None`` -- no deadline of its own, so the limiter's acquire timeout
         applies -- unless the request still has an offload route to go to, that
-        route's circuit would admit it, and its context window is wider than
+        route holds a key this caller may spend (``_serves_caller``), its
+        circuit would admit it, and its context window is wider than
         ``refused_window``, the widest one that has already refused this prompt
         as too long. Leaving a queue only helps when the request has somewhere
         to go; abandoning its place in line for an offload route that would
@@ -767,6 +917,8 @@ class FixedRouter:
         if offload is None or policy is None:
             return None
         if _window_cannot_fit(offload, refused_window):
+            return None
+        if not _serves_caller(offload):
             return None
         if not self._health_registry.allow_request(endpoint_id_for_adapter(offload)):
             return None
@@ -781,6 +933,7 @@ class FixedRouter:
         allow_fallback: bool,
         endpoint_scope: frozenset[str] | None,
         required_modalities: frozenset[str] | None,
+        prefill_tokens: int,
     ) -> _PrimaryOffload:
         """Return how a request's primary attempt relates to its offload route.
 
@@ -789,7 +942,8 @@ class FixedRouter:
         is the queue deadline for a primary that could still be offloaded, and
         ``policy`` the one its stream is watched under. A caller that owns the
         candidate order (``allow_fallback`` off) gets neither: this router will
-        not walk on to the offload route on its behalf.
+        not walk on to the offload route on its behalf. Nor does a prompt over
+        the route's max input, which can never be offloaded.
 
         Never raises. It runs between admission and the attempt, where the
         caller holds a dispatch claim and a prefill lease it has not yet
@@ -802,6 +956,7 @@ class FixedRouter:
                 pin_provider=pin_provider,
                 endpoint_scope=endpoint_scope,
                 required_modalities=required_modalities,
+                prefill_tokens=prefill_tokens,
             )
             if target is None:
                 return _PrimaryOffload()
@@ -825,13 +980,16 @@ class FixedRouter:
         *,
         endpoint_scope: frozenset[str] | None,
         required_modalities: frozenset[str] | None,
+        prefill_tokens: int,
     ) -> tuple[FallbackOrder, OffloadPolicy | None]:
         """Return the rest of the route, in the order this request should try it.
 
         The same candidates the fallback loop has always walked -- every other
         route in declaration order, minus weight-0 routes and routes outside the
         dispatch scope or the request's modalities -- with the offload route, if
-        the model has a usable one, placed by :class:`FallbackOrder` instead.
+        the model has a usable one, placed by :class:`FallbackOrder` instead. A
+        prompt over the offload route's max input does not get it at all, not
+        even last.
         """
         route = self.routes[model_id]
         candidates = self._dispatch_range(
@@ -841,6 +999,9 @@ class FixedRouter:
             required_modalities=required_modalities,
         )
         target = self._offload_target(model_id, route, candidates)
+        if target is not None and not target[1].takes_input(prefill_tokens):
+            candidates = [entry for entry in candidates if entry[0] is not target[0]]
+            target = None
         offload, policy = target if target is not None else (None, None)
         if offload is primary:
             # The primary already was the offload route: it was chosen because
@@ -891,6 +1052,45 @@ class FixedRouter:
         if policy is None or deadline is None:
             return None
         return FirstTokenWatch(endpoint_id_for_adapter(adapter), wait_seconds=policy.wait_seconds)
+
+    def _engine_queue_limit(self, model_id: str) -> int | None:
+        """Return the engine queue limit the model's stored offload policy sets, or None.
+
+        Read from the policy itself, not from whether this request could be
+        offloaded. A pinned request, one whose caller owns the candidate order,
+        one whose primary is the offload route and one too long to offload still
+        reach the model's engines, and an engine's line only holds its limit if
+        it counts every stream it is sent. Never raises, like
+        ``_primary_offload``: it runs where a stranded claim would cost more
+        than a missing hold.
+        """
+        try:
+            source = self.offload_policy_resolver
+            route = self.routes.get(model_id)
+            if source is None or route is None:
+                return None
+            policy = source.get_offload_policy(route.canonical_model_id or model_id)
+            return policy.engine_queue_limit if policy is not None else None
+        except Exception:
+            logger.error(
+                f"Engine queue limit lookup failed for model {model_id}; routing without it",
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _hold_for(engine_queue_limit: int | None) -> EngineHold | None:
+        """Return one streaming attempt's place in line for a local engine, or None.
+
+        Every streaming attempt of a model whose offload policy sets an engine
+        queue limit gets one, whether or not it could be offloaded itself: one
+        that could not still waits behind the requests that came first. The
+        limiter applies it only to a local engine (``upstream_limiter``), and
+        the place is this attempt's alone, like its watch.
+        """
+        if engine_queue_limit is None:
+            return None
+        return EngineHold(engine_queue_limit)
 
     @staticmethod
     async def _await_first_token(stream: AsyncIterator[Any], watch: FirstTokenWatch) -> list[Any]:
@@ -1357,6 +1557,7 @@ class FixedRouter:
         model_id: str,
         *,
         endpoint_scope: frozenset[str] | None = None,
+        size_prompt: Callable[[BaseAdapter], int] | None = None,
     ) -> list[tuple[BaseAdapter, float]]:
         """Return the adapters automatic routing may dispatch to, in route order.
 
@@ -1374,6 +1575,15 @@ class FixedRouter:
         A model's offload route (``routing.offload``) is moved to the end of the
         list: it takes no ordinary traffic, so a surface taking the first usable
         entry reaches it only when nothing ahead of it can serve.
+
+        ``size_prompt`` returns the request's estimated prompt tokens
+        (``estimate_prefill_tokens``) as the adapter it is given would be sent
+        them: a surface whose body depends on the route's wire format sizes it
+        for the offload route's. A prompt over the offload route's max input
+        leaves the route out of the list instead of at its end. It is called
+        only when the route has a max input, so a surface that has not sized its
+        prompt yet pays for it only when the answer matters; without it, the
+        route is listed last whatever the request's size.
         """
         route = self.routes.get(model_id)
         if not route or not route.published or not route.adapters:
@@ -1391,10 +1601,15 @@ class FixedRouter:
         target = self._offload_target(model_id, route, eligible)
         if target is None:
             return eligible
-        offload = target[0]
-        return [entry for entry in eligible if entry[0] is not offload] + [
-            entry for entry in eligible if entry[0] is offload
-        ]
+        offload, policy = target
+        ordinary = [entry for entry in eligible if entry[0] is not offload]
+        if (
+            policy.max_input_tokens is not None
+            and size_prompt is not None
+            and not policy.takes_input(size_prompt(offload))
+        ):
+            return ordinary
+        return ordinary + [entry for entry in eligible if entry[0] is offload]
 
     def select_adapter(
         self,
@@ -1594,12 +1809,19 @@ class FixedRouter:
         # seat, so selection -- the draw, affinity and a preferred target alike --
         # sees it only when it is the last candidate standing. Everything below
         # then works on the reduced list, which is also what drops an affinity
-        # pin left on the offload route by an earlier last-resort pick.
+        # pin left on the offload route by an earlier last-resort pick. A prompt
+        # over the route's max input does not see it even then.
         target = self._offload_target(model_id, route, snapshot)
         if target is not None:
             ordinary = [
                 (adapter, weight) for adapter, weight in allowed if adapter is not target[0]
             ]
+            if not ordinary and not target[1].takes_input(prefill_tokens):
+                raise AllCircuitsOpenError(
+                    f"No route for model {model_id} can take this request: only its offload "
+                    f"route is admissible, and the prompt (about {prefill_tokens} tokens) is "
+                    f"over that route's max input of {target[1].max_input_tokens} tokens"
+                )
             if ordinary:
                 allowed = ordinary
 
@@ -1633,7 +1855,7 @@ class FixedRouter:
                             if self._prefill_load.should_keep_affinity(
                                 entry.endpoint_id, affinity_key=affinity_key
                             ):
-                                entry.expires_at = now + AFFINITY_TTL_SECONDS
+                                entry.expires_at = _affinity_expiry(entry.created_at, now)
                                 return adapter
                             avoid_endpoint_id = entry.endpoint_id
                             break
@@ -1694,7 +1916,8 @@ class FixedRouter:
             with self._lock:
                 self._affinity[(affinity_key, model_id)] = _Affinity(
                     endpoint_id=endpoint_id_for_adapter(chosen),
-                    expires_at=now + AFFINITY_TTL_SECONDS,
+                    expires_at=_affinity_expiry(now, now),
+                    created_at=now,
                 )
                 self._maybe_sweep_affinity_locked(now)
         return chosen
@@ -2051,6 +2274,7 @@ class FixedRouter:
             allow_fallback=allow_fallback,
             endpoint_scope=endpoint_scope,
             required_modalities=required_modalities,
+            prefill_tokens=prefill_tokens,
         )
         try:
             endpoint_id = endpoint_id_for_adapter(primary)
@@ -2064,8 +2288,10 @@ class FixedRouter:
                         endpoint_id, prefill_tokens, affinity_key, fingerprint, messages
                     ),
                     req_ctx.UPSTREAM_QUEUE_DEADLINE: primary_plan.deadline,
-                    # A response that arrives whole has no first token to watch.
+                    # A response that arrives whole has no first token to watch,
+                    # nor one to give its place at the engine up on.
                     req_ctx.UPSTREAM_DISPATCH_WATCH: None,
+                    req_ctx.UPSTREAM_ENGINE_HOLD: None,
                 },
             ):
                 self._ensure_health(endpoint_id)
@@ -2102,7 +2328,7 @@ class FixedRouter:
             # Kept in step with ``failed_attempts`` because that list holds only
             # rendered strings; ``_raise_surfaced_error`` below needs the exception
             # objects to decide which failure the caller is told about.
-            attempts = [_RouteAttempt(primary, primary_error)]
+            attempts = [_RouteAttempt(primary, primary_error, primary_plan.reason, primary)]
             # Attach routing to the surfaced error so the error-log path can
             # attribute the failure to the real upstream instead of the "router"
             # sentinel — mirrors the success-path resp["_routing"] injection.
@@ -2118,6 +2344,11 @@ class FixedRouter:
                     "endpoint_id": endpoint_id_for_adapter(primary),
                     "failed_attempts": failed_attempts,
                 }
+            primary_routing = getattr(primary_error, "_routing", None)
+            if isinstance(primary_routing, dict):
+                # A primary that is the offload route was offloaded however
+                # the request ends.
+                _mark_offload(primary_routing, attempts)
             # Pin mode: never fallback — the caller explicitly requested this
             # provider, so a silent switch would produce misleading results.
             if pin_provider:
@@ -2133,14 +2364,16 @@ class FixedRouter:
             # Every other route in declaration order, bounded by the dispatch
             # scope and the request's modalities exactly as selection was. The
             # model's offload route, if any, is ordered by outcome instead: next
-            # after an attempt that ended in the gateway queue, else last.
+            # after an attempt that ended in the gateway queue, else last. A
+            # route cut short for it is tried once more at the very end.
             order, offload_policy = self._fallback_order(
                 model_id,
                 primary,
                 endpoint_scope=endpoint_scope,
                 required_modalities=required_modalities,
+                prefill_tokens=prefill_tokens,
             )
-            order.record_failure(primary_error)
+            order.record_failure(primary_error, primary)
             while (candidate := order.next()) is not None:
                 adapter, offload_reason = candidate
                 # The offload route included: a window that cannot fit the
@@ -2152,6 +2385,13 @@ class FixedRouter:
                 # costs no admission slot.
                 execution = execution_adapter(adapter, routing_options)
                 leaf = self._leaf_for(self.binding_for(execution, model_id))
+                if adapter is primary:
+                    # The primary's retry, after it was cut short for an offload
+                    # route that failed. Its first attempt is off the wire, so
+                    # the claim it took goes back first; held, a half-open probe
+                    # would refuse this request its own retry.
+                    self._health_registry.end_dispatch(primary_claim)
+                    primary_claim = None
                 # Fallback is still automatic routing, so it must honor the
                 # same shared circuit eligibility as the initial selection.
                 # Explicit pinning returned above and remains the sole circuit
@@ -2185,6 +2425,7 @@ class FixedRouter:
                                 )
                             ),
                             req_ctx.UPSTREAM_DISPATCH_WATCH: None,
+                            req_ctx.UPSTREAM_ENGINE_HOLD: None,
                         },
                     ):
                         self._ensure_health(endpoint_id)
@@ -2211,6 +2452,8 @@ class FixedRouter:
                     resp["_routing"].setdefault("failed_attempts", failed_attempts)
                     if offload_reason is not None:
                         resp["_routing"].setdefault("offload", offload_reason)
+                    # Or the offload route failed before this route served.
+                    _mark_offload(resp["_routing"], attempts)
                     return resp
                 except Exception as fallback_error:
                     self._on_failure(
@@ -2220,9 +2463,11 @@ class FixedRouter:
                         exc=fallback_error,
                     )
                     failed_attempts.append(failed_attempt(execution, fallback_error))
-                    attempts.append(_RouteAttempt(execution, fallback_error))
+                    attempts.append(
+                        _RouteAttempt(execution, fallback_error, offload_reason, adapter)
+                    )
                     refused_window = _widest_refused_window(refused_window, adapter, fallback_error)
-                    order.record_failure(fallback_error)
+                    order.record_failure(fallback_error, adapter)
                     continue
                 finally:
                     self._health_registry.end_dispatch(fallback_claim)
@@ -2230,10 +2475,10 @@ class FixedRouter:
         finally:
             # Every exit, cancellation included: a claim the request keeps is a
             # cooldown the endpoint spends invisible to selection. Released after
-            # the fallback loop rather than inside it because the loop never
-            # revisits ``primary`` -- holding it that long costs nothing, and an
-            # early release would let a second probe start while this one is
-            # still on the wire.
+            # the fallback loop rather than inside it because the loop revisits
+            # ``primary`` only for its retry, which hands the claim back itself --
+            # holding it that long costs nothing, and an early release would let
+            # a second probe start while this one is still on the wire.
             self._health_registry.end_dispatch(primary_claim)
 
     async def stream_chat_completion(
@@ -2329,7 +2574,10 @@ class FixedRouter:
             allow_fallback=allow_fallback,
             endpoint_scope=endpoint_scope,
             required_modalities=required_modalities,
+            prefill_tokens=prefill_tokens,
         )
+        # For every stream of this request, whatever its offload plan says.
+        engine_queue_limit = self._engine_queue_limit(model_id)
         chunks_yielded = False
         try:
             primary_endpoint_id = endpoint_id_for_adapter(primary)
@@ -2345,6 +2593,7 @@ class FixedRouter:
                     ),
                     req_ctx.UPSTREAM_QUEUE_DEADLINE: primary_plan.deadline,
                     req_ctx.UPSTREAM_DISPATCH_WATCH: primary_watch,
+                    req_ctx.UPSTREAM_ENGINE_HOLD: self._hold_for(engine_queue_limit),
                 },
             ):
                 # Emit synthetic _routing chunk so completions.py can recover
@@ -2399,7 +2648,7 @@ class FixedRouter:
             # Kept in step with ``failed_attempts`` because that list holds only
             # rendered strings; ``_raise_surfaced_error`` below needs the exception
             # objects to decide which failure the caller is told about.
-            attempts = [_RouteAttempt(primary, primary_error)]
+            attempts = [_RouteAttempt(primary, primary_error, primary_plan.reason, primary)]
             # Attach routing to the surfaced error so the error-log path can
             # attribute the failure to the real upstream. Unlike the
             # non-streaming twin below, this generator never gets a chance to
@@ -2427,6 +2676,11 @@ class FixedRouter:
                     "endpoint_id": endpoint_id_for_adapter(primary),
                     "failed_attempts": failed_attempts,
                 }
+            primary_routing = getattr(primary_error, "_routing", None)
+            if isinstance(primary_routing, dict):
+                # A primary that is the offload route was offloaded however
+                # the request ends.
+                _mark_offload(primary_routing, attempts)
             # Pin mode: never fallback — re-raise immediately.
             if pin_provider:
                 raise primary_error
@@ -2446,16 +2700,17 @@ class FixedRouter:
             if chunks_yielded:
                 raise primary_error
             refused_window = _widest_refused_window(None, primary, primary_error)
-            # Same candidates, same order, same offload placement and same
-            # context-window skip as the non-streaming loop -- see
-            # ``_fallback_order``.
+            # Same candidates, same order, same offload placement, same retry
+            # of a route cut short for it and same context-window skip as the
+            # non-streaming loop -- see ``_fallback_order``.
             order, offload_policy = self._fallback_order(
                 model_id,
                 primary,
                 endpoint_scope=endpoint_scope,
                 required_modalities=required_modalities,
+                prefill_tokens=prefill_tokens,
             )
-            order.record_failure(primary_error)
+            order.record_failure(primary_error, primary)
             while (candidate := order.next()) is not None:
                 adapter, offload_reason = candidate
                 if _skips_for_context_window(model_id, adapter, refused_window):
@@ -2465,6 +2720,11 @@ class FixedRouter:
                 # non-streaming loop: an unusable binding costs no probe slot.
                 execution = execution_adapter(adapter, routing_options)
                 leaf = self._leaf_for(self.binding_for(execution, model_id))
+                if adapter is primary:
+                    # The primary's retry: its claim goes back first, as in the
+                    # non-streaming loop.
+                    self._health_registry.end_dispatch(primary_claim)
+                    primary_claim = None
                 # Synthetic routing chunks are emitted only after circuit
                 # admission so an open automatic fallback is never exposed as
                 # an attempted upstream. Explicit pinning returned above. The
@@ -2504,13 +2764,19 @@ class FixedRouter:
                             ),
                             req_ctx.UPSTREAM_QUEUE_DEADLINE: queue_deadline,
                             req_ctx.UPSTREAM_DISPATCH_WATCH: fallback_watch,
+                            req_ctx.UPSTREAM_ENGINE_HOLD: self._hold_for(engine_queue_limit),
                         },
                     ):
+                        # This attempt's reason when it is the offload route,
+                        # else that of an offload route that failed before it:
+                        # the request was offloaded whichever route answers.
+                        earlier_offload, earlier_offload_endpoint = _offload_marker(attempts)
                         yield routing_chunk(
                             execution,
                             fallback=True,
                             failed_attempts=failed_attempts,
-                            offload=offload_reason,
+                            offload=offload_reason or earlier_offload,
+                            offload_endpoint_id=earlier_offload_endpoint,
                         )
                         first = True
                         lease = self._prefill_load.acquire(
@@ -2546,15 +2812,31 @@ class FixedRouter:
                         exc=fallback_error,
                     )
                     failed_attempts.append(failed_attempt(execution, fallback_error))
-                    attempts.append(_RouteAttempt(execution, fallback_error))
+                    attempts.append(
+                        _RouteAttempt(execution, fallback_error, offload_reason, adapter)
+                    )
                     # Once this fallback provider's bytes reached the client the
                     # SSE stream has committed to it (same invariant as the
                     # primary path above). Re-raise instead of splicing yet
                     # another provider into the same response.
                     if chunks_yielded:
+                        # With the block the primary gets for the same
+                        # re-raise, so the error log names this attempt, and
+                        # says so when it was the offload route that broke.
+                        if not hasattr(fallback_error, "_routing"):
+                            fallback_error._routing = {  # type: ignore[attr-defined]
+                                "provider": execution.config.provider,
+                                "base_url": execution.config.base_url,
+                                "endpoint_id": adapter_endpoint_id,
+                                "fallback": True,
+                                "failed_attempts": failed_attempts,
+                            }
+                        fallback_routing = getattr(fallback_error, "_routing", None)
+                        if isinstance(fallback_routing, dict):
+                            _mark_offload(fallback_routing, attempts)
                         raise
                     refused_window = _widest_refused_window(refused_window, adapter, fallback_error)
-                    order.record_failure(fallback_error)
+                    order.record_failure(fallback_error, adapter)
                     continue
                 finally:
                     # Covers the attempt that never reached a first token.

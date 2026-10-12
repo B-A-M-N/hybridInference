@@ -70,6 +70,8 @@ const storedOffload: OffloadRoute = {
 
 const queue = { enabled: true, maxWaitSeconds: 30 };
 
+const NO_LIMITS = { engineQueueLimit: null, maxInputTokens: null };
+
 function renderPanel(overrides: Partial<Parameters<typeof OffloadRoutePanel>[0]> = {}) {
   const onChange = vi.fn();
   render(
@@ -111,7 +113,7 @@ describe('OffloadRoutePanel', () => {
     fireEvent.click(save);
 
     await waitFor(() => {
-      expect(setOffloadRoute).toHaveBeenCalledWith(MODEL, reserved.route_id, 4);
+      expect(setOffloadRoute).toHaveBeenCalledWith(MODEL, reserved.route_id, 4, NO_LIMITS);
     });
     expect(onChange).toHaveBeenCalledWith(MODEL, storedOffload);
     expect(toast.success).toHaveBeenCalledWith('Offload route saved');
@@ -156,8 +158,120 @@ describe('OffloadRoutePanel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save offload route' }));
 
     await waitFor(() => {
-      expect(setOffloadRoute).toHaveBeenCalledWith(MODEL, reserved.route_id, 90);
+      expect(setOffloadRoute).toHaveBeenCalledWith(MODEL, reserved.route_id, 90, NO_LIMITS);
     });
+  });
+
+  it('saves an engine queue limit with the route', async () => {
+    vi.mocked(setOffloadRoute).mockResolvedValue({
+      model_id: MODEL,
+      offload: { ...storedOffload, engine_queue_limit: 2 },
+    });
+    renderPanel({ offload: storedOffload });
+
+    expect(screen.getByLabelText('Engine queue limit')).toHaveValue(null);
+    fireEvent.change(screen.getByLabelText('Engine queue limit'), { target: { value: '2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save offload route' }));
+
+    await waitFor(() => {
+      expect(setOffloadRoute).toHaveBeenCalledWith(MODEL, reserved.route_id, 4, {
+        engineQueueLimit: 2,
+        maxInputTokens: null,
+      });
+    });
+  });
+
+  it('shows a stored engine queue limit and turns it off when emptied', async () => {
+    vi.mocked(setOffloadRoute).mockResolvedValue({ model_id: MODEL, offload: storedOffload });
+    renderPanel({ offload: { ...storedOffload, engine_queue_limit: 3 } });
+
+    expect(screen.getByLabelText('Engine queue limit')).toHaveValue(3);
+    const save = screen.getByRole('button', { name: 'Save offload route' });
+    expect(save).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText('Engine queue limit'), { target: { value: '' } });
+    expect(save).toBeEnabled();
+    fireEvent.click(save);
+
+    await waitFor(() => {
+      expect(setOffloadRoute).toHaveBeenCalledWith(MODEL, reserved.route_id, 4, NO_LIMITS);
+    });
+  });
+
+  it.each([
+    ['0', 'Must be ≥ 1.'],
+    ['1.5', 'Must be a whole number.'],
+  ])('rejects an engine queue limit of %s before sending it', (value, error) => {
+    renderPanel({ offload: storedOffload });
+
+    fireEvent.change(screen.getByLabelText('Engine queue limit'), { target: { value } });
+
+    expect(screen.getByRole('alert')).toHaveTextContent(`Engine queue limit: ${error}`);
+    expect(screen.getByRole('button', { name: 'Save offload route' })).toBeDisabled();
+    expect(setOffloadRoute).not.toHaveBeenCalled();
+  });
+
+  it('saves a max offload input with the route', async () => {
+    vi.mocked(setOffloadRoute).mockResolvedValue({
+      model_id: MODEL,
+      offload: { ...storedOffload, max_input_tokens: 32000 },
+    });
+    renderPanel({ offload: { ...storedOffload, engine_queue_limit: 2 } });
+
+    expect(screen.getByLabelText('Max offload input tokens')).toHaveValue(null);
+    fireEvent.change(screen.getByLabelText('Max offload input tokens'), {
+      target: { value: '32000' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save offload route' }));
+
+    await waitFor(() => {
+      expect(setOffloadRoute).toHaveBeenCalledWith(MODEL, reserved.route_id, 4, {
+        engineQueueLimit: 2,
+        maxInputTokens: 32000,
+      });
+    });
+  });
+
+  it('shows a stored max offload input and lifts it when emptied', async () => {
+    vi.mocked(setOffloadRoute).mockResolvedValue({ model_id: MODEL, offload: storedOffload });
+    renderPanel({ offload: { ...storedOffload, max_input_tokens: 16000 } });
+
+    expect(screen.getByLabelText('Max offload input tokens')).toHaveValue(16000);
+    const save = screen.getByRole('button', { name: 'Save offload route' });
+    expect(save).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText('Max offload input tokens'), { target: { value: '' } });
+    expect(save).toBeEnabled();
+    fireEvent.click(save);
+
+    await waitFor(() => {
+      expect(setOffloadRoute).toHaveBeenCalledWith(MODEL, reserved.route_id, 4, NO_LIMITS);
+    });
+  });
+
+  it.each([
+    ['0', 'Must be ≥ 1.'],
+    ['1.5', 'Must be a whole number.'],
+  ])('rejects a max offload input of %s before sending it', (value, error) => {
+    renderPanel({ offload: storedOffload });
+
+    fireEvent.change(screen.getByLabelText('Max offload input tokens'), { target: { value } });
+
+    expect(screen.getByRole('alert')).toHaveTextContent(`Max offload input: ${error}`);
+    expect(screen.getByRole('button', { name: 'Save offload route' })).toBeDisabled();
+    expect(setOffloadRoute).not.toHaveBeenCalled();
+  });
+
+  it('says a request over the max offload input is never offloaded', () => {
+    renderPanel({ offload: storedOffload });
+
+    expect(screen.getByText(/never sent to\s+the offload route/)).toBeInTheDocument();
+  });
+
+  it('says a held request that cannot be offloaded waits its turn', () => {
+    renderPanel({ offload: storedOffload });
+
+    expect(screen.getByText(/one that cannot waits its turn/)).toBeInTheDocument();
   });
 
   it('explains why a stored route is not in force', () => {

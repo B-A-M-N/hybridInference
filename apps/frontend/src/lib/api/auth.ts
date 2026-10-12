@@ -20,6 +20,12 @@ export interface SignupResponse {
 }
 
 export interface LoginRequest {
+  /**
+   * An email address, or the login name of an account created without one
+   * (the first-run administrator). The field keeps its name on the wire: the
+   * backend reads a value containing `@` as an email and anything else as a
+   * login name.
+   */
   email: string;
   password: string;
 }
@@ -30,7 +36,9 @@ export interface LoginResponse {
   expires_in: number;
   user: {
     id: string;
-    email: string;
+    /** `null` for an account that signs in with a login name instead. */
+    email: string | null;
+    login_name?: string | null;
     role: string;
     is_admin: boolean;
   };
@@ -75,6 +83,23 @@ export async function logout(): Promise<void> {
     });
   } finally {
     setAccessToken(null);
+  }
+}
+
+// Wait for 3s for request to complete
+export const AGENT_LOGOUT_TIMEOUT_MS = 3_000;
+
+export async function endAgentSession(agentsUrl: string): Promise<void> {
+  if (!agentsUrl) return;
+  try {
+    await fetch(`${agentsUrl.replace(/\/+$/, '')}/api/v1/session/logout`, {
+      method: 'POST',
+      mode: 'no-cors',
+      credentials: 'include',
+      signal: AbortSignal.timeout(AGENT_LOGOUT_TIMEOUT_MS),
+    });
+  } catch {
+    // Agent unreachable or timed out
   }
 }
 
