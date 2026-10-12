@@ -89,13 +89,7 @@ def pg_dsn() -> str:
     finally:
         loop.close()
     if failure is not None:
-        target = dsn.rsplit("@", maxsplit=1)[-1]
-        message = (
-            "PostgreSQL test database not available: "
-            f"{failure} [target={target}, DB_HOST={os.getenv('DB_HOST')!r}, "
-            f"DB_PORT={os.getenv('DB_PORT')!r}, "
-            f"TEST_PG_DSN={'set' if os.getenv('TEST_PG_DSN') else 'unset'}]"
-        )
+        message = f"PostgreSQL test database not available: {failure}"
         if os.getenv("CI"):
             pytest.fail(message, pytrace=False)
         pytest.skip(message)
