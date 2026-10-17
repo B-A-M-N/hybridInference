@@ -13,12 +13,12 @@ from serving.config.site_identity import get_site_identity
 
 if TYPE_CHECKING:
     from serving.config.runtime_settings import RuntimeSettings
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
 from serving.exceptions import (
     UserNotFoundError,
+    generic_message_for_status,
     user_safe_error_for_log,
 )
 from serving.model_access import get_disabled_models_from_preferences
@@ -59,9 +59,12 @@ from serving.servers.deps import (
     get_router,
 )
 from serving.servers.routers.models import _build_model_list_async
+from serving.servers.routers.reauth import confirm_account_owner
 from serving.storage.utils import coerce_json_object
 from serving.utils import password as password_utils
+from serving.utils.email import is_email_enabled, send_password_changed_email
 from serving.utils.logging import get_logger
+from serving.utils.phone_auth import phone_identity_unverified
 from serving.utils.request_ip import get_client_ip
 
 router = APIRouter(prefix="/user", tags=["User Dashboard"])
@@ -93,6 +96,13 @@ def _escape_ilike_substring_term(term: str) -> str:
     return term.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
 
 
+#: The model a request's row shows its user: the auto model it asked for, when
+#: an auto model served it (serving/auto_mode.py), and the logged model
+#: otherwise. A user is never shown which model served an auto request, so the
+#: row's provider, routing detail and error text are withheld with it.
+_SHOWN_MODEL_SQL = "COALESCE(metadata->'auto'->>'requested', model_id)"
+
+
 def _build_user_recent_requests_filters(
     user_id: str, model_id: str | None
 ) -> tuple[str, list[Any]]:
@@ -105,7 +115,7 @@ def _build_user_recent_requests_filters(
     params: list[Any] = [user_id]
     if model_id:
         params.append(_escape_ilike_substring_term(model_id))
-        where_clauses.append(f"model_id ILIKE '%' || ${len(params)} || '%' ESCAPE '\\'")
+        where_clauses.append(f"{_SHOWN_MODEL_SQL} ILIKE '%' || ${len(params)} || '%' ESCAPE '\\'")
     return " AND ".join(where_clauses), params
 
 
@@ -143,29 +153,6 @@ def _get_daily_quota_reset_at() -> datetime:
     """Return the next daily quota reset timestamp."""
     now = datetime.now(timezone.utc)
     return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-
-
-def _get_usage_period_start(period: str, user_timezone: str) -> datetime | None:
-    """Return the UTC start timestamp for a user-visible usage period."""
-    if period == "all":
-        return None
-    if period == "week":
-        return datetime.now(timezone.utc) - timedelta(days=7)
-
-    try:
-        tz = ZoneInfo(user_timezone)
-    except ZoneInfoNotFoundError as exc:
-        raise HTTPException(status_code=400, detail="Invalid timezone") from exc
-
-    now = datetime.now(tz)
-    if period == "today":
-        local_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    elif period == "month":
-        local_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    else:
-        return None
-
-    return local_start.astimezone(timezone.utc)
 
 
 def _coerce_preferences(value: Any) -> dict[str, Any]:
@@ -280,7 +267,11 @@ async def get_current_user_info(
         id=user_row["id"],
         email=user_row["email"],
         login_name=user_row.get("login_name"),
+        phone=user_row.get("phone"),
+        phone_verified=user_row.get("phone_verified", False),
+        has_password=bool(user_row.get("password_hash")),
         user_name=user_row["user_name"],
+        avatar_url=await op_store.get_user_avatar(user_row["id"]),
         role=user_row["role"] or "free",
         status=user_row["status"],
         email_verified=user_row["email_verified"],
@@ -307,7 +298,6 @@ async def get_user_models(
     return await _build_model_list_async(
         router_exec=router_exec,
         embedding_adapters=embedding_adapters,
-        user_role=current_user.get("role", "free"),
         model_visibility_resolver=model_visibility_resolver,
         user_ctx={**current_user, "disabled_models": disabled_models},
     )
@@ -392,7 +382,11 @@ async def create_api_key(
         require_verification = await rs.get_bool("signup_require_email_verification")
     except (RuntimeError, KeyError):
         pass
-    if require_verification and not current_user.get("email_verified"):
+    if (
+        require_verification
+        and current_user.get("email")
+        and not current_user.get("email_verified")
+    ) or phone_identity_unverified(current_user):
         raise HTTPException(status_code=403, detail="Email is not verified.")
 
     # Check if user already has an active API key. Use the account-or-user
@@ -679,14 +673,14 @@ async def regenerate_api_key(
 @router.get("/usage", response_model=UsageResponse)
 async def get_usage(
     period: str = "today",
-    timezone_name: str = Query("UTC", alias="timezone"),
     current_user=Depends(get_current_user),
     op_store=Depends(get_operational_store),
     log_store=Depends(get_log_store),
 ) -> UsageResponse:
     """Get user's usage statistics and quota information.
 
-    Supports periods: today, week, month, all
+    Supports periods: today, week, month, all. ``today`` and ``month`` start at
+    00:00 UTC, when the daily quota resets; ``week`` is the last 7 days.
     """
     if not op_store:
         raise HTTPException(status_code=500, detail="Database not available")
@@ -811,6 +805,9 @@ async def update_profile(
             current_user["user_id"], user_name=update_data["user_name"]
         )
 
+    if "avatar_url" in update_data:
+        await op_store.set_user_avatar(current_user["user_id"], update_data["avatar_url"] or None)
+
     user_row = await op_store.get_user_by_id(current_user["user_id"])
     if not user_row:
         raise HTTPException(status_code=404, detail="User not found")
@@ -821,7 +818,11 @@ async def update_profile(
         id=user_row["id"],
         email=user_row["email"],
         login_name=user_row.get("login_name"),
+        phone=user_row.get("phone"),
+        phone_verified=user_row.get("phone_verified", False),
+        has_password=bool(user_row.get("password_hash")),
         user_name=user_row["user_name"],
+        avatar_url=await op_store.get_user_avatar(user_row["id"]),
         role=user_row["role"] or "free",
         status=user_row["status"],
         email_verified=user_row["email_verified"],
@@ -833,13 +834,20 @@ async def update_profile(
 
 @router.post("/change-password", response_model=ChangePasswordResponse)
 async def change_password(
+    request: Request,
     body: ChangePasswordRequest,
+    background_tasks: BackgroundTasks,
     current_user=Depends(get_current_user),
     op_store=Depends(get_operational_store),
 ) -> ChangePasswordResponse:
-    """Change password for logged-in user.
+    """Change the signed-in account's password, or give it a first one.
 
-    Requires old password verification for security.
+    An account with a password must give it, and the attempt counts against
+    the login rate limit. One without (a phone account) must give a
+    ``set_password`` code sent to its verified phone.
+
+    Every other session of the account is then revoked, as a password reset
+    does, and its verified email is told.
     """
     if not op_store:
         raise HTTPException(status_code=500, detail="Database not available")
@@ -852,20 +860,42 @@ async def change_password(
     if not user_row:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if not password_utils.verify_password(body.old_password, user_row["password_hash"]):
-        raise HTTPException(status_code=400, detail="Current password is incorrect.")
-
-    if body.new_password == body.old_password:
+    first_password = not user_row.get("password_hash")
+    # The current password, or for a first password (a new way in, which the
+    # session alone cannot add) a code sent to the account's phone.
+    await confirm_account_owner(
+        request,
+        op_store,
+        user_row,
+        password=body.old_password,
+        phone_code=body.phone_code,
+        purpose="set_password",
+    )
+    if not first_password and body.new_password == body.old_password:
         raise HTTPException(
             status_code=400, detail="New password must be different from current password."
         )
 
     new_password_hash = password_utils.hash_password(body.new_password)
     await op_store.update_user_fields(current_user["user_id"], password_hash=new_password_hash)
+    # Whoever else holds a session (the reason to change a password, often)
+    # loses it; this one stays signed in.
+    revoked = await op_store.revoke_user_sessions(
+        current_user["user_id"], except_sid=current_user.get("sid")
+    )
 
-    logger.info(f"Password changed for user: {current_user['user_id']}")
+    if user_row.get("email") and user_row.get("email_verified") and is_email_enabled():
+        background_tasks.add_task(
+            send_password_changed_email, user_row["email"], first_password=first_password
+        )
 
-    return ChangePasswordResponse(message="Password changed successfully.")
+    logger.info(
+        f"Password changed for user: {current_user['user_id']} (revoked {revoked} other sessions)"
+    )
+
+    return ChangePasswordResponse(
+        message="Password changed successfully. Other devices have been signed out."
+    )
 
 
 @router.get("/recent-requests", response_model=RecentRequestsResponse)
@@ -904,13 +934,14 @@ async def get_recent_requests(
             rows = await conn.fetch(
                 f"""
                 SELECT
-                    request_id, model_id, provider, timestamp,
+                    request_id, {_SHOWN_MODEL_SQL} AS model_id, provider, timestamp,
                     status_code, latency_ms, ttft_ms, stream,
                     prompt_tokens, completion_tokens, reasoning_tokens,
                     cache_read_tokens, cache_write_tokens,
                     total_tokens, cost_usd, error,
                     metadata->'routewise' AS routewise,
-                    metadata->>'request_type' AS request_type
+                    metadata->>'request_type' AS request_type,
+                    metadata->'auto'->>'requested' IS NOT NULL AS is_auto
                 FROM api_logs
                 WHERE {where_sql}
                 ORDER BY timestamp DESC
@@ -930,7 +961,7 @@ async def get_recent_requests(
         RecentRequestItem(
             request_id=row["request_id"],
             model_id=row["model_id"],
-            provider=row["provider"],
+            provider="auto" if row["is_auto"] else row["provider"],
             timestamp=row["timestamp"],
             status_code=row["status_code"],
             latency_ms=row["latency_ms"],
@@ -943,8 +974,12 @@ async def get_recent_requests(
             cache_write_tokens=row["cache_write_tokens"],
             total_tokens=row["total_tokens"],
             cost_usd=float(row["cost_usd"]) if row["cost_usd"] is not None else None,
-            error=user_safe_error_for_log(row["error"], row["status_code"]),
-            routewise=coerce_json_object(row["routewise"]),
+            error=(
+                generic_message_for_status(row["status_code"])
+                if row["is_auto"] and row["error"] and row["status_code"] is not None
+                else user_safe_error_for_log(row["error"], row["status_code"])
+            ),
+            routewise=None if row["is_auto"] else coerce_json_object(row["routewise"]),
             request_type=row["request_type"],
         )
         for row in rows

@@ -14,6 +14,7 @@ from typing import Any
 import asyncpg
 
 from serving.config.settings import get_settings
+from serving.storage.browser_session_schema import ensure_browser_session_tables
 from serving.storage.log_schema import (
     ErasureFenceUnavailable,
     apply_column_migrations,
@@ -225,7 +226,9 @@ class DatabaseLogger:
                     id TEXT PRIMARY KEY,
                     email TEXT UNIQUE,
                     login_name TEXT,
-                    password_hash TEXT NOT NULL,
+                    password_hash TEXT,
+                    phone TEXT,
+                    phone_verified BOOLEAN NOT NULL DEFAULT FALSE,
                     user_name TEXT,
                     preferences JSONB NOT NULL DEFAULT '{}'::jsonb,
                     role TEXT NOT NULL DEFAULT 'free'
@@ -523,6 +526,8 @@ class DatabaseLogger:
                 CREATE INDEX IF NOT EXISTS idx_auth_sessions_jti
                 ON auth_sessions(jti)
             """)
+
+            await ensure_browser_session_tables(conn)
 
             # Email verification tokens table
             await conn.execute("""

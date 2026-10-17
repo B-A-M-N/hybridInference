@@ -344,6 +344,39 @@ function detailFixture(overrides: Partial<UserDetail> = {}): UserDetail {
   };
 }
 
+describe('UserTable phone-only identity', () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it.each([
+    ['+8613812345678', '+8613812345678'],
+    [null, 'user-1'],
+  ])(
+    'requires the displayed account identifier before hard-deleting a user with phone %s',
+    async (phone, identifier) => {
+      const onHardDelete = vi.fn(async () => undefined);
+      vi.mocked(getUserDetail).mockResolvedValueOnce(
+        detailFixture({ email: null, phone, status: 'deleted' }),
+      );
+      vi.mocked(listModelVisibility).mockResolvedValueOnce({ models: [] });
+      renderTable({ ...baseUser, email: null, phone, status: 'deleted' }, { onHardDelete });
+      fireEvent.click(screen.getByText(identifier));
+      fireEvent.click(await screen.findByRole('button', { name: 'Permanently Delete' }));
+      const confirm = screen.getAllByRole('button', { name: 'Permanently Delete' }).at(-1)!;
+      expect(confirm).toBeDisabled();
+      const input = screen.getByLabelText('Confirmation');
+      fireEvent.change(input, { target: { value: 'wrong-identity' } });
+      expect(confirm).toBeDisabled();
+      fireEvent.change(input, { target: { value: identifier } });
+      expect(confirm).toBeEnabled();
+      fireEvent.click(confirm);
+      await waitFor(() => expect(onHardDelete).toHaveBeenCalledWith('user-1', ''));
+    },
+  );
+});
+
 describe('UserTable admin note', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -600,5 +633,24 @@ describe('UserTable for an account without an email', () => {
 
     fireEvent.click(dialogSubmit);
     await waitFor(() => expect(onHardDelete).toHaveBeenCalledWith('admin-1', ''));
+  });
+});
+
+describe('UserTable column visibility', () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('drops hidden metric columns and their empty group header', () => {
+    renderTable(baseUser, {
+      hiddenColumns: ['avgTurns', 'avgUserTurns', 'askQuestion', 'automation'],
+    });
+
+    expect(screen.queryByText('Ask-question')).not.toBeInTheDocument();
+    expect(screen.queryByText('Avg turns')).not.toBeInTheDocument();
+    expect(screen.queryByText('Behavior')).not.toBeInTheDocument();
+    // Columns that were not hidden stay.
+    expect(screen.getByText('Requests')).toBeInTheDocument();
+    expect(screen.getByText('Spend (USD)')).toBeInTheDocument();
   });
 });

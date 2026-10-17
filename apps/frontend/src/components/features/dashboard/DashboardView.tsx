@@ -6,10 +6,24 @@ import { ModelsSection } from '@/components/features/dashboard/ModelsSection';
 import { RecentRequests } from '@/components/features/dashboard/RecentRequests';
 import { UsageStats } from '@/components/features/dashboard/UsageStats';
 import { UpdatesBanner } from '@/components/ui/UpdatesBanner';
+import { UserAvatar } from '@/components/ui/UserAvatar';
 import { useAuth } from '@/components/providers';
 import { hasRole } from '@/components/providers/AuthProvider';
 import { useSiteConfig } from '@/components/providers/SiteConfigProvider';
 import { userDisplayName } from '@/lib/utils/userLabel';
+
+/**
+ * The Agents link, naming the account this console tab is using.
+ *
+ * The Agent signs in on its own and may be using a different account of this
+ * browser; given this one, it can say so and offer to switch rather than
+ * silently showing another account's work.
+ */
+function agentsEntryUrl(agentsUrl: string, userId: string | undefined): string {
+  if (!userId) return agentsUrl;
+  const separator = agentsUrl.includes('?') ? '&' : '?';
+  return `${agentsUrl}${separator}gateway_account=${encodeURIComponent(userId)}`;
+}
 
 export function DashboardView() {
   const { state } = useAuth();
@@ -23,9 +37,12 @@ export function DashboardView() {
 
       <div className="mb-8">
         <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-3xl font-bold text-gray-900">Dashboard</h1>
-            <p className="mt-1 text-sm text-gray-600">Welcome back, {displayName}</p>
+          <div className="flex items-center gap-3.5">
+            <UserAvatar user={state.user} size="lg" />
+            <div>
+              <h1 className="text-3xl font-bold text-gray-900">Dashboard</h1>
+              <p className="mt-1 text-sm text-gray-600">Welcome back, {displayName}</p>
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <Link
@@ -95,6 +112,12 @@ export function DashboardView() {
               <span className="font-medium">{state.user.login_name}</span>
             </div>
           )}
+          {state.user?.phone && (
+            <div className="flex justify-between">
+              <span className="text-gray-600">Mobile number:</span>
+              <span className="font-medium">{state.user.phone}</span>
+            </div>
+          )}
           <div className="flex justify-between">
             <span className="text-gray-600">User ID:</span>
             <span className="font-mono text-xs">{state.user?.id}</span>
@@ -122,7 +145,7 @@ export function DashboardView() {
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {features.agents && (
               <a
-                href={agentsUrl}
+                href={agentsEntryUrl(agentsUrl, state.user?.id)}
                 className="inline-flex min-h-11 items-center justify-center rounded-lg bg-gray-900 px-4 py-2.5 text-sm font-medium text-white shadow-sm transition hover:bg-gray-800"
               >
                 <svg className="mr-2 h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">

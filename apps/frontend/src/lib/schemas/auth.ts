@@ -8,6 +8,13 @@ import { translate, type Translate } from '@/lib/i18n/translate';
  */
 export const LOGIN_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{2,31}$/;
 
+export function normalizePhoneWithCountry(raw: string, countryCode = '+1'): string {
+  const trimmed = raw.replace(/[\s()-]/g, '');
+  if (!trimmed) return '';
+  if (trimmed.startsWith('+')) return trimmed;
+  return `${countryCode}${trimmed}`;
+}
+
 /**
  * Build the auth form schemas for one translator.
  *
@@ -68,6 +75,32 @@ export function createAuthSchemas(t: Translate) {
     'auth.validation.combined_max',
     'Combined use case and discovery response is too long (max 2000 characters)',
   );
+
+  const phoneCredentialsSchema = z.object({
+    phone: z
+      .string()
+      .trim()
+      .regex(
+        /^\+?[1-9]\d{7,14}$/,
+        t('auth.validation.phone_invalid', 'Enter a phone number with its country code.'),
+      ),
+    code: z
+      .string()
+      .regex(
+        /^\d{6}$/,
+        t('auth.validation.phone_code_invalid', 'Enter the six-digit verification code.'),
+      ),
+  });
+
+  function createPhoneSignupSchema(siteHost = 'this service') {
+    return signupFieldsSchema
+      .omit({ email: true, password: true, confirmPassword: true })
+      .extend(phoneCredentialsSchema.shape)
+      .refine(
+        (data) => buildCombinedUseCase(data.useCase, data.discoverySource, siteHost).length <= 2000,
+        { message: combinedMaxMessage, path: ['discoverySource'] },
+      );
+  }
 
   /**
    * The signup schema names the site host in the text it measures, so the
@@ -131,13 +164,20 @@ export function createAuthSchemas(t: Translate) {
       .optional(),
   });
 
+  const emailBindSchema = z.object({
+    email: emailSchema,
+  });
+
   return {
     emailSchema,
     passwordSchema,
     signupSchema,
     loginSchema,
     profileUpdateSchema,
+    emailBindSchema,
     createSignupSchema,
+    phoneCredentialsSchema,
+    createPhoneSignupSchema,
   };
 }
 
@@ -177,3 +217,7 @@ export const createSignupSchema = consoleSchemas.createSignupSchema;
 export type SignupFormData = z.infer<typeof signupSchema>;
 export type LoginFormData = z.infer<typeof loginSchema>;
 export type ProfileUpdateData = z.infer<typeof profileUpdateSchema>;
+export type EmailBindFormData = z.infer<typeof consoleSchemas.emailBindSchema>;
+export type PhoneSignupFormData = z.infer<
+  ReturnType<typeof consoleSchemas.createPhoneSignupSchema>
+>;

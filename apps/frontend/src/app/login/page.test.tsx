@@ -16,14 +16,34 @@ let authState = {
 let query = new URLSearchParams();
 
 const replaceMock = vi.fn();
+const pushMock = vi.fn();
 const loginMock = vi.fn();
+const phoneLoginMock = vi.fn();
+const switchAccountMock = vi.fn();
+const removeAccountMock = vi.fn();
+let accountsState: Array<{
+  id: string;
+  email: string | null;
+  login_name?: string | null;
+  user_name?: string | null;
+  role: string;
+  active: boolean;
+  signed_in: boolean;
+}> = [];
 
 vi.mock('@/components/providers', () => ({
-  useAuth: () => ({ state: authState, login: loginMock }),
+  useAuth: () => ({
+    state: authState,
+    login: loginMock,
+    loginPhone: phoneLoginMock,
+    accounts: accountsState,
+    switchAccount: switchAccountMock,
+    removeAccount: removeAccountMock,
+  }),
 }));
 
 vi.mock('next/navigation', () => ({
-  useRouter: () => ({ replace: replaceMock, push: vi.fn() }),
+  useRouter: () => ({ replace: replaceMock, push: pushMock }),
   useSearchParams: () => query,
 }));
 
@@ -39,6 +59,7 @@ beforeEach(() => {
     user: { id: 'user_1', email: 'murphy@example.test', role: 'pro' },
   };
   query = new URLSearchParams();
+  accountsState = [];
 });
 
 afterEach(() => {
@@ -80,6 +101,43 @@ describe('the ?next= round-trip', () => {
 });
 
 describe('signup navigation', () => {
+  it('keeps the email login route as the default', async () => {
+    authState.isAuthenticated = false;
+    loginMock.mockResolvedValueOnce(undefined);
+    render(<LoginPage />);
+    expect(screen.queryByRole('button', { name: 'SMS code login' })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Email or username'), {
+      target: { value: 'email@example.test' },
+    });
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'password' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Log In' }));
+    await waitFor(() => expect(loginMock).toHaveBeenCalledWith('email@example.test', 'password'));
+    expect(phoneLoginMock).not.toHaveBeenCalled();
+  });
+
+  it('logs in by phone through the auth provider and returns to the requested internal page', async () => {
+    authState.isAuthenticated = false;
+    query = new URLSearchParams({ next: '/authorize?client_id=cloud-agent' });
+    phoneLoginMock.mockResolvedValueOnce(undefined);
+    render(
+      <SiteConfigProvider
+        initialConfig={{
+          ...buildTimeSiteConfig,
+          features: { ...buildTimeSiteConfig.features, phoneAuth: true },
+        }}
+      >
+        <LoginPage />
+      </SiteConfigProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'SMS code login' }));
+    expect(screen.queryByLabelText('Email or username')).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Mobile number'), { target: { value: '13812345678' } });
+    fireEvent.change(screen.getByLabelText('Verification code'), { target: { value: '123456' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Log In' }));
+    await waitFor(() => expect(phoneLoginMock).toHaveBeenCalledWith('13812345678', '123456'));
+    await waitFor(() => expect(pushMock).toHaveBeenCalledWith('/authorize?client_id=cloud-agent'));
+    expect(loginMock).not.toHaveBeenCalled();
+  });
   it('offers exactly one signup entry', () => {
     // One, not two. The frame is chosen by the Site UI (see
     // `src/site-ui/`), and both the console's card and a module's frame are
@@ -170,5 +228,92 @@ describe('email or username', () => {
 
     expect(await screen.findByText(message)).toBeInTheDocument();
     expect(loginMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('accounts already signed in on this browser', () => {
+  beforeEach(() => {
+    authState.isAuthenticated = false;
+    authState.user = null;
+    accountsState = [
+      {
+        id: 'ada',
+        email: 'ada@example.test',
+        user_name: 'Ada',
+        role: 'pro',
+        active: false,
+        signed_in: true,
+      },
+      {
+        id: 'bob',
+        email: 'bob@example.test',
+        user_name: 'Bob',
+        role: 'free',
+        active: false,
+        signed_in: false,
+      },
+    ];
+    switchAccountMock.mockReset().mockResolvedValue(undefined);
+    removeAccountMock.mockReset().mockResolvedValue(undefined);
+  });
+
+  it('are offered before the sign-in form', () => {
+    render(<LoginPage />);
+
+    expect(screen.getByRole('heading', { name: 'Choose an account' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Ada/ })).toBeInTheDocument();
+    expect(screen.getByText(/bob@example\.test · Signed out/)).toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+  });
+
+  it('continue as a signed-in account without a password', async () => {
+    query = new URLSearchParams({ next: '/dashboard/settings' });
+    render(<LoginPage />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Ada/ }));
+
+    await waitFor(() => expect(switchAccountMock).toHaveBeenCalledWith('ada'));
+    await waitFor(() => expect(pushMock).toHaveBeenCalledWith('/dashboard/settings'));
+    expect(loginMock).not.toHaveBeenCalled();
+  });
+
+  it('send a signed-out account to the form with its address filled in', () => {
+    render(<LoginPage />);
+
+    fireEvent.click(screen.getByRole('button', { name: /^B/ }));
+
+    expect(screen.getByLabelText('Email or username')).toHaveValue('bob@example.test');
+    expect(switchAccountMock).not.toHaveBeenCalled();
+  });
+
+  it('can each be removed from the browser', async () => {
+    render(<LoginPage />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove bob@example.test' }));
+
+    await waitFor(() => expect(removeAccountMock).toHaveBeenCalledWith('bob'));
+  });
+
+  it('give way to the form for another account, and come back', () => {
+    render(<LoginPage />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Use another account' }));
+    expect(screen.getByLabelText('Email or username')).toHaveValue('');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back to your accounts' }));
+    expect(screen.getByRole('heading', { name: 'Choose an account' })).toBeInTheDocument();
+  });
+
+  it('do not stop a signed-in visitor from adding one', () => {
+    authState.isAuthenticated = true;
+    authState.user = { id: 'ada', email: 'ada@example.test', role: 'pro' };
+    query = new URLSearchParams({ add: '1', next: '/dashboard' });
+    render(<LoginPage />);
+
+    expect(replaceMock).not.toHaveBeenCalled();
+    expect(screen.getByRole('heading', { name: 'Add another account' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Email or username')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(pushMock).toHaveBeenCalledWith('/dashboard');
   });
 });
