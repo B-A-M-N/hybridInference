@@ -70,9 +70,10 @@ CATEGORIES: tuple[Category, ...] = (
     ),
     Category(
         "email",
-        "Email (SMTP)",
+        "Email",
         "Outgoing mail for verification, password reset and notifications.",
     ),
+    Category("phone", "Phone authentication", "Optional phone sign-in and SMS delivery."),
     Category(
         "providers",
         "Providers",
@@ -167,9 +168,29 @@ def _auth_secret_required(context: RequirementContext) -> bool:
     return context.database_enabled or context.user_auth_enabled
 
 
+def _tencent_credentials_required(context: RequirementContext) -> bool:
+    # The selected transport needs credentials even before signup is enabled.
+    return (
+        context.value("SMS_PROVIDER") == "tencent"
+        or context.value("EMAIL_PROVIDER") == "tencent_ses"
+    )
+
+
 def _smtp_required(context: RequirementContext) -> bool:
     # Without mail, a new account can never verify its address.
-    return context.email_verification_needed and not context.email_enabled
+    return (
+        context.value("EMAIL_PROVIDER") != "tencent_ses"
+        and context.email_verification_needed
+        and not context.email_enabled
+    )
+
+
+def _ses_required(context: RequirementContext) -> bool:
+    return (
+        context.value("EMAIL_PROVIDER") == "tencent_ses"
+        and context.email_verification_needed
+        and not context.email_enabled
+    )
 
 
 def _env_string(value: Any) -> str | None:
@@ -440,7 +461,168 @@ _STATIC_ENTRIES: tuple[ConfigEntry, ...] = (
         "str",
         secret=True,
     ),
+    # --- phone authentication -----------------------------------------------
+    _setting(
+        "sms_auth_enabled",
+        "phone",
+        "Enable phone registration, login and binding when SMS delivery is configured.",
+        "bool",
+    ),
+    _setting(
+        "sms_provider",
+        "phone",
+        "SMS verification provider. None disables delivery.",
+        "str",
+        choices=("none", "tencent"),
+    ),
+    _setting(
+        "sms_default_country_code",
+        "phone",
+        "Optional country calling code for local input, without +; empty requires international format.",
+        "str",
+    ),
+    _setting(
+        "sms_allowed_prefixes",
+        "phone",
+        "Comma-separated allowed international prefixes, such as +86. Empty permits any prefix supported by the provider.",
+        "str",
+    ),
+    _setting("sms_region", "phone", "Tencent SMS resource region.", "str"),
+    _setting("sms_sdk_app_id", "phone", "Tencent SMS application ID.", "str"),
+    _setting("sms_sign_name", "phone", "Approved Tencent SMS signature text.", "str"),
+    _setting(
+        "sms_template_id",
+        "phone",
+        "Approved Tencent SMS template with code and lifetime-in-minutes parameters.",
+        "str",
+    ),
+    _setting(
+        "sms_otp_expire_seconds",
+        "phone",
+        "Verification code lifetime in seconds.",
+        "int",
+        minimum=60,
+        maximum=600,
+    ),
+    _setting(
+        "sms_otp_send_cooldown_seconds",
+        "phone",
+        "Minimum seconds between messages to one phone.",
+        "int",
+        minimum=60,
+    ),
+    _setting(
+        "sms_otp_send_per_phone_hour", "phone", "Messages to one phone per hour.", "int", minimum=1
+    ),
+    _setting(
+        "sms_otp_send_per_phone_day", "phone", "Messages to one phone per day.", "int", minimum=1
+    ),
+    _setting(
+        "sms_otp_send_per_ip_hour",
+        "phone",
+        "Messages requested by one client address per hour.",
+        "int",
+        minimum=1,
+    ),
+    _setting(
+        "sms_otp_send_per_ip_day",
+        "phone",
+        "Messages requested by one client address per day.",
+        "int",
+        minimum=1,
+    ),
+    _setting(
+        "sms_otp_max_attempts",
+        "phone",
+        "Maximum guesses for a verification code.",
+        "int",
+        minimum=1,
+        maximum=10,
+    ),
+    _setting(
+        "sms_otp_verify_per_phone_15min",
+        "phone",
+        "Verification attempts for one phone per fifteen minutes.",
+        "int",
+        minimum=1,
+    ),
+    _setting(
+        "sms_otp_verify_per_ip_hour",
+        "phone",
+        "Verification attempts from one client address per hour.",
+        "int",
+        minimum=1,
+    ),
     # --- email -------------------------------------------------------------
+    _setting(
+        "email_provider",
+        "email",
+        "Outgoing email transport; SMTP preserves existing behavior.",
+        "str",
+        choices=("smtp", "tencent_ses"),
+        setup=True,
+    ),
+    _setting(
+        "tencent_ses_region",
+        "email",
+        "Tencent SES resource region.",
+        "str",
+        choices=("ap-guangzhou", "ap-hongkong"),
+    ),
+    _setting(
+        "tencent_ses_from_email",
+        "email",
+        "Approved Tencent SES sender address.",
+        "str",
+        required=_ses_required,
+    ),
+    _setting(
+        "tencent_ses_from_name", "email", "Display name for outgoing Tencent SES mail.", "str"
+    ),
+    _setting(
+        "tencent_ses_template_verification",
+        "email",
+        "Approved Tencent SES verification template ID; leave unset to disable the template.",
+        "int",
+        minimum=1,
+        required=_ses_required,
+    ),
+    _setting(
+        "tencent_ses_template_password_reset",
+        "email",
+        "Approved Tencent SES password reset template ID; leave unset to disable the template.",
+        "int",
+        minimum=1,
+        required=_ses_required,
+    ),
+    _setting(
+        "tencent_ses_template_approval",
+        "email",
+        "Approved Tencent SES approval template ID; leave unset to disable the template.",
+        "int",
+        minimum=1,
+    ),
+    _setting(
+        "tencent_ses_template_rejection",
+        "email",
+        "Approved Tencent SES rejection template ID; leave unset to disable the template.",
+        "int",
+        minimum=1,
+    ),
+    _setting(
+        "tencent_ses_template_admin_signup",
+        "email",
+        "Approved Tencent SES admin signup template ID; leave unset to disable the template.",
+        "int",
+        minimum=1,
+    ),
+    _setting(
+        "tencent_ses_template_notice",
+        "email",
+        "Approved Tencent SES notice template ID; leave unset to disable the template.",
+        "int",
+        minimum=1,
+    ),
     _setting("smtp_host", "email", "SMTP server host.", "str", setup=True),
     _setting(
         "smtp_port", "email", "SMTP server port.", "int", setup=True, minimum=1, maximum=65_535
@@ -866,6 +1048,29 @@ _STATIC_ENTRIES: tuple[ConfigEntry, ...] = (
         "Older name of DEPLOYMENT_ENV, used while DEPLOYMENT_ENV is empty.",
     ),
     # --- integrations ------------------------------------------------------
+    _setting(
+        "tencent_cloud_secret_id",
+        "integrations",
+        "Tencent Cloud CAM credential ID, used only by the selected delivery adapter.",
+        "str",
+        secret=True,
+        required=_tencent_credentials_required,
+    ),
+    _setting(
+        "tencent_cloud_secret_key",
+        "integrations",
+        "Tencent Cloud CAM credential secret. Never sent to the browser.",
+        "str",
+        secret=True,
+        required=_tencent_credentials_required,
+    ),
+    _setting(
+        "tencent_cloud_token",
+        "integrations",
+        "Optional session token for temporary Tencent Cloud credentials.",
+        "str",
+        secret=True,
+    ),
     ConfigEntry(
         "IDENTITY_JWT_PRIVATE_KEY",
         "integrations",
