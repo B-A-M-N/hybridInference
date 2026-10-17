@@ -222,7 +222,13 @@ describe('loadRuntimeSiteConfig', () => {
     const recovered = await loadRuntimeSiteConfig();
 
     expect(recovered.distribution.id).toBe('runtime');
-    expect(recovered.features).toEqual({ publicSignup: false, rag: false, agents: false });
+    expect(recovered.features).toEqual({
+      publicSignup: false,
+      phoneAuth: false,
+      rag: false,
+      agents: false,
+      publicStats: false,
+    });
     expect(recovered.agentsUrl).toBe('');
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });

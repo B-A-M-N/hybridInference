@@ -5,7 +5,12 @@ const API_BASE = config.apiBase;
 
 export interface User {
   id: string;
-  email: string;
+  /** `null` for an account that signs in with a login name instead. */
+  email: string | null;
+  login_name?: string | null;
+  phone?: string | null;
+  phone_verified?: boolean;
+  has_password?: boolean;
   user_name?: string;
   role: string;
   status: string;
@@ -122,9 +127,8 @@ export async function regenerateApiKey(): Promise<ApiKeyResponse> {
 }
 
 export async function getUsage(period: 'today' | 'month' | 'all' = 'today'): Promise<UsageStats> {
+  // Periods start at 00:00 UTC, when the daily quota resets.
   const params = new URLSearchParams({ period });
-  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  if (timeZone) params.set('timezone', timeZone);
   const resp = await fetchWithAuth(API_BASE, `/user/usage?${params.toString()}`);
   return jsonOrThrow<UsageStats>(resp);
 }

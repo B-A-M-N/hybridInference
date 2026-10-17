@@ -2,6 +2,13 @@ import { z } from 'zod';
 import { translate, type Translate } from '@/lib/i18n/translate';
 
 /**
+ * A login name: the first-run administrator signs in with one instead of an
+ * email address. The backend's rule, case-insensitive; a value containing `@`
+ * is an email address instead.
+ */
+export const LOGIN_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{2,31}$/;
+
+/**
  * Build the auth form schemas for one translator.
  *
  * Validation messages are interface copy like any other string, so they go
@@ -62,6 +69,32 @@ export function createAuthSchemas(t: Translate) {
     'Combined use case and discovery response is too long (max 2000 characters)',
   );
 
+  const phoneCredentialsSchema = z.object({
+    phone: z
+      .string()
+      .trim()
+      .regex(
+        /^\+?[1-9]\d{7,14}$/,
+        t('auth.validation.phone_invalid', 'Enter a phone number with its country code.'),
+      ),
+    code: z
+      .string()
+      .regex(
+        /^\d{6}$/,
+        t('auth.validation.phone_code_invalid', 'Enter the six-digit verification code.'),
+      ),
+  });
+
+  function createPhoneSignupSchema(siteHost = 'this service') {
+    return signupFieldsSchema
+      .omit({ email: true, password: true, confirmPassword: true })
+      .extend(phoneCredentialsSchema.shape)
+      .refine(
+        (data) => buildCombinedUseCase(data.useCase, data.discoverySource, siteHost).length <= 2000,
+        { message: combinedMaxMessage, path: ['discoverySource'] },
+      );
+  }
+
   /**
    * The signup schema names the site host in the text it measures, so the
    * factory stays a factory: each call mints fresh refinements over the
@@ -84,8 +117,32 @@ export function createAuthSchemas(t: Translate) {
 
   const signupSchema = createSignupSchema();
 
+  // "Email or username". The field keeps the name `email` because that is the
+  // request's field; a value with an `@` is held to the email rules, anything
+  // else to the login-name rule.
+  const loginIdentifierSchema = z
+    .string()
+    .trim()
+    .min(1, t('auth.validation.identifier_required', 'Please enter your email or username'))
+    .superRefine((value, ctx) => {
+      if (value.includes('@')) {
+        const parsed = emailSchema.safeParse(value);
+        if (!parsed.success) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, message: parsed.error.issues[0].message });
+        }
+      } else if (!LOGIN_NAME_PATTERN.test(value)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: t(
+            'auth.validation.login_name_invalid',
+            'Please enter a valid email address or username',
+          ),
+        });
+      }
+    });
+
   const loginSchema = z.object({
-    email: emailSchema,
+    email: loginIdentifierSchema,
     password: z
       .string()
       .min(1, t('auth.validation.password_required', 'Please enter your password')),
@@ -107,6 +164,8 @@ export function createAuthSchemas(t: Translate) {
     loginSchema,
     profileUpdateSchema,
     createSignupSchema,
+    phoneCredentialsSchema,
+    createPhoneSignupSchema,
   };
 }
 
@@ -146,3 +205,6 @@ export const createSignupSchema = consoleSchemas.createSignupSchema;
 export type SignupFormData = z.infer<typeof signupSchema>;
 export type LoginFormData = z.infer<typeof loginSchema>;
 export type ProfileUpdateData = z.infer<typeof profileUpdateSchema>;
+export type PhoneSignupFormData = z.infer<
+  ReturnType<typeof consoleSchemas.createPhoneSignupSchema>
+>;
