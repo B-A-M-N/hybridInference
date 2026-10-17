@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from serving.utils import login_rate_limit
-from types import SimpleNamespace
 from serving.utils.login_rate_limit import (
     SETUP_ATTEMPTS_PER_15MIN,
     record_failed_setup_attempt,
