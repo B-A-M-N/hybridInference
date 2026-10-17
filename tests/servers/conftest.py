@@ -157,7 +157,11 @@ def auth_test_env():
             "DB_PASSWORD": _db_pass,
             "TEST_DB_HOST": _db_host,
             "TEST_DB_PORT": _db_port,
-            "TEST_DB_NAME": _db_name,
+            # Keep TEST_DB_NAME as the unsuffixed base. Direct integration
+            # fixtures append their xdist worker id themselves; mutating this
+            # value to _db_name makes those fixtures look for *_gw0_gw0 after
+            # a server test has initialized the session environment.
+            "TEST_DB_NAME": _base_db_name,
             "TEST_DB_USER": _db_user,
             "TEST_DB_PASSWORD": _db_pass,
             "COOKIE_SECURE": "0",
