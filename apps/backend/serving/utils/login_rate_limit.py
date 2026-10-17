@@ -34,7 +34,7 @@ import time
 from collections import deque
 
 from serving.config.settings import settings
-from serving.utils.request_ip import get_client_ip_info, normalize_ip_bucket
+from serving.utils.request_ip import ClientIpInfo, get_client_ip_info, normalize_ip_bucket
 
 _FIFTEEN_MIN_SECONDS = 15 * 60
 _HOUR_SECONDS = 3600
@@ -66,7 +66,7 @@ def _sweep_inactive(buckets: dict[str, deque[float]], cutoff: float) -> None:
             del buckets[key]
 
 
-async def check_and_record_login(email: str, request) -> tuple[bool, str | None]:
+async def check_and_record_login(email: str, provenance) -> tuple[bool, str | None]:
     """Record a login attempt and return whether it should be allowed.
 
     *email* is the identifier the client signed in with: an email address or
@@ -84,7 +84,7 @@ async def check_and_record_login(email: str, request) -> tuple[bool, str | None]
     """
     global _sweep_counter
 
-    ip_info = get_client_ip_info(request)
+    ip_info = provenance if isinstance(provenance, ClientIpInfo) else get_client_ip_info(provenance)
     # Normalize email so case variants share the same bucket.
     email_key = email.strip().lower()
 

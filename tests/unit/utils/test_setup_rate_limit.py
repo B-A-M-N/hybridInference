@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from serving.utils import login_rate_limit
+from types import SimpleNamespace
 from serving.utils.login_rate_limit import (
     SETUP_ATTEMPTS_PER_15MIN,
     record_failed_setup_attempt,
@@ -47,10 +48,11 @@ async def test_window_slides(monkeypatch):
 
 
 async def test_independent_of_login_attempts():
+    request = SimpleNamespace(headers={}, client=SimpleNamespace(host="203.0.113.7"))
     for _ in range(SETUP_ATTEMPTS_PER_15MIN):
         await record_failed_setup_attempt("203.0.113.7")
 
-    allowed, reason = await login_rate_limit.check_and_record_login("admin", "203.0.113.7")
+    allowed, reason = await login_rate_limit.check_and_record_login("admin", request)
 
     assert (allowed, reason) == (True, None)
 
