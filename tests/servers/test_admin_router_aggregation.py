@@ -45,7 +45,7 @@ def test_admin_router_has_expected_route_count() -> None:
 
     Bump this number deliberately when adding/removing admin routes.
     """
-    expected = 117  # includes role-quota, provider-key verification/probe, key min-role (db+env)
+    expected = 129  # includes role-quota, provider-key verification/probe, key min-role (db+env)
     # (incl. disable/enable/enable-env and the by-ref disable/enable pair used
     # by the quota dashboard), visibility, concurrency,
     # global + per-model routewise settings/probes/decisions, routing-weight,
@@ -71,6 +71,14 @@ def test_admin_router_has_expected_route_count() -> None:
     # and lift an auth-failure IP block without restarting the gateway.
     # 116 -> 117: upstream-concurrency, the read-only view of the adaptive
     # outbound limiter's per-(provider, key) state.
+    # 117 -> 121: offload-routes list, and per-model get/set/clear, for the
+    # route a model sends requests to once they have queued too long.
+    # 121 -> 124: alerts/mutes list, and per-type mute/unmute, so an operator
+    # can silence one alert type without snoozing every alert.
+    # 124 -> 125: recent-requests/offloads, the past day's offloaded requests
+    # per model and offload route on the Recent Requests tab.
+    # 125 -> 129: config list/update/reset for the database-backed settings,
+    # and system/restart so a restart-required change can be applied.
     routes = [r for r in _admin_api_routes() if r.path.startswith("/admin")]
     assert len(routes) == expected, (
         f"admin route count drifted: expected {expected}, got {len(routes)}"

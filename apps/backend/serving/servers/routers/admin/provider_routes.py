@@ -6,11 +6,11 @@ import asyncio
 import ipaddress
 import json
 import math
-import os
 import re
 import socket
 import time
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from collections.abc import MutableMapping
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import quote, urlparse, urlsplit, urlunsplit
@@ -20,10 +20,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from routing.endpoints import endpoint_id_for_adapter
 from routing.model_router_registry import StaleRouterStrategyChangeError
+from routing.model_selection import is_auto_model_id
 from routing.protocols import RouteTableRefreshable
 from routing.routers import ManagedRouter
 from serving.adapters import ModelConfig, dynamic_keys, provider_registry
 from serving.adapters.openrouter import openrouter_attribution_headers
+from serving.config.app_config import config_value
+from serving.config.offload_routes import offload_route_setting_key
 from serving.config.settings import (
     ROUTE_TYPE_ORDER,
     VALID_ROLES,
@@ -66,7 +69,7 @@ from serving.servers.routewise_rebuild import (
 from serving.utils.logging import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Iterator
 
     from routing.model_router_registry import ModelRouterRegistry
 
@@ -115,7 +118,7 @@ class OpenRouterEndpointPricing:
 
 
 def _env_default(name: str, fallback: str) -> str:
-    return (os.getenv(name) or fallback).strip()
+    return (config_value(name) or fallback).strip()
 
 
 BLOCKED_BASE_URL_HOSTS = {
@@ -125,27 +128,69 @@ BLOCKED_BASE_URL_HOSTS = {
     "metadata.google.internal",
 }
 
-PROVIDER_TARGETS: dict[str, ProviderTarget] = {
+# Built-in targets whose default base URL a deployment may override, with the
+# setting that overrides it and the built-in fallback.
+_BASE_URL_SETTINGS: dict[str, tuple[str, str]] = {
+    "chutes": ("CHUTES_BASE_URL", "https://llm.chutes.ai/v1"),
+    "featherless": ("FEATHERLESS_BASE_URL", "https://api.featherless.ai/v1"),
+    "minimax": ("MINIMAX_BASE_URL", "https://api.minimax.io/v1"),
+}
+
+
+class _ProviderTargets(MutableMapping[str, ProviderTarget]):
+    """Extension-writable targets, with each overridable base URL read at lookup.
+
+    A changed ``*_BASE_URL`` setting therefore applies to the next admin
+    request instead of waiting for a restart.
+    """
+
+    def __init__(self, targets: dict[str, ProviderTarget]) -> None:
+        self._targets = targets.copy()
+
+    def __getitem__(self, provider: str) -> ProviderTarget:
+        target = self._targets[provider]
+        setting = _BASE_URL_SETTINGS.get(provider)
+        if setting is None:
+            return target
+        return replace(target, default_base_url=_env_default(setting[0], target.default_base_url))
+
+    def __setitem__(self, provider: str, target: ProviderTarget) -> None:
+        self._targets[provider] = target
+
+    def __delitem__(self, provider: str) -> None:
+        del self._targets[provider]
+
+    def __contains__(self, provider: object) -> bool:
+        return provider in self._targets
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._targets)
+
+    def __len__(self) -> int:
+        return len(self._targets)
+
+
+_BUILT_IN_TARGETS: dict[str, ProviderTarget] = {
     "chutes": ProviderTarget(
         provider="chutes",
         label="Chutes",
         kind="chutes",
         key_provider="chutes",
-        default_base_url=_env_default("CHUTES_BASE_URL", "https://llm.chutes.ai/v1"),
+        default_base_url=_BASE_URL_SETTINGS["chutes"][1],
     ),
     "featherless": ProviderTarget(
         provider="featherless",
         label="Featherless",
         kind="featherless",
         key_provider="featherless",
-        default_base_url=_env_default("FEATHERLESS_BASE_URL", "https://api.featherless.ai/v1"),
+        default_base_url=_BASE_URL_SETTINGS["featherless"][1],
     ),
     "minimax": ProviderTarget(
         provider="minimax",
         label="MiniMax",
         kind="minimax",
         key_provider="minimax",
-        default_base_url=_env_default("MINIMAX_BASE_URL", "https://api.minimax.io/v1"),
+        default_base_url=_BASE_URL_SETTINGS["minimax"][1],
     ),
     "openrouter": ProviderTarget(
         provider="openrouter",
@@ -169,6 +214,8 @@ PROVIDER_TARGETS: dict[str, ProviderTarget] = {
         default_base_url=OPENROUTER_API_BASE_URL,
     ),
 }
+
+PROVIDER_TARGETS: MutableMapping[str, ProviderTarget] = _ProviderTargets(_BUILT_IN_TARGETS)
 
 RESOURCE_ROUTE_TYPES = {"quota", "concurrency"}
 
@@ -278,6 +325,24 @@ def _model_id_from_strategy_setting_key(key: str) -> str | None:
     return model_id or None
 
 
+def _offload_route_id(services: Any, model_id: str) -> str | None:
+    """Return the route id of the model's stored offload route, if it has one."""
+    resolver = getattr(services, "offload_route_resolver", None)
+    get_policy = getattr(resolver, "get_offload_policy", None)
+    if not callable(get_policy):
+        return None
+    policy = get_policy(model_id)
+    return policy.route_id if policy is not None else None
+
+
+def _clear_offload_route_snapshot(services: Any, model_id: str) -> None:
+    """Drop a removed model's offload route from the routing snapshot."""
+    resolver = getattr(services, "offload_route_resolver", None)
+    clear_model = getattr(resolver, "clear_model", None)
+    if callable(clear_model):
+        clear_model(model_id)
+
+
 def _model_required_role_setting_key(model_id: str) -> str:
     return f"{MODEL_REQUIRED_ROLE_SETTING_PREFIX}{model_id}"
 
@@ -298,6 +363,16 @@ def _validate_model_router_strategy(
         raise HTTPException(status_code=422, detail="strategy must be fixed or routewise")
     registry = _require_model_router_registry(services)
     route = _validate_canonical_route(services, model_id)
+    if strategy != "fixed" and _offload_route_id(services, model_id) is not None:
+        # Offload is a FixedRouter behavior; switching away would leave the
+        # model's reserved route silently back in ordinary selection.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"clear the model's offload route before switching to {strategy}: "
+                "offload routes need fixed routing"
+            ),
+        )
     if strategy == "fixed":
         resource_route_types = sorted(
             {
@@ -2606,6 +2681,16 @@ async def _prepare_model_candidate_from_payload(
     payload: CreateProviderRouteModelRequest,
     route_id: str | None = None,
 ) -> PreparedRouteCandidate:
+    # The auto models are served under these names (serving/auto_mode.py). A
+    # model created under one would be hidden by a tier of that name, or turn
+    # auto off at the next start. Checked here, on the admin's request, and not
+    # where persisted models are restored, so one created before the names were
+    # reserved still loads.
+    if is_auto_model_id(payload.model_id.strip()):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Model id {payload.model_id.strip()!r} is reserved for auto models",
+        )
     upstream_provider = _target_provider_from_request(
         payload.upstream_provider,
         payload.openrouter_provider,
@@ -2821,6 +2906,7 @@ async def _teardown_runtime_model_locked(
             _model_required_role_setting_key(model_id),
             _model_strategy_setting_key(model_id),
             *model_routewise_setting_keys(model_id),
+            offload_route_setting_key(model_id),
         ):
             try:
                 await op_store.delete_setting(setting_key)
@@ -2882,6 +2968,10 @@ async def _teardown_runtime_model_locked(
     clear_routewise_settings = getattr(routewise_settings_resolver, "clear_model", None)
     if callable(clear_routewise_settings):
         clear_routewise_settings(model_id)
+
+    # Same reason as the weight snapshot: a future model created under this id
+    # must not inherit the old one's reserved route.
+    _clear_offload_route_snapshot(services, model_id)
 
     return adapter, float(raw_weight), endpoint_id
 
@@ -3390,6 +3480,7 @@ async def create_provider_route_model(
                     _model_required_role_setting_key(model_id),
                     _model_strategy_setting_key(model_id),
                     *model_routewise_setting_keys(model_id),
+                    offload_route_setting_key(model_id),
                 )
             ]
             if persisted_candidates or persisted_configs or any(persisted_settings):
@@ -3997,6 +4088,17 @@ async def delete_provider_route_candidate(
         # Decide last-route teardown only after acquiring the same lock used by
         # candidate creation and strategy changes.
         deleting_model = len(current_entries) == 1
+        if not deleting_model and _offload_route_id(services, model_id) == route_id:
+            # Refused rather than cleared as a side effect: the admin chose this
+            # route to take the model's overflow, and deleting it would quietly
+            # change where queued requests go.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"route {route_id!r} is the model's offload route; clear the offload "
+                    "route before deleting it"
+                ),
+            )
         candidate_snapshot = _rows_by_route_id(
             await op_store.list_provider_route_candidates_for_model(model_id)
         ).get(route_id)
@@ -4018,6 +4120,7 @@ async def delete_provider_route_candidate(
                                 _model_required_role_setting_key(model_id),
                                 _model_strategy_setting_key(model_id),
                                 *model_routewise_setting_keys(model_id),
+                                offload_route_setting_key(model_id),
                             ),
                         )
                     except BaseException:
@@ -4231,6 +4334,7 @@ async def apply_persisted_provider_route_candidates(services, op_store) -> set[s
                             _model_required_role_setting_key(model_id),
                             _model_strategy_setting_key(model_id),
                             *model_routewise_setting_keys(model_id),
+                            offload_route_setting_key(model_id),
                         ),
                     )
                     continue

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from contextlib import contextmanager
 
 import aiohttp
 import pytest
@@ -18,6 +20,7 @@ from serving.adapters.base import ModelConfig
 from serving.adapters.openai_compat import OpenAICompatAdapter
 from serving.adapters.upstream_limiter import (
     UpstreamConcurrencyLimiter,
+    UpstreamQueueWaitExpired,
     UpstreamSaturated,
     get_upstream_limiter,
     key_fingerprint,
@@ -25,6 +28,7 @@ from serving.adapters.upstream_limiter import (
     upstream_slot,
 )
 from serving.http import AsyncHTTPClient
+from serving.utils import context as req_ctx
 
 PROVIDER = "zai"
 KEY_A = "sk-aaa"
@@ -195,6 +199,215 @@ async def test_cancelled_waiter_is_removed_and_does_not_hold_a_slot():
     assert _state(limiter)["waiting"] == 0
     held.release(status_code=200)
     assert _state(limiter)["in_flight"] == 0
+
+
+# ------------------------------------------------------- dispatch deadlines
+
+
+@contextmanager
+def _queue_deadline(seconds_from_now: float | None):
+    """Push the per-dispatch queue deadline the way FixedRouter does."""
+    deadline = None if seconds_from_now is None else time.monotonic() + seconds_from_now
+    with req_ctx.push(**{req_ctx.UPSTREAM_QUEUE_DEADLINE: deadline}):
+        yield
+
+
+async def test_a_dispatch_deadline_ends_the_wait_before_the_acquire_timeout():
+    limiter = _limiter(initial_limit=1, acquire_timeout=5.0)
+    held = await _acquire(limiter)
+
+    started = time.monotonic()
+    with _queue_deadline(0.02), pytest.raises(UpstreamQueueWaitExpired, match="No outbound slot"):
+        await _acquire(limiter)
+
+    assert time.monotonic() - started < 2.0
+    # It left the queue exactly as a timed-out waiter does, holding nothing.
+    assert _state(limiter)["waiting"] == 0
+    assert _state(limiter)["in_flight"] == 1
+    held.release(status_code=200)
+    assert _state(limiter)["in_flight"] == 0
+
+
+async def test_an_expired_deadline_still_reads_as_plain_saturation():
+    """Key rotation, the breaker exemption and /v1/messages all catch the base class."""
+    limiter = _limiter(initial_limit=1, acquire_timeout=5.0)
+    await _acquire(limiter)
+
+    with _queue_deadline(0.01), pytest.raises(UpstreamSaturated) as excinfo:
+        await _acquire(limiter)
+
+    from routing.endpoint_health import _http_status_of
+
+    assert isinstance(excinfo.value, UpstreamQueueWaitExpired)
+    assert _http_status_of(excinfo.value) is None
+
+
+async def test_a_deadline_past_the_acquire_timeout_changes_nothing():
+    limiter = _limiter(initial_limit=1, acquire_timeout=0.02)
+    await _acquire(limiter)
+
+    with _queue_deadline(60.0), pytest.raises(UpstreamSaturated) as excinfo:
+        await _acquire(limiter)
+
+    assert not isinstance(excinfo.value, UpstreamQueueWaitExpired)
+
+
+async def test_an_explicit_none_deadline_keeps_the_acquire_timeout():
+    """FixedRouter pushes None on attempts it cannot offload; that means "no budget"."""
+    limiter = _limiter(initial_limit=1, acquire_timeout=0.02)
+    await _acquire(limiter)
+
+    with _queue_deadline(None), pytest.raises(UpstreamSaturated) as excinfo:
+        await _acquire(limiter)
+
+    assert not isinstance(excinfo.value, UpstreamQueueWaitExpired)
+
+
+async def test_a_spent_deadline_leaves_without_taking_a_place_in_line():
+    limiter = _limiter(initial_limit=1, acquire_timeout=5.0)
+    held = await _acquire(limiter)
+    queued = asyncio.ensure_future(_acquire(limiter))
+    await asyncio.sleep(0)
+    assert _state(limiter)["waiting"] == 1
+
+    with _queue_deadline(-1.0), pytest.raises(UpstreamQueueWaitExpired):
+        await _acquire(limiter)
+
+    # Only the request that was already queued is still waiting, and it is the
+    # one the next free slot goes to.
+    assert _state(limiter)["waiting"] == 1
+    held.release(status_code=200)
+    (await queued).release(status_code=200)
+    assert _state(limiter)["in_flight"] == 0
+
+
+async def test_a_spent_deadline_still_takes_a_free_slot():
+    """The deadline bounds waiting, never admission: a free slot is simply taken."""
+    limiter = _limiter(initial_limit=1, acquire_timeout=5.0)
+
+    with _queue_deadline(-1.0):
+        slot = await _acquire(limiter)
+
+    assert slot.held
+    assert _state(limiter)["in_flight"] == 1
+    slot.release(status_code=200)
+
+
+async def test_a_waiter_granted_before_its_deadline_keeps_the_slot():
+    limiter = _limiter(initial_limit=1, acquire_timeout=5.0)
+    held = await _acquire(limiter)
+
+    async def budgeted():
+        with _queue_deadline(1.0):
+            return await _acquire(limiter)
+
+    waiting = asyncio.ensure_future(budgeted())
+    await asyncio.sleep(0)
+    held.release(status_code=200)
+    granted = await waiting
+
+    assert granted.held
+    assert _state(limiter)["in_flight"] == 1
+    granted.release(status_code=200)
+
+
+# ---------------------------------------------------------- dispatch watches
+
+
+class _Watch:
+    """Records what the limiter tells a dispatch's first-token watch."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.events: list[str] = []
+        self.fail = fail
+
+    def on_queued(self) -> None:
+        self.events.append("queued")
+        if self.fail:
+            raise RuntimeError("broken watch")
+
+    def on_sent(self) -> None:
+        self.events.append("sent")
+        if self.fail:
+            raise RuntimeError("broken watch")
+
+
+@contextmanager
+def _watched(watch: _Watch):
+    with req_ctx.push(**{req_ctx.UPSTREAM_DISPATCH_WATCH: watch}):
+        yield
+
+
+async def test_a_watch_hears_that_a_free_slot_sends_the_request_at_once():
+    limiter = _limiter()
+    watch = _Watch()
+
+    with _watched(watch):
+        slot = await _acquire(limiter)
+
+    assert watch.events == ["sent"]
+    slot.release(status_code=200)
+
+
+async def test_a_watch_hears_that_an_exempt_request_goes_straight_out():
+    """A local engine is never queued here, so its wait starts at once."""
+    watch = _Watch()
+
+    with _watched(watch):
+        await _limiter().acquire(PROVIDER, KEY_A, base_url=LOCAL)
+    with _watched(watch):
+        await _limiter(enabled=False).acquire(PROVIDER, KEY_A, base_url=REMOTE)
+
+    assert watch.events == ["sent", "sent"]
+
+
+async def test_a_watch_hears_the_wait_and_then_the_slot():
+    limiter = _limiter(initial_limit=1, acquire_timeout=5.0)
+    held = await _acquire(limiter)
+    watch = _Watch()
+
+    async def watched():
+        with _watched(watch):
+            return await _acquire(limiter)
+
+    waiting = asyncio.ensure_future(watched())
+    await asyncio.sleep(0)
+    assert watch.events == ["queued"]
+    held.release(status_code=200)
+    (await waiting).release(status_code=200)
+
+    assert watch.events == ["queued", "sent"]
+
+
+async def test_a_watch_hears_no_slot_when_the_wait_runs_out():
+    limiter = _limiter(initial_limit=1, acquire_timeout=0.02)
+    await _acquire(limiter)
+    watch = _Watch()
+
+    with _watched(watch), pytest.raises(UpstreamSaturated):
+        await _acquire(limiter)
+
+    assert watch.events == ["queued"]
+
+
+async def test_a_broken_watch_never_costs_the_request_its_slot(caplog):
+    limiter = _limiter(initial_limit=1, acquire_timeout=5.0)
+    held = await _acquire(limiter)
+    watch = _Watch(fail=True)
+
+    async def watched():
+        with _watched(watch):
+            return await _acquire(limiter)
+
+    waiting = asyncio.ensure_future(watched())
+    await asyncio.sleep(0)
+    held.release(status_code=200)
+    granted = await waiting
+
+    assert granted.held
+    assert watch.events == ["queued", "sent"]
+    assert [r for r in caplog.records if r.getMessage() == "upstream_dispatch_watch_failed"]
+    granted.release(status_code=200)
 
 
 # ----------------------------------------------------------------------- AIMD
@@ -564,6 +777,75 @@ async def test_stream_releases_the_slot_when_the_client_disconnects(installed_li
 
     await stream.aclose()
     assert _state(installed_limiter)["in_flight"] == 0
+    # Neutrally, like every cancellation (``outcome_status``): an unfinished
+    # generation is no evidence of headroom.
+    assert _state(installed_limiter)["successes_since_probe"] == 0
+
+
+def _queued_at_the_engine(started: asyncio.Event):
+    """An upstream that opens its answer with a role delta and then never starts."""
+
+    async def fake_stream_post(*_args, **_kwargs):
+        yield _chunk({"role": "assistant"})
+        started.set()
+        await asyncio.Event().wait()
+        yield _chunk({"content": "never"})  # pragma: no cover - never scheduled
+
+    return fake_stream_post
+
+
+async def _cancel_while_waiting(adapter: OpenAICompatAdapter, started: asyncio.Event) -> None:
+    async def consume():
+        async for _ in adapter.stream_chat_completion([{"role": "user", "content": "x"}]):
+            pass  # pragma: no cover - nothing is ever yielded
+
+    task = asyncio.create_task(consume())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_a_stream_cancelled_before_its_first_token_is_no_success(
+    installed_limiter, monkeypatch
+):
+    """The router's first-token wait cancels an engine that has not started answering.
+
+    That attempt must hand its slot back without counting toward a probe for
+    more headroom: the engine had none to give it.
+    """
+    adapter = _adapter()
+    started = asyncio.Event()
+    monkeypatch.setattr(adapter.http, "stream_post", _queued_at_the_engine(started))
+
+    await _cancel_while_waiting(adapter, started)
+
+    assert _state(installed_limiter)["in_flight"] == 0
+    assert _state(installed_limiter)["successes_since_probe"] == 0
+
+
+async def test_a_cancelled_stream_leaves_its_key_as_it_was(installed_limiter, monkeypatch):
+    """A pooled key keeps its failure streak through an attempt that never finished."""
+    adapter = _adapter(api_keys=[KEY_A, KEY_B])
+    assert adapter._key_pool is not None
+    keys = adapter._key_pool._keys
+    for key in keys:
+        key.consecutive_failures = 2
+    started = asyncio.Event()
+    monkeypatch.setattr(adapter.http, "stream_post", _queued_at_the_engine(started))
+
+    await _cancel_while_waiting(adapter, started)
+    assert [key.consecutive_failures for key in keys] == [2, 2]
+
+    # A generation that does finish is the success that clears the streak.
+    async def answering(*_args, **_kwargs):
+        yield _chunk({"content": "hi"})
+        yield _chunk({}, finish_reason="stop")
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(adapter.http, "stream_post", answering)
+    [c async for c in adapter.stream_chat_completion([{"role": "user", "content": "x"}])]
+    assert sorted(key.consecutive_failures for key in keys) == [0, 2]
 
 
 async def test_stream_opening_429_feeds_the_limiter(installed_limiter, monkeypatch):
@@ -650,6 +932,32 @@ async def test_every_key_saturated_surfaces_upstream_saturated(monkeypatch):
 
         with pytest.raises(UpstreamSaturated):
             await adapter.chat_completion([{"role": "user", "content": "x"}])
+    finally:
+        reset_upstream_limiter()
+
+
+async def test_one_deadline_bounds_the_wait_across_every_pooled_key(monkeypatch):
+    """Rotating keys must not multiply the wait: the deadline is per dispatch."""
+    limiter = _limiter(initial_limit=1, acquire_timeout=5.0)
+    reset_upstream_limiter(limiter)
+    try:
+        adapter = _adapter(api_keys=[KEY_A, KEY_B])
+        for key in (KEY_A, KEY_B):
+            await limiter.acquire(PROVIDER, key, base_url=REMOTE)
+
+        async def never_called(**_kwargs):  # pragma: no cover - must not run
+            raise AssertionError("no request may be sent when every key is saturated")
+
+        monkeypatch.setattr(adapter.http, "json_post", never_called)
+
+        started = time.monotonic()
+        with _queue_deadline(0.05), pytest.raises(UpstreamQueueWaitExpired):
+            await adapter.chat_completion([{"role": "user", "content": "x"}])
+
+        # Two keys at the 5s acquire timeout each would be 10s.
+        assert time.monotonic() - started < 2.0
+        assert _state(limiter, KEY_A)["waiting"] == 0
+        assert _state(limiter, KEY_B)["waiting"] == 0
     finally:
         reset_upstream_limiter()
 

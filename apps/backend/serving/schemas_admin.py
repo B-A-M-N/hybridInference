@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator
 
 from serving.config.settings import ROUTE_TYPE_ORDER
 
@@ -149,15 +149,19 @@ class RevokeAPIKeyResponse(BaseModel):  # type: ignore[no-any-unimported]
 class UserListItem(BaseModel):
     """Single user item in admin user list.
 
-    Includes API key status and usage data via LEFT JOIN.
+    Includes API key status and usage data via LEFT JOIN. ``email`` is None
+    for the account created by first-run setup, which has a ``login_name``.
     """
 
     id: str
-    email: str
+    email: str | None
+    login_name: str | None = None
+    phone: str | None = None
     user_name: str | None
     role: str = "free"
     status: str
     email_verified: bool
+    phone_verified: bool = False
     approval_note: str | None = None
     reviewed_at: datetime | None = None
     reviewed_by: str | None = None
@@ -310,7 +314,9 @@ class SummaryUserItem(BaseModel):
     """User entry inside a summary card (sub-set of UserListItem)."""
 
     id: str
-    email: str
+    email: str | None
+    login_name: str | None = None
+    phone: str | None = None
     user_name: str | None = None
     role: str = "free"
     today_cost_usd: Decimal = Field(default=Decimal("0"))
@@ -345,7 +351,8 @@ class ApproveUserResponse(BaseModel):
     """Response payload for successful user approval."""
 
     user_id: str
-    email: str
+    email: str | None
+    phone: str | None = None
     status: str
     message: str
 
@@ -362,20 +369,28 @@ class RejectUserResponse(BaseModel):
     """Response payload for successful user rejection."""
 
     user_id: str
-    email: str
+    email: str | None
+    phone: str | None = None
     status: str
     message: str
 
 
 class UserDetailResponse(BaseModel):
-    """Detailed user info including usage analytics."""
+    """Detailed user info including usage analytics.
+
+    ``email`` is None for the account created by first-run setup, which has a
+    ``login_name``.
+    """
 
     id: str
-    email: str
+    email: str | None
+    login_name: str | None = None
+    phone: str | None = None
     user_name: str | None
     role: str = "free"
     status: str
     email_verified: bool
+    phone_verified: bool = False
     created_at: datetime
     last_login_at: datetime | None = None
     # Key info
@@ -489,7 +504,8 @@ class DeleteUserResponse(BaseModel):
     """Response payload for successful user deletion."""
 
     user_id: str
-    email: str
+    email: str | None
+    phone: str | None = None
     status: str
     message: str
 
@@ -504,7 +520,8 @@ class ResumeUserResponse(BaseModel):
     """Response payload for successful user resume."""
 
     user_id: str
-    email: str
+    email: str | None
+    phone: str | None = None
     status: str
     message: str
 
@@ -532,7 +549,8 @@ class HardDeleteUserResponse(BaseModel):
     """Response payload for successful permanent deletion."""
 
     user_id: str
-    email: str
+    email: str | None
+    phone: str | None = None
     message: str
 
 
@@ -699,6 +717,46 @@ class AdminRequestPerfBreakdownResponse(BaseModel):
     truncated: bool = False
 
 
+class AdminRequestOffloadGroup(BaseModel):
+    """Requests one model sent to its offload route (``routing.offload``).
+
+    ``model_id`` is the served model, as in :class:`AdminRequestPerfGroup`.
+    ``endpoint_id`` is the offload route the requests were sent to: the served
+    endpoint of the ones it served, and the logged ``offload_endpoint_id`` of the
+    ones it failed, whether a later route served them or they failed. A model
+    whose offload route moved during the window has one group per route.
+
+    ``reasons`` counts the offloaded requests by the ``offload`` value their log
+    carries: ``queue_wait`` and ``engine_wait`` when an earlier attempt waited
+    too long, ``last_resort`` when no other route could serve.
+    ``request_count`` is their sum, and ``failed_count`` how many of them failed
+    anyway (client disconnects are not counted as failures).
+    ``model_request_count`` is every request the model had in the window, under
+    the same filters, so the share offloaded can be read against it.
+    """
+
+    model_id: str
+    endpoint_id: str
+    request_count: int
+    failed_count: int
+    reasons: dict[str, int]
+    model_request_count: int
+
+
+class AdminRequestOffloadsResponse(BaseModel):
+    """Offloaded requests over the window, per (model, offload route).
+
+    ``total_offloaded`` counts every offloaded request in the window, including
+    any in groups past the cap that ``truncated`` reports.
+    """
+
+    generated_at: datetime
+    days: int
+    total_offloaded: int
+    groups: list[AdminRequestOffloadGroup]
+    truncated: bool = False
+
+
 class AdminRequestPerfTrendBucket(BaseModel):
     """One time bucket of a served route's TTFT / decode-throughput trend.
 
@@ -853,9 +911,13 @@ class SparklineBucket(BaseModel):
 
 
 class AnalyticsUserEntry(BaseModel):
-    """One row in the top-users horizontal bar chart."""
+    """One row in the top-users horizontal bar chart.
 
-    email: str
+    ``email`` is a display label: the email, else the login name, else the
+    user id (a hard-deleted account), so in practice never None.
+    """
+
+    email: str | None
     user_id: str
     requests: int
     fraction: float  # share of user-attributed requests in the period (0.0-1.0)
@@ -870,9 +932,12 @@ class AnalyticsBreakdownEntry(BaseModel):
 
 
 class AnalyticsModelUserEntry(BaseModel):
-    """One user's usage of a single model in the period."""
+    """One user's usage of a single model in the period.
 
-    email: str
+    ``email`` is a display label, as in :class:`AnalyticsUserEntry`.
+    """
+
+    email: str | None
     user_id: str
     requests: int
     tokens: int  # prompt + completion tokens attributed to this user + model
@@ -1178,6 +1243,42 @@ class AlertSnoozeStatus(BaseModel):
     snoozed: bool
     snooze_until: float | None = None
     seconds_remaining: int = 0
+
+
+class MuteAlertTypeRequest(BaseModel):
+    """Request payload for muting one alert type's Slack alerts."""
+
+    duration_seconds: int | None = Field(
+        None,
+        gt=0,
+        le=30 * 24 * 60 * 60,
+        description=(
+            "How long to mute this alert type, in seconds (max 30 days). "
+            "Omit or send null to mute it until it is unmuted."
+        ),
+    )
+
+
+class AlertTypeMuteStatus(BaseModel):
+    """One alert type from the catalog, and whether its Slack alerts are muted."""
+
+    alert_type: str
+    label: str
+    description: str
+    group: str
+    key_pattern: str
+    muted: bool
+    #: Epoch seconds. None while ``muted`` means the mute lasts until lifted.
+    muted_until: float | None = None
+    muted_by: str | None = None
+    #: Epoch seconds the mute was set, when known.
+    muted_at: float | None = None
+
+
+class AlertMuteListResponse(BaseModel):
+    """Every alert type the gateway can send, in catalog order."""
+
+    types: list[AlertTypeMuteStatus]
 
 
 class RoutewiseSettingItem(BaseModel):
@@ -1613,6 +1714,73 @@ class UpstreamConcurrencyResponse(BaseModel):
     buckets: list[UpstreamConcurrencyBucket]
 
 
+class OffloadRouteItem(BaseModel):
+    """One model's queue-offload route, as stored and as routing applies it.
+
+    ``active`` is whether ``FixedRouter`` honors the policy right now. A stored
+    policy can outlive the conditions it needs -- the model switched to another
+    routing policy, the route was removed or weighted to zero -- and
+    ``inactive_reason`` then says which.
+
+    ``engine_queue_limit`` is how many streaming requests a local engine of the
+    model may have been sent without a first token before the gateway holds the
+    rest, or ``None`` when every request goes straight to the engine.
+
+    ``max_input_tokens`` is the largest estimated prompt the offload route may be
+    sent, or ``None`` for no limit; a longer request is served only by the
+    model's other routes.
+    """
+
+    model_id: str
+    route_id: str
+    wait_seconds: float
+    engine_queue_limit: int | None = None
+    max_input_tokens: int | None = None
+    endpoint_id: str | None = None
+    active: bool
+    inactive_reason: str | None = None
+    updated_at: datetime | None = None
+    updated_by: str | None = None
+
+
+class ModelOffloadRouteResponse(BaseModel):
+    """One model's offload route, or ``offload: null`` when it has none."""
+
+    model_id: str
+    offload: OffloadRouteItem | None = None
+
+
+class ListOffloadRoutesResponse(BaseModel):
+    """Every stored offload route plus the queue they are measured against.
+
+    ``queue_enabled`` is false while ``UPSTREAM_CONCURRENCY_ENABLED`` is off: no
+    request then waits for an outbound slot on a remote endpoint, so none is
+    offloaded by waiting there. A request held for a local engine under an
+    engine queue limit still is, and so is one whose engine sends no first token
+    in time.
+    ``max_wait_seconds`` is the limiter's acquire timeout, the longest wait a
+    request can spend in that queue before it fails over anyway.
+    """
+
+    queue_enabled: bool
+    max_wait_seconds: float
+    offload_routes: list[OffloadRouteItem]
+
+
+class UpdateOffloadRouteRequest(BaseModel):
+    """Request payload for designating one model's offload route.
+
+    The whole policy is replaced: leaving ``engine_queue_limit`` or
+    ``max_input_tokens`` out clears it. Both are strict integers, so neither
+    ``true`` nor ``"4"`` passes for one.
+    """
+
+    route_id: str = Field(..., min_length=1, max_length=512)
+    wait_seconds: float = Field(..., gt=0, allow_inf_nan=False)
+    engine_queue_limit: StrictInt | None = Field(default=None, ge=1)
+    max_input_tokens: StrictInt | None = Field(default=None, ge=1)
+
+
 # Rebuild models to ensure forward references are resolved when imported via FastAPI
 __all__ = [
     "APIKeyDetailResponse",
@@ -1630,6 +1798,8 @@ __all__ = [
     "AdminRequestMetricsBucket",
     "AdminRequestMetricsResponse",
     "AdminRequestMetricsWindow",
+    "AdminRequestOffloadGroup",
+    "AdminRequestOffloadsResponse",
     "AdminRequestPerfBreakdownResponse",
     "AdminRequestPerfDistribution",
     "AdminRequestPerfGroup",
@@ -1660,6 +1830,7 @@ __all__ = [
     "ListAllRouteWeightsResponse",
     "ListAuditLogResponse",
     "ListModelVisibilityResponse",
+    "ListOffloadRoutesResponse",
     "ListOpenRouterProviderOptionsResponse",
     "ListProviderApiKeyProvidersResponse",
     "ListProviderDefinitionsResponse",
@@ -1671,7 +1842,9 @@ __all__ = [
     "ListSettingsResponse",
     "ListSignupAllowedDomainsResponse",
     "ListUsersResponse",
+    "ModelOffloadRouteResponse",
     "ModelVisibilityItem",
+    "OffloadRouteItem",
     "OpenRouterProviderOption",
     "ProbeProviderDefinitionRequest",
     "ProbeProviderDefinitionResponse",
@@ -1710,6 +1883,7 @@ __all__ = [
     "UpdateAPIKeyRequest",
     "UpdateAPIKeyResponse",
     "UpdateModelVisibilityRequest",
+    "UpdateOffloadRouteRequest",
     "UpdateProviderDefinitionRequest",
     "UpdateProviderRouteRequest",
     "UpdateProviderRouteStrategyRequest",
@@ -1798,7 +1972,7 @@ class ListBroadcastsResponse(BaseModel):
 
 class BroadcastRecipientItem(BaseModel):
     user_id: str
-    email: str
+    email: str | None
     status: str
     error: str | None
     sent_at: datetime | None

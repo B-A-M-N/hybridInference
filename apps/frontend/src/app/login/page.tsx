@@ -1,27 +1,46 @@
 'use client';
 
-import { Suspense, useEffect, useState } from 'react';
+import { Suspense, useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import toast from 'react-hot-toast';
-import { loginSchema, LoginFormData } from '@/lib/schemas/auth';
+import { createAuthSchemas, LoginFormData } from '@/lib/schemas/auth';
 import { useAuth } from '@/components/providers';
 import { resendVerification } from '@/lib/api/auth';
 import { APIError, getErrorMessage } from '@/lib/utils/errors';
 import { internalPathOr } from '@/lib/utils/navigation';
-import { Button } from '@/components/ui/Button';
-import { InputField } from '@/components/ui/InputField';
-import { Card } from '@/components/ui/Card';
+import { useT } from '@/components/providers/useT';
+import { useSiteConfig } from '@/components/providers/SiteConfigProvider';
+import { fill } from '@/lib/utils/interpolate';
+import { AuthField, AuthLoading, AuthNotice } from '@/components/auth/AuthForm';
+import { useAuthAppearance } from '@/site-ui/appearance';
+import { AuthPageFrame } from '@/site-ui/SiteUiBoundary';
+import { AuthMethodSelector } from '@/components/auth/AuthMethodSelector';
+import { PhoneAuthForm } from '@/components/auth/PhoneAuthForm';
+import { AccountChooser } from '@/components/auth/AccountChooser';
+import type { AccountSummary } from '@/lib/api/auth';
+import { userDisplayName } from '@/lib/utils/userLabel';
 
 function LoginContent() {
+  const t = useT();
+  const skin = useAuthAppearance();
+  const { features } = useSiteConfig();
   const router = useRouter();
   const searchParams = useSearchParams();
   // Where to land after login. Internal paths only — /authorize round-trips
   // through here with its query attached, and a crafted ?next= must never be
   // able to send a fresh session off-site.
   const nextPath = internalPathOr('/dashboard', searchParams.get('next'));
-  const { login, state } = useAuth();
+  // ?add=1 comes from "Add another account": the visitor is signed in already
+  // and wants the form, not to be sent on.
+  const addMode = searchParams.get('add') === '1';
+  const { login, loginPhone, state, accounts = [], switchAccount, removeAccount } = useAuth();
+  // Null until the visitor picks: the chooser when this browser has accounts.
+  const [view, setView] = useState<'chooser' | 'form' | null>(null);
+  const showChooser = !addMode && view !== 'form' && accounts.length > 0;
+  const [method, setMethod] = useState<'email' | 'phone'>('email');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Email of an unverified account that just failed to log in. When set, we
@@ -29,20 +48,47 @@ function LoginContent() {
   const [unverifiedEmail, setUnverifiedEmail] = useState<string | null>(null);
   const [isResending, setIsResending] = useState(false);
   const [resendDone, setResendDone] = useState(false);
+  // Validation copy is interface copy too, so the schemas are rebuilt whenever
+  // the resolved translator changes; `t` is stable per content document.
+  const { loginSchema } = useMemo(() => createAuthSchemas(t), [t]);
 
   const {
     register,
     handleSubmit,
+    setValue,
     formState: { errors },
   } = useForm<LoginFormData>({
     resolver: zodResolver(loginSchema),
+    defaultValues: { email: searchParams.get('identifier') ?? '' },
   });
 
   useEffect(() => {
-    if (!state.loading && state.isAuthenticated) {
+    if (!state.loading && state.isAuthenticated && !addMode) {
       router.replace(nextPath);
     }
-  }, [state.loading, state.isAuthenticated, router, nextPath]);
+  }, [state.loading, state.isAuthenticated, addMode, router, nextPath]);
+
+  const chooseAccount = async (account: AccountSummary) => {
+    await switchAccount(account.id);
+    toast.success(
+      fill(t('auth.accounts.switched_toast', 'Continuing as {name}'), {
+        name: userDisplayName(account),
+      }),
+    );
+    router.push(nextPath);
+  };
+
+  // An account whose session ended signs in again with its own identifier.
+  const signInAgain = (account: AccountSummary) => {
+    const identifier = account.email || account.login_name;
+    if (identifier) {
+      setValue('email', identifier);
+      setMethod('email');
+    } else if (account.phone) {
+      setMethod('phone');
+    }
+    setView('form');
+  };
 
   const onSubmit = async (data: LoginFormData) => {
     setIsLoading(true);
@@ -52,7 +98,7 @@ function LoginContent() {
 
     try {
       await login(data.email, data.password);
-      toast.success('Login successful!');
+      toast.success(t('auth.login.success_toast', 'Login successful!'));
       router.push(nextPath);
     } catch (err) {
       // For a suspended account, prefer the admin-authored message (when set)
@@ -64,7 +110,12 @@ function LoginContent() {
       const errorMsg = suspensionMessage || getErrorMessage(err);
       setError(errorMsg);
       toast.error(errorMsg);
-      if (err instanceof APIError && err.code === 'EMAIL_NOT_VERIFIED') {
+      // Only an email account can be unverified; a login name has no inbox.
+      if (
+        err instanceof APIError &&
+        err.code === 'EMAIL_NOT_VERIFIED' &&
+        data.email.includes('@')
+      ) {
         setUnverifiedEmail(data.email);
       }
     } finally {
@@ -78,7 +129,9 @@ function LoginContent() {
     try {
       await resendVerification(unverifiedEmail);
       setResendDone(true);
-      toast.success('Verification email sent. Please check your inbox.');
+      toast.success(
+        t('auth.login.resent_toast', 'Verification email sent. Please check your inbox.'),
+      );
     } catch (err) {
       toast.error(getErrorMessage(err));
     } finally {
@@ -86,101 +139,178 @@ function LoginContent() {
     }
   };
 
-  if (state.loading || state.isAuthenticated) {
-    return (
-      <div className="flex w-full items-center justify-center">
-        <div className="h-12 w-12 animate-spin rounded-full border-4 border-gray-300 border-t-blue-600"></div>
-      </div>
-    );
+  if (state.loading || (state.isAuthenticated && !addMode)) {
+    return <AuthLoading />;
   }
 
-  return (
-    <div className="mx-auto w-full max-w-md">
-      <Card>
-        <div className="text-center">
-          <h1 className="text-3xl font-bold tracking-tight text-gray-900">Log In</h1>
-          <p className="mt-2 text-sm text-gray-600">Welcome back, please log in with your email</p>
-        </div>
+  // The field wraps its action in the `field-action` hook itself.
+  const forgotLink = (
+    <Link href="/forgot-password" className={skin.linkButton} prefetch={false}>
+      {t('auth.login.forgot_password', 'Forgot password?')}
+    </Link>
+  );
 
-        <form onSubmit={handleSubmit(onSubmit)} className="mt-8 space-y-5">
-          {error && (
-            <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
-              {error}
-            </div>
+  return (
+    <AuthPageFrame
+      page="login"
+      kicker={t('auth.login.kicker', 'GOOD TO SEE YOU AGAIN')}
+      title={
+        showChooser
+          ? t('auth.accounts.title', 'Choose an account')
+          : addMode
+            ? t('auth.accounts.add_title', 'Add another account')
+            : t('auth.login.title', 'Log In')
+      }
+      subtitle={
+        showChooser
+          ? t('auth.accounts.subtitle', 'Accounts signed in on this browser')
+          : features.phoneAuth
+            ? t('auth.phone.login_subtitle', 'Welcome back, please log in')
+            : t('auth.login.subtitle', 'Welcome back, please log in')
+      }
+      topbar={
+        features.publicSignup ? (
+          <>
+            {t('auth.login.no_account', "Don't have an account?")}{' '}
+            <Link href="/signup" prefetch={false}>
+              {t('auth.login.signup_link', 'Sign Up')}
+            </Link>
+          </>
+        ) : undefined
+      }
+      legal={
+        <>
+          {t('auth.legal.see', 'See')}{' '}
+          <Link href="/terms">{t('chrome.footer.terms', 'Terms')}</Link>
+          {' · '}
+          <Link href="/terms#terms-s5">{t('chrome.footer.privacy', 'Privacy')}</Link>
+        </>
+      }
+    >
+      {showChooser ? (
+        <AccountChooser
+          accounts={accounts}
+          onChoose={chooseAccount}
+          onSignIn={signInAgain}
+          onRemove={(account) => removeAccount(account.id)}
+          onUseAnother={() => {
+            setValue('email', '');
+            setView('form');
+          }}
+        />
+      ) : (
+        <>
+          {features.phoneAuth && (
+            <AuthMethodSelector purpose="login" value={method} onChange={setMethod} />
           )}
+          {addMode ? (
+            <button type="button" className={skin.linkButton} onClick={() => router.push(nextPath)}>
+              {t('auth.accounts.cancel_add', 'Cancel')}
+            </button>
+          ) : accounts.length > 0 ? (
+            <button type="button" className={skin.linkButton} onClick={() => setView('chooser')}>
+              {t('auth.accounts.back', 'Back to your accounts')}
+            </button>
+          ) : null}
+        </>
+      )}
+      {showChooser ? null : features.phoneAuth && method === 'phone' ? (
+        <PhoneAuthForm
+          purpose="login"
+          onLogin={async (phone, code) => {
+            await loginPhone(phone, code);
+            toast.success(t('auth.login.success_toast', 'Login successful!'));
+            router.push(nextPath);
+          }}
+        />
+      ) : (
+        <form onSubmit={handleSubmit(onSubmit)} className={skin.form} data-auth="form">
+          {error && <AuthNotice tone="error">{error}</AuthNotice>}
 
           {unverifiedEmail &&
             (resendDone ? (
-              <div className="rounded border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">
-                A new verification email is on its way to {unverifiedEmail}. Please check your inbox
-                (and spam folder).
-              </div>
+              <AuthNotice tone="ok">
+                {fill(
+                  t(
+                    'auth.login.resent_notice',
+                    'A new verification email is on its way to {email}. Please check your inbox (and spam folder).',
+                  ),
+                  { email: unverifiedEmail },
+                )}
+              </AuthNotice>
             ) : (
-              <div className="rounded border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">
-                <p>Didn&apos;t get the verification email?</p>
-                <Button
+              <AuthNotice>
+                <p>{t('auth.login.resend_prompt', "Didn't get the verification email?")}</p>
+                <button
                   type="button"
-                  variant="secondary"
-                  size="sm"
-                  className="mt-2"
-                  isLoading={isResending}
+                  className={skin.linkButton}
                   onClick={handleResend}
+                  disabled={isResending}
                 >
-                  Resend verification email
-                </Button>
-              </div>
+                  {t('auth.login.resend_button', 'Resend verification email')}
+                </button>
+              </AuthNotice>
             ))}
 
-          <InputField
-            label="Email"
-            type="email"
-            autoComplete="email"
+          {/* Email or username: the first-run administrator has a login name and
+            no email, so this is a text field and the schema decides which rule
+            applies. The request still sends it as `email`. */}
+          <AuthField
+            id="email"
+            label={t('auth.login.email_label', 'Email or username')}
             error={errors.email?.message}
-            {...register('email')}
-          />
+          >
+            <input
+              id="email"
+              className={errors.email?.message ? skin.inputError : skin.input}
+              data-auth="control"
+              type="text"
+              autoComplete="username"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              {...register('email')}
+            />
+          </AuthField>
 
-          <InputField
-            label="Password"
-            type="password"
-            autoComplete="current-password"
+          <AuthField
+            id="password"
+            label={t('auth.login.password_label', 'Password')}
             error={errors.password?.message}
-            {...register('password')}
-          />
+            // The action belongs to the field, and where it sits is the
+            // module's `fieldLayout`. Nothing here decides that.
+            action={forgotLink}
+          >
+            <input
+              id="password"
+              className={errors.password?.message ? skin.inputError : skin.input}
+              data-auth="control"
+              type="password"
+              autoComplete="current-password"
+              {...register('password')}
+            />
+          </AuthField>
 
-          <div className="flex items-center justify-end">
-            <a
-              href="/forgot-password"
-              className="text-sm font-medium text-blue-600 hover:text-blue-700"
-            >
-              Forgot password?
-            </a>
-          </div>
-
-          <Button type="submit" className="w-full" isLoading={isLoading}>
-            Log In
-          </Button>
-
-          <div className="text-center text-sm text-gray-600">
-            Don&apos;t have an account?{' '}
-            <a className="font-medium text-blue-600 hover:text-blue-700" href="/signup">
-              Sign Up
-            </a>
-          </div>
+          <button
+            type="submit"
+            className={skin.submit}
+            data-auth="submit"
+            disabled={isLoading}
+            aria-busy={isLoading}
+          >
+            {isLoading
+              ? t('auth.login.submitting', 'Logging in…')
+              : t('auth.login.submit', 'Log In')}
+          </button>
         </form>
-      </Card>
-    </div>
+      )}
+    </AuthPageFrame>
   );
 }
 
 export default function LoginPage() {
   return (
-    <Suspense
-      fallback={
-        <div className="flex w-full items-center justify-center">
-          <div className="h-12 w-12 animate-spin rounded-full border-4 border-gray-300 border-t-blue-600"></div>
-        </div>
-      }
-    >
+    <Suspense fallback={<AuthLoading />}>
       <LoginContent />
     </Suspense>
   );

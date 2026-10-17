@@ -40,6 +40,44 @@ PRICING_TIME = "pricing_time"
 # background reader task that consumes the upstream stream.
 UPSTREAM_PRIORITY = "upstream_priority"
 
+# req_ctx key holding the ``time.monotonic()`` deadline by which this dispatch
+# must hold an outbound concurrency slot, or ``None`` for no deadline of its own.
+# FixedRouter pushes it around each dispatch -- a deadline on an attempt it could
+# offload elsewhere (see ``routing.offload``), ``None`` on every other attempt so
+# no dispatch inherits another's. ``upstream_limiter`` reads it: a request still
+# queued at the deadline gives up its place instead of waiting out the limiter's
+# own acquire timeout. Only ever pushed, never written durably, so it needs no
+# entry in REQUEST_SCOPED_KEYS.
+UPSTREAM_QUEUE_DEADLINE = "upstream_queue_deadline"
+
+# req_ctx key set when a request for an auto model is served by a model chosen
+# for it (serving/auto_mode.py). Its value is ``(auto_model, names)``: the auto
+# model the caller asked for, and every name of the model serving it. The caller
+# is not told which model that is, so every user-facing error message names the
+# auto model instead (``serving.exceptions.conceal_served_model``).
+CONCEALED_MODEL = "concealed_model"
+
+# req_ctx key holding the dispatch's first-token watch
+# (``routing.engine_wait.FirstTokenWatch``), or ``None``. FixedRouter pushes it
+# around each streaming attempt it would offload if the engine did not start
+# answering in time, and ``None`` around every other attempt. The serving layer
+# reports to it (``serving.adapters.dispatch_watch``): ``upstream_limiter`` when
+# the request starts waiting for an outbound slot and when it gets one, so the
+# engine's wait starts when the request actually leaves the gateway, and a
+# streaming adapter when it reads the upstream's first output. Only ever pushed,
+# like the deadline above.
+UPSTREAM_DISPATCH_WATCH = "upstream_dispatch_watch"
+
+# req_ctx key holding the dispatch's place in line for a local engine
+# (``serving.adapters.upstream_limiter.EngineHold``), or ``None``. FixedRouter
+# pushes one around each streaming attempt of a model whose offload policy sets
+# an engine queue limit, and ``None`` around every other attempt.
+# ``upstream_limiter`` holds such a dispatch in the gateway while its local
+# engine already has that many requests without a first token, and a streaming
+# adapter's first-token report (``serving.adapters.dispatch_watch``) gives the
+# place up for the next request. Only ever pushed, like the watch above.
+UPSTREAM_ENGINE_HOLD = "upstream_engine_hold"
+
 # req_ctx key naming the upstream that served (or refused) this request.
 PROVIDER = "provider"
 #: Provider label meaning "no upstream was ever selected" — a pre-routing failure.
@@ -82,6 +120,9 @@ REQUEST_SCOPED_KEYS = (
     # mandatory: a leftover value would rank the next request, which is a
     # different prompt on a possibly different endpoint.
     UPSTREAM_PRIORITY,
+    # A leftover value would rewrite the next request's error messages, for a
+    # model it did not ask for.
+    CONCEALED_MODEL,
 )
 
 

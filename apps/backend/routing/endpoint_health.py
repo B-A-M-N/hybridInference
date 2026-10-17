@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import threading
 import time
 from collections import Counter
@@ -11,9 +10,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from routing.engine_wait import EngineWaitExpired
 from routing.usage_limit import MIN_ALERT_GAP, detect_usage_limit
 from serving.adapters.key_pool import KeyPoolRoleRestricted
 from serving.adapters.upstream_limiter import UpstreamSaturated
+from serving.config.app_config import config_value
 from serving.exceptions import operator_safe_error
 from serving.observability.alerts import AlertSeverity, alert_on_transition
 from serving.observability.state_alert_policy import (
@@ -277,7 +278,7 @@ class _ProviderHealth:
 
     def __init__(self, provider: str, alpha: float | None = None) -> None:
         self.provider = provider
-        env_alpha = os.getenv("ROUTER_HEALTH_EWMA_ALPHA")
+        env_alpha = config_value("ROUTER_HEALTH_EWMA_ALPHA")
         self.alpha = (
             float(env_alpha) if env_alpha is not None else (alpha if alpha is not None else 0.1)
         )
@@ -396,22 +397,25 @@ class _CircuitBreaker:
         self.provider = provider
         self.state = _CircuitState.CLOSED
         self.failure_threshold = int(
-            os.getenv(
+            config_value(
                 "CIRCUIT_FAILURE_THRESHOLD",
                 str(failure_threshold if failure_threshold is not None else 3),
             )
+            or ""
         )
         self.cooldown_seconds = float(
-            os.getenv(
+            config_value(
                 "CIRCUIT_COOLDOWN_SECONDS",
                 str(cooldown_seconds if cooldown_seconds is not None else 30.0),
             )
+            or ""
         )
         self.min_availability = float(
-            os.getenv(
+            config_value(
                 "CIRCUIT_MIN_AVAILABILITY",
                 str(min_availability if min_availability is not None else 0.7),
             )
+            or ""
         )
         self.consecutive_failures = 0
         self.last_opened: float | None = None
@@ -1036,6 +1040,23 @@ class EndpointHealthRegistry:
                 "gateway_throttle_skip_breaker",
                 extra={
                     "event": "gateway_throttle_skip_breaker",
+                    "endpoint_id": endpoint_id,
+                    "detail": _detail_str(detail or operator_safe_error(exc)),
+                },
+            )
+            return
+        if exc is not None and isinstance(exc, EngineWaitExpired):
+            # The router cancelled this attempt because the engine had not
+            # started it within the model's offload wait (``routing.engine_wait``),
+            # and sent the request to the offload route. A queued request is not a
+            # failure of the engine: it is busy, and the next request is still
+            # sent to it. Counting it here would open the circuit on a burst of
+            # load and hold the endpoint out for a cooldown long after its queue
+            # drained.
+            logger.info(
+                "engine_wait_skip_breaker",
+                extra={
+                    "event": "engine_wait_skip_breaker",
                     "endpoint_id": endpoint_id,
                     "detail": _detail_str(detail or operator_safe_error(exc)),
                 },

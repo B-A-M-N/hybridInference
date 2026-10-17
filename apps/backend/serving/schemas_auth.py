@@ -1,13 +1,108 @@
 """Pydantic schemas for authentication and user management."""
 
+import re
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, EmailStr, Field, StringConstraints
+from pydantic import BaseModel, EmailStr, Field, StringConstraints, field_validator
+from pydantic.networks import validate_email
 
 from serving.config.site_identity import get_site_identity
+from serving.utils.password import validate_password_strength
+from serving.utils.phone_auth import normalize_phone
 
 UserName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=50)]
+
+# The sign-in name of an account created without an email address (the
+# first-run setup administrator). Stored lowercased; it can never contain
+# ``@``, which is how sign-in tells it from an email address.
+LOGIN_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{2,31}$")
+
+
+def normalize_login_name(value: str) -> str:
+    """Return *value* as a login name: trimmed, lowercased and checked.
+
+    Raises:
+        ValueError: If it is not 3-32 letters, digits, ``.``, ``_`` or ``-``,
+            starting with a letter or digit (``@`` is never allowed).
+    """
+    name = value.strip().lower()
+    if not LOGIN_NAME_PATTERN.fullmatch(name):
+        raise ValueError(
+            "Username must be 3-32 characters of letters, digits, '.', '_' or '-', "
+            "starting with a letter or digit"
+        )
+    return name
+
+
+class PhoneRequest(BaseModel):
+    """Canonical international phone identifier."""
+
+    phone: str = Field(max_length=32)
+
+    @field_validator("phone")
+    @classmethod
+    def canonical_phone(cls, value: str) -> str:
+        """Validate and normalize the mainland mobile number."""
+        return normalize_phone(value)
+
+
+class PhoneCodeRequest(PhoneRequest):
+    """Issue a code scoped to registration, login, binding, or confirming the owner."""
+
+    purpose: Literal["signup", "login", "bind", "delete_account", "bind_email", "set_password"]
+    turnstile_token: str | None = None
+
+
+class PhoneCodeResponse(BaseModel):
+    """Delivery result without exposing a verification code."""
+
+    message: str
+    retry_after: int
+
+
+class PhoneVerifyRequest(PhoneRequest):
+    """Six-digit verification code and canonical recipient."""
+
+    code: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class PhoneSignupRequest(PhoneVerifyRequest):
+    """Phone registration with profile and terms acceptance."""
+
+    user_name: UserName
+    use_case: str | None = Field(default=None, max_length=2000)
+    accepted_tos: bool
+
+
+class PhoneSignupResponse(BaseModel):
+    """Registration result for a user with no email identity."""
+
+    message: str
+    user_id: str
+    email: None = None
+    phone: str
+    requires_approval: bool = False
+
+
+class BindEmailRequest(BaseModel):
+    """Bind or update the email address on an authenticated account.
+
+    The owner confirms with ``password``, or with ``phone_code`` (a
+    ``bind_email`` code) when the account has no password.
+    """
+
+    email: EmailStr
+    password: str | None = Field(default=None, max_length=1024)
+    phone_code: str | None = Field(default=None, pattern=r"^[0-9]{6}$")
+
+
+class BindEmailResponse(BaseModel):
+    """Result of requesting or completing email binding."""
+
+    message: str
+    email: str
+    email_verified: bool
 
 
 # Authentication request/response schemas
@@ -32,10 +127,24 @@ class SignupResponse(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    """User login request."""
+    """User login request.
 
-    email: EmailStr
+    ``email`` keeps its name for compatibility but takes either an email
+    address or, for an account created without one, a login name. A value
+    containing ``@`` is validated and normalized exactly as an ``EmailStr``;
+    anything else must be a valid login name and is lowercased.
+    """
+
+    email: str
     password: str
+
+    @field_validator("email")
+    @classmethod
+    def _email_or_login_name(cls, value: str) -> str:
+        value = value.strip()
+        if "@" in value:
+            return validate_email(value)[1]
+        return normalize_login_name(value)
 
 
 class LoginResponse(BaseModel):
@@ -70,11 +179,20 @@ class VerifyEmailResponse(BaseModel):
 
 # User info schemas
 class UserInfo(BaseModel):
-    """User information (public)."""
+    """User information (public).
+
+    ``email`` is None for an account created without one (the first-run setup
+    administrator), which has a ``login_name`` instead.
+    """
 
     id: str
-    email: str
+    email: str | None = None
+    login_name: str | None = None
+    phone: str | None = None
+    phone_verified: bool = False
+    has_password: bool = True
     user_name: str | None = None
+    avatar_url: str | None = None
     role: str = "free"
     status: str = "active"
     email_verified: bool = False
@@ -83,10 +201,109 @@ class UserInfo(BaseModel):
     last_login_at: datetime | None = None
 
 
+# Accounts signed in on one browser
+class AccountSummary(BaseModel):
+    """One account in a browser's account chooser."""
+
+    id: str
+    email: str | None = None
+    login_name: str | None = None
+    phone: str | None = None
+    user_name: str | None = None
+    role: str = "free"
+    active: bool = Field(description="The account the browser is currently using.")
+    signed_in: bool = Field(
+        description="False once its session has ended; the chooser then asks to sign in again."
+    )
+    agent_access: bool | None = Field(
+        default=None,
+        description="Whether it may use the Cloud Agent; None when signed out or unknown.",
+    )
+
+
+class AccountsResponse(BaseModel):
+    """The accounts signed in on the calling browser."""
+
+    active_user_id: str | None = None
+    accounts: list[AccountSummary]
+    max_accounts: int
+
+
+class SwitchAccountRequest(BaseModel):
+    """Request a token for another account signed in on this browser."""
+
+    user_id: str = Field(min_length=1, max_length=64)
+    activate: bool = Field(
+        default=True,
+        description=(
+            "Make it the browser's active account. False only mints a token for it, "
+            "which is how the consent page signs the Cloud Agent in as another account."
+        ),
+    )
+
+
+# First-run setup schemas
+class SetupStatusResponse(BaseModel):
+    """Whether the console should show the first-run setup page."""
+
+    setup_required: bool
+    database_enabled: bool
+
+
+class SetupAdminRequest(BaseModel):
+    """First-run setup: the one-time code and the administrator to create.
+
+    Field problems are 422s attributed to their field, so the setup page can
+    show each next to its input.
+    """
+
+    setup_code: str = Field(..., max_length=64)
+    login_name: str = Field(..., max_length=64)
+    password: str
+    display_name: str | None = Field(default=None, max_length=200)
+
+    @field_validator("login_name")
+    @classmethod
+    def _check_login_name(cls, value: str) -> str:
+        return normalize_login_name(value)
+
+    @field_validator("password")
+    @classmethod
+    def _check_password(cls, value: str) -> str:
+        is_valid, error_msg = validate_password_strength(value)
+        if not is_valid:
+            raise ValueError(error_msg or "Password does not meet security requirements")
+        return value
+
+    @field_validator("display_name")
+    @classmethod
+    def _check_display_name(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        value = value.strip()
+        if not 2 <= len(value) <= 50:
+            raise ValueError("Display name must be 2-50 characters")
+        return value
+
+
+AVATAR_URL_PATTERN = re.compile(r"^data:image/(?:webp|png|jpeg);base64,[A-Za-z0-9+/=]+$")
+
+
 class UserProfileUpdate(BaseModel):
     """User profile update request."""
 
     user_name: UserName | None = None
+    avatar_url: str | None = Field(default=None, max_length=65536)
+
+    @field_validator("avatar_url")
+    @classmethod
+    def _check_avatar_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        value = value.strip()
+        if not AVATAR_URL_PATTERN.fullmatch(value):
+            raise ValueError("Portrait must be a PNG, JPEG, or WebP data URL")
+        return value
 
 
 class LLMProberLayoutState(BaseModel):
@@ -247,14 +464,39 @@ class ResendVerificationResponse(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
-    """Change password request (for logged-in users)."""
+    """Change or set password request (for logged-in users).
 
-    old_password: str
+    An account with a password gives ``old_password``; one without (a phone
+    account) gives ``phone_code``, a ``set_password`` code sent to its phone.
+    """
+
+    old_password: str = ""
     new_password: str  # Validate strength in handler to return 400
+    phone_code: str | None = Field(default=None, pattern=r"^[0-9]{6}$")
 
 
 class ChangePasswordResponse(BaseModel):
     """Change password response."""
+
+    message: str
+
+
+class DeleteAccountRequest(BaseModel):
+    """Delete the signed-in account, confirmed the way that account signs in.
+
+    ``confirm`` is the account's sign-in identifier (see
+    ``account_identifier``), typed by its owner. An account with a password
+    confirms with it; a phone-only account with a ``delete_account`` code
+    sent to its verified number.
+    """
+
+    confirm: str = Field(max_length=320)
+    password: str | None = Field(default=None, max_length=1024)
+    phone_code: str | None = Field(default=None, pattern=r"^[0-9]{6}$")
+
+
+class DeleteAccountResponse(BaseModel):
+    """Self-service account deletion result."""
 
     message: str
 

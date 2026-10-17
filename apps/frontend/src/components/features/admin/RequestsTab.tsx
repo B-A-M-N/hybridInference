@@ -11,7 +11,7 @@ import {
   useRef,
   useState,
 } from 'react';
-import toast from 'react-hot-toast';
+import { useAccountToast } from '@/lib/hooks/useAccountToast';
 import {
   AdminRecentRequestItem,
   AdminRequestMetricsWindow,
@@ -26,6 +26,7 @@ import { getErrorMessage } from '@/lib/utils/errors';
 import { formatRouteWiseDecision } from '@/lib/utils/routewise';
 import { InlineErrorText } from '@/components/ui/InlineErrorText';
 import { FoldedText } from './requestContent';
+import { OffloadedRequestsPanel } from './OffloadedRequestsPanel';
 import { RequestPerformancePanel } from './RequestPerformancePanel';
 
 const REQ_PAGE_SIZE = 50;
@@ -465,6 +466,7 @@ function RequestMetricsCard({ metric }: { metric: AdminRequestMetricsWindow }) {
 }
 
 export function RequestsTab() {
+  const toast = useAccountToast();
   // Requests state
   const [reqEntries, setReqEntries] = useState<AdminRecentRequestItem[]>([]);
   const [reqTotal, setReqTotal] = useState(0);
@@ -552,7 +554,7 @@ export function RequestsTab() {
         if (seq === reqSeqRef.current) setReqLoading(false);
       }
     },
-    [reqOffset, reqOutcome, reqType, reqDays, reqSessionFilter],
+    [reqOffset, reqOutcome, reqType, reqDays, reqSessionFilter, toast],
   );
 
   // Debounce text-filter changes into the values that drive the fetch. Offset
@@ -582,7 +584,7 @@ export function RequestsTab() {
     } finally {
       setReqMetricsLoading(false);
     }
-  }, []);
+  }, [toast]);
 
   const handleClearErrors = useCallback(async () => {
     if (
@@ -604,7 +606,7 @@ export function RequestsTab() {
     } finally {
       setClearingErrors(false);
     }
-  }, [loadRequests, loadRequestMetrics, reqUserFilter, reqModelFilter]);
+  }, [toast, loadRequests, reqUserFilter, reqModelFilter, loadRequestMetrics]);
 
   useEffect(() => {
     loadRequests(debouncedUserFilter, debouncedModelFilter);
@@ -906,6 +908,17 @@ export function RequestsTab() {
           not the lookback: it measures its own fixed 24h window, since TTFT and
           decode throughput average away over a week. */}
       <RequestPerformancePanel
+        userFilter={debouncedUserFilter}
+        sessionFilter={reqSessionFilter}
+        modelFilter={debouncedModelFilter}
+        requestType={reqType}
+        outcome={reqOutcome}
+        refreshKey={perfRefreshKey}
+      />
+
+      {/* Requests sent to a model's offload route, over the same fixed 24h and
+          under the same filters as the performance summary above. */}
+      <OffloadedRequestsPanel
         userFilter={debouncedUserFilter}
         sessionFilter={reqSessionFilter}
         modelFilter={debouncedModelFilter}

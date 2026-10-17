@@ -70,6 +70,7 @@ from serving.pricing import effective_pricing
 from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
 from serving.utils.tokens import estimate_prompt_tokens
+from serving.utils.workers import configured_worker_count
 
 from .candidates import (
     CandidatePricing,
@@ -113,20 +114,11 @@ RATE_LIMIT_ERROR_PENALTY_MS: float = 60_000.0
 _RETRYABLE_ROUTEWISE_STATUS_CODES = frozenset({408, 429})
 _PROBE_READBACK_MAX_ROWS = 10_000
 _PROBE_SELF_SAMPLE_ID_CAP = 10_000
-_AIOHTTP_RETRYABLE_ERRORS = tuple(
-    cls
-    for cls in (
-        getattr(aiohttp, "ClientConnectionError", None),
-        getattr(aiohttp, "ServerConnectionError", None),
-        getattr(aiohttp, "ServerDisconnectedError", None),
-        getattr(aiohttp, "ClientError", None),
-    )
-    if isinstance(cls, type)
-)
-_WORKER_COUNT_ENV_KEYS = (
-    "WEB_CONCURRENCY",
-    "UVICORN_WORKERS",
-    "GUNICORN_WORKERS",
+_AIOHTTP_RETRYABLE_ERRORS = (
+    aiohttp.ClientConnectionError,
+    aiohttp.ServerConnectionError,
+    aiohttp.ServerDisconnectedError,
+    aiohttp.ClientError,
 )
 
 
@@ -387,21 +379,6 @@ def _is_routewise_retryable_error(exc: BaseException) -> bool:
             TimeoutError,
         ),
     )
-
-
-def _configured_worker_count() -> int | None:
-    """Best-effort detection for common ASGI worker-count environment vars."""
-    for key in _WORKER_COUNT_ENV_KEYS:
-        raw = os.getenv(key)
-        if raw is None:
-            continue
-        try:
-            count = int(raw)
-        except ValueError:
-            continue
-        if count > 0:
-            return count
-    return None
 
 
 class RouteWiseRouter:
@@ -1360,7 +1337,7 @@ class RouteWiseRouter:
             self._validate_stateful_provider_worker_scope()
 
     def _validate_stateful_provider_worker_scope(self) -> None:
-        worker_count = _configured_worker_count()
+        worker_count = configured_worker_count()
         if worker_count is not None and worker_count > 1:
             if self.config.stateful_providers_single_worker_only:
                 raise RuntimeError(

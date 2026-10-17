@@ -56,11 +56,14 @@ Where to start
      - :doc:`router-tutorial`
    * - Run your own gateway against real providers
      - :doc:`installation`
+   * - Choose what your distribution can configure or customize
+     - :doc:`distribution-customization`
    * - Follow a request from HTTP through to an upstream call
      - :doc:`architecture`
-   * - Publish a new model id, or wire up a provider the gateway has never
-       talked to
+   * - Serve another model from a provider the gateway already supports
      - :doc:`adding-models`
+   * - Support a provider whose API the gateway cannot speak yet
+     - :doc:`provider-adapters`
    * - Add a provider, a key or a model from the admin console, without
        editing YAML or restarting
      - :doc:`configuration`, under *Runtime configuration from the admin
@@ -71,6 +74,8 @@ Where to start
      - :doc:`contributing`
    * - Identify a version or plan an upgrade
      - :doc:`releases`
+   * - Look up a term such as *route*, *endpoint* or *distribution*
+     - :doc:`glossary`
 
 Scope of this site
 ------------------
@@ -82,8 +87,14 @@ operator's to publish separately.
 That separation is built into the repository: a deployment keeps its identity,
 its configuration-file locations and its feature switches in a *distribution
 overlay* under ``distributions/`` rather than in the code, which is why a fresh
-clone comes up as nobody's gateway but your own. :doc:`configuration` explains
-how those overlays resolve.
+clone comes up as nobody's gateway but your own. :doc:`distribution-customization`
+explains how to configure and extend an overlay.
+
+.. Distribution-facing customization lives in three pages:
+   distribution-customization (capability matrix, manifest, branding,
+   upgrades), site-ui-modules (the public UI contract) and backend-extensions.
+   Extend them when adding a customization capability; keep implementation
+   notes under docs/agents/specs.
 
 .. toctree::
    :maxdepth: 2
@@ -99,7 +110,9 @@ how those overlays resolve.
 
    architecture
    routing
+   routing-internals
    public-path-table
+   glossary
 
 .. toctree::
    :maxdepth: 2
@@ -107,10 +120,19 @@ how those overlays resolve.
 
    adding-models
    add-local-model
+   provider-adapters
    openrouter
    hpc-model-host
    claude-code-setup
    rag-chat
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Customizing a Deployment
+
+   distribution-customization
+   site-ui-modules
+   backend-extensions
 
 .. toctree::
    :maxdepth: 2
@@ -119,7 +141,6 @@ how those overlays resolve.
    deployment
    releases
    database
-   staging
    trusted-proxies-and-client-ips
    automation-score
 
@@ -128,6 +149,7 @@ how those overlays resolve.
    :caption: Contributing
 
    contributing
+   translations
 
 .. toctree::
    :maxdepth: 2

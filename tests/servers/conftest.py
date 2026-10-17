@@ -157,7 +157,11 @@ def auth_test_env():
             "DB_PASSWORD": _db_pass,
             "TEST_DB_HOST": _db_host,
             "TEST_DB_PORT": _db_port,
-            "TEST_DB_NAME": _db_name,
+            # Keep TEST_DB_NAME as the unsuffixed base. Direct integration
+            # fixtures append their xdist worker id themselves; mutating this
+            # value to _db_name makes those fixtures look for *_gw0_gw0 after
+            # a server test has initialized the session environment.
+            "TEST_DB_NAME": _base_db_name,
             "TEST_DB_USER": _db_user,
             "TEST_DB_PASSWORD": _db_pass,
             "COOKIE_SECURE": "0",
@@ -394,7 +398,7 @@ async def test_client(test_app):
 
 
 @pytest_asyncio.fixture
-async def auth_app(auth_test_env):
+async def auth_app(auth_test_env, monkeypatch):
     """App instance with lifespan context for auth tests.
 
     This fixture creates a fresh app instance and manages its lifespan,
@@ -412,10 +416,15 @@ async def auth_app(auth_test_env):
     await _skip_if_test_db_unavailable(context="auth_app pre-flight connection")
 
     # Clear settings cache to pick up test environment variables
+    from serving.config import settings as settings_module
     from serving.config.settings import get_settings
     from serving.servers.app import create_app
+    from serving.servers.routers import auth_routes
 
     get_settings.cache_clear()
+    test_settings = get_settings()
+    monkeypatch.setattr(settings_module, "settings", test_settings)
+    monkeypatch.setattr(auth_routes, "settings", test_settings)
 
     app = create_app()
 
@@ -426,7 +435,30 @@ async def auth_app(auth_test_env):
         db_logger = getattr(getattr(app.state, "services", None), "db_logger", None)
         if db_logger and getattr(db_logger, "pool", None):
             await assert_test_db_from_pool(db_logger.pool, context="auth_app fixture")
+        await _complete_first_run_setup(app)
         yield app
+
+
+async def _complete_first_run_setup(app: FastAPI) -> None:
+    """Record the test deployment as set up.
+
+    On a test database without users, bootstrap leaves first-run setup
+    pending, and ``/auth/signup`` answers 503 until it completes. These tests
+    exercise accounts, not setup.
+    """
+    from datetime import datetime, timezone
+
+    from serving.setup_state import SETUP_CODE_KEY, SETUP_MARKER_KEY, mark_setup_completed
+
+    op_store = getattr(getattr(app.state, "services", None), "operational_store", None)
+    if op_store is not None:
+        if await op_store.get_setting(SETUP_MARKER_KEY) is None:
+            await op_store.set_setting(
+                SETUP_MARKER_KEY, datetime.now(timezone.utc).isoformat(), "str", "tests"
+            )
+        # Completing setup deletes the code; do the same here.
+        await op_store.delete_setting(SETUP_CODE_KEY)
+    mark_setup_completed()
 
 
 @pytest_asyncio.fixture

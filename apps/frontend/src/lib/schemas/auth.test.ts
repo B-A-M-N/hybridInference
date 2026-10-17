@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import { createSignupSchema, loginSchema, passwordSchema, signupSchema } from './auth';
+import { translate } from '@/lib/i18n/translate';
+import {
+  createAuthSchemas,
+  createSignupSchema,
+  loginSchema,
+  passwordSchema,
+  signupSchema,
+} from './auth';
 
 describe('auth schemas', () => {
   it('accepts a strong password', () => {
@@ -111,5 +118,75 @@ describe('auth schemas', () => {
         password: 'anything-present',
       }).success,
     ).toBe(true);
+  });
+
+  it('accepts a login name where the email goes, and holds each to its own rule', () => {
+    const parse = (email: string) => loginSchema.safeParse({ email, password: 'pw' });
+
+    // The first-run administrator signs in with a login name.
+    expect(parse('admin').success).toBe(true);
+    expect(parse('Ops.Team_1-x').success).toBe(true);
+    expect(parse(' admin ').data?.email).toBe('admin');
+    // 3–32 characters, starting with a letter or digit.
+    expect(parse('ab').success).toBe(false);
+    expect(parse('_admin').success).toBe(false);
+    expect(parse('a'.repeat(33)).success).toBe(false);
+    // With an `@`, it is an email address and must be a valid one.
+    expect(parse('admin@').error?.issues[0]?.message).toBe('Please enter a valid email address');
+    expect(parse('').error?.issues[0]?.message).toBe('Please enter your email or username');
+  });
+});
+
+describe('auth schema distribution messages', () => {
+  it('resolves validation messages through the supplied translator', () => {
+    // Validation messages are interface copy: a distribution translates them
+    // through the same slots as the page around them.
+    const {
+      createSignupSchema: runtimeSignup,
+      emailSchema,
+      passwordSchema,
+    } = createAuthSchemas((slot, fallback) =>
+      slot.startsWith('auth.validation.') ? `<${slot}>` : fallback,
+    );
+
+    expect(emailSchema.safeParse('not-an-email').error?.issues[0]?.message).toBe(
+      '<auth.validation.email_invalid>',
+    );
+    expect(passwordSchema.safeParse('short').error?.issues[0]?.message).toBe(
+      '<auth.validation.password_min>',
+    );
+    expect(
+      runtimeSignup()
+        .safeParse({
+          email: 'user@example.org',
+          password: 'SecurePass123',
+          confirmPassword: 'DifferentPass123',
+          userName: 'Example User',
+        })
+        .error?.flatten().fieldErrors.confirmPassword,
+    ).toEqual(['<auth.validation.passwords_differ>']);
+  });
+
+  it('resolves the login field\u2019s messages through the translator too', () => {
+    const { loginSchema: runtimeLogin } = createAuthSchemas((slot, fallback) =>
+      slot.startsWith('auth.validation.') ? `<${slot}>` : fallback,
+    );
+
+    expect(runtimeLogin.safeParse({ email: '', password: 'pw' }).error?.issues[0]?.message).toBe(
+      '<auth.validation.identifier_required>',
+    );
+    expect(runtimeLogin.safeParse({ email: 'x', password: 'pw' }).error?.issues[0]?.message).toBe(
+      '<auth.validation.login_name_invalid>',
+    );
+  });
+
+  it('keeps today’s English for a deployment that fills no slot', () => {
+    // The module-level exports are exactly this call, so a regression in the
+    // default path would silently reword every deployment's form errors.
+    const { emailSchema } = createAuthSchemas(translate);
+
+    expect(emailSchema.safeParse('not-an-email').error?.issues[0]?.message).toBe(
+      'Please enter a valid email address',
+    );
   });
 });

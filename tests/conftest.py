@@ -133,6 +133,42 @@ def _reset_runtime_settings_singleton():
 
 
 @pytest.fixture(autouse=True)
+def _reset_setup_state():
+    """Forget first-run setup state between tests.
+
+    ``bootstrap.initialize()`` records it in process memory; a test that leaves
+    setup pending would make every later signup in the worker answer 503.
+    """
+    from serving.setup_state import reset_setup_state
+
+    reset_setup_state()
+    yield
+    reset_setup_state()
+
+
+@pytest.fixture(autouse=True)
+def _reset_app_config():
+    """Forget database-backed configuration a previous test loaded.
+
+    ``serving.config.app_config`` keeps what it loaded in module state and
+    ``config_value`` serves it ahead of the environment, so a test that boots
+    the gateway or loads rows must not hand them to the next one. The skipped
+    model list and a requested restart are module state too — the latter would
+    end the worker process at the next lifespan teardown.
+    """
+    from serving.config import app_config
+    from serving.servers import model_availability, restart
+
+    app_config.reset_state()
+    model_availability.reset()
+    restart.reset()
+    yield
+    app_config.reset_state()
+    model_availability.reset()
+    restart.reset()
+
+
+@pytest.fixture(autouse=True)
 def _reset_dynamic_keys_registry():
     """Clear the in-process provider-key adapter registry between tests.
 
@@ -150,3 +186,26 @@ def _reset_dynamic_keys_registry():
     dynamic_keys.reset()
     yield
     dynamic_keys.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_request_context():
+    """Start each test with an empty request context, and restore it afterwards.
+
+    ``serving.utils.context`` keeps the request context in a ``ContextVar``. A
+    synchronous test runs in the worker's main context, so whatever it writes
+    with ``req_ctx.set``/``update`` stays visible to every later test in that
+    worker. pytest-asyncio runs each async test in a copy, so async tests cannot
+    leak — but they still read what a sync test left behind. A leaked
+    ``affinity_key`` is the costly one: a later test's ``FixedRouter`` pins all
+    its weighted draws to whichever backend it drew first. Under
+    ``--dist loadfile`` that needs the writer and the victim on one worker, and
+    any new test file reshuffles which files share one, so it surfaces as a
+    rare flake on an unrelated change.
+    """
+    from serving.utils import context as req_ctx
+
+    saved = req_ctx.get()
+    req_ctx.set({})
+    yield
+    req_ctx.set(saved)

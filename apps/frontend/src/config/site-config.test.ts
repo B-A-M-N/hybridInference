@@ -77,6 +77,21 @@ const runtimeDocument = {
 };
 
 describe('resolveRuntimeSiteConfig', () => {
+  it('only enables phone authentication when the server advertises it', () => {
+    expect(resolveRuntimeSiteConfig(runtimeDocument).features.phoneAuth).toBe(false);
+    expect(
+      resolveRuntimeSiteConfig({
+        ...runtimeDocument,
+        features: { ...runtimeDocument.features, phone_auth: true },
+      }).features.phoneAuth,
+    ).toBe(true);
+    expect(() =>
+      resolveRuntimeSiteConfig({
+        ...runtimeDocument,
+        features: { ...runtimeDocument.features, phone_auth: 'true' },
+      }),
+    ).toThrow();
+  });
   it('maps the complete v1 runtime branding document', () => {
     const resolved = resolveRuntimeSiteConfig(runtimeDocument);
 
@@ -120,7 +135,13 @@ describe('resolveRuntimeSiteConfig', () => {
       },
     ]);
     expect(resolved.distribution).toEqual({ id: 'example', release: '2026.07' });
-    expect(resolved.features).toEqual({ publicSignup: false, rag: false, agents: false });
+    expect(resolved.features).toEqual({
+      publicSignup: false,
+      phoneAuth: false,
+      rag: false,
+      agents: false,
+      publicStats: false,
+    });
   });
 
   it('preserves build-time branding exactly when v1 branding is null', () => {
@@ -174,7 +195,13 @@ describe('resolveRuntimeSiteConfig', () => {
       contactEmail: 'support@example.test',
     });
     expect(resolved.distribution).toEqual({ id: 'example', release: '2026.07' });
-    expect(resolved.features).toEqual({ publicSignup: false, rag: false, agents: false });
+    expect(resolved.features).toEqual({
+      publicSignup: false,
+      phoneAuth: false,
+      rag: false,
+      agents: false,
+      publicStats: false,
+    });
   });
 
   it('keeps legacy feature gates when its optional identity URL is malformed', () => {
@@ -191,7 +218,13 @@ describe('resolveRuntimeSiteConfig', () => {
     expect(resolved.branding.exampleApiBase).toBe(buildTimeSiteConfig.branding.exampleApiBase);
     expect(resolved.branding.siteHost).toBe(buildTimeSiteConfig.branding.siteHost);
     expect(resolved.branding.appName).toBe('Example Inference');
-    expect(resolved.features).toEqual({ publicSignup: false, rag: false, agents: false });
+    expect(resolved.features).toEqual({
+      publicSignup: false,
+      phoneAuth: false,
+      rag: false,
+      agents: false,
+      publicStats: false,
+    });
   });
 
   it('rejects unsafe or malformed branding without silently replacing operator settings', () => {
@@ -205,6 +238,11 @@ describe('resolveRuntimeSiteConfig', () => {
       }),
     ).toThrow(SiteConfigLoadError);
 
+    // A key the console does not declare is refused, not dropped. This document
+    // is served to every visitor, so an undeclared field is either a typo or
+    // something that should not be public, and the gateway's own model forbids
+    // both — a console that quietly ignored it would only ever hide a
+    // deployment misconfiguration.
     expect(() =>
       resolveRuntimeSiteConfig({
         ...runtimeDocument,
@@ -325,5 +363,122 @@ describe('example quickstart base', () => {
 
     expect(resolved.branding.exampleApiBase).toBe('');
     expect(resolved.branding.exampleHidden).toBe(true);
+  });
+});
+
+describe('unknown configuration keys', () => {
+  // The endpoint envelope accepts unknown keys during rolling upgrades, while
+  // the public branding document is strict so unsupported settings fail clearly.
+  it('ignores an unknown top-level key and refuses an unknown branding key', () => {
+    const resolved = resolveRuntimeSiteConfig({
+      ...runtimeDocument,
+      content: { locale: 'zh-CN', strings: { 'landing.hero.subtitle': '面向科研的推理服务' } },
+    });
+    expect(resolved.branding.appDescription).toBe(runtimeBranding.app_description);
+    expect(resolved).not.toHaveProperty('content');
+
+    expect(() =>
+      resolveRuntimeSiteConfig({
+        ...runtimeDocument,
+        branding: {
+          ...runtimeBranding,
+          theme: { accent: '#0052D9', accent_dark: '#003CAB', accent_light: '#3B7BFF' },
+        },
+      }),
+    ).toThrow(SiteConfigLoadError);
+  });
+
+  it('still refuses a document that is genuinely malformed elsewhere', () => {
+    // Tolerating a key this console does not read is not the same as accepting
+    // anything: the keys that *are* this endpoint's contract keep their rules.
+    expect(() => resolveRuntimeSiteConfig({ schema_version: 99, distribution: {} })).toThrow(
+      SiteConfigLoadError,
+    );
+    expect(() =>
+      resolveRuntimeSiteConfig({
+        ...runtimeDocument,
+        features: { ...runtimeDocument.features, routers: 'fixed' },
+      }),
+    ).toThrow(SiteConfigLoadError);
+  });
+});
+
+describe('unsupported runtime layout settings', () => {
+  // Public-page layouts and design assets belong to build-time modules.
+  // These keys are not part of the runtime branding schema.
+  it('refuses unsupported presentation and hero-image settings', () => {
+    for (const branding of [
+      { ...runtimeBranding, presentation: { preset: 'custom', model_families: [] } },
+      { ...runtimeBranding, assets: { ...runtimeBranding.assets, hero_image_url: '/a.png' } },
+    ]) {
+      expect(() => resolveRuntimeSiteConfig({ ...runtimeDocument, branding })).toThrow(
+        SiteConfigLoadError,
+      );
+    }
+  });
+});
+
+describe('first-run setup and configuration health', () => {
+  it('reads both states from the top level of a v1 document', () => {
+    const resolved = resolveRuntimeSiteConfig({
+      ...runtimeDocument,
+      setup: { required: true },
+      configuration: { incomplete: true },
+    });
+
+    expect(resolved.setup).toEqual({ required: true });
+    expect(resolved.configuration).toEqual({ incomplete: true });
+    // Siblings of `features`, never members of it: that object stays strict.
+    expect(resolved.features).toEqual({
+      publicSignup: false,
+      phoneAuth: false,
+      rag: false,
+      agents: false,
+      publicStats: false,
+    });
+  });
+
+  it('treats a gateway without them as set up and complete', () => {
+    expect(resolveRuntimeSiteConfig(runtimeDocument)).toMatchObject({
+      setup: { required: false },
+      configuration: { incomplete: false },
+    });
+    expect(
+      resolveRuntimeSiteConfig({ ...runtimeDocument, setup: null, configuration: null }),
+    ).toMatchObject({ setup: { required: false }, configuration: { incomplete: false } });
+
+    const {
+      schema_version: _schemaVersion,
+      branding: _branding,
+      ...legacyDocument
+    } = runtimeDocument;
+    expect(resolveRuntimeSiteConfig(legacyDocument)).toMatchObject({
+      setup: { required: false },
+      configuration: { incomplete: false },
+    });
+    expect(buildTimeSiteConfig.setup).toEqual({ required: false });
+    expect(buildTimeSiteConfig.configuration).toEqual({ incomplete: false });
+  });
+
+  it('ignores fields a later gateway adds to either object', () => {
+    const resolved = resolveRuntimeSiteConfig({
+      ...runtimeDocument,
+      setup: { required: false, started_at: '2026-10-10T12:00:00Z' },
+      configuration: { incomplete: true, missing_count: 2 },
+    });
+
+    expect(resolved.setup).toEqual({ required: false });
+    expect(resolved.configuration).toEqual({ incomplete: true });
+  });
+
+  it.each([
+    { setup: { required: 'yes' } },
+    { setup: true },
+    { configuration: { incomplete: 1 } },
+    { configuration: {} },
+  ])('refuses a malformed state rather than guessing: %j', (state) => {
+    expect(() => resolveRuntimeSiteConfig({ ...runtimeDocument, ...state })).toThrow(
+      SiteConfigLoadError,
+    );
   });
 });

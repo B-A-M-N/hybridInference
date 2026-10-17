@@ -1,7 +1,7 @@
 'use client';
 
 import { Fragment, useCallback, useEffect, useState } from 'react';
-import toast from 'react-hot-toast';
+import { useAccountToast } from '@/lib/hooks/useAccountToast';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -15,6 +15,7 @@ import {
   sendTestBroadcastEmail,
 } from '@/lib/api/admin';
 import { getErrorMessage } from '@/lib/utils/errors';
+import { userAccountLabel } from '@/lib/utils/userLabel';
 
 function relTime(s: string | null): string {
   if (!s) return 'Never';
@@ -30,6 +31,7 @@ function relTime(s: string | null): string {
 }
 
 export function BroadcastsTab() {
+  const toast = useAccountToast();
   // Broadcast email state
   const [broadcasts, setBroadcasts] = useState<BroadcastListItem[]>([]);
   const [broadcastLoading, setBroadcastLoading] = useState(false);
@@ -570,7 +572,9 @@ export function BroadcastsTab() {
                                   <tbody>
                                     {broadcastDetail.recipients.map((r) => (
                                       <tr key={r.user_id} className="border-t border-gray-100">
-                                        <td className="pr-4 py-1 text-gray-700">{r.email}</td>
+                                        <td className="pr-4 py-1 text-gray-700">
+                                          {userAccountLabel(r)}
+                                        </td>
                                         <td className="pr-4 py-1">
                                           <span
                                             className={

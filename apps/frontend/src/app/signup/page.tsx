@@ -2,64 +2,113 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
-import Script from 'next/script';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
-import { buildCombinedUseCase, createSignupSchema, SignupFormData } from '@/lib/schemas/auth';
+import { buildCombinedUseCase, createAuthSchemas, SignupFormData } from '@/lib/schemas/auth';
 import { signup, type SignupResponse } from '@/lib/api/auth';
 import { getErrorMessage } from '@/lib/utils/errors';
-import { Button } from '@/components/ui/Button';
-import { InputField } from '@/components/ui/InputField';
-import { Card } from '@/components/ui/Card';
 import { useSiteConfig } from '@/components/providers/SiteConfigProvider';
-import { SignupConsentStep } from './SignupConsentStep';
+import { useT } from '@/components/providers/useT';
+import { fill } from '@/lib/utils/interpolate';
+import { AuthField, AuthNotice } from '@/components/auth/AuthForm';
+import { useAuthAppearance } from '@/site-ui/appearance';
+import { AuthPageFrame } from '@/site-ui/SiteUiBoundary';
+import { NO_CONSENT, SignupConsentStep, type ConsentProgress } from './SignupConsentStep';
+import { SignupSteps, type SignupStep } from './SignupSteps';
+import { AuthMethodSelector } from '@/components/auth/AuthMethodSelector';
+import { PasswordInput, PasswordRules } from '@/components/auth/PasswordInput';
+import { PhoneAuthForm } from '@/components/auth/PhoneAuthForm';
+import { SignupDetailsHeading } from '@/components/auth/SignupDetailsHeading';
+import { TurnstileChallenge } from '@/components/auth/TurnstileChallenge';
 
-const TURNSTILE_CALLBACK = '__signupTurnstileCallback';
+/** The result's mark: a tick for an account that is ready, a clock for one in review. */
+function ResultIcon({ pending }: { pending: boolean }): JSX.Element {
+  return (
+    <div
+      aria-hidden="true"
+      className={`mx-auto flex h-12 w-12 items-center justify-center rounded-full ${
+        pending ? 'bg-blue-50 text-blue-600' : 'bg-emerald-50 text-emerald-600'
+      }`}
+    >
+      <svg
+        className="h-6 w-6"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={2}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        {pending ? (
+          <>
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 7v5l3 2" />
+          </>
+        ) : (
+          <path d="m5 12.5 4.5 4.5L19 7.5" />
+        )}
+      </svg>
+    </div>
+  );
+}
 
-declare global {
-  interface Window {
-    [TURNSTILE_CALLBACK]?: (token: string) => void;
-  }
+function Spinner(): JSX.Element {
+  return (
+    <svg className="mr-2 h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+      <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+    </svg>
+  );
 }
 
 export default function SignupPage() {
+  const t = useT();
+  const skin = useAuthAppearance();
   const { branding, features } = useSiteConfig();
   const turnstileSiteKey = branding.turnstileSiteKey;
-  const [step, setStep] = useState<'consent' | 'form'>('consent');
+  const [step, setStep] = useState<SignupStep>('consent');
+  const [accountStarted, setAccountStarted] = useState(false);
+  const accountFormRef = useRef<HTMLDivElement>(null);
+  const [consent, setConsent] = useState<ConsentProgress>(NO_CONSENT);
+  const [method, setMethod] = useState<'email' | 'phone'>('email');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [signupResult, setSignupResult] = useState<SignupResponse | null>(null);
   const turnstileTokenRef = useRef<string | null>(null);
+  const [captchaReset, setCaptchaReset] = useState(0);
+  // Validation copy is interface copy too: the schemas are rebuilt per
+  // translator, and the signup one also takes the runtime site host because it
+  // measures the text buildCombinedUseCase will submit.
   const runtimeSignupSchema = useMemo(
-    () => createSignupSchema(branding.siteHost),
-    [branding.siteHost],
+    () => createAuthSchemas(t).createSignupSchema(branding.siteHost),
+    [t, branding.siteHost],
   );
 
   const {
     register,
     handleSubmit,
+    watch,
     formState: { errors },
   } = useForm<SignupFormData>({
     resolver: zodResolver(runtimeSignupSchema),
+    // A field reports a problem once the visitor leaves it, and from then on
+    // as they fix it, rather than all at once on submit.
+    mode: 'onTouched',
   });
+  const password = watch('password') ?? '';
 
   useEffect(() => {
-    turnstileTokenRef.current = null;
-    if (!turnstileSiteKey) return;
-    window[TURNSTILE_CALLBACK] = (token: string) => {
-      turnstileTokenRef.current = token;
-    };
-    return () => {
-      delete window[TURNSTILE_CALLBACK];
-    };
-  }, [turnstileSiteKey]);
+    if (step === 'form') {
+      accountFormRef.current?.querySelector<HTMLElement>('[data-auth="control"]')?.focus();
+    }
+  }, [step]);
 
   const onSubmit = async (data: SignupFormData) => {
     setIsLoading(true);
     setError(null);
 
     if (turnstileSiteKey && !turnstileTokenRef.current) {
-      setError('Please complete the captcha.');
+      setError(t('auth.signup.captcha_required', 'Please complete the captcha.'));
       setIsLoading(false);
       return;
     }
@@ -76,8 +125,10 @@ export default function SignupPage() {
         password: data.password,
         user_name: data.userName.trim(),
         use_case: combinedUseCase || undefined,
-        // The account form is only reachable after every consent on the
-        // preceding step was checked, and the backend stores one flag.
+        // The account form is only reachable after every confirmation on the
+        // preceding step was checked — the console's four, or the module's
+        // `consentItems` when it publishes its own terms — and the backend
+        // stores one flag for all of them.
         accepted_tos: true,
         turnstileToken: turnstileTokenRef.current ?? undefined,
       });
@@ -85,23 +136,29 @@ export default function SignupPage() {
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
+      turnstileTokenRef.current = null;
+      setCaptchaReset((value) => value + 1);
       setIsLoading(false);
     }
   };
 
   if (!features.publicSignup) {
     return (
-      <div className="mx-auto w-full max-w-md">
-        <Card>
-          <h1 className="text-xl font-semibold text-gray-900">Public signup is unavailable</h1>
-          <p className="mt-2 text-sm text-gray-600">
-            This distribution does not currently accept public registrations.
-          </p>
-          <Link href="/login" className="mt-4 inline-block text-sm text-crimson hover:underline">
-            Sign in
+      <AuthPageFrame
+        page="signup"
+        kicker={t('auth.signup.kicker_unavailable', 'REGISTRATION CLOSED')}
+        title={t('auth.signup.unavailable_title', 'Public signup is unavailable')}
+        subtitle={t(
+          'auth.signup.unavailable_body',
+          'This distribution does not currently accept public registrations.',
+        )}
+      >
+        <div className={skin.form} data-auth="form">
+          <Link href="/login" className={skin.submit} data-auth="submit">
+            {t('auth.signup.signin_link', 'Sign in')}
           </Link>
-        </Card>
-      </div>
+        </div>
+      </AuthPageFrame>
     );
   }
 
@@ -109,195 +166,235 @@ export default function SignupPage() {
     const isPendingApproval = signupResult.requires_approval;
 
     return (
-      <div className="mx-auto w-full max-w-md">
-        <Card className={isPendingApproval ? 'border-amber-100' : 'border-green-100'}>
-          <div
-            className={`mb-4 flex h-12 w-12 items-center justify-center rounded-full ${
-              isPendingApproval ? 'bg-amber-100' : 'bg-green-100'
-            }`}
-          >
-            {isPendingApproval ? (
-              <svg
-                className="h-6 w-6 text-amber-600"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
-                />
-              </svg>
-            ) : (
-              <svg
-                className="h-6 w-6 text-green-600"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M5 13l4 4L19 7"
-                />
-              </svg>
-            )}
-          </div>
-          <h1 className="text-2xl font-bold text-gray-900">
-            {isPendingApproval ? 'Registration Submitted' : 'Registration Successful!'}
-          </h1>
-          <p className="mt-3 text-base text-gray-600">{signupResult.message}</p>
-          <div className="mt-6">
-            <a
-              href="/login"
-              className="inline-flex items-center text-sm font-medium text-blue-600 transition-colors hover:text-blue-700"
-            >
-              &larr; Back to Login
-            </a>
-          </div>
-        </Card>
-      </div>
+      <AuthPageFrame
+        page="signup"
+        kicker={t('auth.signup.kicker_result', 'ALMOST THERE')}
+        title={
+          isPendingApproval
+            ? t('auth.signup.pending_title', 'Registration Submitted')
+            : t('auth.signup.success_title', 'Registration Successful!')
+        }
+        subtitle={t('auth.signup.result_subtitle', 'Here is what happens with your account next.')}
+      >
+        <div className={skin.form} data-auth="form">
+          <ResultIcon pending={isPendingApproval} />
+          <AuthNotice tone={isPendingApproval ? 'info' : 'ok'}>{signupResult.message}</AuthNotice>
+          <Link href="/login" className={skin.submit} data-auth="submit" prefetch={false}>
+            {t('auth.signup.back_to_login', 'Back to Login')}
+          </Link>
+        </div>
+      </AuthPageFrame>
     );
   }
 
-  if (step === 'consent') {
-    return <SignupConsentStep onContinue={() => setStep('form')} />;
-  }
+  const accountForm = (
+    <AuthPageFrame
+      page="signup"
+      kicker={t('auth.signup.kicker', 'START BUILDING')}
+      title={t('auth.signup.title', 'Sign Up')}
+      subtitle={t('auth.signup.subtitle', 'Create an account to manage API keys and usage')}
+      topbar={
+        <>
+          {t('auth.signup.have_account', 'Already have an account?')}{' '}
+          <Link href="/login" prefetch={false}>
+            {t('auth.signup.login_link', 'Log In')}
+          </Link>
+        </>
+      }
+      legal={
+        <>
+          {t('auth.legal.see', 'See')}{' '}
+          <Link href="/terms">{t('chrome.footer.terms', 'Terms')}</Link>
+          {' · '}
+          <Link href="/terms#terms-s5">{t('chrome.footer.privacy', 'Privacy')}</Link>
+        </>
+      }
+    >
+      <SignupSteps current="form" onBack={() => setStep('consent')} />
+      {features.phoneAuth && <AuthMethodSelector value={method} onChange={setMethod} />}
+      {features.phoneAuth && method === 'phone' ? (
+        <PhoneAuthForm purpose="signup" onSuccess={setSignupResult} />
+      ) : (
+        <form onSubmit={handleSubmit(onSubmit)} className={skin.form} data-auth="form">
+          {error && <AuthNotice tone="error">{error}</AuthNotice>}
 
-  return (
-    <div className="mx-auto w-full max-w-md">
-      <Card>
-        <div className="text-center">
-          <h1 className="text-3xl font-bold tracking-tight text-gray-900">Sign Up</h1>
-          <p className="mt-2 text-sm text-gray-600">
-            Create an account to manage API keys and usage
-          </p>
           {branding.fastTrackDomain && (
-            <div className="mt-4 rounded border border-blue-100 bg-blue-50 px-4 py-3 text-left text-sm text-blue-900">
-              Open to {branding.fastTrackOrg} students — sign up with your{' '}
-              <span className="font-medium">@{branding.fastTrackDomain}</span> email for instant
-              access. Everyone else: please describe your use case below — we review and approve
-              manually.
-            </div>
-          )}
-        </div>
-
-        <form onSubmit={handleSubmit(onSubmit)} className="mt-8 space-y-5">
-          {error && (
-            <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
-              {error}
-            </div>
+            <AuthNotice>
+              {fill(
+                t(
+                  'auth.signup.fast_track',
+                  'Open to {org} students — sign up with your @{domain} email for instant access. Everyone else: please describe your use case below — we review and approve manually.',
+                ),
+                { org: branding.fastTrackOrg, domain: branding.fastTrackDomain },
+              )}
+            </AuthNotice>
           )}
 
-          <InputField
-            label="Email"
-            type="email"
-            autoComplete="email"
+          <AuthField
+            id="email"
+            label={t('auth.signup.email_label', 'Email')}
             error={errors.email?.message}
-            {...register('email')}
-          />
+          >
+            <input
+              id="email"
+              className={errors.email?.message ? skin.inputError : skin.input}
+              data-auth="control"
+              type="email"
+              autoComplete="email"
+              // The visitor just pressed Continue to reach this form.
+              // eslint-disable-next-line jsx-a11y/no-autofocus
+              autoFocus
+              {...register('email')}
+            />
+          </AuthField>
 
-          <InputField
-            label="Username"
-            type="text"
-            autoComplete="username"
-            hint="This name is shown in your account and admin review."
+          <AuthField
+            id="userName"
+            label={t('auth.signup.username_label', 'Username')}
+            hint={t(
+              'auth.signup.username_hint',
+              'This name is shown in your account and admin review.',
+            )}
             error={errors.userName?.message}
-            {...register('userName')}
-          />
+          >
+            <input
+              id="userName"
+              className={errors.userName?.message ? skin.inputError : skin.input}
+              data-auth="control"
+              type="text"
+              autoComplete="username"
+              {...register('userName')}
+            />
+          </AuthField>
 
-          <InputField
-            label="Password"
-            type="password"
-            hint="At least 8 characters with uppercase, lowercase, and numbers."
-            autoComplete="new-password"
+          <AuthField
+            id="password"
+            label={t('auth.signup.password_label', 'Password')}
+            hint={
+              <PasswordRules
+                value={password}
+                hint={t(
+                  'auth.signup.password_hint',
+                  'At least 8 characters with uppercase, lowercase, and numbers.',
+                )}
+              />
+            }
             error={errors.password?.message}
-            {...register('password')}
-          />
+          >
+            <PasswordInput
+              id="password"
+              className={errors.password?.message ? skin.inputError : skin.input}
+              data-auth="control"
+              autoComplete="new-password"
+              {...register('password')}
+            />
+          </AuthField>
 
-          <InputField
-            label="Confirm Password"
-            type="password"
-            autoComplete="new-password"
+          <AuthField
+            id="confirmPassword"
+            label={t('auth.signup.confirm_password_label', 'Confirm Password')}
             error={errors.confirmPassword?.message}
-            {...register('confirmPassword')}
-          />
+          >
+            <PasswordInput
+              id="confirmPassword"
+              className={errors.confirmPassword?.message ? skin.inputError : skin.input}
+              data-auth="control"
+              autoComplete="new-password"
+              {...register('confirmPassword')}
+            />
+          </AuthField>
 
-          <label className="block">
-            <span className="text-sm font-medium text-gray-700">How did you find us?</span>
+          <SignupDetailsHeading />
+
+          <AuthField
+            id="discoverySource"
+            label={t('auth.signup.discovery_label', 'How did you find us?')}
+            hint={t('auth.signup.discovery_hint', 'Optional, but helpful for improving outreach.')}
+            error={errors.discoverySource?.message}
+          >
             <textarea
+              id="discoverySource"
               rows={2}
               maxLength={500}
-              placeholder="Friend/classmate, search engine, social media, course link, etc."
-              className={
-                errors.discoverySource
-                  ? 'mt-1.5 w-full rounded-lg border border-red-300 bg-white px-4 py-2.5 text-sm shadow-sm transition-all duration-200 placeholder:text-gray-400 hover:border-gray-400 focus:border-red-500 focus:ring-2 focus:ring-red-500/20'
-                  : 'mt-1.5 w-full rounded-lg border border-gray-300 bg-white px-4 py-2.5 text-sm shadow-sm transition-all duration-200 placeholder:text-gray-400 hover:border-gray-400 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20'
-              }
+              placeholder={t(
+                'auth.signup.discovery_placeholder',
+                'Friend/classmate, search engine, social media, course link, etc.',
+              )}
+              className={`${errors.discoverySource?.message ? skin.inputError : skin.input} auth-textarea`}
+              data-auth="control"
               {...register('discoverySource')}
             />
-            {errors.discoverySource ? (
-              <span className="mt-1.5 block text-xs text-red-600">
-                {errors.discoverySource.message}
-              </span>
-            ) : (
-              <span className="mt-1.5 block text-xs text-gray-500">
-                Optional, but helpful for improving outreach.
-              </span>
-            )}
-          </label>
+          </AuthField>
 
-          <label className="block">
-            <span className="text-sm font-medium text-gray-700">Use case</span>
+          <AuthField
+            id="useCase"
+            label={t('auth.signup.use_case_label', 'Use case')}
+            hint={t('auth.signup.use_case_hint', 'Helps admins review signups faster.')}
+            error={errors.useCase?.message}
+          >
             <textarea
+              id="useCase"
               rows={4}
               maxLength={2000}
-              placeholder="Tell us briefly what you plan to use the service for (research project, course, app prototype, etc.)."
-              className={
-                errors.useCase
-                  ? 'mt-1.5 w-full rounded-lg border border-red-300 bg-white px-4 py-2.5 text-sm shadow-sm transition-all duration-200 placeholder:text-gray-400 hover:border-gray-400 focus:border-red-500 focus:ring-2 focus:ring-red-500/20'
-                  : 'mt-1.5 w-full rounded-lg border border-gray-300 bg-white px-4 py-2.5 text-sm shadow-sm transition-all duration-200 placeholder:text-gray-400 hover:border-gray-400 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20'
-              }
+              placeholder={t(
+                'auth.signup.use_case_placeholder',
+                'Tell us briefly what you plan to use the service for (research project, course, app prototype, etc.).',
+              )}
+              className={`${errors.useCase?.message ? skin.inputError : skin.input} auth-textarea`}
+              data-auth="control"
               {...register('useCase')}
             />
-            {errors.useCase ? (
-              <span className="mt-1.5 block text-xs text-red-600">{errors.useCase.message}</span>
-            ) : (
-              <span className="mt-1.5 block text-xs text-gray-500">
-                Helps admins review signups faster.
-              </span>
-            )}
-          </label>
+          </AuthField>
 
           {turnstileSiteKey && (
-            <>
-              <Script
-                src="https://challenges.cloudflare.com/turnstile/v0/api.js"
-                strategy="afterInteractive"
+            // The widget's height, held before it loads so the button does not jump.
+            <div className="min-h-[65px]">
+              <TurnstileChallenge
+                siteKey={turnstileSiteKey}
+                onToken={(token) => {
+                  turnstileTokenRef.current = token;
+                }}
+                resetKey={captchaReset}
               />
-              <div
-                className="cf-turnstile"
-                data-sitekey={turnstileSiteKey}
-                data-callback={TURNSTILE_CALLBACK}
-              />
-            </>
+            </div>
           )}
 
-          <Button type="submit" className="w-full" isLoading={isLoading}>
-            Sign Up
-          </Button>
-
-          <div className="text-center text-sm text-gray-600">
-            Already have an account?{' '}
-            <a className="font-medium text-blue-600 hover:text-blue-700" href="/login">
-              Log In
-            </a>
-          </div>
+          <button
+            type="submit"
+            className={skin.submit}
+            data-auth="submit"
+            disabled={isLoading}
+            aria-busy={isLoading}
+          >
+            {isLoading && <Spinner />}
+            {isLoading
+              ? t('auth.signup.submitting', 'Creating your account…')
+              : t('auth.signup.submit', 'Sign Up')}
+          </button>
         </form>
-      </Card>
-    </div>
+      )}
+    </AuthPageFrame>
+  );
+
+  return (
+    <>
+      {step === 'consent' && (
+        <SignupConsentStep
+          progress={consent}
+          onProgress={setConsent}
+          onContinue={() => {
+            setAccountStarted(true);
+            setStep('form');
+            window.scrollTo({ top: 0 });
+          }}
+        />
+      )}
+      {/* Retain the phone draft, pending request and absolute resend deadline while reviewing. */}
+      {accountStarted && (
+        <div ref={accountFormRef} hidden={step !== 'form'}>
+          {accountForm}
+        </div>
+      )}
+    </>
   );
 }

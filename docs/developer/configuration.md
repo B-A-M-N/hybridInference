@@ -6,99 +6,85 @@ same file. It is the conceptual companion to
 [Adding a New Model](adding-models.md) (the field-by-field model registry reference)
 and [Routing](routing.md) (what the routing engine does with the result).
 
+For distribution manifests, branding, UI modules and backend extensions, see
+[Distribution customization](distribution-customization.md).
+
+## Optional Tencent SES email delivery
+
+`EMAIL_PROVIDER` defaults to `smtp`. Select `tencent_ses` in **Admin > Configuration** to use Tencent Cloud transactional email instead. The selection is explicit: a failed SES request or missing SES template does not fall back to SMTP. The existing verification, password-reset and notification callers use the selected transport.
+
+Configure `TENCENT_CLOUD_SECRET_ID`, `TENCENT_CLOUD_SECRET_KEY`, optional `TENCENT_CLOUD_TOKEN`, `TENCENT_SES_REGION`, `TENCENT_SES_FROM_EMAIL` and optional `TENCENT_SES_FROM_NAME`. The sender must be approved in the selected region. Secret values remain server-side and are redacted in the configuration API. Keep production credentials and sender identities in deployment configuration.
+
+Set positive IDs for `TENCENT_SES_TEMPLATE_VERIFICATION` and `TENCENT_SES_TEMPLATE_PASSWORD_RESET` before enabling SES account mail. Configure `TENCENT_SES_TEMPLATE_APPROVAL`, `TENCENT_SES_TEMPLATE_REJECTION`, `TENCENT_SES_TEMPLATE_ADMIN_SIGNUP` and `TENCENT_SES_TEMPLATE_NOTICE` for the notifications the deployment uses. Unset IDs disable those templates. Configuration health reports missing SES account-mail fields when public signup requires email verification, instead of asking for SMTP credentials.
+
+Reference HTML lives in `config/examples/tencent-ses/`. Before submitting templates for provider approval, replace the example domain with the deployment console domain and choose the desired language and wording. Verification and reset templates contain a fixed HTTPS origin and path; only the encoded `token` query value varies. Other templates use `site_name` and, where applicable, `reason`, `identifier` or `body`. Keep template links consistent with `FRONTEND_URL`; the gateway cannot inspect approved template contents.
+
+SES receives approved templates with escaped scalar values, never arbitrary HTML variables. Serialized template data is limited to 800 UTF-8 bytes; oversized notices and HTML-only notices fail rather than being truncated. Successful submission means provider acceptance, not inbox delivery. Calls are not automatically retried because a timeout can follow acceptance. Deployments that require unrestricted HTML mail or long notices can continue to use SMTP.
+
 ## What the gateway reads at startup
 
-| Kind | Holds | Read by |
-|---|---|---|
-| `models` | The model registry: every model id the gateway serves and the upstream routes behind it | `register_from_models_yaml` in `apps/backend/serving/servers/registry.py` |
-| `routing` | Deployment-wide routing behaviour: local/remote split, health probing | `RoutingManager` in `apps/backend/routing/manager.py` |
-| `alerts` | Alert rules and thresholds | `load_alert_config` in `apps/backend/serving/observability/alert_config.py` |
-| Environment | Everything secret or host-specific: credentials, database connection, feature switches | `Settings` in `apps/backend/serving/config/settings.py` |
+| Kind | Holds |
+|---|---|
+| `models` | The model registry: every model id the gateway serves and the upstream routes behind it |
+| `routing` | Optional deployment-wide settings: health probing and a local/remote weight split |
+| `alerts` | Alert rules and thresholds |
+| Settings | Credentials, SMTP, proxy trust, logging, routing tuning and every other application setting, stored in the database and edited in the admin console |
+| Environment | The database connection, the paths to the files above, and how the containers are wired |
 
-Only the model registry is load-bearing. Without it the gateway starts, serves
-`/health`, and answers `GET /v1/models` with an empty list. Without a routing
-file the registry's own per-route weights stand — which is also what a fresh
-clone gets, because the built-in default `config/examples/routing.minimal.yaml`
-declares empty endpoint pools rather than overriding anything. Without an alerts
-file the built-in thresholds apply.
-
-A fourth kind, `mcp`, is accepted by the resolver and by the distribution
-manifest schema, but nothing at this revision reads it.
+Only the model registry is required to serve traffic. Without it the gateway
+starts, serves `/health`, and answers `GET /v1/models` with an empty list.
+Without a routing file each route keeps the weight the registry gives it, and
+without an alerts file the built-in thresholds apply.
 
 The files are not the whole story once a database is configured. The admin
 console writes providers, keys, routes, weights and per-model overrides to the
 operational store, and the gateway re-applies that state on top of the loaded
 registry at every start.
 [Runtime configuration from the admin console](#runtime-configuration-from-the-admin-console)
-covers that layer.
+covers that layer, and
+[Settings stored in the database](#settings-stored-in-the-database) covers the
+settings.
 
 ## Where configuration lives
 
-There is no `config/models.yaml` or `config/routing.yaml` in this repository.
-`config/` holds one directory, `config/examples/`, containing reference files
-that are meant to be copied or pointed at:
+`config/examples/` contains reference gateway configuration, including
+`models.openrouter.yaml` and `routing.minimal.yaml`. A deployment keeps its
+model registry, routing rules and alerts in its own configuration directory,
+such as `distributions/<name>/config/`, and selects them through explicit
+environment variables or an active distribution manifest.
+[Distribution customization](distribution-customization.md#the-distribution-manifest)
+explains the manifest and overlay layout.
 
-```text
-config/examples/
-├── models.openrouter.yaml     # neutral default catalog (llama-3.3-70b, ...)
-├── routing.minimal.yaml       # companion routing file, names no hosts
-└── distribution.example.yaml  # annotated manifest reference
-```
-
-A real deployment's configuration lives in a **distribution overlay**: one
-directory under `distributions/` holding that deployment's manifest, config
-files, Compose/env inputs, and branding.
-
-```text
-distributions/<name>/
-├── distribution.yaml       # the manifest: identity + where the config files are
-├── config/
-│   ├── models.yaml
-│   └── routing.yaml
-└── deploy/
-    ├── backend.env         # any *.env here; Compose reads them all
-    └── docker-compose.yml  # optional overlay on deploy/docker/docker-compose.yml
-```
-
-The split exists so the source tree and the container image stay neutral. Model
-IDs, upstream base URLs, ports, site identity and branding are properties of one
-deployment, not of the project; keeping them in an overlay means the image can be
-built once and a deployment's overlay mounted into it (`deploy/docker/docker-compose.yml`
-mounts the overlay read-only rather than baking it into the image). It also means
-a clone of this repository ships nobody's hosts.
-
-Not every change needs a file. A provider, a key, a route or a whole model can
-also be added from the admin console while the gateway runs; that state lives
-in Postgres rather than in the overlay, and is described
+A provider, key, route or whole model can also be added from the admin console
+while the gateway runs. That state lives in Postgres and is described
 [below](#runtime-configuration-from-the-admin-console).
 
 ## How a gateway finds its config
 
 Precedence is environment, then manifest, then built-in default.
 
-`resolve_config_path()` in `apps/backend/serving/config/distribution.py` resolves
-each config kind independently, in this order:
+Each kind of file is looked up on its own, in this order:
 
 1. **An explicit environment variable.** `MODELS_CONFIG_PATH`,
    `ROUTING_CONFIG_PATH`, `ALERTS_CONFIG_PATH`. (The older names `MODELS_CONFIG`
    and `ROUTING_CONFIG` are still accepted; the canonical `*_CONFIG_PATH` name
-   wins when both are set.) `ALERTS_CONFIG_PATH` counts as an override only when
-   you actually set it: it has a non-empty built-in default, so the resolver
-   tracks whether you supplied the value rather than testing it against `""`.
+   wins when both are set.)
 2. **The distribution manifest's `paths:` section** — only when
-   `DISTRIBUTION_CONFIG_MODE=active`; see below.
+   `DISTRIBUTION_CONFIG_MODE=active`. By default a manifest is only checked,
+   not applied; see
+   [Activating a manifest](distribution-customization.md#activating-a-manifest).
 3. **The built-in default**, which points at the reference examples:
    `config/examples/models.openrouter.yaml` and
    `config/examples/routing.minimal.yaml`. The `alerts` default is
-   `config/alerts.yaml`, a path this repository deliberately does not ship — a
+   `config/alerts.yaml`, a path this repository does not ship — a
    missing alerts file means "use the built-in thresholds".
 
-Two consequences worth internalising:
+Two things follow:
 
 - An environment variable **beats the manifest**. If you set `MODELS_CONFIG_PATH`
-  in a deployment that also has a manifest, the manifest's `models:` path becomes
-  decorative. The gateway logs this rather than hiding it
-  (`explicit env override ... wins over manifest value ...`). Pick one mechanism.
+  in a deployment that also has a manifest, the manifest's `models:` path is
+  ignored, and the gateway logs
+  `explicit env override ... wins over manifest value ...`. Pick one mechanism.
 - Paths that come from the environment are resolved relative to the **working
   directory** of the process. Relative paths inside a manifest are resolved
   against **the manifest file's own directory**.
@@ -106,368 +92,6 @@ Two consequences worth internalising:
 A path that resolves from layer 1 or 2 but does not exist is a warning, not a
 failure: the gateway logs `Models config not found: <path> (source=env)` and
 continues with no models registered.
-
-## The distribution manifest
-
-A manifest is one versioned YAML document that names a deployment and tells the
-gateway where its config files are. `config/examples/distribution.example.yaml`
-is the annotated reference. Both examples below and in that file close public
-signup when activated; change `public_signup` to `true` or null if this
-deployment should accept new accounts through the public signup API:
-
-```yaml
-schema_version: 1
-
-distribution:
-  id: example
-  display_name: Example Router
-  release: "1.0.0"
-
-site:
-  public_base_url: https://your-gateway.example
-  support_email: support@your-gateway.example
-
-features:
-  routers: [fixed]
-  public_signup: false
-  rag: false
-
-paths:
-  models: config/models.yaml      # relative to this file's directory
-  routing: config/routing.yaml
-
-deployment:
-  target: local
-```
-
-Point the gateway at it with two environment variables:
-
-```bash
-export DISTRIBUTION_CONFIG_PATH=distributions/<name>/distribution.yaml
-export DISTRIBUTION_CONFIG_MODE=active
-```
-
-With an active manifest, `features.public_signup: false` disables both the
-signup UI and `POST /auth/signup` (HTTP 403, without creating an account).
-Neither `SIGNUP_ENABLED=true` nor a runtime `signup_enabled=true` override can
-reopen it. To enable public signup, change the manifest to `true` or leave the
-field unset/null and restart the backend, then ensure the effective
-`signup_enabled` setting is enabled.
-
-The admin API rejects attempts to set `signup_enabled=true` while the active
-manifest disables signup (HTTP 400, without saving the setting). Manifest root
-and `features` fields reject unknown keys, including `public-signup`,
-`publicSignup`, or a `public_signup` field at the manifest root.
-
-When the manifest allows signup, the runtime `signup_enabled` setting takes
-precedence over `SIGNUP_ENABLED` (default `true`). The same rule applies with
-no manifest or in dark mode; dark-mode feature values have no effect.
-`GET /site-config` reports the resulting boolean in `features.public_signup`,
-so the console follows the backend policy. Email verification, domain-based
-approval, and quotas remain separate checks; allowing registration does not
-bypass them.
-
-If a runtime signup-setting read fails or exceeds one second, the gateway
-temporarily disables public signup. A valid `/site-config` response still
-returns HTTP 200 with its identity and branding intact and
-`public_signup: false`; registration returns HTTP 403 without creating an
-account. It does not fall back to an environment value that could reopen
-registration.
-
-Because `/site-config` is unauthenticated and read while rendering every
-console page, the gateway does not repeat a failing read for every request.
-Callers that arrive together while the setting's cache is cold share one
-store round-trip, and a failed read is reused for five seconds, so an outage
-costs one timeout per window rather than one per request. Recovery needs no
-restart: the window expires on its own, and writing `signup_enabled` through
-the administrator API clears it at once.
-
-### Dark mode is the default, and that is deliberate
-
-`DISTRIBUTION_CONFIG_MODE` defaults to `dark`. In dark mode the manifest is
-loaded and validated, and the resolver logs what it *would* change, but current
-resolution stays effective:
-
-```text
-[distribution dark mode] models config stays config/examples/models.openrouter.yaml
-(source=default, sha256=51fd6cde50fd); manifest would use
-/srv/app/distributions/example/config/models.yaml (sha256=6117799cd0bf) — DIFFERENT
-```
-
-Setting only `DISTRIBUTION_CONFIG_PATH` therefore cannot change behaviour; you
-get a warning telling you the mode defaulted to `dark`. Config-path resolution
-treats an unrecognised mode as `dark` with a warning. Signup, `/site-config`, and
-the RAG feature policy are stricter: an explicitly empty or unknown mode, or
-`active` without a manifest path, closes signup (HTTP 403), makes `/site-config`
-report an unavailable configuration (HTTP 503), and makes authenticated
-`/v1/rag/status` and `/v1/rag/chat` requests return HTTP 503. Only an unset mode
-defaults to `dark`, including in Compose. Enable a manifest by running dark
-first, reading the comparison lines, and only then setting `active`.
-
-Mode warnings are logged once per distinct value per process. When diagnosing
-RAG configuration errors, check the startup logs and the backend's effective
-`DISTRIBUTION_CONFIG_MODE` and `DISTRIBUTION_CONFIG_PATH`, rather than expecting
-the warning to repeat on every request. Correct the values and restart the
-backend. See [Docs RAG Assistant](rag-chat.md) for the feature restriction.
-
-Failure behaviour differs by mode, on purpose. In dark mode a manifest that will
-not load is logged and skipped. In active mode the manifest *is* where the paths
-come from, so a manifest that will not load — a lost overlay mount, a YAML error
-— refuses to start rather than quietly serving a different registry.
-
-The manifest root and `features` are closed schemas: unknown keys are rejected,
-including misspelled feature names or feature flags placed at the root. This
-changes the earlier behavior that silently ignored these keys. Before upgrading
-an active deployment, validate its actual overlay with the new backend code;
-the repository's example manifests do not validate privately maintained
-overlays. Correct misspellings and keep operator-specific metadata in a separate
-file. With `DISTRIBUTION_CONFIG_PATH` set to the deployed manifest, run:
-
-```bash
-uv run python - <<'PY'
-import os
-from pathlib import Path
-from serving.config.distribution import load_distribution_config
-
-load_distribution_config(Path(os.environ["DISTRIBUTION_CONFIG_PATH"]))
-print("Manifest valid.")
-PY
-```
-
-This is not exhaustive typo detection: `paths`, `site`, `distribution`, and
-`deployment` still ignore unknown section keys for compatibility. In particular,
-check `paths.models` and the resolved model-registry log before activating an
-overlay; an unknown path key is treated as an omitted path and can select a
-legacy default. Strict validation of those sections is a separate compatibility
-change.
-
-If an invalid active manifest reaches the HTTP handlers, signup remains closed
-and `/site-config` returns HTTP 503 without exposing file paths or parser
-errors. It cannot return a valid identity until the manifest is repaired.
-
-### Identity, and what the manifest must not contain
-
-`site:` and `features:` are served as a public subset by `GET /site-config`, and
-`distribution.display_name` / `site:` feed backend-rendered content (transactional
-emails, attribution headers) through `get_site_identity()` in
-`apps/backend/serving/config/site_identity.py`. Both are gated on
-`DISTRIBUTION_CONFIG_MODE=active`; in dark mode `/site-config` returns a
-neutral document and identity falls back to `SITE_NAME` / `SITE_PUBLIC_BASE_URL`
-/ `SITE_DOCS_URL` / `SITE_SUPPORT_EMAIL` or to neutral defaults.
-
-Manifests must not contain secrets. Credentials stay in the environment, and
-`schema_version: 1` deliberately does not interpolate environment variables into
-manifest values.
-
-## Backend extensions
-
-`BACKEND_EXTENSIONS` is an optional comma-delimited list of trusted, local Python
-module names. It is empty by default. Each module must expose a synchronous
-`register()` function that takes no arguments. The gateway imports and registers
-each module once per process, after loading dotenv and before constructing
-runtime routes or consuming their registries. An import or registration failure
-aborts startup; the gateway does not silently use a different adapter.
-
-Extensions register factories through
-`serving.servers.registry.register_adapter_factory(kind, factory, *, override=False)`.
-A factory receives a configuration dictionary and returns an adapter, before
-built-in provider defaults are applied. Registering an existing extension kind
-is an error. Replacing a built-in kind requires `override=True` and emits a log
-entry. Registered kinds also become reserved provider labels. The startup
-`register()` function may populate the existing runtime-setting and provider
-metadata dictionaries before their consumers run; it must mutate those shared
-dictionaries rather than replace them.
-
-The deployment must make these modules importable, for example through its
-read-only overlay mount. This executes trusted server code, not user-supplied
-configuration: do not derive module names from requests or allow an admin form
-to choose them. The loader does not fetch remote modules or load code per
-request. Import all extension code during startup, avoid later lazy imports or
-live code reloads, and restart the backend when changing the mounted extension.
-See [Deployment-local adapters](adding-models.md#deployment-local-adapters) for
-a minimal factory example.
-
-### Cloud Agent access
-
-The gateway keeps its fixed role hierarchy and resolves current account state.
-The deployment owns the rule for who can use or administer its Cloud Agent.
-A trusted extension registers one synchronous callback during `register()` with
-`serving.agent_access.register_agent_access_policy(policy)`. The callback receives
-a read-only mapping containing exactly `user_id` and `role`, after the gateway
-has verified that the user exists and has status `active`. It receives no
-profile, credentials, or database connection.
-
-The callback returns a `list[str]` or `tuple[str, ...]` of explicit permissions:
-`agent.use` permits Agent use, and `agent.admin` permits Agent administration.
-Administration requires both permissions. Unknown, repeated, or non-string
-permissions are invalid; values are not coerced. Registering a second policy is
-an error. With no registered policy, Agent access is denied for every role.
-The gateway imposes no deployment-specific role-to-permission rule.
-
-The standalone Agent reads `GET /internal/users/{user_id}/agent-access` using
-the existing `GATEWAY_GRANT_DISPATCH_TOKEN` bearer token. A successful response
-contains exactly `user_id`, `allowed`, and `permissions`; `allowed` is true
-exactly when `agent.use` is present. Permissions are returned in the order
-`agent.use`, `agent.admin`. An intentional denial is HTTP 200 with
-`allowed: false` and `permissions: []`. The endpoint reads the gateway's
-operational store and evaluates the policy on each request; it does not cache
-permission decisions. Account reads retain the existing user-cache semantics:
-`CachedOperationalStore` caches user rows for 60 seconds, and account changes
-through that wrapper invalidate the affected entry. Direct database edits or
-writes in another process may remain unseen until that cache entry expires.
-
-Unknown or inactive accounts receive HTTP 403 with error type
-`subject_unavailable`, before the callback runs. A callback exception or invalid
-result receives HTTP 503 with error type `agent_access_unavailable`, without
-policy details. Both use the gateway's standard `{"error": {"type": ...,
-"message": ...}}` envelope. Dispatch authentication and unavailable internal
-API configuration retain their existing 401 and 404 responses. The legacy
-user-status and model-catalog endpoints retain their existing contracts.
-
-### Quota reporting
-
-The gateway keeps quota reporting and quota-aware routing independent of the
-service that measures usage. The public framework supplies the Providers
-tab's result rows, disabled-key cards, key discovery and `gather_all`, plus
-RouteWise's quota snapshots. No quota source is enabled by default. A trusted
-backend extension connects an authorized usage API or the operator's own
-metering service; the framework does not require a particular supplier,
-website login or cookie.
-
-An extension's `register()` calls
-`serving.admin.provider_quotas.register_quota_fetcher(provider, display_name, fetch)`;
-`fetch` is awaited as `fetch(operational_store, services)` and returns one
-`ProviderQuotaResult` per configured key, converting its own failures into
-results rather than raising. The admin endpoint supplies the store and services;
-RouteWise currently calls it with `(None, None)`, so the fetcher must also work
-without those objects. Registration runs at startup, not when the module is
-merely imported. A fetcher queries usage; it does not send user inference
-requests or change the route's inference protocol.
-
-Each result contains `ProviderQuotaUsage` rows with `label`, `used`, `limit`,
-`unit` and an optional timezone-aware `reset_at`. The deployment's provider
-identifier links the source to its routes; it is not a hard-coded vendor
-enum. `quota_source.provider`, `usage_label` and `unit` must exactly match a
-returned result and usage row. Report the account/window shared by that quota
-pool, and keep independent accounts in distinct sources. Do not sum unrelated
-keys or present a failed query as zero usage.
-
-The UI can display percentages, currencies and other units, but RouteWise's
-quota admission consumes one **request** at a time and requires a compatible
-count-based source. A percentage alone is not a request allowance. The source
-owns window boundaries and reset times; `quota.limit` is a cross-check against
-its reported limit, not a replacement measurement. A source with no successful
-snapshot stays unready. A failed refresh does not manufacture a fresh balance;
-an existing pool retains its last successful snapshot and local increments.
-
-#### Run a local quota source
-
-The complete [example extension](../../distributions/example/quota_extension.py)
-reads `/usage` from the bundled fake provider. Its in-memory daily counter is
-only a teaching fixture, resets on process restart or at UTC midnight, and is
-not production accounting. It uses no real account or credential and is loaded
-only when explicitly selected through `BACKEND_EXTENSIONS`.
-
-After the developer setup, run these commands from the repository root in
-three terminals. First, start a simulated quota provider:
-
-```bash
-uv run python distributions/example/fixtures/fake-openai-provider/server.py \
-  --port 18353 --response-text ROUTED_TO_QUOTA --quota-limit 100
-```
-
-Then start a slower, priced fallback (its prices in the example are fictional):
-
-```bash
-uv run python distributions/example/fixtures/fake-openai-provider/server.py \
-  --port 18352 --response-text ROUTED_TO_FALLBACK --ttft-delay-ms 400
-```
-
-Finally start the gateway with the opt-in
-[quota registry](../../config/examples/models.routewise.quota.yaml). Name the
-demo token once so the admin call below can reuse it:
-
-```bash
-export DEMO_ADMIN_TOKEN=local-quota-demo-only
-
-PYTHONPATH=.:apps/backend \
-  PYTHON_DOTENV_DISABLED=1 \
-  BACKEND_EXTENSIONS=distributions.example.quota_extension \
-  EXAMPLE_QUOTA_BASE_URL=http://127.0.0.1:18353 \
-  MODELS_CONFIG_PATH=config/examples/models.routewise.quota.yaml \
-  ROUTING_CONFIG_PATH=config/examples/routing.minimal.yaml \
-  DB_ENABLED=false USER_AUTH_ENABLED=false ADMIN_TOKEN="${DEMO_ADMIN_TOKEN}" \
-  JWT_SECRET_KEY=local-quota-demo-signing-secret-not-for-production \
-  uv run uvicorn serving.servers.app:app --no-proxy-headers --host 127.0.0.1 --port 18080
-```
-
-These settings disable dotenv loading and user authentication and use a public
-demo-only admin token and JWT signing secret: keep the listener on loopback and
-never use them for a real deployment. The admin endpoint needs the signing
-secret even when authenticating with the demo token. Read the same result the
-console uses:
-
-```bash
-curl http://127.0.0.1:18080/admin/provider-quotas \
-  -H "Authorization: Bearer ${DEMO_ADMIN_TOKEN}"
-```
-
-Send several requests to calibrate the cost envelope and allow the first
-five-second probe/snapshot cycle to finish:
-
-```bash
-curl http://127.0.0.1:18080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"quota-demo","messages":[{"role":"user","content":"hi"}]}'
-```
-
-The response identifies the selected fixture. Initial requests use the fallback
-until the quota route has both a usage snapshot and cost-envelope evidence.
-Accepted chat requests, including active probes, consume the mock quota;
-health, model discovery and `/usage` reads do not. To simulate exhaustion,
-restart only the quota fixture with `--quota-limit 100 --quota-used 100`; after
-the next snapshot refresh, requests continue through the fallback. Stop each
-local process with Ctrl+C when finished.
-
-To see the card in the authenticated Web/Admin Console, configure this same
-extension and registry on a local full-stack demo backend, then open
-**Providers → Quotas**. Use a quota endpoint reachable from that backend:
-inside Compose, `127.0.0.1` denotes the backend container, not the host. The
-[Router Tutorial](router-tutorial.md) covers the full-stack demo and its
-authentication. With no returned results the Quotas tab stays visible and
-links back here; Overview, Keys, Availability and Performance are independent.
-
-For your own integration, copy the extension and replace its local HTTP query
-and mapping with your authorized data source. Preserve the result contract, bound network
-requests with a timeout, handle failures explicitly and keep credentials out
-of responses and logs. Supplier-specific authorization and service terms still
-apply; using an extension is a software boundary, not an exemption from them.
-
-## The example distribution
-
-`distributions/example/` is a complete, runnable overlay kept in the repository
-as a teaching artifact: a manifest, a one-model registry pointing at a bundled
-fake provider that needs no credential, Compose overlays, and smoke scripts.
-Walk through it with the [Quickstart](router-tutorial.md):
-
-```bash
-make up DISTRIBUTION=example
-make smoke DISTRIBUTION=example
-```
-
-It carries a marker file, `EXAMPLE_OVERLAY`, whose presence keeps it out of
-automatic discovery. The Makefile picks a distribution like this:
-
-- Overlays are discovered from `distributions/*/deploy/*.env`, minus any
-  directory containing `EXAMPLE_OVERLAY`.
-- Exactly one candidate: it is selected automatically, and `make` prints which
-  identity it is compiling in.
-- Several candidates: `make` fails and asks you to name one.
-- None (the state of a fresh clone of this repository): no overlay is selected,
-  and the stack is neutral.
-
-`DISTRIBUTION=<name>` selects one by name — including the example, which is only
-ever selected explicitly. `DISTRIBUTION=none` opts out.
 
 ## What a fresh clone does with no configuration at all
 
@@ -488,9 +112,13 @@ key expands to empty — and the gateway says so before serving anything:
 
 ```text
 No models are available: every model in config/examples/models.openrouter.yaml was
-skipped because its credential is unset. Set OPENROUTER_API_KEY and restart.
-/v1/models will stay empty until then, and requests will report the model as not found.
+skipped because its credential is unset. Set OPENROUTER_API_KEY (Admin > Configuration)
+and restart. /v1/models will stay empty until then, and requests will report the
+model as not found.
 ```
+
+With a database, set it on the admin console's **Configuration** tab instead,
+which lists it as missing, and restart the backend.
 
 This is the fastest way to a gateway that routes real traffic. Replace the file
 with your own registry once you know what you want to serve.
@@ -502,16 +130,14 @@ here because they are properties of *configuration loading* rather than of any
 one field:
 
 **A route's `kind:` picks the adapter; the model's `provider:` is its default.**
-Each entry under `route:` names a `kind:`, and `kind` is what
-`registry._make_adapter` dispatches on. When a route omits `kind:`, the model's
-top-level `provider:` is used; when a model omits `route:` entirely, a single
-route is synthesised from the top-level `provider:`, `base_url` and `api_key`.
-`provider` is also the label written to `api_logs.provider` and shown in metrics,
-which is why a route may override it independently with `provider:`.
+When a route omits `kind:`, the model's top-level `provider:` is used; when a
+model omits `route:` entirely, a single route is built from the top-level
+`provider:`, `base_url` and `api_key`. `provider` is also the label written to
+`api_logs.provider` and shown in metrics, which is why a route may override it
+independently with `provider:`.
 
-**Adapter construction is centralized.** `_make_adapter`
-(`apps/backend/serving/servers/registry.py`) checks registered extension factories
-first, then dispatches these built-in kinds:
+**These are the built-in kinds.** A deployment can add more with a
+[backend extension](backend-extensions.md); those are checked first.
 
 | Kind | Adapter |
 |---|---|
@@ -523,26 +149,15 @@ first, then dispatches these built-in kinds:
 
 Local inference servers have no dedicated adapter: `vllm`, `sglang` and `ollama`
 are OpenAI-compatible kinds that differ only in their provider label and usage
-handling. A kind that is neither built-in nor explicitly registered by an
-extension raises `ValueError: Unknown adapter kind: <kind>` during registry
-loading. To re-derive the built-in list from the code:
+handling. Any other kind fails registry loading with
+`ValueError: Unknown adapter kind: <kind>`.
 
-```bash
-sed -n '/def _make_adapter/,/Unknown adapter kind/p' apps/backend/serving/servers/registry.py
-```
-
-A `grep` for `if kind` misses most of it: the OpenAI-compat arm is a single
-`if kind in (` followed by the names on their own lines, so none of them
-appear in the output.
-
-The neighbouring `RESERVED_PROVIDER_LABELS` set in the same module is a
-different, larger list — the labels a route may not borrow as a custom
-`provider:` — and includes registered extension kinds and names such as `openai`
-and `router` that are *not* adapter kinds.
-
-**Environment interpolation in the registry is whole-value only.** In
-`models.yaml`, a value is expanded only when the entire string is exactly
-`${VAR}`. There is no `${VAR:-default}` and no embedded substitution:
+**`${VAR}` interpolation in the registry is whole-value only.** In
+`models.yaml`, only `base_url`, `api_key`, `api_keys`, `provider_model_id` and a
+route's `embeddings_path` are expanded, and only when the entire value is
+exactly `${VAR}`. The value is the [setting](#settings-stored-in-the-database)
+of that name: its database value, else the environment variable. There is no
+`${VAR:-default}` and no embedded substitution:
 
 ```yaml
 base_url: ${LOCAL_BASE_URL}                  # expanded
@@ -553,18 +168,23 @@ base_url: http://${LOCAL_HOST}/v1            # NOT expanded — the literal stri
                                              #   including "${LOCAL_HOST}", is used
 ```
 
-The routing file uses a different, more capable expander (see below). Do not
-carry habits from one file to the other.
+The routing and alerts files are more permissive (see below), so do not carry
+habits from one file to the other.
 
 ## The routing file
 
-`routing.yaml` is optional. It configures the deployment-wide weight strategy and
-the health probe loop. The schema is `RoutingConfig` in
-`apps/backend/routing/config.py`; every key with its real default:
+`routing.yaml` is optional, and most deployments can leave it out. Read this
+section before relying on it: on a gateway with a database, which includes the
+standard Docker stack, its weight split has no effect, and its health probe
+never changes routing. Where traffic goes is decided by the weights in the
+model registry, any weight overrides set in the admin console, and the router
+described in [Routing](routing.md).
+
+Every key, with its default:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `default_router` | `fixed` | Deployment-wide weight strategy. Only `fixed` does anything: `RoutingManager.apply()` returns without touching weights for any other value. |
+| `default_router` | `fixed` | The router for models that do not name one with `router:`. The weight split below also runs only when this is `fixed`. |
 | `timeout` | `2` | Seconds a health probe waits for a connection. |
 | `health_check` | `0` | Seconds between health probes; `0` disables probing. |
 | `local_deployment` | `[]` | Endpoints treated as local. |
@@ -593,32 +213,27 @@ remote_deployment:
     models: [<model-id>]
 ```
 
-How it is applied: `RoutingManager` groups each model's registered adapters into
-local and remote — an adapter joins a group when its `base_url` matches that
-entry's `endpoint:` exactly *and* the model is named in that entry's `models:`.
-It then splits traffic
-between the two groups (`FixedRatioStrategy`, 50/50 unless the deprecated
-`routing_parameter.local_fraction` block sets otherwise), spreads weight evenly
-within each group, and renormalises so the weights of a model's routes sum to
-1.0. When one group is empty for a given model, the whole weight goes to the
-other. A model that matches nothing here keeps the weights from its `route:`
-list.
+**The weight split applies only to a gateway without a database.** At startup,
+the gateway sorts each model's routes into local and remote: a route joins a
+group when its `base_url` matches that entry's `endpoint:` exactly *and* the
+model is named in that entry's `models:`. It then gives each group half the
+traffic (unless the deprecated `routing_parameter.local_fraction` sets another
+share), spreads that evenly within the group, and scales a model's weights to
+sum to 1.0. When one group is empty for a model, the other gets everything. A
+model that matches nothing keeps the weights from its `route:` list. On a
+gateway with a database, routing reads the registry's weights plus any admin
+overrides and never sees this split.
 
 Health probing covers `local_deployment` endpoints only — remote providers do not
 serve the gateway's `/health` path and would be marked unhealthy for it. Each
 probe is a `GET` to the endpoint's origin root plus `/health`.
 
-**The probe is advisory: it does not change routing.** `RoutingManager.apply()`
-is the only reader of its verdicts and it runs once, during bootstrap,
-synchronously — before the prober task it just started has had a chance to run a
-single probe. So grouping always sees every endpoint as healthy, and an endpoint
-that fails every probe keeps its weight and keeps taking traffic. What the probe
-does do is report: each transition (healthy → unhealthy and back) is logged at
-`WARNING`, and `GET /routing` publishes the current verdicts under
-`manager_status.endpoint_health`, alongside `endpoint_health_enforced: false` as
-a standing reminder that the map is observation, not admission control. Removing
-a wedged endpoint from rotation is the circuit breaker's job
-([Routing](routing.md)).
+**The probe only reports; it never changes routing.** An endpoint that fails
+every probe keeps its weight and keeps receiving traffic. Each change of state
+is logged at `WARNING`, and `GET /routing` shows the latest results under
+`manager_status.endpoint_health`, next to `endpoint_health_enforced: false`.
+The [circuit breaker](routing.md#endpoint-health-and-circuit-breaking) is what
+takes a failing endpoint out of rotation.
 
 Unlike the model registry, this file's expander handles `${VAR}`,
 `${VAR:-default}`, and variables embedded in longer strings, at any depth.
@@ -628,6 +243,22 @@ Unlike the model registry, this file's expander handles `${VAR}`,
 deprecation warning. Per-model router selection (`router:` / `router_params:` in
 the model registry) overrides `default_router` and is documented in
 [Routing](routing.md).
+
+## Settings that currently have no effect
+
+The gateway accepts these when it loads its configuration, so setting them
+does not stop it from starting, but today they do nothing — or, in the case of
+the routing file's weight split, nothing on a gateway with a database.
+
+| Setting | Where | What happens |
+|---|---|---|
+| `local_deployment` / `remote_deployment` weight split | routing file | Applied only on a gateway without a database; see [The routing file](#the-routing-file) |
+| `health_check` probe results | routing file | Logged and reported on `GET /routing`, never used for routing |
+| `router_params.local_fraction` | model registry, `router: fixed` | Accepted and validated, not read |
+| `features.routers` | distribution manifest | Published in `/site-config`, does not select or restrict a router |
+| `paths.mcp` | distribution manifest | Accepted, not read by any component |
+| `site.terms_document`, `site.privacy_document` | distribution manifest | Accepted, not loaded into the terms page; use a [Site UI module](site-ui-modules.md) |
+| `deployment.target` | distribution manifest | A label only; does not select a host or build anything |
 
 ## Runtime configuration from the admin console
 
@@ -662,12 +293,15 @@ label a route declares — is read-only in this table, and a stored definition
 that reuses one of those slugs is skipped at boot rather than allowed to shadow
 it. Custom providers are `openai_compat` only; a protocol the generic adapter
 cannot speak needs an adapter, which is a code change
-([Adding a New Provider](adding-models.md#adding-a-new-provider)).
+([Writing a Provider Adapter](provider-adapters.md)).
 
 A key added here joins the same pool as the keys the registry names through
-`${VAR}` and rotates with them. An environment key has no row of its own, so
-the console can disable it or reserve it for a tier but cannot delete it; unset
-the variable and restart for that.
+`${VAR}` and rotates with them. A key the registry names — an *environment
+key* on this tab, whose value comes from the
+[settings](#settings-stored-in-the-database) — has no row in this table, so
+this tab can disable it or reserve it for a tier but cannot delete it. To
+remove it, clear the variable on the **Configuration** tab and restart the
+backend.
 
 ### Routing tab
 
@@ -678,19 +312,19 @@ the variable and restart for that.
 | Point a registry route somewhere else | edit the route's **Target** | `PUT /admin/routing/provider-routes/{model_id}/{route_id}`; `.../provider-route-verifications/{model_id}/{route_id}` to check first; `DELETE` removes the override and restores the YAML route | `provider_route_configs` |
 | Change a route's weight | the weight field on each route | `PUT` / `DELETE /admin/routing/weights/{model_id}/{endpoint_id}`; `GET` shows the YAML, override and effective values | `provider_weight_overrides` |
 | Switch a model between `fixed` and `routewise` | the strategy selector | `PATCH /admin/routing/provider-route-strategies/{model_id}` | `site_settings` |
+| Reserve a route for requests left waiting in the outbound queue or for an engine's first token | **Queue offload** | `PUT` / `DELETE /admin/routing/offload-routes/{model_id}`; `GET /admin/routing/offload-routes` lists every model's, and whether routing applies it — see [Queue-wait offload](routing.md#queue-wait-offload) | `site_settings` |
 | Tune RouteWise for one model | RouteWise settings | `/admin/routewise/model-settings` — see [RouteWise](routing.md#routewise) | `site_settings` |
 
 `GET /admin/routing/provider-routes` (or `.../{model_id}`) returns every route
 the gateway is serving, each tagged `source: yaml`, `override` or `runtime`,
 and is the quickest way to see what the two layers add up to.
 
-The provider selector on this tab is derived from the deployment, not from a
-list in the code: a built-in vendor kind is offered once the registry, the live
-route table or a configured credential names it, alongside every custom
-provider. Which route types a provider may be added as — `on_demand`,
+The provider selector on this tab offers every custom provider, plus each
+built-in kind that the registry, the live route table or a configured
+credential already names. Which route types a provider may be added as — `on_demand`,
 `quota` or `concurrency` — is the deployment's contract with that vendor and
-is declared with `PROVIDER_ROUTE_TYPES` (see
-[Environment variables](#environment-variables)); an unlisted provider may
+is declared with the `PROVIDER_ROUTE_TYPES` setting (see
+[Environment variables](installation.md#environment-variables)); an unlisted provider may
 use any of the three.
 
 A model created here is a **runtime model**: it exists only in the database,
@@ -719,14 +353,14 @@ moment it is saved.
 2. Stored provider keys, seeded into each provider's pool beside the
    environment keys.
 3. Per-model router strategy overrides.
-4. Runtime route candidates. A runtime *model* is resurrected only when its
-   commit marker is present; a candidate whose model is no longer in the
-   registry is quarantined with a warning rather than registered, so removing
-   a model from YAML does not bring it back through a leftover row.
+4. Runtime routes. A runtime model is restored only if its creation finished;
+   a stored route whose model is no longer in the registry is skipped with a
+   warning, so removing a model from YAML does not bring it back through a
+   leftover row.
 5. Route overrides, retargeting the registry routes they name.
 6. Key tier reservations, re-read now that every provider is known; then
-   weight overrides, disabled providers and model visibility, loaded into
-   resolvers the router consults at request time.
+   weight overrides, disabled providers, offload routes and model visibility,
+   loaded into resolvers the router consults at request time.
 
 Two rules follow from that order. A stored change never edits the file it
 overrides: delete the override and the registry route, weight or `router:`
@@ -735,13 +369,192 @@ than replacing them. And the file still wins for anything the store has no row
 for, so a registry edit plus restart is how catalog metadata, aliases and new
 adapter kinds change.
 
+## Settings stored in the database
+
+Everything the gateway reads that is not one of the files above, the database
+connection or container wiring is a *setting*: provider keys, SMTP, Slack
+webhooks, proxy trust, browser origins, logging, routing and timeout tuning,
+the cloud-agent contract, and the secrets that sign sessions and protect API
+keys. A gateway with a database keeps them in its `app_config` table, and an
+administrator edits them on the admin console's **Configuration** tab. A
+gateway with `DB_ENABLED=false` has no stored settings and reads the
+environment and the built-in defaults only.
+
+### Where a value comes from
+
+Each setting resolves in this order:
+
+1. its row in the database — even an empty one, which is how a setting is
+   cleared;
+2. the environment variable of the same name;
+3. the built-in default.
+
+The environment is a starting point. At every start, a setting that has a
+non-empty value in the environment and no row in the database is copied into
+the database, and from then on the row wins. That is how an existing `.env`
+carries over on an upgrade, and why editing the variable afterwards changes
+nothing: the tab marks it **Environment ignored**. Change the value on the tab
+instead, or **Reset** it, so that the environment, and then the default,
+applies again. A reset lasts: the database remembers it, so the next start does
+not copy the variable in again, and later edits to it take effect. The
+switches on the **Settings** tab —
+`USER_AUTH_ENABLED`, `SIGNUP_ENABLED` and the others — are copied from the
+environment the same way.
+
+An environment value that is not valid on its own — a CIDR range that does not
+parse, a number that is not one — is not copied in. The backend then starts
+only if the database holds a valid value for that setting, which applies, with
+a warning in the log; otherwise it stops and names the variable. Fix or remove
+the variable, or store a valid value with `python -m serving.config.manage set`
+(see *Without the console* below), which works while the environment is
+invalid. The database connection settings (`DB_HOST`, `DB_PORT` and the
+others) are the exception: they are needed to read the database, so an invalid
+one always stops the backend.
+
+Settings that depend on each other — `TRUST_X_REAL_IP` needs
+`TRUST_PROXY_HEADERS` — are judged together, the database's values over the
+environment's. A variable whose partner is already stored is copied in like any
+other, so it survives the variable's removal. When the two sources together
+still break such a rule, neither side is copied in and the backend stops,
+naming the rule, until one side is corrected.
+
+On the first start against an empty database the backend also generates the
+two secrets it cannot run without, `JWT_SECRET_KEY` and `API_KEY_SECRET`,
+unless the environment supplies them. `API_KEY_SECRET` and
+`ERASURE_FENCE_SECRET` cannot be changed once set, because records depend on
+them; see [Database](database.md#secrets-for-deleting-accounts). The backend
+refuses to start rather than generate `API_KEY_SECRET` for a database that
+already holds API keys, since a new secret would invalidate every one of them.
+
+### The Configuration tab
+
+The tab groups the settings by category, describes each one and shows where
+its value comes from. Besides every setting the gateway reads itself, it lists:
+
+- every `${VAR}` the active model registry and routing file name, under
+  **Providers**, with the models that use it, and those of the alert rules
+  under **Alerts**;
+- numbered extra keys for a provider's key pool, such as `MINIMAX_API_KEY2`,
+  once one is set;
+- variables added with **Add variable**, for a `${VAR}` reference the gateway
+  cannot see yet, such as one in a registry you are about to switch to.
+
+Secrets are write-only: the tab shows whether one is set, never its value, and
+the admin audit log records only that it changed. A save is checked as a
+whole, against everything it leaves in force, so settings that depend on each
+other — `TRUST_CLOUDFLARE_HEADERS` needs `TRUST_PROXY_HEADERS` — can change
+together. A save or a **Reset** that would leave another setting unable to
+apply is refused and names it: turning `TRUST_PROXY_HEADERS` off while
+`TRUST_X_REAL_IP` is on, for example, or clearing the Cloudflare networks while
+`TRUST_CLOUDFLARE_HEADERS` is on. Change both in one save. A **Reset** is also
+refused when the environment value it would fall back to is not valid. A
+setting that was already invalid never blocks an unrelated change. The names that stay in the
+environment, such as `DB_PASSWORD` or `MODELS_CONFIG_PATH`, cannot be set here.
+Behind the tab are `GET` and `PATCH /admin/config` and
+`DELETE /admin/config/{key}`.
+
+### When a change applies
+
+Most settings apply as soon as they are saved: at once in the backend process
+that served the save, and within ten seconds in every other one. A setting
+marked **Restart required** is read only at startup, and the process keeps the
+value it started with until it restarts. Provider credentials and every
+variable the registry names are among them, as are the circuit-breaker and
+outbound-concurrency tuning, alerting and `DB_STORE_FULL_CONTENT`.
+
+While such a change is waiting, the tab shows a **Restart pending** notice with
+a **Restart backend** button. The button (`POST /admin/system/restart`) makes
+the backend exit so that its supervisor starts it again: Docker, through the
+bundled Compose file's `restart: unless-stopped`, or systemd, through the
+bundled units' `Restart=on-failure`. Nothing inside the process can see that
+policy, so the deployment declares it: the bundled Compose file and units set
+`SUPERVISOR_RESTARTS_BACKEND=1` next to it, and a deployment that starts the
+backend some other way sets it only if its supervisor restarts the process
+when it exits. Without it, and whenever several worker processes serve the
+backend (`WEB_CONCURRENCY` or `UVICORN_WORKERS` above 1, or
+`uvicorn --workers`, where the button would restart only one of them), the tab
+shows a command to run yourself instead, such as
+`docker restart hybridinference-backend`. A restart cuts off requests in
+flight, streams included. The console knows the restart is over once `/health`
+names a different process in its `instance` field, however quickly the backend
+came back.
+
+### Without the console
+
+A setting can break the console that edits it — a value that stops sign-in
+from working, say. `python -m serving.config.manage` changes stored settings
+from the command line instead, with the console's own validation:
+
+```bash
+docker exec -it hybridinference-backend python -m serving.config.manage list
+docker exec -it hybridinference-backend python -m serving.config.manage reset JWT_ALGORITHM
+```
+
+`list` shows every setting, `get KEY` one of them, `set KEY VALUE` stores a
+value — add `--secret` when it creates a custom variable that holds one — and
+`reset KEY` resets it as the tab's **Reset** does, so that the environment or
+the default applies again. It talks to the database directly with the `DB_*`
+connection settings alone, so it needs no sign-in and still runs when another
+setting in the environment is invalid, and it never prints a secret's value. When
+the backend container is not running, run it in the repository root of a
+source checkout instead (`uv run python -m serving.config.manage ...`), where
+`.env` reaches Postgres on `127.0.0.1:5432`. A running backend picks the
+change up within about ten seconds, or at its next restart for a setting
+marked **Restart required**. The command that resets an administrator's
+password works the same way; see
+[The first admin account](deployment.md#the-first-admin-account).
+
+### Missing settings
+
+Some settings are required: the two generated secrets, every variable a model
+route needs to load (unless the route is `optional: true`), and `SMTP_USER`
+and `SMTP_PASSWORD` while public signup requires email verification. When one
+of them has no value, the console shows a banner to signed-in users.
+Administrators get a link to the Configuration tab, where **Missing only**
+lists what to fill in; everyone else is told that some features may not work
+and to contact the administrator. A model whose credential is missing is not
+loaded, and a request for it is answered with a `404`. When an administrator
+sends it with their own API key, the `404` says the deployment's configuration
+is incomplete; anyone else gets the same "not found" as for a model the
+deployment does not define, so the difference reveals nothing beyond what
+they may use.
+
+A deployment that leaves a model's credential unset on purpose — a route it
+does not use yet, or a canary it enables elsewhere — should mark that route
+`optional: true` in the model registry. The route is then skipped quietly,
+and its variable is not reported as missing.
+
+```{warning}
+Settings are stored in plaintext. Anyone who can read the database — a
+`pg_dump`, a backup, a `psql` or pgAdmin session — can read every provider
+key, decrypt users' stored API keys and sign administrator tokens. Protect
+database access and backups as you would the credentials themselves.
+```
+
 ## Environment variables
 
-`Settings` (`apps/backend/serving/config/settings.py`) reads a `.env` file from
-the working directory and the process environment, case-insensitively; the
-process environment wins. `.env.example` in the repository root is the annotated
-list — copy it to `.env` and edit. Secrets belong here and only here: not in the
-model registry (reference them as `${VAR}`), not in the manifest.
+The environment keeps what the backend needs before it can reach its database
+and what describes the containers rather than the application:
+
+- the database connection: `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`,
+  `DB_PASSWORD`, `DB_ENABLED`;
+- the configuration files: `MODELS_CONFIG_PATH`, `ROUTING_CONFIG_PATH`,
+  `ALERTS_CONFIG_PATH`, `DISTRIBUTION_CONFIG_PATH`,
+  `DISTRIBUTION_CONFIG_MODE`;
+- the backend process: `LOG_FILE`, `BACKEND_EXTENSIONS`, `GEOIP_COUNTRY_DB`,
+  `GEOIP_COUNTRY_PROVIDER`, `WEB_CONCURRENCY`, `SUPERVISOR_RESTARTS_BACKEND`,
+  and `REFRESH_TOKEN_COOKIE_NAME`, which the console reads too;
+- Compose and the console: host ports and bind addresses, the console's build
+  values and its runtime ones such as `AGENT_WEB_INTERNAL_URL`.
+
+The gateway reads a `.env` file from its working directory and the process
+environment; the process environment wins. `.env.example` in the repository
+root is the annotated list — copy it to `.env` and edit.
+[Installation](installation.md#environment-variables) lists the settings you
+are most likely to set. A value in the environment for any other setting is
+imported into the database at startup, as described above. Never write a
+secret into the model registry or the manifest: reference it there as
+`${VAR}`.
 
 ## Running with your configuration
 
@@ -756,10 +569,10 @@ curl -s localhost:8080/health           # includes routes_configured
 curl -s localhost:8080/v1/models        # generated from the registered adapters
 ```
 
-The startup log is the authority on resolution. `Registered N routes from <path>`
-names the file that won; `[distribution dark mode] ...` lines show what a manifest
-would have changed; `Skipping model '<id>' ... after env expansion` names each
-model whose credentials were unset.
+The startup log says what was loaded. `Registered N routes from <path>` names
+the registry file that was used; `[distribution dark mode] ...` lines show what
+a manifest would change once activated; `Skipping model '<id>' ... after env
+expansion` names each model whose credentials were unset.
 
 ```{warning}
 `GET /routing` requires no credentials and returns, for every published route,
@@ -771,3 +584,15 @@ additionally reports unpublished routes and requires an administrator's JWT
 or `ADMIN_TOKEN` in the `Authorization: Bearer ...` header. Treat both endpoints'
 output as sensitive.
 ```
+
+## Optional phone authentication
+
+Phone signup, login and binding are disabled by default. Enable `SMS_AUTH_ENABLED` and select `SMS_PROVIDER=tencent` in **Admin > Configuration** only after delivery is configured. The gateway advertises `features.phone_auth` through `/site-config`; the shared forms show the phone option only when it is available. Existing email and first-run administrator logins continue to work.
+
+The Tencent adapter requires `TENCENT_CLOUD_SECRET_ID`, `TENCENT_CLOUD_SECRET_KEY`, `SMS_REGION`, `SMS_SDK_APP_ID`, `SMS_SIGN_NAME` and `SMS_TEMPLATE_ID`. Temporary credentials also require `TENCENT_CLOUD_TOKEN`. Its approved template takes the code and its lifetime in minutes, in that order. This adapter currently sends to mainland China mobile numbers only. Keep real credentials, approved signatures and template IDs in deployment configuration, outside source control.
+
+Account identifiers use international format, such as `+8613812345678`. `SMS_DEFAULT_COUNTRY_CODE` optionally supplies a calling code for local input; leave it empty to require international input. `SMS_ALLOWED_PREFIXES` optionally restricts destinations using comma-separated prefixes. For the Tencent domestic adapter, set the former to `86` if local input is desired and the latter to `+86`. Number policy belongs to the deployment, while provider delivery remains separate from account storage.
+
+Codes expire after 300 seconds by default, allow at most five guesses, and can be consumed once. PostgreSQL serializes send and verification quotas across workers; the `SMS_OTP_*` settings control their bounds. Turnstile and trusted-proxy client IP handling remain shared with signup. Phone registration follows public-signup and approval policy, never automatically merges with an email account, and creates no password. Binding requires an authenticated session and a separate code for that account.
+
+Startup adds phone identity columns and durable code tables and makes password hashes nullable. Upgrade every gateway worker before enabling phone signup. Back up the database first; once phone-only accounts exist, an older binary that assumes every account has a password is not a supported rollback. Disabling SMS hides phone login but does not remove accounts, so arrange another verified sign-in method before disabling it for phone-only users. Site UI v1 message overrides remain optional; distributions can translate the added phone message slots without owning authentication logic.

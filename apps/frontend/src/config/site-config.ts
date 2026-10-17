@@ -115,11 +115,18 @@ const runtimeBrandingSchema = z
       .object({
         logo_url: assetUrlSchema,
         favicon_url: assetUrlSchema,
+        // Optional: the backend omits it (`exclude_none`) for documents that
+        // never named a hero image.
       })
       .strict(),
     team: z.array(teamMemberSchema),
     sponsors: z.array(sponsorSchema),
   })
+  // Strict, like the gateway's own branding model: this object is handed around
+  // the application and rendered, so a key nobody declared is a mistake worth
+  // reporting. It is also the same rule on both sides of the wire — the
+  // gateway refuses such a document before it is ever served, so a console that
+  // quietly dropped the key would only ever hide a deployment misconfiguration.
   .strict();
 
 const distributionSchema = z
@@ -141,9 +148,23 @@ const featuresSchema = z
   .object({
     routers: z.array(z.string()),
     public_signup: z.boolean().nullable(),
+    phone_auth: z.boolean().optional().default(false),
     rag: z.boolean().nullable(),
+    // The gateway only sends this key when the deployment enables public
+    // stats, so a document without it means "off".
+    public_stats: z.boolean().nullable().optional(),
   })
   .strict();
+
+// First-run setup and configuration health. Top-level siblings of `features`
+// rather than members of it: `features` is strict, so a key added there would
+// make an older console refuse the whole document, while unknown top-level keys
+// pass through. Optional for the same reason in the other direction — a gateway
+// that predates them has no setup flow and no configuration registry, which is
+// "not required" and "complete". The inner objects are not strict, so a later
+// field (a count, say) does not take this console down either.
+const setupStateSchema = z.object({ required: z.boolean() });
+const configurationStateSchema = z.object({ incomplete: z.boolean() });
 
 const versionedSiteConfigDocumentSchema = z
   .object({
@@ -155,8 +176,15 @@ const versionedSiteConfigDocumentSchema = z
     // before its branding document without replacing the compatibility values
     // already baked into the transition image.
     branding: z.unknown().nullable(),
+    setup: setupStateSchema.nullish(),
+    configuration: configurationStateSchema.nullish(),
   })
-  .strict();
+  // Unknown *top-level* keys are ignored rather than refused, and the asymmetry
+  // with the branding object below is deliberate. This envelope is what a
+  // gateway serves, and a gateway one version ahead of the console is a normal
+  // state during a rollout — refusing would take the deployment's identity and
+  // feature gates down over a key this console does not read.
+  .passthrough();
 
 // The endpoint immediately preceding schema v1 exposed this exact subset.
 // Accept it during rolling upgrades and paired rollbacks so a neutral console
@@ -183,8 +211,18 @@ export interface RuntimeSiteConfig {
   };
   features: {
     publicSignup: boolean;
+    phoneAuth: boolean;
     rag: boolean;
     agents: boolean;
+    publicStats: boolean;
+  };
+  /** First-run setup: while required, every route but `/setup` redirects there. */
+  setup: {
+    required: boolean;
+  };
+  /** A required setting has no value. No setting names are published. */
+  configuration: {
+    incomplete: boolean;
   };
 }
 
@@ -192,7 +230,9 @@ export const buildTimeSiteConfig: RuntimeSiteConfig = {
   branding: buildTimeBranding,
   agentsUrl: '',
   distribution: { id: 'legacy', release: '' },
-  features: { publicSignup: true, rag: true, agents: false },
+  features: { publicSignup: true, phoneAuth: false, rag: true, agents: false, publicStats: false },
+  setup: { required: false },
+  configuration: { incomplete: false },
 };
 
 function resolveBranding(input: unknown, displayName: string, supportEmail: string): Branding {
@@ -280,12 +320,18 @@ export function resolveRuntimeSiteConfig(input: unknown): RuntimeSiteConfig {
 
   const document = parsed.data;
   let branding: Branding;
+  // A legacy document predates both states, and so does a v1 gateway without
+  // the setup flow: neither has anything to set up or report as missing.
+  let setupRequired = false;
+  let configurationIncomplete = false;
   if ('schema_version' in document) {
     branding = resolveBranding(
       document.branding,
       document.distribution.display_name,
       document.site.support_email,
     );
+    setupRequired = document.setup?.required === true;
+    configurationIncomplete = document.configuration?.incomplete === true;
   } else {
     branding = resolveLegacyBranding(
       document.distribution.display_name,
@@ -303,11 +349,16 @@ export function resolveRuntimeSiteConfig(input: unknown): RuntimeSiteConfig {
     },
     features: {
       publicSignup: document.features.public_signup ?? buildTimeSiteConfig.features.publicSignup,
+      phoneAuth: document.features.phone_auth,
       rag: document.features.rag ?? buildTimeSiteConfig.features.rag,
       // Only the server-side loader may enable the entry point, from an
       // explicit public URL or a configured local proxy.
       agents: false,
+      // Opt-in only: publishing usage stats needs an explicit true.
+      publicStats: document.features.public_stats === true,
     },
+    setup: { required: setupRequired },
+    configuration: { incomplete: configurationIncomplete },
   };
 }
 

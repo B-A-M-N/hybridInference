@@ -81,7 +81,7 @@ class DistributionInfo(_ManifestModel):
 
 
 class DistributionSite(_ManifestModel):
-    """Site identity and paths to distribution-owned public content."""
+    """Site identity and the path to the distribution-owned branding document."""
 
     public_base_url: str = ""
     support_email: str = ""
@@ -101,6 +101,9 @@ class DistributionFeatures(_ManifestModel):
     # True/None defer to the effective runtime/environment signup setting.
     public_signup: bool | None = None
     rag: bool | None = None
+    # Opt-in: publish aggregate usage stats at /stats (GET /public-stats).
+    # None and False keep them private.
+    public_stats: bool | None = None
 
 
 class DistributionPaths(_ManifestModel):
@@ -144,7 +147,7 @@ class DistributionConfigError(Exception):
 
 
 def load_distribution_config(path: Path) -> DistributionConfig:
-    """Load and validate a manifest and its declared branding document.
+    """Load and validate a manifest and its declared public documents.
 
     Relative ``paths:`` and ``site.branding`` values resolve against the
     manifest directory.

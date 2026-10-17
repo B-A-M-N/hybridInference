@@ -14,7 +14,10 @@ const API_BASE = config.apiBase;
 
 export interface AdminUser {
   id: string;
-  email: string;
+  /** `null` for an account that signs in with a login name instead. */
+  email: string | null;
+  login_name?: string | null;
+  phone?: string | null;
   user_name: string | null;
   role: string;
   status: string;
@@ -62,7 +65,8 @@ export interface ListUsersResponse {
 
 export interface ApproveRejectResponse {
   user_id: string;
-  email: string;
+  email: string | null;
+  phone?: string | null;
   status: string;
   message: string;
 }
@@ -187,7 +191,9 @@ export async function rejectUser(userId: string, reason: string): Promise<Approv
 
 export interface UserDetail {
   id: string;
-  email: string;
+  email: string | null;
+  login_name?: string | null;
+  phone?: string | null;
   user_name: string | null;
   role: string;
   status: string;
@@ -360,7 +366,8 @@ export async function resumeUser(userId: string, reason?: string): Promise<Appro
 
 export interface HardDeleteUserResponse {
   user_id: string;
-  email: string;
+  email: string | null;
+  phone?: string | null;
   message: string;
 }
 
@@ -738,6 +745,68 @@ export async function getRecentRequestsPerformance({
   return jsonOrThrow<AdminRequestPerfBreakdownResponse>(resp);
 }
 
+// ----------------------------------------------------------------------------
+// Offloaded requests — requests a model sent to its offload route
+// ----------------------------------------------------------------------------
+
+export interface AdminRequestOffloadGroup {
+  // The *served* model, as in the performance summary, and the offload route
+  // the requests were sent to. A model whose offload route moved during the
+  // window has one group per route.
+  model_id: string;
+  endpoint_id: string;
+  request_count: number;
+  // Offloaded requests that failed anyway. Client disconnects are not counted.
+  failed_count: number;
+  // Offloaded requests by the reason their log carries: `queue_wait`,
+  // `engine_wait` or `last_resort`. Keyed by string so a reason a newer gateway
+  // adds still arrives.
+  reasons: Record<string, number>;
+  // Every request the model had in the window, under the same filters.
+  model_request_count: number;
+}
+
+export interface AdminRequestOffloadsResponse {
+  generated_at: string;
+  days: number;
+  // Every offloaded request in the window, groups past the cap included.
+  total_offloaded: number;
+  groups: AdminRequestOffloadGroup[];
+  truncated: boolean;
+}
+
+export async function getRecentRequestOffloads({
+  days,
+  userId,
+  sessionId,
+  modelId,
+  requestType,
+  refresh = false,
+}: {
+  days?: number;
+  userId?: string;
+  sessionId?: string;
+  modelId?: string;
+  requestType?: 'chat' | 'embedding';
+  // Bypass the backend's short-lived per-filter cache, as for the performance
+  // summary.
+  refresh?: boolean;
+} = {}): Promise<AdminRequestOffloadsResponse> {
+  const params = new URLSearchParams();
+  if (days != null) params.set('days', String(days));
+  if (userId) params.set('user_id', userId);
+  if (sessionId) params.set('session_id', sessionId);
+  if (modelId) params.set('model_id', modelId);
+  if (requestType) params.set('request_type', requestType);
+  if (refresh) params.set('refresh', 'true');
+  const query = params.toString();
+  const resp = await fetchWithAuth(
+    API_BASE,
+    query ? `/admin/recent-requests/offloads?${query}` : '/admin/recent-requests/offloads',
+  );
+  return jsonOrThrow<AdminRequestOffloadsResponse>(resp);
+}
+
 export interface AdminRequestPerfTrendBucket {
   start_time: string;
   request_count: number;
@@ -848,7 +917,9 @@ export interface SparklineBucket {
 }
 
 export interface AnalyticsUserEntry {
-  email: string;
+  email: string | null;
+  login_name?: string | null;
+  phone?: string | null;
   user_id: string;
   requests: number;
   fraction: number; // 0.0–1.0 share of user-attributed requests in period
@@ -861,7 +932,9 @@ export interface AnalyticsBreakdownEntry {
 }
 
 export interface AnalyticsModelUserEntry {
-  email: string;
+  email: string | null;
+  login_name?: string | null;
+  phone?: string | null;
   user_id: string;
   requests: number;
   tokens: number; // prompt + completion tokens for this user + model
@@ -1220,7 +1293,9 @@ export interface ListBroadcastsResponse {
 
 export interface BroadcastRecipientItem {
   user_id: string;
-  email: string;
+  // Recipients are selected by email, so this is set in practice; typed like
+  // every other user email so a display site cannot assume it.
+  email: string | null;
   status: string;
   error: string | null;
   sent_at: string | null;
@@ -1758,6 +1833,59 @@ export async function clearAlertSnooze(): Promise<AlertSnoozeStatus> {
 }
 
 // ========================================
+// Per-Type Slack Alert Mutes
+// ========================================
+
+export interface AlertTypeMute {
+  alert_type: string;
+  label: string;
+  description: string;
+  group: string;
+  key_pattern: string;
+  muted: boolean;
+  /** Epoch seconds. `null` while `muted` means the mute lasts until lifted. */
+  muted_until: number | null;
+  muted_by: string | null;
+  /** Epoch seconds the mute was set, when known. */
+  muted_at: number | null;
+}
+
+export interface ListAlertMutesResponse {
+  types: AlertTypeMute[];
+}
+
+export async function listAlertMutes(): Promise<ListAlertMutesResponse> {
+  const resp = await fetchWithAuth(API_BASE, '/admin/alerts/mutes');
+  return jsonOrThrow<ListAlertMutesResponse>(resp);
+}
+
+/** Mute one alert type for `durationSeconds`, or until unmuted when `null`. */
+export async function muteAlertType(
+  alertType: string,
+  durationSeconds: number | null,
+): Promise<AlertTypeMute> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    `/admin/alerts/mutes/${encodeURIComponent(alertType)}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ duration_seconds: durationSeconds }),
+    },
+  );
+  return jsonOrThrow<AlertTypeMute>(resp);
+}
+
+export async function unmuteAlertType(alertType: string): Promise<AlertTypeMute> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    `/admin/alerts/mutes/${encodeURIComponent(alertType)}`,
+    { method: 'DELETE' },
+  );
+  return jsonOrThrow<AlertTypeMute>(resp);
+}
+
+// ========================================
 // Per-Role Daily Quota
 // ========================================
 
@@ -1962,6 +2090,93 @@ export async function clearRouteWeight(modelId: string, endpointId: string): Pro
     { method: 'DELETE' },
   );
   return jsonOrThrow<RouteWeight>(resp);
+}
+
+/** One model's queue-offload route: a reserved route for requests left waiting too long. */
+export interface OffloadRoute {
+  model_id: string;
+  route_id: string;
+  wait_seconds: number;
+  /**
+   * How many streaming requests a local engine of the model may have been sent
+   * without a first token before the gateway holds the rest in line; null sends
+   * every request straight to the engine. Absent from a gateway that predates it.
+   */
+  engine_queue_limit?: number | null;
+  /**
+   * The largest estimated prompt, in tokens, the offload route may be sent; a
+   * longer request is served only by the model's other routes. Null is no limit.
+   * Absent from a gateway that predates it.
+   */
+  max_input_tokens?: number | null;
+  endpoint_id: string | null;
+  active: boolean;
+  inactive_reason: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
+export interface ListOffloadRoutesResponse {
+  /**
+   * False while UPSTREAM_CONCURRENCY_ENABLED is off: nothing queues for a remote
+   * route. A local engine under an engine queue limit still holds its requests.
+   */
+  queue_enabled: boolean;
+  /** The outbound queue's acquire timeout: the longest a request waits in that queue. */
+  max_wait_seconds: number;
+  offload_routes: OffloadRoute[];
+}
+
+export interface ModelOffloadRouteResponse {
+  model_id: string;
+  offload: OffloadRoute | null;
+}
+
+export async function listOffloadRoutes(): Promise<ListOffloadRoutesResponse> {
+  const resp = await fetchWithAuth(API_BASE, '/admin/routing/offload-routes');
+  return jsonOrThrow<ListOffloadRoutesResponse>(resp);
+}
+
+/** The optional limits of an offload policy. A null or absent one is off. */
+export interface OffloadRouteLimits {
+  engineQueueLimit?: number | null;
+  maxInputTokens?: number | null;
+}
+
+/**
+ * Replace one model's offload policy. The policy is replaced whole, so a limit
+ * left out of `limits` is turned off.
+ */
+export async function setOffloadRoute(
+  modelId: string,
+  routeId: string,
+  waitSeconds: number,
+  limits: OffloadRouteLimits = {},
+): Promise<ModelOffloadRouteResponse> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    `/admin/routing/offload-routes/${encodeURIComponent(modelId)}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        route_id: routeId,
+        wait_seconds: waitSeconds,
+        engine_queue_limit: limits.engineQueueLimit ?? null,
+        max_input_tokens: limits.maxInputTokens ?? null,
+      }),
+    },
+  );
+  return jsonOrThrow<ModelOffloadRouteResponse>(resp);
+}
+
+export async function clearOffloadRoute(modelId: string): Promise<ModelOffloadRouteResponse> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    `/admin/routing/offload-routes/${encodeURIComponent(modelId)}`,
+    { method: 'DELETE' },
+  );
+  return jsonOrThrow<ModelOffloadRouteResponse>(resp);
 }
 
 export async function listRoutewiseSettings(

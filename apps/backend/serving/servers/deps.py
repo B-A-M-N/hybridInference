@@ -17,6 +17,7 @@ from fastapi import Depends, Header, HTTPException, Request
 
 from serving.config.settings import get_settings
 from serving.utils.logging import get_logger
+from serving.utils.phone_auth import phone_identity_unverified
 from serving.utils.request_ip import get_client_ip
 
 logger = get_logger(__name__)
@@ -62,9 +63,11 @@ if TYPE_CHECKING:
     from routing.manager import RoutingManager
     from routing.model_router_registry import ModelRouterRegistry
     from routing.routers import ManagedRouter
+    from serving.auto_mode import AutoMode
     from serving.config.disabled_providers import DisabledProviderResolver
     from serving.config.model_concurrency import ModelConcurrencyResolver
     from serving.config.model_visibility import ModelVisibilityResolver
+    from serving.config.offload_routes import OffloadRouteResolver
     from serving.config.routewise_model_settings import RouteWiseSettingsResolver
     from serving.config.weight_overrides import WeightOverrideResolver
     from serving.observability.alert_rules import AlertEngine
@@ -99,6 +102,7 @@ class AppServices:
     weight_override_resolver: WeightOverrideResolver | None = None
     routewise_settings_resolver: RouteWiseSettingsResolver | None = None
     disabled_provider_resolver: DisabledProviderResolver | None = None
+    offload_route_resolver: OffloadRouteResolver | None = None
     user_concurrency_limiter: UserConcurrencyLimiter | None = None
     alert_engine: AlertEngine | None = None
     runtime_settings: Any | None = None
@@ -106,9 +110,13 @@ class AppServices:
     pricing_lookup: PricingLookup | None = None
     cost_tracker: CostTracker | None = None
     responses_store: ResponseStore | None = None
+    # The ``auto:`` section of models.yaml, when it loaded cleanly. Served only
+    # while the ``auto_mode_enabled`` runtime setting is on (serving/auto_mode.py).
+    auto_mode: AutoMode | None = None
     weight_override_refresh_task: Any | None = None
     routewise_settings_refresh_task: Any | None = None
     disabled_provider_refresh_task: Any | None = None
+    offload_route_refresh_task: Any | None = None
 
 
 def model_router_transition_lock(
@@ -186,6 +194,13 @@ def get_model_visibility_resolver(
 ) -> ModelVisibilityResolver | None:
     """Dependency to obtain the ModelVisibilityResolver (if configured)."""
     return getattr(services, "model_visibility_resolver", None)
+
+
+def get_auto_mode(
+    services: AppServices = Depends(get_services),
+) -> AutoMode | None:
+    """Dependency to obtain the loaded auto mode (if configured)."""
+    return getattr(services, "auto_mode", None)
 
 
 def get_model_concurrency_resolver(
@@ -278,7 +293,9 @@ async def get_current_user(
         op_store: Operational store instance.
 
     Returns:
-        User context dictionary with user_id, email, role, etc.
+        User context dictionary with user_id, email, login_name, role, etc.
+        ``email`` is None for an account created without one (the first-run
+        setup administrator), whose token carries an empty ``email`` claim.
 
     Raises:
         HTTPException: 401 if token is missing, invalid, or expired.
@@ -306,11 +323,11 @@ async def get_current_user(
             detail="Invalid authentication token.",
         ) from None
 
-    # Extract user info from token
+    # Only the subject is needed: the email and role come from the database
+    # below, and an account without an email has an empty ``email`` claim.
     user_id = payload.get("sub")
-    email = payload.get("email")
 
-    if not user_id or not email:
+    if not user_id:
         raise HTTPException(
             status_code=401,
             detail="Invalid token payload.",
@@ -345,7 +362,9 @@ async def get_current_user(
         require_verification = await rs.get_bool("signup_require_email_verification")
     except (RuntimeError, KeyError):
         pass
-    if require_verification and not user_row["email_verified"]:
+    if (
+        require_verification and user_row.get("email") and not user_row["email_verified"]
+    ) or phone_identity_unverified(user_row):
         raise HTTPException(
             status_code=403,
             detail="Email not verified. Please check your email for the verification link.",
@@ -356,10 +375,15 @@ async def get_current_user(
     return {
         "user_id": user_id,
         "email": user_row["email"],
+        "login_name": user_row.get("login_name"),
         "role": user_role,
         "is_admin": user_role == "admin",
         "email_verified": user_row["email_verified"],
+        "phone": user_row.get("phone"),
+        "phone_verified": user_row.get("phone_verified", False),
         "status": user_row["status"],
+        # The auth session this token was issued for; ``auth_sessions.sid``.
+        "sid": payload.get("sid"),
     }
 
 
@@ -402,9 +426,13 @@ async def verify_admin_access(
 
     This dependency allows admin endpoints to be called from both the
     frontend dashboard (JWT) and scripts/legacy admin UI (ADMIN_TOKEN).
+    For a JWT admin it also records the account's user id on the request,
+    readable through :func:`get_admin_user_id`.
 
     Returns:
-        Admin identifier string (email for JWT auth, IP for token auth).
+        Admin identifier string: for JWT auth the admin's email, or its login
+        name when the account has no email (the first-run setup
+        administrator); for token auth the client IP.
     """
     from serving.utils.jwt import verify_access_token
 
@@ -419,7 +447,6 @@ async def verify_admin_access(
     try:
         payload = verify_access_token(token)
         user_id = payload.get("sub")
-        email = payload.get("email", "")
 
         if op_store and user_id:
             user_row = await op_store.get_user_by_id(user_id)
@@ -433,14 +460,17 @@ async def verify_admin_access(
                 require_verification = await rs.get_bool("signup_require_email_verification")
             except (RuntimeError, KeyError):
                 pass
-            if require_verification and not user_row["email_verified"]:
+            if (
+                require_verification and user_row.get("email") and not user_row["email_verified"]
+            ) or phone_identity_unverified(user_row):
                 raise HTTPException(
                     status_code=403,
                     detail="Email not verified. Please verify your email to continue.",
                 )
-            email = user_row["email"]
             if (user_row["role"] or "free") != "admin":
                 raise HTTPException(status_code=403, detail="Admin access required.")
+            request.state.admin_user_id = user_id
+            admin_identity = user_row["email"] or user_row.get("login_name") or user_id
         else:
             # DB unavailable — fail closed.  Admin endpoints require
             # authoritative role verification from the database.
@@ -452,7 +482,7 @@ async def verify_admin_access(
                 detail="Database unavailable; cannot verify admin role. Try again later.",
             )
 
-        return email
+        return admin_identity
     except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
         pass
 
@@ -474,3 +504,13 @@ async def verify_admin_access(
 
     client_ip = get_client_ip(request)
     return client_ip if client_ip != "unknown" else "admin-token"
+
+
+def get_admin_user_id(request: Request) -> str | None:
+    """Return the user id of the admin account ``verify_admin_access`` admitted.
+
+    The identity string that dependency returns is for display and audit; use
+    this to compare against a user id (it is None for an ``ADMIN_TOKEN``
+    caller, which has no account).
+    """
+    return getattr(request.state, "admin_user_id", None)

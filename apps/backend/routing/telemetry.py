@@ -35,6 +35,8 @@ def routing_chunk(
     *,
     fallback: bool = False,
     failed_attempts: list[dict[str, str]] | None = None,
+    offload: str | None = None,
+    offload_endpoint_id: str | None = None,
 ) -> str:
     """Build a synthetic SSE chunk carrying ``_routing`` metadata for streaming.
 
@@ -50,6 +52,12 @@ def routing_chunk(
     sees routing info on the very first iteration. ``sanitize_chunk`` pops
     ``_routing`` before forwarding to the client, so users never see this
     field on the wire.
+
+    ``offload`` says why the request was sent to the model's offload route
+    (``routing.offload.OFFLOAD_QUEUE_WAIT``, ``OFFLOAD_ENGINE_WAIT`` or
+    ``OFFLOAD_LAST_RESORT``), the same marker the non-streaming path puts on
+    ``resp["_routing"]``. ``offload_endpoint_id`` names that route when this
+    attempt is another one, tried after the offload route failed.
     """
     routing: dict[str, Any] = {
         "provider": adapter.config.provider,
@@ -60,4 +68,8 @@ def routing_chunk(
         routing["fallback"] = True
     if failed_attempts:
         routing["failed_attempts"] = failed_attempts
+    if offload:
+        routing["offload"] = offload
+    if offload_endpoint_id:
+        routing["offload_endpoint_id"] = offload_endpoint_id
     return f"data: {json.dumps({'choices': [], '_routing': routing})}\n\n"
