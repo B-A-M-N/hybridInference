@@ -1,20 +1,42 @@
 """Authentication routes for user signup, login, logout, and email verification."""
 
-import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 
+from serving.auth.browser_sessions import (
+    MAX_ACCOUNTS_PER_BROWSER,
+    BrowserSession,
+    account_summaries,
+    account_user_info,
+    complete_sign_in,
+    delete_refresh_token_cookie,
+    email_verification_required,
+    get_refresh_token_cookie,
+    hash_refresh_token,
+    identity_unverified,
+    issue_account_token,
+    prepare_sign_in,
+    resolve_browser_session,
+    rotate_cookie,
+    send_pending_cookie,
+    session_live,
+)
 from serving.auth.signup_policy import (
     allowlist_is_empty,
     is_domain_allowed,
     is_public_signup_enabled,
 )
 from serving.config.settings import get_signup_notify_emails, is_admin_email, settings
-from serving.exceptions import AccountSuspendedError
+from serving.exceptions import AccountSuspendedError, SelfDeleteRefused
 from serving.schemas_auth import (
+    AccountsResponse,
+    BindEmailRequest,
+    BindEmailResponse,
+    DeleteAccountRequest,
+    DeleteAccountResponse,
     ForgotPasswordRequest,
     LoginRequest,
     LoginResponse,
@@ -26,15 +48,20 @@ from serving.schemas_auth import (
     ResetPasswordRequest,
     SignupRequest,
     SignupResponse,
+    SwitchAccountRequest,
     UserInfo,
     VerifyEmailResponse,
 )
 from serving.servers.auth import log_admin_action
 from serving.servers.deps import get_current_user, get_db_logger, get_operational_store
+from serving.servers.routers.phone_auth_routes import router as phone_auth_router
+from serving.servers.routers.reauth import account_identifier, confirm_account_owner
 from serving.setup_state import refresh_setup_state
 from serving.utils import password as password_utils
 from serving.utils.email import (
     is_email_enabled,
+    send_account_deleted_email,
+    send_email_changed_email,
     send_new_registration_admin_email,
     send_verification_email,
 )
@@ -49,11 +76,13 @@ from serving.utils.jwt import (
 )
 from serving.utils.logging import get_logger
 from serving.utils.login_rate_limit import check_and_record_login
+from serving.utils.phone_auth import phone_identity_unverified
 from serving.utils.request_ip import get_client_ip
 from serving.utils.signup_rate_limit import check_and_record_signup
 from serving.utils.turnstile import verify_turnstile_token
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+router.include_router(phone_auth_router)
 logger = get_logger(__name__)
 
 
@@ -65,55 +94,10 @@ def get_base_url(request: Request) -> str:
     return f"{request.url.scheme}://{request.url.netloc}"
 
 
-def hash_refresh_token(token: str) -> str:
-    """Hash a refresh token with SHA-256 for storage in the sessions table."""
-    return hashlib.sha256(token.encode()).hexdigest()
-
-
-def get_refresh_token_cookie(request: Request) -> str | None:
-    """Read the deployment-scoped refresh cookie from an incoming request."""
-    return request.cookies.get(settings.refresh_token_cookie_name)
-
-
-def _refresh_cookie_options() -> dict[str, object]:
-    """Return shared options for refresh-token cookie operations.
-
-    Reads from validated `settings` (not raw env) so tests and Pydantic
-    field defaults are the single source of truth. Defaults: secure=True,
-    samesite=lax, domain unset.
-    """
-    return {
-        "httponly": True,
-        "secure": settings.cookie_secure,
-        "samesite": settings.cookie_samesite,
-        "domain": settings.cookie_domain,
-        "path": "/",
-    }
-
-
-def set_refresh_token_cookie(response: Response, refresh_token: str) -> None:
-    """Set the persistent refresh-token cookie."""
-    refresh_token_max_age = get_refresh_token_expire_days() * 24 * 60 * 60
-    response.set_cookie(
-        key=settings.refresh_token_cookie_name,
-        value=refresh_token,
-        max_age=refresh_token_max_age,
-        expires=datetime.now(timezone.utc) + timedelta(seconds=refresh_token_max_age),
-        **_refresh_cookie_options(),
-    )
-
-
-def delete_refresh_token_cookie(response: Response) -> None:
-    """Delete the refresh-token cookie using the same domain/path settings."""
-    response.delete_cookie(
-        key=settings.refresh_token_cookie_name,
-        **_refresh_cookie_options(),
-    )
-
-
 async def start_user_session(
     op_store: Any,
     response: Response,
+    browser: BrowserSession | None,
     user_row: dict[str, Any],
     *,
     user_role: str,
@@ -121,9 +105,10 @@ async def start_user_session(
     """Sign *user_row* in: open a session and return the login response body.
 
     Shared by ``POST /auth/login`` and first-run setup, so both issue the same
-    access token, store the same refresh-token session and set the same
-    refresh cookie on *response*. *user_role* is the role the caller has
-    settled on (login may just have promoted an ``ADMIN_EMAILS`` account).
+    access token and store the same session. The session joins *browser*, the
+    caller's ``prepare_sign_in`` result, as its active account; the accounts
+    already signed in there stay signed in. *user_role* is the role the caller
+    has settled on (login may just have promoted an ``ADMIN_EMAILS`` account).
     """
     session_id = generate_session_id()
     is_admin = user_role == "admin"
@@ -134,21 +119,22 @@ async def start_user_session(
         is_admin=is_admin,
         role=user_role,
     )
-    refresh_token = create_refresh_token()
-    refresh_token_hash_str = hash_refresh_token(refresh_token)
-
-    # Store refresh token in database
+    # The browser's cookie names its browser session, never this one, so the
+    # session's own refresh hash is a value no browser holds.
+    auth_session_id = generate_ulid()
     session_expires = datetime.now(timezone.utc) + timedelta(days=get_refresh_token_expire_days())
     await op_store.create_session(
-        session_id=generate_ulid(),
+        session_id=auth_session_id,
         user_id=user_row["id"],
-        refresh_token_hash=refresh_token_hash_str,
+        refresh_token_hash=hash_refresh_token(create_refresh_token()),
         jti=jti,
         sid=session_id,
         expires_at=session_expires,
     )
 
-    set_refresh_token_cookie(response, refresh_token)
+    await complete_sign_in(
+        op_store, response, browser, user_id=user_row["id"], auth_session_id=auth_session_id
+    )
 
     return LoginResponse(
         access_token=access_token,
@@ -158,6 +144,9 @@ async def start_user_session(
             id=user_row["id"],
             email=user_row["email"],
             login_name=user_row.get("login_name"),
+            phone=user_row.get("phone"),
+            phone_verified=user_row.get("phone_verified", False),
+            has_password=bool(user_row.get("password_hash")),
             user_name=user_row["user_name"],
             role=user_role,
             status=user_row["status"],
@@ -411,7 +400,9 @@ async def login(
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     # Verify password
-    if not password_utils.verify_password(body.password, user_row["password_hash"]):
+    if not user_row.get("password_hash") or not password_utils.verify_password(
+        body.password, user_row["password_hash"]
+    ):
         await _record("failure", failure_reason="invalid_password", user_id=user_row["id"])
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
@@ -463,12 +454,20 @@ async def login(
         require_verification = await rs.get_bool("signup_require_email_verification")
     except (RuntimeError, KeyError):
         pass
-    if require_verification and not user_row["email_verified"]:
+    if (
+        require_verification and user_row.get("email") and not user_row["email_verified"]
+    ) or phone_identity_unverified(user_row):
         await _record("failure", failure_reason="email_unverified", user_id=user_row["id"])
         raise HTTPException(
             status_code=403,
             detail="Email not verified. Please check your email for the verification link.",
         )
+
+    try:
+        browser = await prepare_sign_in(op_store, request, user_row["id"])
+    except HTTPException as exc:
+        await _record("failure", failure_reason="browser_account_limit", user_id=user_row["id"])
+        raise exc
 
     await _record("success", failure_reason=None, user_id=user_row["id"])
 
@@ -484,54 +483,209 @@ async def login(
         await op_store.update_user_fields(user_row["id"], role="admin")
         logger.info(f"Bootstrap-seeded user {user_row['id']} to admin (ADMIN_EMAILS)")
 
-    login_response = await start_user_session(op_store, response, user_row, user_role=user_role)
+    login_response = await start_user_session(
+        op_store, response, browser, user_row, user_role=user_role
+    )
 
     logger.info(f"User logged in: {user_row['id']} ({identifier})")
 
     return login_response
 
 
+async def _sign_out_of_browser(
+    op_store: Any, response: Response, browser: BrowserSession, user_id: str
+) -> int:
+    """Sign one account out of a browser; return how many accounts remain there.
+
+    The cookie is retired with the browser's last account. The store retires
+    the browser session itself in the detaching transaction, so a sign-in in
+    another tab cannot land in between and be signed out with it.
+    """
+    remaining = await op_store.detach_browser_session_account(browser.id, user_id)
+    if remaining == 0:
+        delete_refresh_token_cookie(response)
+    else:
+        send_pending_cookie(response, browser)
+    return remaining
+
+
 @router.post("/logout", response_model=LogoutResponse)
 async def logout(
+    request: Request,
     response: Response,
-    refresh_token: str | None = Depends(get_refresh_token_cookie),
     current_user=Depends(get_current_user),
     op_store=Depends(get_operational_store),
 ) -> LogoutResponse:
-    """Logout current user.
+    """Sign the current account out of this browser.
 
-    Revokes the refresh token session and clears the cookie.
-    Access tokens will expire naturally (15 minutes).
+    Other accounts signed in on the browser stay signed in, with none of them
+    active; the cookie goes with the last one. Access tokens already issued
+    expire on their own (15 minutes).
+
+    A cookie that names no browser is cleared. Unlike deleting an account,
+    which takes it off every browser first, logout cannot tell which browser
+    still holds the account when the cookie was rotated by another tab, and
+    leaving it would let the account be chosen again without a password;
+    signing the browser's other accounts out is the safe way to fail.
     """
     if not op_store:
         raise HTTPException(status_code=500, detail="Database not available")
 
-    # Revoke refresh token session if provided
-    if refresh_token:
-        refresh_token_hash_str = hash_refresh_token(refresh_token)
-        session_row = await op_store.get_session_by_token_hash(refresh_token_hash_str)
-        if session_row and session_row["user_id"] == current_user["user_id"]:
-            await op_store.revoke_session(session_row["id"])
-
-    delete_refresh_token_cookie(response)
+    browser = await resolve_browser_session(op_store, request)
+    if browser is not None:
+        await _sign_out_of_browser(op_store, response, browser, current_user["user_id"])
+    else:
+        delete_refresh_token_cookie(response)
 
     logger.info(f"User logged out: {current_user['user_id']}")
 
     return LogoutResponse(message="Logged out successfully")
 
 
+@router.post("/logout-all", response_model=LogoutResponse)
+async def logout_all(
+    request: Request,
+    response: Response,
+    op_store=Depends(get_operational_store),
+) -> LogoutResponse:
+    """Sign every account out of this browser and drop its cookie."""
+    if not op_store:
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    browser = await resolve_browser_session(op_store, request, upgrade=False)
+    if browser is not None:
+        await op_store.revoke_browser_session(browser.id)
+    else:
+        # A cookie from before browser sessions: revoke the one session it names.
+        refresh_token = get_refresh_token_cookie(request)
+        if refresh_token:
+            session_row = await op_store.get_session_by_token_hash(
+                hash_refresh_token(refresh_token)
+            )
+            if session_row:
+                await op_store.revoke_session(session_row["id"])
+    delete_refresh_token_cookie(response)
+    return LogoutResponse(message="Logged out of all accounts")
+
+
+@router.post("/delete-account", response_model=DeleteAccountResponse)
+async def delete_own_account(
+    request: Request,
+    response: Response,
+    body: DeleteAccountRequest,
+    background_tasks: BackgroundTasks,
+    current_user=Depends(get_current_user),
+    op_store=Depends(get_operational_store),
+) -> DeleteAccountResponse:
+    """Delete the signed-in account at its owner's request.
+
+    The same soft delete an administrator performs: the account is marked
+    ``deleted``, its keys are revoked and its sessions end, while its request
+    history is kept and an administrator can still resume it. The owner types
+    the account's identifier and proves it is theirs the way it signs in --
+    its password, or a code sent to its verified phone when it has none.
+    Administrator accounts are refused, so a deployment cannot lose its last
+    administrator this way.
+    """
+    if not op_store:
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    user_id = current_user["user_id"]
+    user_row = await op_store.get_user_by_id(user_id)
+    if not user_row:
+        raise HTTPException(status_code=404, detail="User not found")
+    if (user_row.get("role") or "free") == "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="An administrator account cannot delete itself. "
+            "Ask another administrator to delete it.",
+        )
+
+    identifier = account_identifier(user_row)
+    if not identifier or body.confirm.strip().lower() != identifier.lower():
+        raise HTTPException(status_code=400, detail="The confirmation does not match this account.")
+
+    await confirm_account_owner(
+        request,
+        op_store,
+        user_row,
+        password=body.password,
+        phone_code=body.phone_code,
+        purpose="delete_account",
+    )
+
+    client_ip = get_client_ip(request)
+    browser = await resolve_browser_session(op_store, request)
+    try:
+        await op_store.delete_user(
+            user_id,
+            admin_ip=client_ip,
+            admin_id=user_id,
+            reason="Deleted by the account owner",
+            email=user_row.get("email"),
+            self_service=True,
+        )
+    except SelfDeleteRefused:
+        raise HTTPException(
+            status_code=409,
+            detail="This account changed while it was being deleted, so it was not deleted.",
+        ) from None
+    # The account is off every browser now; retire this browser's cookie if it
+    # was the last account here, and leave the others signed in otherwise. A
+    # cookie that names no browser is left alone: another tab may have just
+    # rotated it, and clearing it would sign every other account out.
+    if browser is not None:
+        await _sign_out_of_browser(op_store, response, browser, user_id)
+
+    if user_row.get("email") and is_email_enabled():
+        background_tasks.add_task(send_account_deleted_email, user_row["email"])
+
+    logger.info(f"User deleted their own account: {user_id}")
+    return DeleteAccountResponse(message="Your account has been deleted.")
+
+
+async def _usable_account(browser: BrowserSession, user_id: str | None) -> dict[str, Any]:
+    """Return a browser's account that may be given a token now.
+
+    Raises:
+        HTTPException: 401 when the account is not signed in on this browser,
+            or its session has ended; 403 when its address is unverified.
+    """
+    account = browser.account(user_id)
+    if account is None:
+        raise HTTPException(
+            status_code=401,
+            detail="No account is signed in on this browser. Please login again.",
+        )
+    if account.get("status") is not None and account["status"] != "active":
+        raise HTTPException(status_code=401, detail="User account is not active.")
+    if not session_live(account):
+        raise HTTPException(
+            status_code=401,
+            detail="This account's session has ended. Please login again.",
+        )
+    if identity_unverified(account, require_verification=await email_verification_required()):
+        raise HTTPException(
+            status_code=403,
+            detail="Email not verified. Please verify your email to continue.",
+        )
+    return account
+
+
 @router.post("/refresh", response_model=RefreshResponse)
 async def refresh(
+    request: Request,
     response: Response,
-    refresh_token: str | None = Depends(get_refresh_token_cookie),
     op_store=Depends(get_operational_store),
 ) -> RefreshResponse:
-    """Refresh access token using refresh token from cookie.
+    """Issue a new access token for the browser's active account.
 
-    Issues a new access token with 15-minute expiration.
-    Optionally rotates the refresh token for enhanced security.
+    The cookie is rotated on every refresh. Returns 401 when the browser has
+    no active account any more — after signing that account out, say — even
+    while other accounts are signed in on it; the console then shows the
+    account chooser.
     """
-    if not refresh_token:
+    if not get_refresh_token_cookie(request):
         raise HTTPException(
             status_code=401,
             detail="Missing refresh token. Please login again.",
@@ -540,83 +694,18 @@ async def refresh(
     if not op_store:
         raise HTTPException(status_code=500, detail="Database not available")
 
-    # Verify refresh token
-    refresh_token_hash_str = hash_refresh_token(refresh_token)
-    session_row = await op_store.get_session_by_token_hash(refresh_token_hash_str)
-
-    if not session_row:
+    browser = await resolve_browser_session(op_store, request)
+    if browser is None:
         raise HTTPException(
             status_code=401,
             detail="Invalid refresh token. Please login again.",
         )
 
-    if session_row["revoked"]:
-        raise HTTPException(
-            status_code=401,
-            detail="Refresh token has been revoked. Please login again.",
-        )
+    account = await _usable_account(browser, browser.active_user_id)
+    access_token, _role = await issue_account_token(op_store, account)
+    await rotate_cookie(op_store, response, browser)
 
-    if session_row["expires_at"] < datetime.now(timezone.utc):
-        raise HTTPException(
-            status_code=401,
-            detail="Refresh token has expired. Please login again.",
-        )
-
-    user_row = await op_store.get_user_by_id(session_row["user_id"])
-
-    if not user_row or user_row["status"] != "active":
-        raise HTTPException(
-            status_code=401,
-            detail="User account is not active.",
-        )
-
-    # Check if email verification is required and if email is verified
-    require_verification = settings.signup_require_email_verification
-    try:
-        from serving.config.runtime_settings import get_runtime_settings_instance
-
-        rs = get_runtime_settings_instance()
-        require_verification = await rs.get_bool("signup_require_email_verification")
-    except (RuntimeError, KeyError):
-        pass
-    if require_verification and not user_row["email_verified"]:
-        raise HTTPException(
-            status_code=403,
-            detail="Email not verified. Please verify your email to continue.",
-        )
-
-    # Create new access token
-    user_role = user_row["role"] or "free"
-
-    # Bootstrap seed on refresh (same logic as login — only when role is 'free')
-    if user_row["email"] and is_admin_email(user_row["email"]) and user_role == "free":
-        user_role = "admin"
-        await op_store.update_user_fields(user_row["id"], role="admin")
-        logger.info(f"Bootstrap-seeded user {user_row['id']} to admin on refresh (ADMIN_EMAILS)")
-
-    is_admin = user_role == "admin"
-    access_token, jti = create_access_token(
-        user_id=user_row["id"],
-        email=user_row["email"],
-        session_id=session_row["sid"],
-        is_admin=is_admin,
-        role=user_role,
-    )
-
-    # Generate new refresh token for rotation
-    new_refresh_token = create_refresh_token()
-    new_refresh_token_hash = hash_refresh_token(new_refresh_token)
-
-    # Update session with new refresh token hash and jti
-    await op_store.rotate_session(
-        session_row["id"],
-        new_refresh_token_hash=new_refresh_token_hash,
-        new_jti=jti,
-    )
-
-    set_refresh_token_cookie(response, new_refresh_token)
-
-    logger.info(f"Token refreshed for user: {user_row['id']}")
+    logger.info(f"Token refreshed for user: {account['user_id']}")
 
     return RefreshResponse(
         access_token=access_token,
@@ -625,14 +714,115 @@ async def refresh(
     )
 
 
+@router.get("/accounts", response_model=AccountsResponse)
+async def list_accounts(
+    request: Request,
+    response: Response,
+    op_store=Depends(get_operational_store),
+) -> AccountsResponse:
+    """List the accounts signed in on this browser, for the account chooser.
+
+    Authenticated by the browser's cookie alone, because the chooser is shown
+    when no account is active. A browser without one answers an empty list.
+    """
+    if not op_store:
+        raise HTTPException(status_code=500, detail="Database not available")
+    browser = await resolve_browser_session(op_store, request)
+    send_pending_cookie(response, browser)
+    return AccountsResponse(
+        active_user_id=browser.active_user_id if browser else None,
+        accounts=account_summaries(
+            browser, require_verification=await email_verification_required()
+        ),
+        max_accounts=MAX_ACCOUNTS_PER_BROWSER,
+    )
+
+
+@router.post("/switch", response_model=LoginResponse)
+async def switch_account(
+    body: SwitchAccountRequest,
+    request: Request,
+    response: Response,
+    op_store=Depends(get_operational_store),
+) -> LoginResponse:
+    """Issue a token for another account already signed in on this browser.
+
+    No password: the account signed in here earlier and its session is still
+    live. With ``activate`` (the default) it becomes the browser's active
+    account, and every other console tab is told to reload. Without, only the
+    token is issued, which is how the consent page signs the Cloud Agent in as
+    an account the console is not currently using.
+    """
+    if not op_store:
+        raise HTTPException(status_code=500, detail="Database not available")
+    browser = await resolve_browser_session(op_store, request)
+    if browser is None:
+        raise HTTPException(
+            status_code=401,
+            detail="No account is signed in on this browser. Please login again.",
+        )
+
+    account = await _usable_account(browser, body.user_id)
+    access_token, user_role = await issue_account_token(op_store, account)
+    if body.activate:
+        await op_store.set_browser_session_active(browser.id, account["user_id"])
+        await rotate_cookie(op_store, response, browser)
+        logger.info(f"Browser {browser.id} switched to user {account['user_id']}")
+    else:
+        send_pending_cookie(response, browser)
+
+    return LoginResponse(
+        access_token=access_token,
+        token_type="bearer",
+        expires_in=get_access_token_expire_minutes() * 60,
+        user=account_user_info(account, role=user_role),
+    )
+
+
+@router.delete("/accounts/{user_id}", response_model=AccountsResponse)
+async def remove_account(
+    user_id: str,
+    request: Request,
+    response: Response,
+    op_store=Depends(get_operational_store),
+) -> AccountsResponse:
+    """Sign one account out of this browser and drop it from the chooser.
+
+    Works for an account whose session has already ended, so the chooser can
+    forget it; the cookie goes with the last account.
+    """
+    if not op_store:
+        raise HTTPException(status_code=500, detail="Database not available")
+    browser = await resolve_browser_session(op_store, request)
+    if browser is None or browser.account(user_id) is None:
+        raise HTTPException(status_code=404, detail="That account is not signed in here.")
+
+    if await _sign_out_of_browser(op_store, response, browser, user_id):
+        browser.accounts = await op_store.list_browser_session_accounts(browser.id)
+        if browser.active_user_id == user_id:
+            browser.active_user_id = None
+        left: BrowserSession | None = browser
+    else:
+        left = None
+    return AccountsResponse(
+        active_user_id=left.active_user_id if left else None,
+        accounts=account_summaries(left, require_verification=await email_verification_required()),
+        max_accounts=MAX_ACCOUNTS_PER_BROWSER,
+    )
+
+
 @router.get("/verify-email", response_model=VerifyEmailResponse)
 async def verify_email(
     token: str,
+    background_tasks: BackgroundTasks,
     op_store=Depends(get_operational_store),
 ) -> VerifyEmailResponse:
     """Verify user email address using token from email.
 
-    Marks user's email as verified, allowing them to generate API keys.
+    Marks user's email as verified, allowing them to generate API keys. A
+    token issued by ``POST /auth/email/bind`` carries the address it proves;
+    following it makes that the account's address and tells the address it
+    replaced. Such a token applies once: following it again changes nothing.
     """
     if not op_store:
         raise HTTPException(status_code=500, detail="Database not available")
@@ -642,10 +832,24 @@ async def verify_email(
     if not token_row:
         raise HTTPException(status_code=400, detail="Invalid verification token.")
 
+    pending_email = token_row.get("pending_email")
+
     if token_row["used_at"]:
         user_row = await op_store.get_user_by_id(token_row["user_id"])
         if not user_row:
             raise HTTPException(status_code=400, detail="Invalid verification token.")
+
+        if pending_email:
+            # Re-applying a used link could put back an address the account
+            # has since replaced; it only reports what already happened.
+            if user_row.get("email") == pending_email and user_row.get("email_verified"):
+                return VerifyEmailResponse(
+                    message="Your email has already been verified. You can log in now.",
+                    email_verified=True,
+                )
+            raise HTTPException(
+                status_code=400, detail="This verification link has already been used."
+            )
 
         if not user_row["email_verified"]:
             if token_row["expires_at"] < datetime.now(timezone.utc):
@@ -671,8 +875,18 @@ async def verify_email(
             detail="Verification token has expired. Please request a new one.",
         )
 
-    # Mark email as verified and token as used
-    await op_store.mark_user_email_verified(token_row["user_id"])
+    if pending_email:
+        owner = await op_store.get_user_by_id(token_row["user_id"])
+        previous_email = owner.get("email") if owner else None
+        if not await op_store.bind_user_email(token_row["user_id"], pending_email):
+            raise HTTPException(
+                status_code=409,
+                detail="Email address cannot be bound to this account.",
+            )
+        if previous_email and previous_email.lower() != pending_email.lower():
+            background_tasks.add_task(send_email_changed_email, previous_email, pending_email)
+    else:
+        await op_store.mark_user_email_verified(token_row["user_id"])
     await op_store.mark_verification_used(token)
 
     logger.info(f"Email verified for user: {token_row['user_id']}")
@@ -820,3 +1034,91 @@ async def resend_verification(
     logger.info(f"Verification email resent for user: {user_row['id']}")
 
     return generic_response
+
+
+@router.post("/email/bind", response_model=BindEmailResponse)
+async def bind_email(
+    request: Request,
+    body: BindEmailRequest,
+    background_tasks: BackgroundTasks,
+    current_user=Depends(get_current_user),
+    op_store=Depends(get_operational_store),
+    db_logger=Depends(get_db_logger),
+) -> BindEmailResponse:
+    """Bind an email address to the signed-in account, or change it.
+
+    The owner confirms first (``confirm_account_owner``), because the address
+    becomes a way in: it signs in and it receives password resets. The new
+    address is then always proven by a link sent to it, whatever the signup
+    verification setting -- an address nobody proved must never be recorded as
+    verified, not least because an ``ADMIN_EMAILS`` address is promoted to
+    administrator on its next token. The current address stays until the link
+    is followed, and it is told when it is replaced.
+    """
+    if not op_store:
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    normalized_email = body.email.strip().lower()
+    if is_email_domain_blocked(normalized_email):
+        raise HTTPException(status_code=400, detail="This email domain is not allowed")
+
+    user_id = current_user["user_id"]
+    user_row = await op_store.get_user_by_id(user_id)
+    if not user_row or user_row.get("status") != "active":
+        raise HTTPException(
+            status_code=403, detail="Account is not active. Please contact support."
+        )
+
+    if (user_row.get("email") or "").strip().lower() == normalized_email and user_row.get(
+        "email_verified"
+    ):
+        return BindEmailResponse(
+            message="This email address is already bound to your account.",
+            email=normalized_email,
+            email_verified=True,
+        )
+
+    if not is_email_enabled():
+        raise HTTPException(status_code=503, detail="Email verification is currently unavailable.")
+
+    # Before anything about the address is revealed: whether it is taken is
+    # not something a stolen session should be able to ask.
+    await confirm_account_owner(
+        request,
+        op_store,
+        user_row,
+        password=body.password,
+        phone_code=body.phone_code,
+        purpose="bind_email",
+    )
+
+    existing_user = await op_store.get_user_by_email(normalized_email)
+    if existing_user and existing_user["id"] != user_id:
+        raise HTTPException(
+            status_code=409, detail="Email address cannot be bound to this account."
+        )
+
+    verification_token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+    await op_store.delete_user_verification_tokens(user_id)
+    await op_store.create_verification_token(
+        token=verification_token,
+        user_id=user_id,
+        expires_at=expires_at,
+        pending_email=normalized_email,
+    )
+    background_tasks.add_task(
+        send_verification_email, normalized_email, verification_token, get_base_url(request)
+    )
+    await log_admin_action(
+        db_logger,
+        get_client_ip(request),
+        "request_bind_email",
+        user_id,
+        {"email": normalized_email},
+    )
+    return BindEmailResponse(
+        message="Verification email sent. Please check your inbox to complete binding.",
+        email=normalized_email,
+        email_verified=False,
+    )

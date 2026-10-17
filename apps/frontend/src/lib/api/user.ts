@@ -8,7 +8,11 @@ export interface User {
   /** `null` for an account that signs in with a login name instead. */
   email: string | null;
   login_name?: string | null;
+  phone?: string | null;
+  phone_verified?: boolean;
+  has_password?: boolean;
   user_name?: string;
+  avatar_url?: string | null;
   role: string;
   status: string;
   email_verified: boolean;
@@ -124,14 +128,16 @@ export async function regenerateApiKey(): Promise<ApiKeyResponse> {
 }
 
 export async function getUsage(period: 'today' | 'month' | 'all' = 'today'): Promise<UsageStats> {
+  // Periods start at 00:00 UTC, when the daily quota resets.
   const params = new URLSearchParams({ period });
-  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  if (timeZone) params.set('timezone', timeZone);
   const resp = await fetchWithAuth(API_BASE, `/user/usage?${params.toString()}`);
   return jsonOrThrow<UsageStats>(resp);
 }
 
-export async function updateProfile(data: { user_name?: string }): Promise<User> {
+export async function updateProfile(data: {
+  user_name?: string;
+  avatar_url?: string | null;
+}): Promise<User> {
   const resp = await fetchWithAuth(API_BASE, '/user/profile', {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
@@ -140,14 +146,23 @@ export async function updateProfile(data: { user_name?: string }): Promise<User>
   return jsonOrThrow<User>(resp);
 }
 
+/**
+ * Change the password, or set a first one. An account without a password
+ * confirms its owner with `phoneCode`, a `set_password` code.
+ */
 export async function updatePassword(
   currentPassword: string,
   newPassword: string,
+  phoneCode?: string,
 ): Promise<{ message: string }> {
   const resp = await fetchWithAuth(API_BASE, '/user/change-password', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ old_password: currentPassword, new_password: newPassword }),
+    body: JSON.stringify({
+      old_password: currentPassword,
+      new_password: newPassword,
+      ...(phoneCode ? { phone_code: phoneCode } : {}),
+    }),
   });
   return jsonOrThrow<{ message: string }>(resp);
 }

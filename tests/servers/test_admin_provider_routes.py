@@ -2080,6 +2080,8 @@ async def test_runtime_candidate_pricing_schedule_survives_restart(admin_client,
         {
             "effective_at": "2026-08-16T16:00:00Z",
             "timezone": "UTC",
+            "weekdays": [1, 2, 3, 4, 5],
+            "excluded_dates": ["2026-08-18"],
             "default": {"prompt": "0.22", "completion": "0.66"},
             "windows": [{"start": "01:00", "end": "04:00", "pricing": {"prompt": "0.44"}}],
         }
@@ -2155,6 +2157,12 @@ async def test_runtime_candidate_pricing_schedule_survives_restart(admin_client,
     assert restored_adapter.config.pricing_schedule == schedule
     assert effective_pricing(restored_adapter.config, at=_PEAK_INSTANT) == effective_pricing(
         created_adapter.config, at=_PEAK_INSTANT
+    )
+    assert (
+        effective_pricing(
+            restored_adapter.config, at=datetime(2026, 8, 18, 2, tzinfo=timezone.utc)
+        )["prompt"]
+        == "0.22"
     )
 
 
@@ -2623,6 +2631,38 @@ async def test_post_provider_route_model_rejects_orphaned_routewise_settings(adm
     )
     assert model_id not in route_executor.routes
     op_store.upsert_provider_route_candidate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_id", ["auto", "auto-balance", " auto-new "])
+async def test_post_provider_route_model_refuses_an_auto_model_name(admin_client, model_id):
+    """The auto models are served under these names; a model there would be hidden."""
+    client, op_store, route_executor, _fake_routewise, verify_mock = admin_client
+
+    response = await client.post(
+        "/admin/routing/provider-route-models",
+        json={
+            "model_id": model_id,
+            "strategy": "fixed",
+            "route_type": "on_demand",
+            "upstream_provider": "openrouter",
+            "openrouter_provider": "parasail",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key_id": "db-openrouter",
+            "provider_model_id": "deepseek/deepseek-v4-flash",
+            "weight": 1.0,
+            "pricing": RUNTIME_PRICING,
+        },
+        headers=AUTH,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        f"Model id {model_id.strip()!r} is reserved for auto models"
+    )
+    assert model_id.strip() not in route_executor.routes
+    op_store.upsert_provider_route_candidate.assert_not_awaited()
+    verify_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

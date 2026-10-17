@@ -17,6 +17,7 @@ from fastapi import Depends, Header, HTTPException, Request
 
 from serving.config.settings import get_settings
 from serving.utils.logging import get_logger
+from serving.utils.phone_auth import phone_identity_unverified
 from serving.utils.request_ip import get_client_ip
 
 logger = get_logger(__name__)
@@ -62,6 +63,7 @@ if TYPE_CHECKING:
     from routing.manager import RoutingManager
     from routing.model_router_registry import ModelRouterRegistry
     from routing.routers import ManagedRouter
+    from serving.auto_mode import AutoMode
     from serving.config.disabled_providers import DisabledProviderResolver
     from serving.config.model_concurrency import ModelConcurrencyResolver
     from serving.config.model_visibility import ModelVisibilityResolver
@@ -108,6 +110,9 @@ class AppServices:
     pricing_lookup: PricingLookup | None = None
     cost_tracker: CostTracker | None = None
     responses_store: ResponseStore | None = None
+    # The ``auto:`` section of models.yaml, when it loaded cleanly. Served only
+    # while the ``auto_mode_enabled`` runtime setting is on (serving/auto_mode.py).
+    auto_mode: AutoMode | None = None
     weight_override_refresh_task: Any | None = None
     routewise_settings_refresh_task: Any | None = None
     disabled_provider_refresh_task: Any | None = None
@@ -189,6 +194,13 @@ def get_model_visibility_resolver(
 ) -> ModelVisibilityResolver | None:
     """Dependency to obtain the ModelVisibilityResolver (if configured)."""
     return getattr(services, "model_visibility_resolver", None)
+
+
+def get_auto_mode(
+    services: AppServices = Depends(get_services),
+) -> AutoMode | None:
+    """Dependency to obtain the loaded auto mode (if configured)."""
+    return getattr(services, "auto_mode", None)
 
 
 def get_model_concurrency_resolver(
@@ -350,7 +362,9 @@ async def get_current_user(
         require_verification = await rs.get_bool("signup_require_email_verification")
     except (RuntimeError, KeyError):
         pass
-    if require_verification and not user_row["email_verified"]:
+    if (
+        require_verification and user_row.get("email") and not user_row["email_verified"]
+    ) or phone_identity_unverified(user_row):
         raise HTTPException(
             status_code=403,
             detail="Email not verified. Please check your email for the verification link.",
@@ -365,7 +379,11 @@ async def get_current_user(
         "role": user_role,
         "is_admin": user_role == "admin",
         "email_verified": user_row["email_verified"],
+        "phone": user_row.get("phone"),
+        "phone_verified": user_row.get("phone_verified", False),
         "status": user_row["status"],
+        # The auth session this token was issued for; ``auth_sessions.sid``.
+        "sid": payload.get("sid"),
     }
 
 
@@ -442,7 +460,9 @@ async def verify_admin_access(
                 require_verification = await rs.get_bool("signup_require_email_verification")
             except (RuntimeError, KeyError):
                 pass
-            if require_verification and not user_row["email_verified"]:
+            if (
+                require_verification and user_row.get("email") and not user_row["email_verified"]
+            ) or phone_identity_unverified(user_row):
                 raise HTTPException(
                     status_code=403,
                     detail="Email not verified. Please verify your email to continue.",
