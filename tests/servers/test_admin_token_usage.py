@@ -393,12 +393,13 @@ async def test_token_usage_window_inclusion(db_logger):
         reasoning=0,
         cost=0.001,
     )
-    # 25h ago: outside the 24h window
+    # 26h ago: outside the 24h window even when the route shifts its end
+    # backward by one hour during the rollup grace period.
     await _seed(
         pool,
         provider="p2",
         model_id="m2",
-        bucket=now - timedelta(hours=25),
+        bucket=now - timedelta(hours=26),
         input_tokens=999,
         output_tokens=999,
         cached=999,
