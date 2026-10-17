@@ -21,7 +21,6 @@ import asyncio
 import contextlib
 import copy
 import json
-import os
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -41,15 +40,26 @@ from serving.adapters.anthropic_aliases import resolve_anthropic_alias
 from serving.adapters.anthropic_translator import normalize_inline_system
 from serving.adapters.key_pool import KeyPool, KeyPoolExhausted
 from serving.adapters.upstream_limiter import UpstreamSaturated
-from serving.config.settings import has_role
+from serving.auto_mode import (
+    AnthropicStreamModelRenamer,
+    AutoModelUnavailable,
+    anthropic_features,
+    apply_to_anthropic_body,
+    auto_mode_for,
+    hide_served_model,
+    session_key,
+    strip_foreign_thinking,
+)
+from serving.config.app_config import config_value, on_change
 from serving.exceptions import (
+    conceal_served_model,
     generic_message_for_status,
     operator_safe_error,
     safe_detail_text,
     scrub_error_for_user,
 )
 from serving.grant_auth import ledger_attribution
-from serving.model_access import is_model_disabled_for_user, is_model_outside_grant_scope
+from serving.model_access import model_access_denial
 from serving.observability.rejection_log import log_rejection
 from serving.observability.tracked_tasks import tracked_task
 from serving.pricing import effective_pricing
@@ -65,6 +75,7 @@ from serving.servers.deps import (
     get_operational_store,
     get_router,
 )
+from serving.servers.model_availability import model_not_found_detail
 from serving.storage.utils import calculate_cost
 from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
@@ -76,6 +87,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from fastapi.exceptions import RequestValidationError
+
+    from serving.auto_mode import AutoSelection
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -117,18 +130,30 @@ _KEEPALIVE_INTERVAL = 15
 # before any surrounding validation can matter. Far above any real message: heavy
 # tool use runs to dozens of blocks, not thousands.
 _MAX_CONTENT_BLOCKS = 1024
-try:
-    _MAX_STREAM_IDLE = int(os.environ.get("STREAM_MAX_IDLE_S", "240"))
-except (TypeError, ValueError):
-    _MAX_STREAM_IDLE = 240
-try:
-    _MAX_FIRST_FRAME_IDLE = int(os.environ.get("STREAM_MAX_FIRST_FRAME_IDLE_S", "300"))
-except (TypeError, ValueError):
-    _MAX_FIRST_FRAME_IDLE = 300
-# An operator who raised STREAM_MAX_IDLE_S did so to stop a slow model being cut
-# off, and before the split that value covered prefill too. Never give them less
-# head room for the first frame than they asked for overall.
-_MAX_FIRST_FRAME_IDLE = max(_MAX_FIRST_FRAME_IDLE, _MAX_STREAM_IDLE)
+_MAX_STREAM_IDLE = 240
+_MAX_FIRST_FRAME_IDLE = 300
+
+
+def _load_stream_limits() -> None:
+    """Read ``STREAM_MAX_IDLE_S`` and ``STREAM_MAX_FIRST_FRAME_IDLE_S``."""
+    global _MAX_STREAM_IDLE, _MAX_FIRST_FRAME_IDLE
+    try:
+        max_stream_idle = int(config_value("STREAM_MAX_IDLE_S", "240") or "")
+    except (TypeError, ValueError):
+        max_stream_idle = 240
+    try:
+        max_first_frame_idle = int(config_value("STREAM_MAX_FIRST_FRAME_IDLE_S", "300") or "")
+    except (TypeError, ValueError):
+        max_first_frame_idle = 300
+    _MAX_STREAM_IDLE = max_stream_idle
+    # An operator who raised STREAM_MAX_IDLE_S did so to stop a slow model being
+    # cut off, and before the split that value covered prefill too. Never give
+    # them less head room for the first frame than they asked for overall.
+    _MAX_FIRST_FRAME_IDLE = max(max_first_frame_idle, max_stream_idle)
+
+
+_load_stream_limits()
+on_change(_load_stream_limits)
 _STREAM_SENTINEL: Any = object()
 
 
@@ -153,6 +178,9 @@ def _anthropic_error(
     error_type: str | None = None,
     headers: dict[str, str] | None = None,
 ) -> JSONResponse:
+    # Every error this surface answers with passes here, so an auto request's
+    # error never names the model serving it (serving/auto_mode.py).
+    message = conceal_served_model(message)
     return JSONResponse(
         status_code=status,
         content={
@@ -364,7 +392,8 @@ async def anthropic_aware_validation_exception_handler(
     The status is unchanged at 422 -- same as FastAPI's default -- and the
     correlation id still rides on the ``X-Request-ID`` response header, so a
     client that reports "I got a 422, here is the id" is still supportable. The
-    full validation detail, ``input`` included, goes to the log.
+    full validation detail, ``input`` included, goes to the log except on
+    phone-auth routes, where submitted OTPs and phone numbers are omitted.
 
     Registered on the Anthropic-aware pair in ``create_app`` alongside the
     HTTPException handler, so the Anthropic surfaces keep their own envelope
@@ -380,7 +409,21 @@ async def anthropic_aware_validation_exception_handler(
         # cannot render). Answering the request matters more than the log line,
         # and a body with no field list is still a correct 422.
         errors = None
-    detail = str(errors) if errors is not None else str(exc)
+    if request.url.path.startswith("/auth/phone/"):
+        # A missing signup field carries the whole body in ``input``, including
+        # a valid OTP. Keep diagnostics without retaining that credential.
+        detail = (
+            str(
+                [
+                    {key: error[key] for key in ("type", "loc", "msg") if key in error}
+                    for error in errors
+                ]
+            )
+            if errors is not None
+            else "Invalid phone authentication request"
+        )
+    else:
+        detail = str(errors) if errors is not None else str(exc)
     logger.warning(
         "request_validation_error",
         extra={
@@ -513,25 +556,22 @@ async def _resolve(
     """
     canonical = resolve_anthropic_alias(model_id)
     route = router_exec.routes.get(canonical)
-    if route is None or not route.published:
+    if route is None:
         req_ctx.mark_model_not_found()
-        raise HTTPException(404, f"Model '{model_id}' not found")
-    required = route.required_role or ("admin" if route.admin_only else "free")
-    user_role = (user_ctx or {}).get("role", "free")
-    if model_visibility_resolver is not None:
-        required = await model_visibility_resolver.get_effective_required_role(canonical, required)
-    if not has_role(user_role, required):
-        req_ctx.mark_model_not_found()
-        raise HTTPException(404, f"Model '{model_id}' not found")
-    # Same answer for "the owner disabled it" and "your grant does not name
-    # it". Checked on the canonical id, which the alias resolution above has
-    # already produced — a grant stores canonical ids, so scoping on the
-    # requested spelling would let an alias walk straight past it.
-    if is_model_disabled_for_user(canonical, user_ctx) or is_model_outside_grant_scope(
-        canonical, user_ctx
+        raise HTTPException(404, model_not_found_detail(model_id, canonical, user_ctx=user_ctx))
+    # The same answer for every reason the caller may not use the model. The
+    # check reads the canonical id off the route: the alias map above covers
+    # Anthropic's display names only, a registry alias is a route-table key of
+    # its own, and the visibility override, the denylist and a grant's list
+    # all name the canonical id (serving/model_access.py).
+    if (
+        await model_access_denial(
+            route, canonical, user_ctx, visibility_resolver=model_visibility_resolver
+        )
+        is not None
     ):
         req_ctx.mark_model_not_found()
-        raise HTTPException(404, f"Model '{model_id}' not found")
+        raise HTTPException(404, model_not_found_detail(model_id, canonical, user_ctx=user_ctx))
     if not route.adapters:
         raise HTTPException(404, f"Model '{model_id}' has no adapters")
     if not for_dispatch:
@@ -540,7 +580,13 @@ async def _resolve(
     return (
         canonical,
         route,
-        _pick_dispatch_adapter(model_id, canonical, router_exec, user_role, size_prompt),
+        _pick_dispatch_adapter(
+            model_id,
+            canonical,
+            router_exec,
+            (user_ctx or {}).get("role", "free"),
+            size_prompt,
+        ),
     )
 
 
@@ -585,11 +631,28 @@ def _pick_adapter_for_role(adapters, user_role: str):
 # These calls are rerouted to a fast non-reasoning model with an output budget
 # large enough to actually answer. The reroute is best-effort: if the target is
 # unavailable (not configured, or not visible to the caller) the request is left
-# on its original model rather than failed. Set the threshold env var to 0 to
+# on its original model rather than failed. Set the threshold setting to 0 to
 # disable entirely.
-_SMALL_MAXTOK_REROUTE_TARGET = os.environ.get("SMALL_MAXTOK_REASONING_TARGET", "qwen3.6-35b")
-_SMALL_MAXTOK_THRESHOLD = int(os.environ.get("SMALL_MAXTOK_REASONING_THRESHOLD", "64"))
-_SMALL_MAXTOK_FLOOR = int(os.environ.get("SMALL_MAXTOK_REASONING_FLOOR", "512"))
+_SMALL_MAXTOK_REROUTE_TARGET: str | None = "qwen3.6-35b"
+_SMALL_MAXTOK_THRESHOLD = 64
+_SMALL_MAXTOK_FLOOR = 512
+
+
+def _load_small_call_reroute() -> None:
+    """Read the ``SMALL_MAXTOK_REASONING_*`` settings."""
+    global _SMALL_MAXTOK_REROUTE_TARGET, _SMALL_MAXTOK_THRESHOLD, _SMALL_MAXTOK_FLOOR
+    target = config_value("SMALL_MAXTOK_REASONING_TARGET", "qwen3.6-35b")
+    threshold = int(config_value("SMALL_MAXTOK_REASONING_THRESHOLD", "64") or "")
+    floor = int(config_value("SMALL_MAXTOK_REASONING_FLOOR", "512") or "")
+    _SMALL_MAXTOK_REROUTE_TARGET, _SMALL_MAXTOK_THRESHOLD, _SMALL_MAXTOK_FLOOR = (
+        target,
+        threshold,
+        floor,
+    )
+
+
+_load_small_call_reroute()
+on_change(_load_small_call_reroute)
 # A model is treated as "reasoning" when it advertises a thinking/reasoning knob.
 _REASONING_PARAMS = ("thinking", "reasoning_effort")
 
@@ -1443,6 +1506,64 @@ async def anthropic_messages(
     # routes broken for exactly the clients that send it.
     body = normalize_inline_system(body)
 
+    # A request naming an auto model (``auto``, ``auto-<tier>``) is rewritten
+    # here to the model its tier chooses, and from here on is served exactly as
+    # a request naming that model: resolved, access-checked and dispatched below,
+    # and logged and billed under it with the decision in ``metadata.auto``
+    # (serving/auto_mode.py). The caller is not told which model that is: the
+    # response names the auto model, and so do error messages. Read before
+    # ``consume_session_fields`` takes the session declarations out of the body.
+    auto_selection: AutoSelection | None = None
+    # What the client sent, for the log, taken before the rewrite below.
+    client_request: dict[str, Any] | None = None
+    auto_mode = await auto_mode_for(model_id, getattr(request.app.state, "services", None))
+    if auto_mode is not None:
+        prompt_messages, prompt_tools = _prefill_inputs(body)
+        features = anthropic_features(
+            body,
+            prompt_tokens=estimate_prefill_tokens(prompt_messages, tools=prompt_tools),
+            side_call=_is_tool_safety_check(body),
+        )
+        try:
+            auto_selection = await auto_mode.select(
+                model_id,
+                features,
+                router_exec=router_exec,
+                user_ctx=user_ctx,
+                visibility_resolver=model_visibility_resolver,
+                session=session_key(
+                    user_ctx,
+                    session_identity(request.headers, body),
+                    conversation_fingerprint(prompt_messages),
+                ),
+            )
+        except AutoModelUnavailable as exc:
+            asyncio.create_task(  # noqa: RUF006 — fire-and-forget rejection log
+                log_rejection(
+                    request=request,
+                    status_code=exc.status_code,
+                    error_code=(
+                        "model_not_found"
+                        if exc.status_code == 404
+                        else "no_provider_available"
+                        if exc.status_code == 503
+                        else "invalid_request"
+                    ),
+                    reason=exc.detail or f"Model '{model_id}' not found",
+                    user=user_ctx,
+                    model_id=model_id,
+                    prompt=body.get("messages") or "",
+                )
+            )
+            if exc.status_code == 404:
+                req_ctx.mark_model_not_found()
+                return _anthropic_error(404, model_not_found_detail(model_id, user_ctx=user_ctx))
+            return _anthropic_error(exc.status_code, exc.detail or "")
+        client_request = copy.deepcopy(body)
+        apply_to_anthropic_body(auto_selection, body)
+        hide_served_model(auto_selection)
+        model_id = auto_selection.model_id
+
     try:
         canonical, _route, adapter = await _resolve(
             model_id,
@@ -1485,7 +1606,7 @@ async def anthropic_messages(
         # keeps the raw detail server-side either way.
         return _anthropic_error(exc.status_code, safe_detail_text(exc.detail, exc.status_code))
 
-    request_payload_for_log = copy.deepcopy(body)
+    request_payload_for_log = client_request if client_request is not None else copy.deepcopy(body)
 
     # Which session this request belongs to. This is the surface Claude Code
     # uses, and it sends no ``X-Session-ID``: it packs the run into
@@ -1531,6 +1652,9 @@ async def anthropic_messages(
         if canonical != _orig_model
         else None
     )
+    if auto_selection is not None and reroute_info is not None:
+        # The reroute's target serves the request now; keep it from the caller too.
+        hide_served_model(auto_selection, *(entry[0].config for entry in _route.adapters))
 
     forwarded_headers = _extract_forwarded_headers(request)
 
@@ -1563,6 +1687,16 @@ async def anthropic_messages(
     # Snapshot messages before _sanitize_for_openai_backend mutates them in-place
     # (strips cache_control blocks). The log must preserve the original client payload.
     messages_for_log = copy.deepcopy(body.get("messages"))
+
+    # After the log snapshot, which keeps what the client sent, and after the
+    # reroute, so it is the serving adapter's format that decides.
+    if auto_selection is not None and adapter.native_format != "openai":
+        removed_thinking = strip_foreign_thinking(auto_selection, body)
+        if removed_thinking:
+            logger.info(
+                f"[{request_id}] Removed {removed_thinking} thinking block(s) another "
+                f"model may have written before dispatch to {canonical}"
+            )
 
     if adapter.native_format == "openai":
         normalized_tool_inputs = _count_non_object_tool_inputs(body)
@@ -1662,6 +1796,7 @@ async def anthropic_messages(
         "surface": "anthropic_messages",
         "alias_input": model_id if model_id != canonical else None,
         "reroute": reroute_info,
+        "auto": auto_selection.log_metadata() if auto_selection is not None else None,
         # ``LogStore.log_request`` recovers ``api_logs.served_endpoint_id`` from
         # ``metadata["endpoint_id"]``; without it the column falls through to the
         # bare provider label ("sglang"), so every endpoint of a provider — and
@@ -1732,6 +1867,12 @@ async def anthropic_messages(
             ttft_buffer = b""
             response_acc: dict | None = None
             sse_buffer = b""
+            # An auto request's stream names the auto model, not the one serving it.
+            renamer = (
+                AnthropicStreamModelRenamer(auto_selection.requested)
+                if auto_selection is not None
+                else None
+            )
             try:
                 upstream = adapter.stream_messages(
                     body,
@@ -1891,7 +2032,11 @@ async def anthropic_messages(
                             # gets neither the credit nor the delimiter, so it
                             # is never dressed up as a complete answer.
                             if sse_buffer.strip() and _account_sse(b"\n\n"):
-                                yield b"\n\n"
+                                tail = renamer.feed(b"\n\n") if renamer is not None else b"\n\n"
+                                if tail:
+                                    yield tail
+                            if renamer is not None and (held := renamer.flush()):
+                                yield held
                             break
                         if isinstance(item, Exception):
                             raise item
@@ -1910,6 +2055,10 @@ async def anthropic_messages(
                             elif len(ttft_buffer) > 16384:
                                 ttft_buffer = b""
                         _account_sse(chunk)
+                        if renamer is not None:
+                            chunk = renamer.feed(chunk)
+                            if not chunk:
+                                continue
                         yield chunk
                 finally:
                     reader_task.cancel()
@@ -2303,6 +2452,9 @@ async def anthropic_messages(
         ),
     )
 
+    if auto_selection is not None and isinstance(resp, dict) and "model" in resp:
+        resp["model"] = auto_selection.requested
+
     usage = (resp.get("usage") or {}) if isinstance(resp, dict) else {}
     usage_for_log = {
         "input_tokens": int(usage.get("input_tokens", 0)),
@@ -2367,10 +2519,20 @@ async def anthropic_count_tokens(
     # used to probe hidden models or make an unusable model look available.
     # Visibility only: the count is computed locally, so a provider outage must
     # not blind the client's context tracking.
+    # An auto model is visible when the caller may use any of its tier's
+    # models. Which one would serve does not change the estimate below.
+    auto_mode = await auto_mode_for(model_id, getattr(request.app.state, "services", None))
     try:
-        await _resolve(
-            model_id, router_exec, user_ctx, model_visibility_resolver, for_dispatch=False
-        )
+        if auto_mode is not None:
+            if not await auto_mode.reachable(
+                model_id, router_exec, user_ctx, model_visibility_resolver
+            ):
+                req_ctx.mark_model_not_found()
+                raise HTTPException(404, model_not_found_detail(model_id, user_ctx=user_ctx))
+        else:
+            await _resolve(
+                model_id, router_exec, user_ctx, model_visibility_resolver, for_dispatch=False
+            )
     except HTTPException as exc:
         # Visibility check only, and _resolve's messages are static contract
         # text; see the note on the same call in the messages handler.
