@@ -147,6 +147,29 @@ second, it treats sign-up as closed rather than falling back to
 `SIGNUP_ENABLED`, and tries again after five seconds. Saving the switch in the
 admin console clears the error at once.
 
+**Public usage stats.** `features.public_stats: true` publishes aggregate
+figures at `/stats`: approved accounts and the waiting list, tokens served per
+day, requests and tokens per day for each model (folded until the reader opens
+it), countries, the languages people write in and the agent clients that call
+the API. The page reads `GET /public-stats`, which serves the newest snapshot
+from the `public_stats_snapshots` table and answers 404 when the flag is off or
+unset. Snapshots are written by a job you schedule once a day, for example from
+cron or a systemd timer:
+
+```bash
+docker exec <backend-container> python -m serving.analytics.public_stats
+```
+
+Add `--dry-run` to print the snapshot instead of storing it, and `--weeks N` to
+change the 26-week window. The job reads `api_logs`, the hourly country rollup,
+account statuses and the model catalog, and stores aggregates only. Per-item
+account counts below 3 are withheld. A model is named only if a `pro` account
+may use it; internal, admin and retired models are counted together as other,
+and the per-model section is left out when the catalog cannot be read.
+The language section needs message text, so it is left out unless
+`DB_STORE_FULL_CONTENT=true`. A snapshot over 10 weeks of a busy gateway takes
+about a minute. The job keeps the 30 newest snapshots.
+
 ### Activating a manifest
 
 Setting `DISTRIBUTION_CONFIG_PATH` alone changes nothing. By default the
