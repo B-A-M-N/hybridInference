@@ -15,13 +15,21 @@ from fastapi.responses import StreamingResponse
 
 from routing.endpoints import endpoint_id_for_adapter
 from routing.executor import ProviderPinError
+from routing.prefill_load import conversation_fingerprint
 from routing.protocols import RoutingRequestOptions
 from routing.routers import AllCircuitsOpenError, TargetUnavailableError
+from serving.auto_mode import (
+    AutoModelUnavailable,
+    apply_to_chat_request,
+    auto_mode_for,
+    hide_served_model,
+    openai_features,
+    session_key,
+)
 from serving.config.runtime_settings import RuntimeSettings, get_runtime_settings
-from serving.config.settings import has_role
 from serving.exceptions import scrub_error_for_user
 from serving.grant_auth import ledger_attribution
-from serving.model_access import is_model_disabled_for_user, is_model_outside_grant_scope
+from serving.model_access import ModelAccessDenial, model_access_denial
 from serving.openai_chat_serializer import resolve_mode, sanitize_response
 from serving.schemas import (
     ChatCompletionRequest,
@@ -39,6 +47,7 @@ from serving.servers.deps import (
     get_pricing_lookup,
     get_router,
 )
+from serving.servers.model_availability import model_not_found_detail
 from serving.servers.routers.completions_stream import StreamSession, ToolCallAccumulator
 from serving.servers.routers.routing_info import (
     RoutingInfo,
@@ -63,6 +72,7 @@ from serving.utils.token_utils import normalize_usage
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from serving.auto_mode import AutoSelection
     from serving.servers.routers.completions_cost import CostTracker, PricingLookup
     from serving.servers.routers.completions_logging import CompletionsLogger
 
@@ -638,6 +648,69 @@ async def chat_completions(
     if session_id:
         early_params["session_id"] = session_id
 
+    # A request naming an auto model (``auto``, ``auto-<tier>``) is rewritten
+    # here to the model its tier chooses, and from here on is served exactly as
+    # a request naming that model: the access check below runs on it, its own
+    # router picks the endpoint, and it is logged and billed under it with the
+    # decision in ``metadata.auto`` (serving/auto_mode.py). The caller is not
+    # told which model that is: responses name the auto model, and so do error
+    # messages. The services are read off the app rather than injected, because
+    # the Responses API and the legacy completions route call this handler
+    # directly.
+    auto_selection: AutoSelection | None = None
+    auto_mode = await auto_mode_for(model, getattr(request.app.state, "services", None))
+    if auto_mode is not None:
+        features = openai_features(
+            messages,
+            tools=payload.tools,
+            response_format=(
+                payload.response_format.model_dump(by_alias=True, exclude_none=True)
+                if payload.response_format is not None
+                else None
+            ),
+            max_tokens=payload.max_tokens,
+            required_modalities=_required_modalities(messages),
+        )
+        try:
+            auto_selection = await auto_mode.select(
+                model,
+                features,
+                router_exec=router_exec,
+                user_ctx=user_ctx,
+                visibility_resolver=model_visibility_resolver,
+                session=session_key(user_ctx, declared_session, conversation_fingerprint(messages)),
+            )
+        except AutoModelUnavailable as exc:
+            if log_store and not suppress_synthetic_logging:
+                completions_logger.schedule_log(
+                    request_id,
+                    {
+                        "request_id": request_id,
+                        "model_id": model,
+                        "provider": "router",
+                        "prompt": messages,
+                        "response": None,
+                        "usage": None,
+                        "latency_ms": int((time.time() - start_time) * 1000),
+                        "status_code": exc.status_code,
+                        "error": exc.detail or f"Model '{model}' not found",
+                        "params": early_params,
+                        "metadata": metadata,
+                        "pricing": None,
+                        "request_payload": body,
+                    },
+                )
+            if exc.status_code == 404:
+                req_ctx.mark_model_not_found()
+                raise HTTPException(404, model_not_found_detail(model, user_ctx=user_ctx)) from None
+            raise HTTPException(exc.status_code, exc.detail) from None
+        apply_to_chat_request(auto_selection, payload)
+        hide_served_model(auto_selection)
+        model = auto_selection.model_id
+        metadata["auto"] = auto_selection.log_metadata()
+    # The model name the client is shown, when it is not the one serving it.
+    response_model = auto_selection.requested if auto_selection is not None else None
+
     # Check if model has routing configured
     if model not in router_exec.routes:
         if log_store and not suppress_synthetic_logging:
@@ -660,26 +733,33 @@ async def chat_completions(
                 },
             )
         req_ctx.mark_model_not_found()
-        raise HTTPException(404, f"Model '{model}' not found")
+        raise HTTPException(404, model_not_found_detail(model, user_ctx=user_ctx))
 
-    # Role-based model gate: insufficient role sees a 404 as if the model doesn't exist
+    # Every reason the caller may not use this model gets one answer: the model
+    # does not exist. A sandbox cannot enumerate what is outside its scope by
+    # reading the difference between 403 and 404 (serving/model_access.py).
     route = router_exec.routes[model]
-    if not route.published:
-        req_ctx.mark_model_not_found()
-        raise HTTPException(404, f"Model '{model}' not found")
-    required = route.required_role or ("admin" if route.admin_only else "free")
-    user_role = user_ctx.get("role", "free")
-    if model_visibility_resolver is not None:
-        canonical_id = route.adapters[0][0].config.id if route.adapters else model
-        required = await model_visibility_resolver.get_effective_required_role(
-            canonical_id, required
-        )
-    if not has_role(user_role, required):
-        logger.info(
-            "Insufficient role for model",
-            extra={"model": model, "user_id": user_ctx.get("user_id"), "role": user_role},
-        )
-        if log_store and not suppress_synthetic_logging:
+    denial = await model_access_denial(
+        route, model, user_ctx, visibility_resolver=model_visibility_resolver
+    )
+    if denial is not None:
+        if denial is ModelAccessDenial.ROLE:
+            logger.info(
+                "Insufficient role for model",
+                extra={
+                    "model": model,
+                    "user_id": user_ctx.get("user_id"),
+                    "role": user_ctx.get("role", "free"),
+                },
+            )
+        # An unpublished route is a runtime model creation that has not
+        # committed yet. It is refused without a request log row, as it was
+        # before this check was shared.
+        if (
+            denial is not ModelAccessDenial.UNPUBLISHED
+            and log_store
+            and not suppress_synthetic_logging
+        ):
             completions_logger.schedule_log(
                 request_id,
                 {
@@ -699,36 +779,7 @@ async def chat_completions(
                 },
             )
         req_ctx.mark_model_not_found()
-        raise HTTPException(404, f"Model '{model}' not found")
-    # Two different reasons, one answer. The owner disabled this model, or a
-    # grant-authenticated caller was not given it — either way the caller is
-    # told it does not exist, so a sandbox cannot enumerate what is outside its
-    # scope by reading the difference between 403 and 404.
-    canonical_for_access = route.adapters[0][0].config.id if route.adapters else model
-    if is_model_disabled_for_user(canonical_for_access, user_ctx) or is_model_outside_grant_scope(
-        canonical_for_access, user_ctx
-    ):
-        if log_store and not suppress_synthetic_logging:
-            completions_logger.schedule_log(
-                request_id,
-                {
-                    "request_id": request_id,
-                    "model_id": model,
-                    "provider": "router",
-                    "prompt": messages,
-                    "response": None,
-                    "usage": None,
-                    "latency_ms": int((time.time() - start_time) * 1000),
-                    "status_code": 404,
-                    "error": f"Model '{model}' not found",
-                    "params": early_params,
-                    "metadata": metadata,
-                    "pricing": None,
-                    "request_payload": body,
-                },
-            )
-        req_ctx.mark_model_not_found()
-        raise HTTPException(404, f"Model '{model}' not found")
+        raise HTTPException(404, model_not_found_detail(model, user_ctx=user_ctx))
 
     # Extract parameters
     params: dict[str, Any] = {"stream": effective_stream}
@@ -942,6 +993,7 @@ async def chat_completions(
             get_adapter_config_for_provider=get_adapter_config_for_provider,
             request_payload=body,
             timeout_fired_probe=_timeout_fired_probe(request),
+            response_model=response_model,
         )
 
         logger.debug(f"Creating StreamingResponse for model: {model}")
@@ -950,7 +1002,7 @@ async def chat_completions(
             keepalive_gen = _streaming_response_with_keepalive(
                 session.stream(adapter_chunks),
                 request_id=request_id,
-                model=model,
+                model=response_model or model,
                 request_headers=request.headers,
             )
             first_chunk: bytes | None = None
@@ -1059,6 +1111,10 @@ async def chat_completions(
         if isinstance(response, dict):
             sanitize_result = sanitize_response(response, serializer_mode)
             response = sanitize_result.response_json
+            if response_model is not None:
+                response.pop("provider", None)
+                if "model" in response:
+                    response["model"] = response_model
             routing_info = sanitize_result.routing_info
             if routing_info:
                 routing = merge_adapter_routing(routing, routing_info)

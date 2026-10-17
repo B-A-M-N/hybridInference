@@ -3,10 +3,13 @@
 import Link from 'next/link';
 import { Fragment } from 'react';
 import { BuildInfo } from '@/components/ui/BuildInfo';
-import { useBranding } from '@/components/providers/SiteConfigProvider';
+import { useBranding, useSiteConfig } from '@/components/providers/SiteConfigProvider';
+import { useConsoleWidth } from '@/components/ui/consoleWidth';
 
 export function SiteFooter(): JSX.Element {
+  const consoleWidth = useConsoleWidth();
   const branding = useBranding();
+  const { features } = useSiteConfig();
 
   // Built as a list so a deployment that has no operating organization, docs
   // site or status page simply shows fewer entries — rendering an empty href
@@ -72,6 +75,17 @@ export function SiteFooter(): JSX.Element {
     ),
   });
 
+  if (features.publicStats) {
+    entries.push({
+      key: 'stats',
+      node: (
+        <Link href="/stats" prefetch={false} className="hover:text-crimson">
+          Stats
+        </Link>
+      ),
+    });
+  }
+
   if (branding.team.length > 0) {
     entries.push({
       key: 'team',
@@ -102,7 +116,9 @@ export function SiteFooter(): JSX.Element {
   entries.push({ key: 'build', node: <BuildInfo /> });
 
   return (
-    <footer className="mx-auto w-full max-w-5xl px-6 py-6 text-center text-sm text-gray-400">
+    <footer
+      className={`mx-auto w-full ${consoleWidth} px-6 py-6 text-center text-sm text-gray-400`}
+    >
       <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1">
         {entries.map((entry, index) => (
           <Fragment key={entry.key}>
