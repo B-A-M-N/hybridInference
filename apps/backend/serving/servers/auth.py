@@ -3,7 +3,6 @@
 import asyncio
 import hashlib
 import hmac
-import os
 import secrets
 from base64 import urlsafe_b64encode
 from datetime import datetime, timedelta, timezone
@@ -13,6 +12,7 @@ from cryptography.fernet import Fernet
 from fastapi import Depends, Header, HTTPException, Request
 
 from serving import grants, quota
+from serving.config.app_config import config_value
 from serving.config.settings import get_settings
 from serving.config.site_identity import get_site_identity
 from serving.grant_auth import (
@@ -38,6 +38,7 @@ from serving.servers.deps import (
 from serving.utils import context as req_ctx
 from serving.utils.auth_failure_blocklist import is_ip_blocked, record_auth_failure
 from serving.utils.logging import get_logger
+from serving.utils.phone_auth import phone_identity_unverified
 from serving.utils.request_ip import get_client_ip, get_client_ip_info
 
 logger = get_logger(__name__)
@@ -417,7 +418,9 @@ async def _authenticate_by_api_key(
             "RuntimeSettings lookup for signup_require_email_verification failed; "
             f"falling back to env: {exc}"
         )
-    if require_verification and user.get("email") and not user.get("email_verified"):
+    if (
+        require_verification and user.get("email") and not user.get("email_verified")
+    ) or phone_identity_unverified(user):
         raise HTTPException(
             status_code=403,
             detail="Email not verified. Please verify your email to continue.",
@@ -440,7 +443,7 @@ def _impersonation_service_key_hashes() -> frozenset[str]:
     yields an empty set, disabling impersonation entirely. Recomputed per call (a
     cheap HMAC) so key rotation / env changes take effect without a restart.
     """
-    rag_key = os.getenv("RAG_API_KEY", "").strip()
+    rag_key = (config_value("RAG_API_KEY") or "").strip()
     if not rag_key:
         return frozenset()
     try:
@@ -813,7 +816,9 @@ async def optional_verify_api_key(
             "RuntimeSettings lookup for signup_require_email_verification failed; "
             f"falling back to env: {exc}"
         )
-    if require_verification and row["email"] and not row["email_verified"]:
+    if (
+        require_verification and row["email"] and not row["email_verified"]
+    ) or phone_identity_unverified(row):
         return None
 
     user_role = row["role"] or "free"

@@ -543,10 +543,8 @@ async def test_db_logger_accepts_routewise_metadata_with_nonfinite_values(
 
 
 @pytest.mark.asyncio
-async def test_verify_api_key_against_real_database(db_logger: DatabaseLogger, monkeypatch):
+async def test_verify_api_key_against_real_database(db_logger: DatabaseLogger):
     assert db_logger.pool is not None
-    monkeypatch.setenv("USER_AUTH_ENABLED", "1")
-    monkeypatch.setenv("API_KEY_SECRET", "integration-secret")
 
     plaintext_key = "hyi-integration-key"
     key_hash = hash_api_key(plaintext_key)

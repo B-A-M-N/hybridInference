@@ -140,14 +140,54 @@ class OperationalStore(ABC):
     async def health_check(self) -> bool:
         """Return True if the store is reachable and healthy."""
 
+    # -- phone authentication (optional for legacy store implementations) ----
+
+    async def get_user_by_phone(self, phone: str) -> Row | None:
+        """Fetch an account by its canonical phone number."""
+        raise RuntimeError("Phone authentication is unavailable in this store")
+
+    async def create_phone_user(self, **fields: Any) -> bool:
+        """Create a verified phone-only identity, refusing duplicate identifiers."""
+        raise RuntimeError("Phone authentication is unavailable in this store")
+
+    async def bind_user_phone(self, user_id: str, phone: str) -> bool:
+        """Bind a verified phone atomically without replacing or merging identities."""
+        raise RuntimeError("Phone authentication is unavailable in this store")
+
+    async def reserve_phone_code(self, **fields: Any) -> int:
+        """Reserve a send within shared quotas and install an inactive challenge."""
+        raise RuntimeError("Phone authentication is unavailable in this store")
+
+    async def activate_phone_code(self, challenge_id: str) -> bool:
+        """Activate only the challenge acknowledged by the SMS provider."""
+        raise RuntimeError("Phone authentication is unavailable in this store")
+
+    async def invalidate_phone_code(self, challenge_id: str) -> None:
+        """Remove a failed delivery without removing another concurrent challenge."""
+        raise RuntimeError("Phone authentication is unavailable in this store")
+
+    async def consume_phone_code(self, **fields: Any) -> str:
+        """Record bounded attempts and atomically consume a matching challenge once."""
+        raise RuntimeError("Phone authentication is unavailable in this store")
+
+    async def create_phone_session(self, **fields: Any) -> bool:
+        """Issue a session, timestamp, and success event under an active-owner lock."""
+        raise RuntimeError("Phone authentication is unavailable in this store")
+
+    async def record_phone_login_event(self, **fields: Any) -> None:
+        """Record phone login outcomes without fabricating an email."""
+        raise RuntimeError("Phone authentication is unavailable in this store")
+
     # -- users ---------------------------------------------------------------
 
     @abstractmethod
     async def get_user_by_id(self, user_id: str) -> Row | None:
         """Fetch a single user row by primary key.
 
-        Returns columns: id, email, user_name, role, status, email_verified,
-        created_at, last_login_at, password_hash, preferences.
+        Returns columns: id, email, login_name, user_name, role, status,
+        email_verified, created_at, last_login_at, password_hash, preferences.
+        ``email`` is None for an account created without one (the first-run
+        setup administrator), which signs in with ``login_name`` instead.
         """
 
     @abstractmethod
@@ -158,21 +198,76 @@ class OperationalStore(ABC):
         """
 
     @abstractmethod
+    async def get_user_by_login_name(self, login_name: str) -> Row | None:
+        """Fetch a single user row by login name, compared case-insensitively.
+
+        Returns the same columns as ``get_user_by_id``.
+        """
+
+    @abstractmethod
     async def create_user(
         self,
         *,
         user_id: str,
-        email: str,
+        email: str | None,
         password_hash: str,
         user_name: str | None = None,
         email_verified: bool = False,
         status: str = "active",
         signup_reason: str | None = None,
+        login_name: str | None = None,
     ) -> None:
         """Insert a new user row.
 
         ``signup_reason`` captures the free-text use case the user submitted at
         registration; surfaced in the admin user list to aid manual approval.
+        ``email`` may be None only for an account that has a ``login_name``.
+        """
+
+    @abstractmethod
+    async def get_or_create_setup_code(
+        self,
+        *,
+        marker_key: str,
+        code_key: str,
+        completed_at: str,
+        candidate_code: str,
+    ) -> str | None:
+        """Return the code that completes first-run setup, or None once it is complete.
+
+        Setup is complete when the ``site_settings`` marker *marker_key*
+        exists. Without it, a users table that already has rows means the
+        deployment predates first-run setup (or got an account another way):
+        the marker is recorded with *completed_at*, any stored code is
+        deleted, and the result is None. Otherwise setup is pending, and the
+        code stored under *code_key* is returned, *candidate_code* being
+        stored first when there is none, so every process and every restart
+        uses the same code until setup completes. Serialized with
+        :meth:`create_first_admin`, so a code is never stored once setup has
+        completed.
+        """
+
+    @abstractmethod
+    async def create_first_admin(
+        self,
+        *,
+        user_id: str,
+        login_name: str,
+        password_hash: str,
+        user_name: str,
+        marker_key: str,
+        marker_value: str,
+        code_key: str,
+        admin_ip: str,
+    ) -> bool:
+        """Create the deployment's first administrator, at most once.
+
+        In one transaction, serialized across processes: re-check that the
+        users table is empty and the setup marker *marker_key* absent, insert
+        an active, verified ``admin`` without an email address, write the
+        marker, delete the setup code stored under *code_key* and audit
+        ``setup.admin_created``. Returns False, writing nothing, when setup
+        has already been completed.
         """
 
     @abstractmethod
@@ -563,6 +658,76 @@ class OperationalStore(ABC):
     async def delete_user_sessions(self, user_id: str) -> None:
         """Delete all sessions for a user (used during user deletion)."""
 
+    # -- browser sessions ----------------------------------------------------
+    #
+    # A browser holds one cookie naming one browser session, and that session
+    # lists the accounts signed in there, each through its own auth session.
+
+    @abstractmethod
+    async def create_browser_session(
+        self, *, browser_session_id: str, secret_hash: str, expires_at: datetime
+    ) -> None:
+        """Insert a browser session with no accounts yet."""
+
+    @abstractmethod
+    async def get_browser_session(self, secret_hash: str) -> Row | None:
+        """Fetch a browser session by the hash of its cookie.
+
+        Returns: ``id, active_user_id, expires_at, revoked``.
+        """
+
+    @abstractmethod
+    async def rotate_browser_session(
+        self,
+        browser_session_id: str,
+        *,
+        current_secret_hash: str,
+        new_secret_hash: str,
+        expires_at: datetime | None = None,
+    ) -> bool:
+        """Replace the cookie hash if it is still *current_secret_hash*.
+
+        Extends the expiry to *expires_at* when that is later. Returns False
+        when another request rotated it first or the session is revoked.
+        """
+
+    @abstractmethod
+    async def list_browser_session_accounts(self, browser_session_id: str) -> list[Row]:
+        """Return the accounts signed in to a browser, oldest first.
+
+        Each row carries the account's ``auth_session_id`` and that session's
+        ``sid``, ``session_expires_at`` and ``session_revoked`` (all None once
+        the session row is gone), and the user's profile columns (None once
+        the user row is gone).
+        """
+
+    @abstractmethod
+    async def attach_browser_session_account(
+        self, browser_session_id: str, *, user_id: str, auth_session_id: str
+    ) -> None:
+        """Make *auth_session_id* the browser's session for *user_id* and its active account.
+
+        Revokes the session the browser held for that account before, if any.
+        """
+
+    @abstractmethod
+    async def set_browser_session_active(
+        self, browser_session_id: str, user_id: str | None
+    ) -> None:
+        """Choose the browser's active account, or none."""
+
+    @abstractmethod
+    async def detach_browser_session_account(self, browser_session_id: str, user_id: str) -> int:
+        """Revoke and remove one account's session in a browser.
+
+        Clears the active account when it was this one. Returns how many
+        accounts remain signed in to the browser.
+        """
+
+    @abstractmethod
+    async def revoke_browser_session(self, browser_session_id: str) -> None:
+        """Revoke every account's session in a browser, and the browser session."""
+
     # -- login events (audit) ------------------------------------------------
 
     @abstractmethod
@@ -580,7 +745,9 @@ class OperationalStore(ABC):
 
         Best-effort for callers — callers may catch + log on exception so
         audit failures don't break login. ``outcome`` must be one of
-        ``'success'`` | ``'failure'``.
+        ``'success'`` | ``'failure'``. ``email`` is the identifier the client
+        signed in with: an email address or, for an account without one, a
+        login name.
         """
 
     @abstractmethod
@@ -1512,11 +1679,14 @@ class LogStore(ABC):
         until: datetime,
         limit: int,
         after: tuple[datetime, str] | None = None,
+        response_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Page through the same rows, ordered by start time then request id.
 
         ``after`` is the ``(request_started_at, request_id)`` of the last row
         already returned; rows sorting at or before it are skipped.
+        ``response_id`` optionally matches the exact delivered response identity,
+        within the same grant and window. It does not filter the window totals.
         """
 
     @abstractmethod

@@ -56,6 +56,7 @@ from serving.schemas_admin import (
 from serving.servers.auth import log_admin_action
 from serving.servers.deps import (
     AppServices,
+    get_admin_user_id,
     get_log_store,
     get_operational_store,
     get_response_store,
@@ -121,6 +122,19 @@ async def _run_hard_delete_stage_with_heartbeat(
         await asyncio.gather(heartbeat_task, return_exceptions=True)
 
 
+def _user_label(user_row: dict) -> str:
+    """Name a user in a message: the email, else the login name, else the id.
+
+    The first-run setup administrator has no email address.
+    """
+    return (
+        user_row.get("email")
+        or user_row.get("login_name")
+        or user_row.get("phone")
+        or user_row["id"]
+    )
+
+
 @router.get("/users", response_model=ListUsersResponse)
 async def list_users(
     request: Request,
@@ -151,7 +165,8 @@ async def list_users(
 
     Query Parameters:
     - status: Filter by status (pending_approval|active|suspended|rejected|deleted)
-    - search: Search by email, user_name, user id prefix, or active key prefix
+    - search: Search by email, login name, user_name, user id prefix, or active
+      key prefix
     - sort_by: Sort order
       (created|cost_today|cost_month|cost_alltime|last_login|requests|tokens).
       ``requests`` / ``tokens`` sort by the user's all-time request count and
@@ -206,6 +221,9 @@ async def list_users(
             UserListItem(
                 id=row["id"],
                 email=row["email"],
+                login_name=row.get("login_name"),
+                phone=row.get("phone"),
+                phone_verified=row.get("phone_verified", False),
                 user_name=row["user_name"],
                 role=row["role"] or "free",
                 status=row["status"],
@@ -459,7 +477,9 @@ async def admin_get_users_summary(
             top=[
                 SummaryUserItem(
                     id=u["id"],
-                    email=u["email"],
+                    email=u.get("email"),
+                    login_name=u.get("login_name"),
+                    phone=u.get("phone"),
                     user_name=u.get("user_name"),
                     role=u.get("role", "free"),
                     today_cost_usd=Decimal(str(u.get("today_cost_usd", 0))),
@@ -555,14 +575,15 @@ async def approve_user(
 
     from serving.utils.email import is_email_enabled, send_approval_email
 
-    if is_email_enabled():
+    if is_email_enabled() and user_row["email"]:
         send_approval_email(user_row["email"])
 
     return ApproveUserResponse(
         user_id=user_id,
         email=user_row["email"],
+        phone=user_row.get("phone"),
         status="active",
-        message=f"User {user_row['email']} has been approved.",
+        message=f"User {_user_label(user_row)} has been approved.",
     )
 
 
@@ -613,14 +634,15 @@ async def reject_user(
 
     from serving.utils.email import is_email_enabled, send_rejection_email
 
-    if is_email_enabled():
+    if is_email_enabled() and user_row["email"]:
         send_rejection_email(user_row["email"], payload.reason)
 
     return RejectUserResponse(
         user_id=user_id,
         email=user_row["email"],
+        phone=user_row.get("phone"),
         status="rejected",
-        message=f"User {user_row['email']} has been rejected.",
+        message=f"User {_user_label(user_row)} has been rejected.",
     )
 
 
@@ -728,6 +750,9 @@ async def get_user_detail(
     return UserDetailResponse(
         id=user_row["id"],
         email=user_row["email"],
+        login_name=user_row.get("login_name"),
+        phone=user_row.get("phone"),
+        phone_verified=user_row.get("phone_verified", False),
         user_name=user_row["user_name"],
         role=user_row["role"] or "free",
         status=user_row["status"],
@@ -787,15 +812,13 @@ async def update_user(
 
     # --- Validate all fields first, then write atomically ---
 
-    # Validate role
+    # Validate role. Compare account ids: the admin identity string is an
+    # email, a login name or (for ADMIN_TOKEN) an IP, none of which is a
+    # reliable key for "this is my own account".
     new_role: str | None = None
     if "role" in payload_dict:
         new_role = payload_dict["role"]
-        if (
-            user_row["email"]
-            and user_row["email"].lower() == admin_id.lower()
-            and new_role != "admin"
-        ):
+        if user_id == get_admin_user_id(request) and new_role != "admin":
             raise HTTPException(409, "Cannot demote your own admin role.")
 
     # Validate status transition
@@ -998,8 +1021,9 @@ async def delete_user(
     return DeleteUserResponse(
         user_id=user_id,
         email=user_row["email"],
+        phone=user_row.get("phone"),
         status="deleted",
-        message=f"User {user_row['email']} has been deleted.",
+        message=f"User {_user_label(user_row)} has been deleted.",
     )
 
 
@@ -1064,8 +1088,9 @@ async def resume_user(
     return ResumeUserResponse(
         user_id=user_id,
         email=user_row["email"],
+        phone=user_row.get("phone"),
         status="active",
-        message=f"User {user_row['email']} has been resumed.",
+        message=f"User {_user_label(user_row)} has been resumed.",
     )
 
 
@@ -1148,6 +1173,7 @@ async def hard_delete_user(
         )
 
     email = user_row["email"]
+    label = _user_label(user_row)
 
     claim: HardDeleteClaim | None = None
     try:
@@ -1284,5 +1310,6 @@ async def hard_delete_user(
     return HardDeleteUserResponse(
         user_id=user_id,
         email=email,
-        message=f"User {email} has been permanently deleted.",
+        phone=user_row.get("phone"),
+        message=f"User {label} has been permanently deleted.",
     )
