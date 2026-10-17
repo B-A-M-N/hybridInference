@@ -34,7 +34,9 @@ from tests.fixtures.auth_helpers import (
 @pytest.fixture
 def auth_env(monkeypatch):
     """Set up environment variables for auth testing."""
+    from serving.config import settings as settings_module
     from serving.config.settings import get_settings
+    from serving.servers.routers import auth_routes
 
     get_settings.cache_clear()
 
@@ -51,6 +53,9 @@ def auth_env(monkeypatch):
         monkeypatch.setenv(key, value)
 
     get_settings.cache_clear()
+    test_settings = get_settings()
+    monkeypatch.setattr(settings_module, "settings", test_settings)
+    monkeypatch.setattr(auth_routes, "settings", test_settings)
 
     return test_env
 
