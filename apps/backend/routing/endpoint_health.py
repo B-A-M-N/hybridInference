@@ -297,6 +297,19 @@ class _ProviderHealth:
         self.consecutive_auth_rejections = 0
         self._lock = threading.Lock()
 
+    def record_liveness(self) -> None:
+        """Record transport liveness without allowing credential recovery.
+
+        A response header or first stream chunk proves the endpoint emitted
+        bytes, but not that its credential was accepted or that the model did
+        work. This updates only EWMA liveness; credential-rejection recovery
+        remains exclusively the job of :meth:`record` with semantic success.
+        """
+        inc_s = 1.0
+        with self._lock:
+            self.ewma_success = (1 - self.alpha) * self.ewma_success + self.alpha * inc_s
+            self.ewma_total = (1 - self.alpha) * self.ewma_total + self.alpha
+
     def record(self, success: bool) -> bool:
         """Record an outcome; return whether it ended a credential-rejection run.
 
@@ -1035,7 +1048,7 @@ class EndpointHealthRegistry:
         """
         with self._lock:
             self.ensure(endpoint_id)
-            self._health[endpoint_id].record(True)
+            self._health[endpoint_id].record_liveness()
 
     def record_failure(
         self,
