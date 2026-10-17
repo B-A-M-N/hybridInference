@@ -25,6 +25,8 @@ useful *serving*.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 from routing.completion_outcome import CompletionOutcome
@@ -50,6 +52,14 @@ NO_PROGRESS_OUTCOMES = [
     CompletionOutcome.ABORTED,
     CompletionOutcome.UNKNOWN,
 ]
+
+
+class _StatusError(Exception):
+    """Adapter exception carrying an upstream HTTP status."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"HTTP {status}")
+        self.status = status
 
 
 def _trip(monkeypatch, registry: EndpointHealthRegistry, endpoint_id: str = _ENDPOINT) -> None:
@@ -131,6 +141,22 @@ def test_liveness_never_recovers_a_half_open_breaker(monkeypatch):
 
     registry.record_success(_ENDPOINT, outcome=CompletionOutcome.COMPLETE)
     assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED
+
+
+def test_liveness_does_not_clear_credential_rejections(monkeypatch):
+    """Liveness proves the endpoint emitted bytes, not that auth recovered."""
+    monkeypatch.setenv(_THRESHOLD_ENV, "999")
+    registry = EndpointHealthRegistry()
+
+    with patch("serving.observability.alerts.alert_slack", new=AsyncMock()):
+        registry.record_failure(_ENDPOINT, reason="stream_exception", exc=_StatusError(401))
+        assert registry.snapshot()[_ENDPOINT]["consecutive_auth_rejections"] == 1
+
+        registry.record_liveness(_ENDPOINT)
+        assert registry.snapshot()[_ENDPOINT]["consecutive_auth_rejections"] == 1
+
+        registry.record_success(_ENDPOINT, outcome=CompletionOutcome.COMPLETE)
+        assert registry.snapshot()[_ENDPOINT]["consecutive_auth_rejections"] == 0
 
 
 def test_unclassified_success_is_rejected_not_counted(monkeypatch):
