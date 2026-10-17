@@ -13,6 +13,7 @@ holds the appropriate advisory lock to force the desired schedule.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 from datetime import datetime, timezone
@@ -764,6 +765,157 @@ async def test_resume_race_hard_delete_wins(fence_store):
         await conn.execute("DELETE FROM users WHERE id = $1", _OWNER)
 
 
+async def test_resume_endpoint_delete_wins_after_preflight_returns_conflict(
+    fence_store, monkeypatch
+):
+    """A completed delete between route preflight and store mutation returns 409."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    import serving.servers.routers.admin.users as admin_users
+    from serving.schemas_admin import HardDeleteUserRequest, ResumeUserRequest
+
+    log_store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    resume_ready = asyncio.Event()
+    allow_resume = asyncio.Event()
+
+    class PausingResumeStore:
+        def __getattr__(self, name: str):
+            return getattr(op_store, name)
+
+        async def resume_user(self, *args, **kwargs):
+            # The route has already read the soft-deleted user and checked
+            # that no erasure fence exists before reaching this boundary.
+            resume_ready.set()
+            await allow_resume.wait()
+            return await op_store.resume_user(*args, **kwargs)
+
+    class ResponseStore:
+        async def delete_user_responses(self, user_id: str) -> None:
+            return None
+
+    monkeypatch.setattr(
+        admin_users,
+        "get_settings",
+        lambda: SimpleNamespace(erasure_fence_protocol_ready=True),
+    )
+    request_scope = {
+        "type": "http",
+        "headers": [],
+        "client": ("127.0.0.1", 12345),
+        "server": ("test", 80),
+        "scheme": "http",
+    }
+    resume = asyncio.create_task(
+        admin_users.resume_user(
+            Request(request_scope),
+            _OWNER,
+            ResumeUserRequest(reason="raced with hard delete"),
+            admin_id="admin",
+            op_store=PausingResumeStore(),
+            log_store=log_store,
+        )
+    )
+
+    try:
+        await asyncio.wait_for(resume_ready.wait(), timeout=5)
+        assert await log_store.account_has_erasure_fence(_OWNER) is False
+
+        await admin_users.hard_delete_user(
+            Request(request_scope),
+            _OWNER,
+            HardDeleteUserRequest(confirm=True),
+            admin_id="delete-admin",
+            op_store=op_store,
+            log_store=log_store,
+            response_store=ResponseStore(),
+        )
+        allow_resume.set()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await resume
+
+        assert exc_info.value.status_code == 409
+        async with pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT id FROM users WHERE id = $1", _OWNER)
+            resume_audits = await conn.fetchval(
+                "SELECT COUNT(*) FROM admin_audit_log "
+                "WHERE target_user_id = $1 AND action = 'resume_user'",
+                _OWNER,
+            )
+        assert user is None
+        assert resume_audits == 0
+    finally:
+        allow_resume.set()
+        if not resume.done():
+            resume.cancel()
+        with contextlib.suppress(BaseException):
+            await resume
+
+
+async def test_missing_user_mutations_fail_without_resume_audit(fence_store):
+    """Status mutations fail closed when hard-delete already removed the row."""
+    _store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    user_id = "u-fence-missing-status"
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (id, email, password_hash, status) "
+            "VALUES ($1, $1 || '@example.com', 'x', 'active')",
+            user_id,
+        )
+        await conn.execute("DELETE FROM users WHERE id = $1", user_id)
+
+    with pytest.raises(HardDeleteStateChanged):
+        await op_store.update_user_fields(user_id, status="suspended")
+    with pytest.raises(HardDeleteStateChanged):
+        await op_store.resume_user(
+            user_id,
+            admin_ip="127.0.0.1",
+            admin_id="admin",
+            reason="test",
+        )
+    with pytest.raises(HardDeleteStateChanged):
+        await op_store.approve_user(user_id, admin_id="admin")
+    with pytest.raises(HardDeleteStateChanged):
+        await op_store.reject_user(user_id, admin_id="admin", reason="test")
+
+    async with pool.acquire() as conn:
+        audit_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM admin_audit_log "
+            "WHERE target_user_id = $1 AND action = 'resume_user'",
+            user_id,
+        )
+    assert audit_count == 0
+
+
+async def test_approval_mutations_require_pending_approval(fence_store):
+    """Approve/reject cannot overwrite a status changed after the route read."""
+    _store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    user_id = "u-fence-no-longer-pending"
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (id, email, password_hash, status) "
+            "VALUES ($1, $1 || '@example.com', 'x', 'active')",
+            user_id,
+        )
+
+    with pytest.raises(HardDeleteStateChanged):
+        await op_store.approve_user(user_id, admin_id="admin")
+    with pytest.raises(HardDeleteStateChanged):
+        await op_store.reject_user(user_id, admin_id="admin", reason="test")
+
+    async with pool.acquire() as conn:
+        status = await conn.fetchval("SELECT status FROM users WHERE id = $1", user_id)
+    assert status == "active"
+
+
 async def test_failed_hard_delete_claim_can_be_released(fence_store):
     """Concurrent claims are rejected and released claims can be retried."""
     _store, pool = fence_store
@@ -1056,6 +1208,392 @@ async def test_superseded_worker_cannot_continue_after_fence(fence_store):
         )
 
     await op_store.renew_hard_delete_user_claim(_OWNER, recovered_claim.token)
+
+
+async def test_hard_delete_route_stops_after_claim_recovery_between_stages(
+    fence_store, monkeypatch
+):
+    """An old worker cannot enter Responses or operational deletion after takeover."""
+    from types import SimpleNamespace
+
+    from starlette.requests import Request
+
+    import serving.servers.routers.admin.users as admin_users
+    from serving.schemas_admin import HardDeleteUserRequest
+
+    inner_log_store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    fence_written = asyncio.Event()
+    resume_original_worker = asyncio.Event()
+    response_deletions: list[str] = []
+    operational_deletions: list[str] = []
+
+    class PausingLogStore:
+        async def hard_delete_user_data(self, user_id: str) -> dict[str, int]:
+            result = await inner_log_store.hard_delete_user_data(user_id)
+            fence_written.set()
+            await resume_original_worker.wait()
+            return result
+
+        async def account_has_erasure_fence(self, user_id: str) -> bool:
+            return await inner_log_store.account_has_erasure_fence(user_id)
+
+    class ResponseStore:
+        async def delete_user_responses(self, user_id: str) -> None:
+            response_deletions.append(user_id)
+
+    original_hard_delete = op_store.hard_delete_user
+
+    async def record_operational_delete(*args, **kwargs):
+        operational_deletions.append(str(args[0] if args else kwargs.get("user_id")))
+        return await original_hard_delete(*args, **kwargs)
+
+    monkeypatch.setattr(op_store, "hard_delete_user", record_operational_delete)
+    monkeypatch.setattr(
+        admin_users,
+        "get_settings",
+        lambda: SimpleNamespace(erasure_fence_protocol_ready=True),
+    )
+    request = Request(
+        {
+            "type": "http",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("test", 80),
+            "scheme": "http",
+        }
+    )
+    original_worker = asyncio.create_task(
+        admin_users.hard_delete_user(
+            request,
+            _OWNER,
+            HardDeleteUserRequest(confirm=True),
+            admin_id="old-worker",
+            op_store=op_store,
+            log_store=PausingLogStore(),
+            response_store=ResponseStore(),
+        )
+    )
+
+    try:
+        await asyncio.wait_for(fence_written.wait(), timeout=5)
+        assert await inner_log_store.account_has_erasure_fence(_OWNER) is True
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET hard_delete_claimed_at = NOW() - INTERVAL '2 hours' "
+                "WHERE id = $1",
+                _OWNER,
+            )
+        recovered_claim = await op_store.begin_hard_delete_user(
+            _OWNER,
+            allow_existing_fence=True,
+        )
+
+        resume_original_worker.set()
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc_info:
+            await original_worker
+
+        assert exc_info.value.status_code == 409
+        assert response_deletions == []
+        assert operational_deletions == []
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT status, hard_delete_pending, hard_delete_claim_token "
+                "FROM users WHERE id = $1",
+                _OWNER,
+            )
+        assert row["status"] == "deleted"
+        assert row["hard_delete_pending"] is True
+        assert row["hard_delete_claim_token"] == recovered_claim.token
+    finally:
+        resume_original_worker.set()
+        if not original_worker.done():
+            original_worker.cancel()
+        with contextlib.suppress(BaseException):
+            await original_worker
+
+
+@pytest.mark.parametrize("stage", ("log", "responses", "operational"))
+async def test_hard_delete_route_cancellation_stops_before_the_next_stage(
+    fence_store, monkeypatch, stage
+):
+    """Cancellation at any destructive boundary cannot enter the next store."""
+    from types import SimpleNamespace
+
+    from starlette.requests import Request
+
+    import serving.servers.routers.admin.users as admin_users
+    from serving.schemas_admin import HardDeleteUserRequest
+
+    inner_log_store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    stage_started = asyncio.Event()
+    resume_stage = asyncio.Event()
+    response_started: list[str] = []
+    response_completed: list[str] = []
+    operational_started: list[str] = []
+    operational_completed: list[str] = []
+
+    class PausingLogStore:
+        async def hard_delete_user_data(self, user_id: str) -> dict[str, int]:
+            result = await inner_log_store.hard_delete_user_data(user_id)
+            if stage == "log":
+                stage_started.set()
+                await resume_stage.wait()
+            return result
+
+        async def account_has_erasure_fence(self, user_id: str) -> bool:
+            return await inner_log_store.account_has_erasure_fence(user_id)
+
+    class ResponseStore:
+        async def delete_user_responses(self, user_id: str) -> None:
+            response_started.append(user_id)
+            if stage == "responses":
+                stage_started.set()
+                await resume_stage.wait()
+            response_completed.append(user_id)
+
+    original_hard_delete = op_store.hard_delete_user
+
+    async def pause_operational_delete(*args, **kwargs):
+        user_id = str(args[0] if args else kwargs.get("user_id"))
+        operational_started.append(user_id)
+        if stage == "operational":
+            stage_started.set()
+            await resume_stage.wait()
+        result = await original_hard_delete(*args, **kwargs)
+        operational_completed.append(user_id)
+        return result
+
+    monkeypatch.setattr(op_store, "hard_delete_user", pause_operational_delete)
+    monkeypatch.setattr(
+        admin_users,
+        "get_settings",
+        lambda: SimpleNamespace(erasure_fence_protocol_ready=True),
+    )
+    request = Request(
+        {
+            "type": "http",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("test", 80),
+            "scheme": "http",
+        }
+    )
+    worker = asyncio.create_task(
+        admin_users.hard_delete_user(
+            request,
+            _OWNER,
+            HardDeleteUserRequest(confirm=True),
+            admin_id="cancelled-worker",
+            op_store=op_store,
+            log_store=PausingLogStore(),
+            response_store=ResponseStore(),
+        )
+    )
+
+    try:
+        await asyncio.wait_for(stage_started.wait(), timeout=5)
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+        assert response_started == ([_OWNER] if stage in ("responses", "operational") else [])
+        assert response_completed == ([_OWNER] if stage == "operational" else [])
+        assert operational_started == ([_OWNER] if stage == "operational" else [])
+        assert operational_completed == []
+        assert await inner_log_store.account_has_erasure_fence(_OWNER) is True
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT status, hard_delete_pending, hard_delete_claim_token "
+                "FROM users WHERE id = $1",
+                _OWNER,
+            )
+        assert row["status"] == "deleted"
+        assert row["hard_delete_pending"] is True
+        assert row["hard_delete_claim_token"]
+    finally:
+        resume_stage.set()
+        if not worker.done():
+            worker.cancel()
+        with contextlib.suppress(BaseException):
+            await worker
+
+
+async def test_log_store_error_after_fence_commit_retains_claim_and_stops(fence_store, monkeypatch):
+    """A post-commit error is ambiguous, so the route retains its claim."""
+    from types import SimpleNamespace
+
+    from starlette.requests import Request
+
+    import serving.servers.routers.admin.users as admin_users
+    from serving.schemas_admin import HardDeleteUserRequest
+
+    inner_log_store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    response_deletions: list[str] = []
+    operational_deletions: list[str] = []
+    original_hard_delete = op_store.hard_delete_user
+
+    async def record_operational_delete(*args, **kwargs):
+        operational_deletions.append(str(args[0] if args else kwargs.get("user_id")))
+        return await original_hard_delete(*args, **kwargs)
+
+    class CommitThenFailLogStore:
+        async def hard_delete_user_data(self, user_id: str) -> dict[str, int]:
+            await inner_log_store.hard_delete_user_data(user_id)
+            raise RuntimeError("connection lost after the LogStore commit")
+
+        async def account_has_erasure_fence(self, user_id: str) -> bool:
+            return await inner_log_store.account_has_erasure_fence(user_id)
+
+    class ResponseStore:
+        async def delete_user_responses(self, user_id: str) -> None:
+            response_deletions.append(user_id)
+
+    monkeypatch.setattr(op_store, "hard_delete_user", record_operational_delete)
+    monkeypatch.setattr(
+        admin_users,
+        "get_settings",
+        lambda: SimpleNamespace(erasure_fence_protocol_ready=True),
+    )
+    request = Request(
+        {
+            "type": "http",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("test", 80),
+            "scheme": "http",
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="after the LogStore commit"):
+        await admin_users.hard_delete_user(
+            request,
+            _OWNER,
+            HardDeleteUserRequest(confirm=True),
+            admin_id="ambiguous-worker",
+            op_store=op_store,
+            log_store=CommitThenFailLogStore(),
+            response_store=ResponseStore(),
+        )
+
+    assert await inner_log_store.account_has_erasure_fence(_OWNER) is True
+    assert response_deletions == []
+    assert operational_deletions == []
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, hard_delete_pending, hard_delete_claim_token FROM users WHERE id = $1",
+            _OWNER,
+        )
+    assert row["status"] == "deleted"
+    assert row["hard_delete_pending"] is True
+    assert row["hard_delete_claim_token"]
+
+
+async def test_status_reactivation_after_admin_read_blocks_hard_delete(fence_store, monkeypatch):
+    """A status change between the route read and claim prevents the purge."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    import serving.servers.routers.admin.users as admin_users
+    from serving.schemas_admin import HardDeleteUserRequest
+
+    inner_log_store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    initial_read_complete = asyncio.Event()
+    allow_route_to_continue = asyncio.Event()
+    fence_calls: list[str] = []
+    response_deletions: list[str] = []
+    operational_deletions: list[str] = []
+
+    class PausingOperationalStore:
+        def __getattr__(self, name: str):
+            return getattr(op_store, name)
+
+        async def get_user_by_id(self, user_id: str):
+            row = await op_store.get_user_by_id(user_id)
+            initial_read_complete.set()
+            await allow_route_to_continue.wait()
+            return row
+
+    class CountingLogStore:
+        async def account_has_erasure_fence(self, user_id: str) -> bool:
+            return await inner_log_store.account_has_erasure_fence(user_id)
+
+        async def hard_delete_user_data(self, user_id: str) -> dict[str, int]:
+            fence_calls.append(user_id)
+            return await inner_log_store.hard_delete_user_data(user_id)
+
+    class ResponseStore:
+        async def delete_user_responses(self, user_id: str) -> None:
+            response_deletions.append(user_id)
+
+    original_hard_delete = op_store.hard_delete_user
+
+    async def record_operational_delete(*args, **kwargs):
+        operational_deletions.append(str(args[0] if args else kwargs.get("user_id")))
+        return await original_hard_delete(*args, **kwargs)
+
+    monkeypatch.setattr(op_store, "hard_delete_user", record_operational_delete)
+    monkeypatch.setattr(
+        admin_users,
+        "get_settings",
+        lambda: SimpleNamespace(erasure_fence_protocol_ready=True),
+    )
+    request = Request(
+        {
+            "type": "http",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("test", 80),
+            "scheme": "http",
+        }
+    )
+    hard_delete = asyncio.create_task(
+        admin_users.hard_delete_user(
+            request,
+            _OWNER,
+            HardDeleteUserRequest(confirm=True),
+            admin_id="admin",
+            op_store=PausingOperationalStore(),
+            log_store=CountingLogStore(),
+            response_store=ResponseStore(),
+        )
+    )
+
+    try:
+        await asyncio.wait_for(initial_read_complete.wait(), timeout=5)
+        await op_store.update_user_fields(_OWNER, status="active")
+        allow_route_to_continue.set()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await hard_delete
+
+        assert exc_info.value.status_code == 409
+        assert fence_calls == []
+        assert response_deletions == []
+        assert operational_deletions == []
+        assert await inner_log_store.account_has_erasure_fence(_OWNER) is False
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT status, hard_delete_pending FROM users WHERE id = $1",
+                _OWNER,
+            )
+        assert row["status"] == "active"
+        assert row["hard_delete_pending"] is False
+    finally:
+        allow_route_to_continue.set()
+        if not hard_delete.done():
+            hard_delete.cancel()
+        with contextlib.suppress(BaseException):
+            await hard_delete
 
 
 async def test_concurrent_stale_post_fence_recovery_has_one_owner(fence_store):
