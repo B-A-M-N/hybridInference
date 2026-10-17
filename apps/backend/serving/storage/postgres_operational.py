@@ -8,14 +8,14 @@ user_routes.py, internal.py, and user_stats.py.
 from __future__ import annotations
 
 import json
-import os
 import secrets
 from typing import TYPE_CHECKING, Any, Literal
 
 from serving import grants, quota
-from serving.config.settings import ROLE_RANK, VALID_ROLES
-from serving.exceptions import DuplicateAPIKeyError, HardDeleteStateChanged
+from serving.config.settings import ROLE_RANK, VALID_ROLES, get_settings
+from serving.exceptions import DuplicateAPIKeyError, HardDeleteStateChanged, SelfDeleteRefused
 from serving.storage.base import OperationalStore, ProviderDefinitionRow, ProviderKeyRow, Row
+from serving.storage.browser_session_schema import ensure_browser_session_tables
 from serving.storage.log_schema import (
     SchemaLockUnavailable,
     apply_column_migrations,
@@ -26,6 +26,7 @@ from serving.storage.log_schema import (
     drop_columns_if_present,
     execute_ddl,
 )
+from serving.storage.phone_auth import PostgresPhoneAuthMixin, initialize_phone_auth
 from serving.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -36,6 +37,18 @@ if TYPE_CHECKING:
     import asyncpg
 
 logger = get_logger(__name__)
+
+# Columns of a single-user lookup (get_user_by_id / _by_email / _by_login_name).
+_USER_COLUMNS = (
+    "id, email, login_name, phone, phone_verified, user_name, role, status, email_verified, "
+    "created_at, last_login_at, password_hash, preferences, max_concurrent_requests, "
+    "signup_reason, admin_note, suspension_message"
+)
+
+# Serializes first-run setup claims across every process sharing the database.
+_FIRST_RUN_SETUP_LOCK_SQL = (
+    "SELECT pg_advisory_xact_lock(hashtext('hybridinference:first-run-setup'))"
+)
 
 
 class RequiredOperationalSchemaUnavailable(SchemaLockUnavailable):
@@ -108,7 +121,7 @@ def _coerce_user_row(row: Any) -> Row | None:
     return d
 
 
-class PostgresOperationalStore(OperationalStore):
+class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
     """OperationalStore backed by an asyncpg connection pool."""
 
     def __init__(self, pool: asyncpg.Pool, *, fence_secret: str | None = None) -> None:
@@ -139,11 +152,15 @@ class PostgresOperationalStore(OperationalStore):
         import asyncpg as _asyncpg
 
         # --- users ---
+        # ``email`` admits NULL for the one account created without an address
+        # (the first-run setup administrator), which signs in with
+        # ``login_name``; keep in step with the copy in ``database.py``.
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
-                email TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
+                email TEXT UNIQUE,
+                login_name TEXT,
+                password_hash TEXT,
                 user_name TEXT,
                 preferences JSONB NOT NULL DEFAULT '{}'::jsonb,
                 role TEXT NOT NULL DEFAULT 'free'
@@ -165,16 +182,23 @@ class PostgresOperationalStore(OperationalStore):
                 suspension_message TEXT
             )
         """)
+        try:
+            await initialize_phone_auth(conn)
+        except SchemaLockUnavailable as exc:
+            raise RequiredOperationalSchemaUnavailable(
+                "Phone identity columns are required before the operational store can serve."
+            ) from exc
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)")
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at DESC)"
         )
-        # This column is part of the hard-delete state machine. Install it
-        # before any other deferrable operational migration. If the upgrade
-        # cannot acquire the lock, refuse to expose the store rather than
-        # letting bootstrap defer a migration while hard-delete/resume queries
-        # would fail with UndefinedColumnError.
+        # The hard-delete columns are part of the hard-delete state machine, and
+        # every single-user lookup (_USER_COLUMNS: sign-in, token refresh, the
+        # auth dependency) selects login_name. Install them before any other
+        # deferrable operational migration. If the upgrade cannot acquire the
+        # lock, refuse to expose the store rather than letting bootstrap defer a
+        # migration while those queries would fail with UndefinedColumnError.
         try:
             await apply_column_migrations(
                 conn,
@@ -189,13 +213,28 @@ class PostgresOperationalStore(OperationalStore):
                         "hard_delete_claim_token",
                         "ALTER TABLE users ADD COLUMN IF NOT EXISTS hard_delete_claim_token TEXT",
                     ),
+                    # Sign-in name of an account created without an email address.
+                    ("login_name", "ALTER TABLE users ADD COLUMN IF NOT EXISTS login_name TEXT"),
                 ],
             )
+            # Databases created before email-less accounts have email NOT NULL,
+            # and first-run setup inserts its administrator without one. DROP NOT
+            # NULL takes ACCESS EXCLUSIVE, so it is gated on the catalog like the
+            # role column below. UNIQUE still admits any number of NULLs.
+            email_meta = await column_metadata(conn, "users", "email")
+            if email_meta is not None and email_meta["not_null"]:
+                async with bounded_ddl(conn):
+                    await execute_ddl(conn, "ALTER TABLE users ALTER COLUMN email DROP NOT NULL")
         except SchemaLockUnavailable as exc:
             raise RequiredOperationalSchemaUnavailable(
-                "hard-delete claim columns are required before the operational store "
-                "can serve; refusing deferred startup while its migration is locked"
+                "the users columns every account lookup reads (hard-delete claim, login "
+                "name, nullable email) are required before the operational store can "
+                "serve; refusing deferred startup while their migration is locked"
             ) from exc
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_login_name "
+            "ON users (lower(login_name)) WHERE login_name IS NOT NULL"
+        )
 
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_users_pending_approval "
@@ -242,6 +281,13 @@ class PostgresOperationalStore(OperationalStore):
                 (
                     "suspension_message",
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS suspension_message TEXT",
+                ),
+                # The user's portrait, a small image data URL. A column of its
+                # own rather than a preference: preferences ride along on every
+                # API-key authentication, and a portrait has no business there.
+                (
+                    "avatar_data_url",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data_url TEXT",
                 ),
             ],
         )
@@ -362,8 +408,10 @@ class PostgresOperationalStore(OperationalStore):
             )
             raise
 
-        # Seed admin roles from ADMIN_EMAILS
-        admin_emails = _parse_admin_emails(os.getenv("ADMIN_EMAILS", ""))
+        # Seed admin roles from ADMIN_EMAILS. Read through settings, which
+        # carry the database-backed configuration; an account without an
+        # email (NULL) never matches.
+        admin_emails = _parse_admin_emails(get_settings().admin_emails or "")
         if admin_emails:
             tag = await conn.execute(
                 "UPDATE users SET role = 'admin' "
@@ -380,6 +428,7 @@ class PostgresOperationalStore(OperationalStore):
             CREATE TABLE IF NOT EXISTS api_keys (
                 id BIGSERIAL PRIMARY KEY,
                 key_hash TEXT NOT NULL UNIQUE,
+                api_key_encrypted TEXT,
                 key_prefix TEXT NOT NULL,
                 user_id TEXT NOT NULL,
                 user_name TEXT,
@@ -420,6 +469,10 @@ class PostgresOperationalStore(OperationalStore):
                     "quota_monthly_cost_usd",
                     "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS "
                     "quota_monthly_cost_usd DECIMAL(10, 4)",
+                ),
+                (
+                    "api_key_encrypted",
+                    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS api_key_encrypted TEXT",
                 ),
                 ("account_id", "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS account_id TEXT"),
             ],
@@ -477,6 +530,8 @@ class PostgresOperationalStore(OperationalStore):
         )
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_jti ON auth_sessions(jti)")
 
+        await ensure_browser_session_tables(conn)
+
         # --- login_events ---
         await conn.execute(
             """
@@ -484,7 +539,8 @@ class PostgresOperationalStore(OperationalStore):
                 id BIGSERIAL PRIMARY KEY,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 user_id TEXT,
-                email TEXT NOT NULL,
+                email TEXT,
+                phone TEXT,
                 outcome TEXT NOT NULL
                     CHECK (outcome IN ('success', 'failure')),
                 failure_reason TEXT,
@@ -493,6 +549,15 @@ class PostgresOperationalStore(OperationalStore):
             )
             """
         )
+        await apply_column_migrations(
+            conn,
+            "login_events",
+            [("phone", "ALTER TABLE login_events ADD COLUMN IF NOT EXISTS phone TEXT")],
+        )
+        login_email_meta = await column_metadata(conn, "login_events", "email")
+        if login_email_meta and login_email_meta["not_null"]:
+            async with bounded_ddl(conn):
+                await execute_ddl(conn, "ALTER TABLE login_events ALTER COLUMN email DROP NOT NULL")
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_login_events_user "
             "ON login_events (user_id, created_at DESC) WHERE user_id IS NOT NULL"
@@ -516,9 +581,20 @@ class PostgresOperationalStore(OperationalStore):
                 user_id TEXT NOT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 expires_at TIMESTAMPTZ NOT NULL,
-                used_at TIMESTAMPTZ
+                used_at TIMESTAMPTZ,
+                pending_email TEXT
             )
         """)
+        await apply_column_migrations(
+            conn,
+            "email_verification_tokens",
+            [
+                (
+                    "pending_email",
+                    "ALTER TABLE email_verification_tokens ADD COLUMN IF NOT EXISTS pending_email TEXT",
+                ),
+            ],
+        )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_email_verification_user "
             "ON email_verification_tokens(user_id)"
@@ -940,10 +1016,7 @@ class PostgresOperationalStore(OperationalStore):
         """Fetch a single user row by primary key."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, email, user_name, role, status, email_verified, "
-                "created_at, last_login_at, password_hash, preferences, max_concurrent_requests, "
-                "signup_reason, admin_note, suspension_message "
-                "FROM users WHERE id = $1",
+                f"SELECT {_USER_COLUMNS} FROM users WHERE id = $1",
                 user_id,
             )
         return _coerce_user_row(row)
@@ -952,11 +1025,19 @@ class PostgresOperationalStore(OperationalStore):
         """Fetch a single user row by lowercased email."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, email, user_name, role, status, email_verified, "
-                "created_at, last_login_at, password_hash, preferences, max_concurrent_requests, "
-                "signup_reason, admin_note, suspension_message "
-                "FROM users WHERE email = $1",
+                f"SELECT {_USER_COLUMNS} FROM users WHERE email = $1",
                 email.lower(),
+            )
+        return _coerce_user_row(row)
+
+    async def get_user_by_login_name(self, login_name: str) -> Row | None:
+        """Fetch a single user row by login name, compared case-insensitively."""
+        async with self._pool.acquire() as conn:
+            # Matches the expression and predicate of idx_users_login_name.
+            row = await conn.fetchrow(
+                f"SELECT {_USER_COLUMNS} FROM users "
+                "WHERE lower(login_name) = $1 AND login_name IS NOT NULL",
+                login_name.strip().lower(),
             )
         return _coerce_user_row(row)
 
@@ -964,27 +1045,135 @@ class PostgresOperationalStore(OperationalStore):
         self,
         *,
         user_id: str,
-        email: str,
+        email: str | None,
         password_hash: str,
         user_name: str | None = None,
         email_verified: bool = False,
         status: str = "active",
         signup_reason: str | None = None,
+        login_name: str | None = None,
     ) -> None:
         """Insert a new user row."""
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO users (id, email, password_hash, user_name, "
-                "email_verified, status, signup_reason) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                "email_verified, status, signup_reason, login_name) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 user_id,
-                email.lower(),
+                email.lower() if email is not None else None,
                 password_hash,
                 user_name,
                 email_verified,
                 status,
                 signup_reason,
+                login_name.lower() if login_name is not None else None,
             )
+
+    async def get_or_create_setup_code(
+        self,
+        *,
+        marker_key: str,
+        code_key: str,
+        completed_at: str,
+        candidate_code: str,
+    ) -> str | None:
+        """Return the shared first-run setup code, or None once setup is complete.
+
+        Everything after the marker check runs under the first-run setup lock,
+        so it cannot interleave with :meth:`create_first_admin`: a code is
+        never stored after the claim committed, and a code stored before it is
+        deleted by it.
+        """
+        async with self._pool.acquire() as conn:
+            # A settled deployment reads one row and takes no lock.
+            if await conn.fetchval("SELECT 1 FROM site_settings WHERE key = $1", marker_key):
+                return None
+            async with conn.transaction():
+                await conn.execute(_FIRST_RUN_SETUP_LOCK_SQL)
+                if await conn.fetchval("SELECT 1 FROM site_settings WHERE key = $1", marker_key):
+                    return None
+                if await conn.fetchval("SELECT EXISTS (SELECT 1 FROM users)"):
+                    # Accounts but no marker: a deployment from before
+                    # first-run setup, or an account an operator script
+                    # inserted. Either way it is set up.
+                    await conn.execute(
+                        "INSERT INTO site_settings (key, value, value_type, updated_at, updated_by) "
+                        "VALUES ($1, $2, 'str', NOW(), 'existing-users') "
+                        "ON CONFLICT (key) DO NOTHING",
+                        marker_key,
+                        completed_at,
+                    )
+                    await conn.execute("DELETE FROM site_settings WHERE key = $1", code_key)
+                    logger.info(
+                        "First-run setup marked complete: the database already has user accounts."
+                    )
+                    return None
+                await conn.execute(
+                    "INSERT INTO site_settings (key, value, value_type, updated_at, updated_by) "
+                    "VALUES ($1, $2, 'str', NOW(), 'first-run-setup') "
+                    "ON CONFLICT (key) DO NOTHING",
+                    code_key,
+                    candidate_code,
+                )
+                return await conn.fetchval(
+                    "SELECT value FROM site_settings WHERE key = $1", code_key
+                )
+
+    async def create_first_admin(
+        self,
+        *,
+        user_id: str,
+        login_name: str,
+        password_hash: str,
+        user_name: str,
+        marker_key: str,
+        marker_value: str,
+        code_key: str,
+        admin_ip: str,
+    ) -> bool:
+        """Create the first administrator unless setup has already completed.
+
+        The transaction-scoped advisory lock serializes concurrent claims, in
+        this process or another, and :meth:`get_or_create_setup_code`. Under
+        READ COMMITTED (asyncpg's default) every statement after the lock takes
+        a fresh snapshot, so a claim that waited on the lock sees the winner's
+        committed user and marker and backs out.
+        """
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.execute(_FIRST_RUN_SETUP_LOCK_SQL)
+            if await conn.fetchval("SELECT 1 FROM site_settings WHERE key = $1", marker_key):
+                return False
+            if await conn.fetchval("SELECT EXISTS (SELECT 1 FROM users)"):
+                return False
+            await conn.execute(
+                "INSERT INTO users (id, email, login_name, password_hash, user_name, "
+                "role, status, email_verified) "
+                "VALUES ($1, NULL, $2, $3, $4, 'admin', 'active', TRUE)",
+                user_id,
+                login_name.lower(),
+                password_hash,
+                user_name,
+            )
+            await conn.execute(
+                "INSERT INTO site_settings (key, value, value_type, updated_at, updated_by) "
+                "VALUES ($1, $2, 'str', NOW(), $3)",
+                marker_key,
+                marker_value,
+                login_name.lower(),
+            )
+            # The code has done its job; it must not outlive the setup it guards.
+            await conn.execute("DELETE FROM site_settings WHERE key = $1", code_key)
+            await conn.execute(
+                "INSERT INTO admin_audit_log "
+                "(admin_ip, action, target_user_id, details, success) "
+                "VALUES ($1, $2, $3, $4::jsonb, $5)",
+                admin_ip,
+                "setup.admin_created",
+                user_id,
+                json.dumps({"login_name": login_name.lower(), "user_name": user_name}),
+                True,
+            )
+        return True
 
     async def update_user_fields(self, user_id: str, **fields: Any) -> None:
         """Update one or more columns on the users table for *user_id*."""
@@ -1018,19 +1207,37 @@ class PostgresOperationalStore(OperationalStore):
         admin_id: str,
         reason: str | None = None,
         email: str | None = None,
+        self_service: bool = False,
     ) -> None:
         """Soft-delete: set status='deleted', revoke keys, purge sessions/tokens.
 
         All mutations and the audit-log insert are atomic (single transaction).
+        *self_service* marks the audit entry as the owner's own deletion, and
+        requires the account to still be active and not an administrator
+        under the row lock; otherwise ``SelfDeleteRefused`` rolls it all back.
         """
         async with self._pool.acquire() as conn, conn.transaction():
+            if self_service:
+                # The route checked these before proving ownership; a promotion
+                # or suspension committed since must win over the deletion.
+                owner = await conn.fetchrow(
+                    "SELECT status, role FROM users WHERE id = $1 FOR UPDATE", user_id
+                )
+                if owner is None or owner["status"] != "active" or owner["role"] == "admin":
+                    raise SelfDeleteRefused(user_id)
             await conn.execute("UPDATE users SET status = 'deleted' WHERE id = $1", user_id)
             await conn.execute(
                 "UPDATE api_keys SET status = 'revoked' "
                 "WHERE (account_id = $1 OR user_id = $1) AND status = 'active'",
                 user_id,
             )
+            await conn.execute(
+                "DELETE FROM phone_auth_codes WHERE user_id = $1 OR "
+                "phone = (SELECT phone FROM users WHERE id = $1)",
+                user_id,
+            )
             await conn.execute("DELETE FROM auth_sessions WHERE user_id = $1", user_id)
+            await self._forget_browser_session_account(conn, user_id)
             await conn.execute("DELETE FROM email_verification_tokens WHERE user_id = $1", user_id)
             await conn.execute("DELETE FROM password_reset_tokens WHERE user_id = $1", user_id)
             await conn.execute(
@@ -1040,9 +1247,25 @@ class PostgresOperationalStore(OperationalStore):
                 admin_ip,
                 "delete_user",
                 user_id,
-                json.dumps({"email": email, "reason": reason}),
+                json.dumps(
+                    {"email": email, "reason": reason}
+                    | ({"self_service": True} if self_service else {})
+                ),
                 True,
             )
+
+    @staticmethod
+    async def _forget_browser_session_account(conn: asyncpg.Connection, user_id: str) -> None:
+        """Take a deleted account off every browser that listed it.
+
+        Its sessions are gone already; this removes the account from browsers'
+        account lists, which name it, and from any browser that had it active.
+        """
+        await conn.execute("DELETE FROM browser_session_accounts WHERE user_id = $1", user_id)
+        await conn.execute(
+            "UPDATE browser_sessions SET active_user_id = NULL WHERE active_user_id = $1",
+            user_id,
+        )
 
     async def begin_hard_delete_user(self, user_id: str) -> str:
         """Claim a soft-deleted user before purging rows in another store."""
@@ -1170,6 +1393,17 @@ class PostgresOperationalStore(OperationalStore):
             )
             sessions_status = await conn.execute(
                 "DELETE FROM auth_sessions WHERE user_id = $1", user_id
+            )
+            await self._forget_browser_session_account(conn, user_id)
+            await conn.execute(
+                "DELETE FROM phone_auth_codes WHERE user_id = $1 OR "
+                "phone = (SELECT phone FROM users WHERE id = $1)",
+                user_id,
+            )
+            await conn.execute(
+                "DELETE FROM phone_auth_attempts WHERE "
+                "phone = (SELECT phone FROM users WHERE id = $1)",
+                user_id,
             )
             login_events_status = await conn.execute(
                 "DELETE FROM login_events WHERE user_id = $1", user_id
@@ -1319,12 +1553,15 @@ class PostgresOperationalStore(OperationalStore):
             where_clauses.append(f"u.status = ${len(filter_params) + 1}")
             filter_params.append(status)
         if search:
-            # Search now also matches user.id prefix and active key_prefix.
+            # Search matches email, login name and display name as substrings,
+            # plus a user.id prefix and an active key_prefix prefix.
             substr_idx = len(filter_params) + 1  # %search%
             id_idx = len(filter_params) + 2  # search% (id prefix)
             kp_idx = len(filter_params) + 3  # search% (key prefix)
             where_clauses.append(
                 f"(u.email ILIKE ${substr_idx} "
+                f"OR u.login_name ILIKE ${substr_idx} "
+                f"OR u.phone ILIKE ${substr_idx} "
                 f"OR u.user_name ILIKE ${substr_idx} "
                 f"OR u.id::text LIKE ${id_idx} "
                 f"OR EXISTS (SELECT 1 FROM api_keys k2 "
@@ -1500,7 +1737,7 @@ class PostgresOperationalStore(OperationalStore):
             # share the WHERE clause and join optional cost CTEs uniformly.
             cte_parts = [
                 f"filtered_users AS ("
-                f"  SELECT u.id, u.email, u.user_name, u.role, u.status, "
+                f"  SELECT u.id, u.email, u.login_name, u.phone, u.phone_verified, u.user_name, u.role, u.status, "
                 f"  u.email_verified, u.approval_note, u.reviewed_at, u.reviewed_by, "
                 f"  u.signup_reason, u.admin_note, "
                 f"  u.created_at, u.last_login_at, "
@@ -1748,7 +1985,7 @@ class PostgresOperationalStore(OperationalStore):
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT k.id, k.user_id, k.user_name, k.quota_daily_cost_usd, "
-                "u.email, u.role, u.email_verified, u.preferences, u.max_concurrent_requests "
+                "u.email, u.login_name, u.phone, u.phone_verified, u.role, u.email_verified, u.preferences, u.max_concurrent_requests "
                 "FROM api_keys k "
                 "LEFT JOIN users u ON u.id = k.user_id "
                 "WHERE k.key_hash = $1 "
@@ -1763,7 +2000,7 @@ class PostgresOperationalStore(OperationalStore):
         """Lightweight identity lookup (no quota check, no last_used write)."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT k.user_id, u.email, u.role, u.email_verified, u.preferences, "
+                "SELECT k.user_id, u.email, u.login_name, u.phone, u.phone_verified, u.role, u.email_verified, u.preferences, "
                 "u.max_concurrent_requests "
                 "FROM api_keys k "
                 "LEFT JOIN users u ON u.id = k.user_id "
@@ -2125,6 +2362,203 @@ class PostgresOperationalStore(OperationalStore):
         async with self._pool.acquire() as conn:
             await conn.execute("DELETE FROM auth_sessions WHERE user_id = $1", user_id)
 
+    async def revoke_user_sessions(self, user_id: str, *, except_sid: str | None = None) -> int:
+        """Revoke every live session of *user_id* but the one whose sid is *except_sid*.
+
+        The rows stay, so a browser that listed the account shows it signed
+        out rather than forgetting it.
+        """
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE auth_sessions SET revoked = TRUE "
+                "WHERE user_id = $1 AND revoked IS NOT TRUE AND sid IS DISTINCT FROM $2::text",
+                user_id,
+                except_sid,
+            )
+        return int(result.split()[-1])
+
+    # -- browser sessions ----------------------------------------------------
+
+    async def create_browser_session(
+        self, *, browser_session_id: str, secret_hash: str, expires_at: datetime
+    ) -> None:
+        """Insert a browser session with no accounts yet."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO browser_sessions (id, secret_hash, expires_at) VALUES ($1, $2, $3)",
+                browser_session_id,
+                secret_hash,
+                expires_at,
+            )
+
+    async def get_browser_session(self, secret_hash: str) -> Row | None:
+        """Fetch a browser session by the hash of its cookie."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, active_user_id, expires_at, revoked "
+                "FROM browser_sessions WHERE secret_hash = $1",
+                secret_hash,
+            )
+        return dict(row) if row else None
+
+    async def rotate_browser_session(
+        self,
+        browser_session_id: str,
+        *,
+        current_secret_hash: str,
+        new_secret_hash: str,
+        expires_at: datetime | None = None,
+    ) -> bool:
+        """Replace the cookie hash if it is still *current_secret_hash*."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE browser_sessions SET secret_hash = $1, last_used_at = NOW(), "
+                "expires_at = GREATEST(expires_at, COALESCE($2, expires_at)) "
+                "WHERE id = $3 AND secret_hash = $4 AND NOT revoked RETURNING id",
+                new_secret_hash,
+                expires_at,
+                browser_session_id,
+                current_secret_hash,
+            )
+        return row is not None
+
+    async def list_browser_session_accounts(self, browser_session_id: str) -> list[Row]:
+        """Return the accounts signed in to a browser, oldest first."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT a.user_id, a.auth_session_id, a.added_at, "
+                "s.sid, s.expires_at AS session_expires_at, s.revoked AS session_revoked, "
+                "u.email, u.login_name, u.phone, u.phone_verified, u.user_name, u.role, "
+                "u.status, u.email_verified, u.password_hash IS NOT NULL AS has_password, "
+                "u.created_at, u.last_login_at "
+                "FROM browser_session_accounts a "
+                "LEFT JOIN auth_sessions s ON s.id = a.auth_session_id "
+                "LEFT JOIN users u ON u.id = a.user_id "
+                "WHERE a.browser_session_id = $1 ORDER BY a.added_at, a.user_id",
+                browser_session_id,
+            )
+        return [dict(row) for row in rows]
+
+    async def attach_browser_session_account(
+        self, browser_session_id: str, *, user_id: str, auth_session_id: str
+    ) -> bool:
+        """Make *auth_session_id* the browser's session for *user_id*, and its active account.
+
+        A session the browser already held for the same account is revoked:
+        signing in again replaces it, and nothing can reach the old one.
+        Returns False, changing nothing, when the browser session has been
+        retired; the browser row lock orders this against a sign-out that
+        retires it.
+        """
+        async with self._pool.acquire() as conn, conn.transaction():
+            revoked = await conn.fetchval(
+                "SELECT revoked FROM browser_sessions WHERE id = $1 FOR UPDATE",
+                browser_session_id,
+            )
+            if revoked is None or revoked:
+                return False
+            previous = await conn.fetchval(
+                "SELECT auth_session_id FROM browser_session_accounts "
+                "WHERE browser_session_id = $1 AND user_id = $2 FOR UPDATE",
+                browser_session_id,
+                user_id,
+            )
+            await conn.execute(
+                "INSERT INTO browser_session_accounts (browser_session_id, user_id, auth_session_id) "
+                "VALUES ($1, $2, $3) ON CONFLICT (browser_session_id, user_id) "
+                "DO UPDATE SET auth_session_id = EXCLUDED.auth_session_id",
+                browser_session_id,
+                user_id,
+                auth_session_id,
+            )
+            if previous is not None and previous != auth_session_id:
+                await conn.execute(
+                    "UPDATE auth_sessions SET revoked = TRUE WHERE id = $1", previous
+                )
+            await conn.execute(
+                "UPDATE browser_sessions SET active_user_id = $1, last_used_at = NOW() "
+                "WHERE id = $2",
+                user_id,
+                browser_session_id,
+            )
+        return True
+
+    async def set_browser_session_active(
+        self, browser_session_id: str, user_id: str | None
+    ) -> None:
+        """Choose the browser's active account, or none."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE browser_sessions SET active_user_id = $1, last_used_at = NOW() "
+                "WHERE id = $2",
+                user_id,
+                browser_session_id,
+            )
+
+    async def detach_browser_session_account(self, browser_session_id: str, user_id: str) -> int:
+        """Sign *user_id* out of one browser; return how many accounts remain there.
+
+        A browser left with no account is retired in the same transaction,
+        under the browser row lock a sign-in also takes, so a sign-in racing
+        it either lands before (and the browser is kept) or finds it retired.
+        """
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                "SELECT 1 FROM browser_sessions WHERE id = $1 FOR UPDATE", browser_session_id
+            )
+            auth_session_id = await conn.fetchval(
+                "DELETE FROM browser_session_accounts "
+                "WHERE browser_session_id = $1 AND user_id = $2 RETURNING auth_session_id",
+                browser_session_id,
+                user_id,
+            )
+            if auth_session_id is not None:
+                await conn.execute(
+                    "UPDATE auth_sessions SET revoked = TRUE WHERE id = $1", auth_session_id
+                )
+            await conn.execute(
+                "UPDATE browser_sessions SET active_user_id = NULL "
+                "WHERE id = $1 AND active_user_id = $2",
+                browser_session_id,
+                user_id,
+            )
+            remaining = int(
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM browser_session_accounts WHERE browser_session_id = $1",
+                    browser_session_id,
+                )
+                or 0
+            )
+            if remaining == 0:
+                await conn.execute(
+                    "UPDATE browser_sessions SET revoked = TRUE, active_user_id = NULL "
+                    "WHERE id = $1",
+                    browser_session_id,
+                )
+        return remaining
+
+    async def revoke_browser_session(self, browser_session_id: str) -> None:
+        """Sign every account out of one browser and retire its cookie."""
+        async with self._pool.acquire() as conn, conn.transaction():
+            # Same lock as attach: a racing sign-in starts a fresh browser.
+            await conn.execute(
+                "SELECT 1 FROM browser_sessions WHERE id = $1 FOR UPDATE", browser_session_id
+            )
+            await conn.execute(
+                "UPDATE auth_sessions SET revoked = TRUE WHERE id IN ("
+                "SELECT auth_session_id FROM browser_session_accounts "
+                "WHERE browser_session_id = $1)",
+                browser_session_id,
+            )
+            await conn.execute(
+                "DELETE FROM browser_session_accounts WHERE browser_session_id = $1",
+                browser_session_id,
+            )
+            await conn.execute(
+                "UPDATE browser_sessions SET revoked = TRUE, active_user_id = NULL WHERE id = $1",
+                browser_session_id,
+            )
+
     # -- login events --------------------------------------------------------
 
     async def record_login_event(
@@ -2183,22 +2617,34 @@ class PostgresOperationalStore(OperationalStore):
         token: str,
         user_id: str,
         expires_at: datetime,
+        pending_email: str | None = None,
     ) -> None:
         """Insert a new email verification token."""
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO email_verification_tokens (token, user_id, expires_at) "
-                "VALUES ($1, $2, $3)",
-                token,
-                user_id,
-                expires_at,
-            )
+            if pending_email is not None:
+                await conn.execute(
+                    "INSERT INTO email_verification_tokens "
+                    "(token, user_id, expires_at, pending_email) "
+                    "VALUES ($1, $2, $3, $4)",
+                    token,
+                    user_id,
+                    expires_at,
+                    pending_email,
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO email_verification_tokens (token, user_id, expires_at) "
+                    "VALUES ($1, $2, $3)",
+                    token,
+                    user_id,
+                    expires_at,
+                )
 
     async def get_verification_token(self, token: str) -> Row | None:
         """Fetch verification token row."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT token, user_id, created_at, expires_at, used_at "
+                "SELECT token, user_id, created_at, expires_at, used_at, pending_email "
                 "FROM email_verification_tokens WHERE token = $1",
                 token,
             )
@@ -2498,6 +2944,18 @@ class PostgresOperationalStore(OperationalStore):
                 "UPDATE users SET preferences = $1::jsonb WHERE id = $2",
                 json.dumps(preferences),
                 user_id,
+            )
+
+    async def get_user_avatar(self, user_id: str) -> str | None:
+        """Return the user's portrait data URL, or None."""
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval("SELECT avatar_data_url FROM users WHERE id = $1", user_id)
+
+    async def set_user_avatar(self, user_id: str, avatar_data_url: str | None) -> None:
+        """Replace the user's portrait; None removes it."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET avatar_data_url = $1 WHERE id = $2", avatar_data_url, user_id
             )
 
     # -- signup domain allowlist --------------------------------------------
@@ -3410,7 +3868,7 @@ class PostgresOperationalStore(OperationalStore):
         async with self._pool.acquire() as conn:
             # 1. Pending count + top
             pending_rows = await conn.fetch(
-                "SELECT id, email, user_name, role, created_at "
+                "SELECT id, email, login_name, phone, user_name, role, created_at "
                 "FROM users WHERE status = 'pending_approval' "
                 "ORDER BY created_at DESC LIMIT $1",
                 top_n,
@@ -3437,7 +3895,7 @@ class PostgresOperationalStore(OperationalStore):
                     WHERE day BETWEEN $2 AND $3
                     GROUP BY user_id
                 )
-                SELECT u.id, u.email, u.user_name, u.role,
+                SELECT u.id, u.email, u.login_name, u.phone, u.user_name, u.role,
                        COALESCE(t.today_cost, 0) AS today_cost,
                        COALESCE(p.total, 0) AS prior_7d_total,
                        COALESCE(p.days_with_history, 0) AS days_with_history,
@@ -3467,6 +3925,8 @@ class PostgresOperationalStore(OperationalStore):
                 base_item = {
                     "id": r["id"],
                     "email": r["email"],
+                    "login_name": r.get("login_name"),
+                    "phone": r.get("phone"),
                     "user_name": r["user_name"],
                     "role": r["role"] or "free",
                     "today_cost_usd": today,
@@ -3513,6 +3973,8 @@ class PostgresOperationalStore(OperationalStore):
                     {
                         "id": r["id"],
                         "email": r["email"],
+                        "login_name": r.get("login_name"),
+                        "phone": r.get("phone"),
                         "user_name": r["user_name"],
                         "role": r["role"] or "free",
                         "today_cost_usd": _Decimal("0"),

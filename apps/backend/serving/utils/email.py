@@ -4,7 +4,7 @@ import html as html_lib
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from markdown_it import MarkdownIt
 
@@ -32,29 +32,58 @@ def get_smtp_config() -> dict[str, str | int]:
 
 
 def is_email_enabled() -> bool:
-    """Check if email sending is enabled (SMTP credentials configured).
+    """Check whether the selected email delivery provider is configured.
 
     Returns:
-        True if SMTP is configured, False otherwise.
+        True if the selected provider is configured, False otherwise.
     """
+    if settings.email_provider == "tencent_ses":
+        from serving.utils.tencent_ses import is_ses_enabled
+
+        return is_ses_enabled()
     return bool(settings.smtp_user and settings.smtp_password)
 
 
-def send_email(to_email: str, subject: str, html_body: str, text_body: str | None = None) -> bool:
-    """Send an email using SMTP.
+def send_email(
+    to_email: str | None,
+    subject: str,
+    html_body: str,
+    text_body: str | None = None,
+    *,
+    template: str = "notice",
+    template_data: dict[str, str] | None = None,
+) -> bool:
+    """Send an email using the configured delivery provider.
 
     Args:
-        to_email: Recipient email address.
+        to_email: Recipient email address. None or blank (an account created
+            without an email address) sends nothing.
         subject: Email subject.
         html_body: HTML email body.
         text_body: Plain text email body (optional, defaults to stripped HTML).
+        template: Approved SES template kind; ignored by SMTP.
+        template_data: Scalar SES variables; omitted notices use the text body.
 
     Returns:
         True if email sent successfully, False otherwise.
     """
-    if not is_email_enabled():
-        logger.warning("Email sending disabled: SMTP not configured")
+    if not to_email or not to_email.strip():
+        logger.warning("Email not sent: the recipient has no email address")
         return False
+
+    if not is_email_enabled():
+        logger.warning("Email sending disabled: delivery provider not configured")
+        return False
+
+    if settings.email_provider == "tencent_ses":
+        from serving.utils.tencent_ses import send_template
+
+        if template_data is None:
+            if text_body is None:
+                logger.warning("Tencent SES notices require a plain text body")
+                return False
+            template_data = {"site_name": get_site_identity().name, "body": text_body}
+        return send_template(to_email, subject, template, template_data)
 
     config = get_smtp_config()
 
@@ -167,7 +196,14 @@ This link will expire in 24 hours.
 If you didn't create an account, you can safely ignore this email.
     """
 
-    return send_email(to_email, subject, html_body, text_body)
+    return send_email(
+        to_email,
+        subject,
+        html_body,
+        text_body,
+        template="verification",
+        template_data={"site_name": site_name, "token": quote(verification_token, safe="")},
+    )
 
 
 def send_password_reset_email(to_email: str, reset_token: str, base_url: str) -> bool:
@@ -252,7 +288,14 @@ This link will expire in 1 hour.
 If you didn't request a password reset, you can safely ignore this email.
     """
 
-    return send_email(to_email, subject, html_body, text_body)
+    return send_email(
+        to_email,
+        subject,
+        html_body,
+        text_body,
+        template="password_reset",
+        template_data={"site_name": site_name, "token": quote(reset_token, safe="")},
+    )
 
 
 def send_approval_email(to_email: str) -> bool:
@@ -303,7 +346,14 @@ You can now log in and start using the API:
 If you did not register for {site_name}, please ignore this email.
     """
 
-    return send_email(to_email, subject, html_body, text_body)
+    return send_email(
+        to_email,
+        subject,
+        html_body,
+        text_body,
+        template="approval",
+        template_data={"site_name": site_name},
+    )
 
 
 def send_rejection_email(to_email: str, reason: str) -> bool:
@@ -347,6 +397,163 @@ Unfortunately, your {site_name} registration was not approved at this time.
 Reason: {reason}
 
 If you believe this was a mistake, please contact the administrator.
+    """
+
+    return send_email(
+        to_email,
+        subject,
+        html_body,
+        text_body,
+        template="rejection",
+        template_data={"site_name": site_name, "reason": reason},
+    )
+
+
+def send_account_deleted_email(to_email: str) -> bool:
+    """Tell an account's owner that the account was deleted from its settings.
+
+    Sent after the deletion, so someone who did not ask for it hears about it.
+
+    Args:
+        to_email: The deleted account's email address.
+
+    Returns:
+        True if email sent successfully, False otherwise.
+    """
+    identity = get_site_identity()
+    site_name = identity.name
+    subject = f"Your {site_name} account has been deleted"
+    contact = (
+        f"contact {identity.support_email}"
+        if identity.support_email
+        else "contact the administrator"
+    )
+    safe_email = html_lib.escape(to_email)
+    safe_contact = html_lib.escape(contact)
+
+    html_body = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #ef4444;">Account Deleted</h2>
+            <p>The {site_name} account {safe_email} was deleted from its account settings.
+               Its API keys were revoked and it was signed out everywhere.</p>
+            <p>If you did not do this, please {safe_contact} right away.</p>
+        </div>
+    </body>
+    </html>
+    """
+
+    text_body = f"""
+Account Deleted
+
+The {site_name} account {to_email} was deleted from its account settings.
+Its API keys were revoked and it was signed out everywhere.
+
+If you did not do this, please {contact} right away.
+    """
+
+    return send_email(to_email, subject, html_body, text_body)
+
+
+def send_email_changed_email(old_email: str, new_email: str) -> bool:
+    """Tell an account's previous address that its sign-in email was replaced.
+
+    Sent to the address that lost the account, so an owner whose session was
+    used to change it hears about it.
+
+    Args:
+        old_email: The address the account used to have.
+        new_email: The address it has now.
+
+    Returns:
+        True if email sent successfully, False otherwise.
+    """
+    identity = get_site_identity()
+    site_name = identity.name
+    subject = f"Your {site_name} sign-in email was changed"
+    contact = (
+        f"contact {identity.support_email}"
+        if identity.support_email
+        else "contact the administrator"
+    )
+    safe_old = html_lib.escape(old_email)
+    safe_new = html_lib.escape(new_email)
+    safe_contact = html_lib.escape(contact)
+
+    html_body = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #ef4444;">Sign-in Email Changed</h2>
+            <p>The {site_name} account that used {safe_old} now signs in with {safe_new}.
+               This address will no longer receive its password resets.</p>
+            <p>If you did not do this, please {safe_contact} right away.</p>
+        </div>
+    </body>
+    </html>
+    """
+
+    text_body = f"""
+Sign-in Email Changed
+
+The {site_name} account that used {old_email} now signs in with {new_email}.
+This address will no longer receive its password resets.
+
+If you did not do this, please {contact} right away.
+    """
+
+    return send_email(old_email, subject, html_body, text_body)
+
+
+def send_password_changed_email(to_email: str, *, first_password: bool = False) -> bool:
+    """Tell an account's owner that its password was changed, or first set.
+
+    Sent after a change made from a signed-in session, so an owner whose
+    session was used to do it hears about it.
+
+    Args:
+        to_email: The account's verified email address.
+        first_password: Whether the account had no password before.
+
+    Returns:
+        True if email sent successfully, False otherwise.
+    """
+    identity = get_site_identity()
+    site_name = identity.name
+    verb = "set" if first_password else "changed"
+    subject = f"Your {site_name} password was {verb}"
+    contact = (
+        f"contact {identity.support_email}"
+        if identity.support_email
+        else "contact the administrator"
+    )
+    reset_url = f"{settings.frontend_url}/forgot-password"
+    safe_contact = html_lib.escape(contact)
+    safe_reset_url = html_lib.escape(reset_url)
+
+    html_body = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #ef4444;">Password {verb.capitalize()}</h2>
+            <p>The password of your {site_name} account was {verb}.
+               Every other device signed in to it has been signed out.</p>
+            <p>If you did not do this, <a href="{safe_reset_url}">reset your password</a>
+               and {safe_contact} right away.</p>
+        </div>
+    </body>
+    </html>
+    """
+
+    text_body = f"""
+Password {verb.capitalize()}
+
+The password of your {site_name} account was {verb}.
+Every other device signed in to it has been signed out.
+
+If you did not do this, reset your password at {reset_url}
+and {contact} right away.
     """
 
     return send_email(to_email, subject, html_body, text_body)
@@ -430,7 +637,14 @@ Use case: {use_case_text}
 Review at: {admin_url}
     """
 
-    return send_email(to_email, subject, html_body, text_body)
+    return send_email(
+        to_email,
+        subject,
+        html_body,
+        text_body,
+        template="admin_signup",
+        template_data={"site_name": site_name, "identifier": user_email},
+    )
 
 
 # ── Broadcast email templates ──────────────────────────────────────────────

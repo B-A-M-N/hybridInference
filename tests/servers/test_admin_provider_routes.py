@@ -33,6 +33,39 @@ from serving.servers.routers.admin.provider_routes import (
 from serving.storage.base import ProviderKeyRow
 
 AUTH = {"Authorization": "Bearer test-admin"}
+
+
+def test_extensions_can_register_replace_and_remove_provider_targets(monkeypatch):
+    targets = provider_routes.PROVIDER_TARGETS
+    target = provider_routes.ProviderTarget(
+        provider="extension",
+        label="Extension",
+        kind="openai_compat",
+        key_provider="extension",
+        default_base_url="https://extension.example/v1",
+    )
+    monkeypatch.setitem(targets, "extension", target)
+    assert targets["extension"] == target
+    assert dict(targets)["extension"] == target
+    replacement = provider_routes.replace(target, label="Updated")
+    targets.update({"extension": replacement})
+    assert targets["extension"] == replacement
+    del targets["extension"]
+    assert "extension" not in targets
+
+
+def test_extension_target_overrides_keep_dynamic_base_url_settings(monkeypatch):
+    targets = provider_routes.PROVIDER_TARGETS
+    custom = provider_routes.replace(
+        targets["minimax"], default_base_url="https://extension.example/v1"
+    )
+    monkeypatch.setattr(provider_routes, "config_value", lambda key: None)
+    monkeypatch.setitem(targets, "minimax", custom)
+    assert targets["minimax"] == custom
+    monkeypatch.setattr(provider_routes, "config_value", lambda key: "https://db.example/v1")
+    assert targets["minimax"].default_base_url == "https://db.example/v1"
+
+
 NOW = datetime(2026, 6, 16, tzinfo=timezone.utc)
 # Inside the scheduled peak window, after its activation timestamp.
 _PEAK_INSTANT = datetime(2026, 8, 17, 2, 0, tzinfo=timezone.utc)
@@ -2047,6 +2080,8 @@ async def test_runtime_candidate_pricing_schedule_survives_restart(admin_client,
         {
             "effective_at": "2026-08-16T16:00:00Z",
             "timezone": "UTC",
+            "weekdays": [1, 2, 3, 4, 5],
+            "excluded_dates": ["2026-08-18"],
             "default": {"prompt": "0.22", "completion": "0.66"},
             "windows": [{"start": "01:00", "end": "04:00", "pricing": {"prompt": "0.44"}}],
         }
@@ -2122,6 +2157,12 @@ async def test_runtime_candidate_pricing_schedule_survives_restart(admin_client,
     assert restored_adapter.config.pricing_schedule == schedule
     assert effective_pricing(restored_adapter.config, at=_PEAK_INSTANT) == effective_pricing(
         created_adapter.config, at=_PEAK_INSTANT
+    )
+    assert (
+        effective_pricing(
+            restored_adapter.config, at=datetime(2026, 8, 18, 2, tzinfo=timezone.utc)
+        )["prompt"]
+        == "0.22"
     )
 
 
@@ -2590,6 +2631,38 @@ async def test_post_provider_route_model_rejects_orphaned_routewise_settings(adm
     )
     assert model_id not in route_executor.routes
     op_store.upsert_provider_route_candidate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_id", ["auto", "auto-balance", " auto-new "])
+async def test_post_provider_route_model_refuses_an_auto_model_name(admin_client, model_id):
+    """The auto models are served under these names; a model there would be hidden."""
+    client, op_store, route_executor, _fake_routewise, verify_mock = admin_client
+
+    response = await client.post(
+        "/admin/routing/provider-route-models",
+        json={
+            "model_id": model_id,
+            "strategy": "fixed",
+            "route_type": "on_demand",
+            "upstream_provider": "openrouter",
+            "openrouter_provider": "parasail",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key_id": "db-openrouter",
+            "provider_model_id": "deepseek/deepseek-v4-flash",
+            "weight": 1.0,
+            "pricing": RUNTIME_PRICING,
+        },
+        headers=AUTH,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        f"Model id {model_id.strip()!r} is reserved for auto models"
+    )
+    assert model_id.strip() not in route_executor.routes
+    op_store.upsert_provider_route_candidate.assert_not_awaited()
+    verify_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

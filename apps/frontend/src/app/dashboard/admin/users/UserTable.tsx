@@ -10,8 +10,10 @@ import type {
   UserTurnAverages,
 } from '@/lib/api/admin';
 import { getUserDetail, listModelVisibility, updateUser as apiUpdateUser } from '@/lib/api/admin';
+import { userAccountLabel, userAccountLabelKind } from '@/lib/utils/userLabel';
 import type { CostHistoryPoint, Density, FilterState, UserRow as UserRowType } from './types';
 import { UserRow } from './UserRow';
+import { COLUMN_GROUPS, type ColumnId } from './lib/columns';
 import { UserDetailPanel } from './UserDetailPanel';
 
 interface UserTableProps {
@@ -24,6 +26,8 @@ interface UserTableProps {
   scoreSortDir: 'desc' | 'asc' | null;
   onScoreHeader: () => void;
   density: Density;
+  /** Optional metric columns the admin has hidden from the Columns menu. */
+  hiddenColumns?: ColumnId[];
   filterState: FilterState;
   onSortChange: (sortBy: FilterState['sortBy']) => void;
   // action handlers (all return Promise for async operations)
@@ -65,6 +69,7 @@ export function UserTable(props: UserTableProps) {
     scoreSortDir,
     onScoreHeader,
     density,
+    hiddenColumns = [],
     filterState,
     onSortChange,
   } = props;
@@ -89,7 +94,20 @@ export function UserTable(props: UserTableProps) {
   );
 
   const showSparkline = density === 'comfortable';
-  const colSpan = showSparkline ? 16 : 15;
+  // Metric columns actually rendered, in table order. The 7-day trend also
+  // needs the comfortable density (compact rows don't fetch the history).
+  const hidden = new Set(hiddenColumns);
+  const visibleGroups = COLUMN_GROUPS.map((g) => ({
+    label: g.label,
+    ids: g.columns
+      .map((c) => c.id)
+      .filter((id) => !hidden.has(id) && (id !== 'trend' || showSparkline)),
+  })).filter((g) => g.ids.length > 0);
+  const visible = new Set<ColumnId>(visibleGroups.flatMap((g) => g.ids));
+  const groupStarts = new Set<ColumnId>(visibleGroups.map((g) => g.ids[0]));
+  // A left rule where a column group begins.
+  const edge = (id: ColumnId) => (groupStarts.has(id) ? 'border-l border-gray-100' : '');
+  const colSpan = 2 + visible.size;
 
   const scoreIndicator =
     scoreState === 'loaded'
@@ -103,6 +121,37 @@ export function UserTable(props: UserTableProps) {
   const sortIndicator = (col: FilterState['sortBy']) => (filterState.sortBy === col ? ' ↓' : '');
   const ariaSortFor = (col: FilterState['sortBy']): 'ascending' | 'none' =>
     filterState.sortBy === col ? 'ascending' : 'none';
+
+  // A sortable column header. The server sorts descending only, so the
+  // indicator is a single arrow on the active column.
+  const sortHeader = ({
+    col,
+    label,
+    title,
+    className = '',
+  }: {
+    col: FilterState['sortBy'];
+    label: string;
+    title?: string;
+    className?: string;
+  }) => (
+    <th
+      className={`whitespace-nowrap px-2.5 py-2 text-right align-bottom ${className}`}
+      aria-sort={ariaSortFor(col)}
+    >
+      <button
+        type="button"
+        className={`cursor-pointer uppercase tracking-wide transition hover:text-gray-900 ${
+          filterState.sortBy === col ? 'text-gray-900' : ''
+        }`}
+        onClick={() => onSortChange(col)}
+        title={title}
+      >
+        {label}
+        {sortIndicator(col)}
+      </button>
+    </th>
+  );
 
   const toggleDetail = async (userId: string) => {
     if (expandedId === userId) {
@@ -244,7 +293,12 @@ export function UserTable(props: UserTableProps) {
   const [deleteReason, setDeleteReason] = useState('');
   const [hardDeleteTarget, setHardDeleteTarget] = useState<AdminUser | null>(null);
   const [hardDeleteReason, setHardDeleteReason] = useState('');
+  // What the admin types to confirm a permanent delete: the account's email,
+  // or its login name when it has none (the first-run administrator), or as a
+  // last resort its id. The backend does not see it; it is a typo guard.
   const [hardDeleteEmailConfirm, setHardDeleteEmailConfirm] = useState('');
+  const hardDeleteConfirmTarget = hardDeleteTarget ? userAccountLabel(hardDeleteTarget) : '';
+  const hardDeleteConfirmKind = userAccountLabelKind(hardDeleteTarget);
   // Reject modal state — replaces window.prompt (UX consistency + a11y).
   const [rejectTarget, setRejectTarget] = useState<UserRowType | null>(null);
   const [rejectReason, setRejectReason] = useState('');
@@ -302,7 +356,7 @@ export function UserTable(props: UserTableProps) {
 
   const doHardDelete = async () => {
     if (!hardDeleteTarget) return;
-    if (hardDeleteEmailConfirm !== hardDeleteTarget.email) return;
+    if (!hardDeleteConfirmTarget || hardDeleteEmailConfirm !== hardDeleteConfirmTarget) return;
     setBusy(hardDeleteTarget.id);
     try {
       await props.onHardDelete(hardDeleteTarget.id, hardDeleteReason.trim());
@@ -318,95 +372,106 @@ export function UserTable(props: UserTableProps) {
 
   return (
     <>
-      <div className="overflow-x-auto rounded-md border border-gray-200">
+      {/* `container-type` lets the expanded detail row size itself to the
+          visible width (100cqw) instead of the full scrolled table width, so
+          its controls never end up off-screen to the right. */}
+      <div className="overflow-x-auto [container-type:inline-size]">
         <table className="min-w-full text-sm">
-          <thead className="bg-gray-50">
-            <tr className="text-left">
-              <th className="w-8 px-2 py-2" />
-              <th className="w-48 px-2 py-2">Email</th>
-              <th className="px-2 py-2">Role</th>
-              <th className="px-2 py-2" aria-sort={ariaSortFor('cost_today')}>
-                <button
-                  type="button"
-                  className="cursor-pointer"
-                  onClick={() => onSortChange('cost_today')}
+          <thead>
+            {/* Column groups make the wide metric block scannable. */}
+            <tr className="border-b border-gray-100 bg-gray-50/70 text-[10px] font-semibold uppercase tracking-wider text-gray-400">
+              <th colSpan={2} className="sticky left-0 z-10 bg-gray-50 px-3 pt-2 text-left" />
+              {visibleGroups.map((g) => (
+                <th
+                  key={g.label}
+                  colSpan={g.ids.length}
+                  className="whitespace-nowrap border-l border-gray-100 px-3 pt-2 text-center"
                 >
-                  Today{sortIndicator('cost_today')}
-                </button>
+                  {g.label}
+                </th>
+              ))}
+            </tr>
+            <tr className="border-b border-gray-200 bg-gray-50/70 text-[11px] font-medium uppercase tracking-wide text-gray-500">
+              <th className="sticky left-0 z-10 bg-gray-50 py-2 pl-9 pr-2.5 text-left align-bottom">
+                User
               </th>
-              {showSparkline && <th className="w-16 px-2 py-2">7d</th>}
-              <th className="px-2 py-2" aria-sort={ariaSortFor('cost_month')}>
-                <button
-                  type="button"
-                  className="cursor-pointer"
-                  onClick={() => onSortChange('cost_month')}
+              <th className="px-2.5 py-2 text-left align-bottom">Status</th>
+              {visible.has('today') &&
+                sortHeader({ col: 'cost_today', label: 'Today', className: edge('today') })}
+              {visible.has('trend') && (
+                <th
+                  className={`w-16 px-2 py-2 text-left align-bottom font-medium normal-case text-gray-400 ${edge('trend')}`}
                 >
-                  Month{sortIndicator('cost_month')}
-                </button>
-              </th>
-              <th className="px-2 py-2" aria-sort={ariaSortFor('cost_alltime')}>
-                <button
-                  type="button"
-                  className="cursor-pointer"
-                  onClick={() => onSortChange('cost_alltime')}
+                  7d
+                </th>
+              )}
+              {visible.has('month') &&
+                sortHeader({ col: 'cost_month', label: 'Month', className: edge('month') })}
+              {visible.has('alltime') &&
+                sortHeader({ col: 'cost_alltime', label: 'All-time', className: edge('alltime') })}
+              {visible.has('requests') &&
+                sortHeader({
+                  col: 'requests',
+                  label: 'Requests',
+                  title: 'All-time request count',
+                  className: edge('requests'),
+                })}
+              {visible.has('tokens') &&
+                sortHeader({
+                  col: 'tokens',
+                  label: 'Tokens',
+                  title: 'All-time total tokens',
+                  className: edge('tokens'),
+                })}
+              {visible.has('avgTurns') && (
+                <th
+                  className={`w-[4.5rem] px-2.5 py-2 text-right align-bottom leading-tight xl:w-auto xl:whitespace-nowrap ${edge('avgTurns')}`}
+                  title="Average messages per chat request (all-time)"
                 >
-                  All-time{sortIndicator('cost_alltime')}
-                </button>
-              </th>
-              <th className="px-2 py-2" aria-sort={ariaSortFor('requests')}>
-                <button
-                  type="button"
-                  className="cursor-pointer"
-                  onClick={() => onSortChange('requests')}
-                  title="All-time request count"
+                  Avg turns
+                </th>
+              )}
+              {visible.has('avgUserTurns') && (
+                <th
+                  className={`w-[4.5rem] px-2.5 py-2 text-right align-bottom leading-tight xl:w-auto xl:whitespace-nowrap ${edge('avgUserTurns')}`}
+                  title="Average user messages per chat request (all-time)"
                 >
-                  Requests{sortIndicator('requests')}
-                </button>
-              </th>
-              <th className="px-2 py-2" aria-sort={ariaSortFor('tokens')}>
-                <button
-                  type="button"
-                  className="cursor-pointer"
-                  onClick={() => onSortChange('tokens')}
-                  title="All-time total tokens"
+                  Avg user turns
+                </th>
+              )}
+              {visible.has('askQuestion') && (
+                <th
+                  className={`w-[4.5rem] px-2.5 py-2 text-right align-bottom leading-tight xl:w-auto xl:whitespace-nowrap ${edge('askQuestion')}`}
+                  title="Share of this user's early-conversation requests (first 5 turns) whose available tools offer an ask-the-user question tool"
                 >
-                  Tokens{sortIndicator('tokens')}
-                </button>
-              </th>
-              <th className="px-2 py-2" title="Average messages per chat request (all-time)">
-                Avg turns
-              </th>
-              <th className="px-2 py-2" title="Average user messages per chat request (all-time)">
-                Avg user turns
-              </th>
-              <th
-                className="px-2 py-2"
-                title="Share of this user's early-conversation requests (first 5 turns) whose available tools offer an ask-the-user question tool"
-              >
-                Ask-question
-              </th>
-              <th className="px-2 py-2">
-                <button
-                  type="button"
-                  onClick={onScoreHeader}
-                  className="inline-flex cursor-pointer items-center gap-1"
-                  title="Automation score (human vs. script). Click to compute for this page, then click again to sort."
+                  Ask-question
+                </th>
+              )}
+              {visible.has('automation') && (
+                <th
+                  className={`whitespace-nowrap px-2.5 py-2 pr-3 text-right align-bottom ${edge('automation')}`}
                 >
-                  <span>{scoreState === 'idle' ? 'Score ▸' : `Automation${scoreIndicator}`}</span>
-                  {scoreState === 'loading' && (
-                    <span className="h-3 w-3 animate-spin rounded-full border-2 border-gray-200 border-t-gray-900" />
-                  )}
-                </button>
-              </th>
-              <th className="px-2 py-2">Status</th>
-              <th className="w-8 px-2 py-2" />
-              <th className="px-2 py-2">Actions</th>
+                  <button
+                    type="button"
+                    onClick={onScoreHeader}
+                    className={`inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 uppercase tracking-wide transition hover:bg-gray-200/70 hover:text-gray-900 ${
+                      scoreState === 'idle' ? 'text-indigo-600' : ''
+                    }`}
+                    title="Automation score (human vs. script). Click to compute for this page, then click again to sort."
+                  >
+                    <span>{scoreState === 'idle' ? 'Score ▸' : `Automation${scoreIndicator}`}</span>
+                    {scoreState === 'loading' && (
+                      <span className="h-3 w-3 animate-spin rounded-full border-2 border-gray-200 border-t-gray-900" />
+                    )}
+                  </button>
+                </th>
+              )}
             </tr>
           </thead>
           <tbody>
             {users.length === 0 && (
               <tr>
-                <td colSpan={colSpan} className="px-4 py-8 text-center text-gray-500">
+                <td colSpan={colSpan} className="px-4 py-12 text-center text-[13px] text-gray-400">
                   No users match your filters.
                 </td>
               </tr>
@@ -415,6 +480,8 @@ export function UserTable(props: UserTableProps) {
               const asAdminUser: AdminUser = {
                 id: u.id,
                 email: u.email,
+                login_name: u.login_name ?? null,
+                phone: u.phone,
                 user_name: u.user_name,
                 role: u.role,
                 status: u.status,
@@ -447,6 +514,8 @@ export function UserTable(props: UserTableProps) {
                     scoreState={scoreState}
                     pageMedianToday={pageMedianToday}
                     density={density}
+                    visible={visible}
+                    groupStarts={groupStarts}
                     expanded={isExpanded}
                     onToggleExpanded={() => toggleDetail(u.id)}
                     onApprove={() => {
@@ -459,50 +528,52 @@ export function UserTable(props: UserTableProps) {
                     }}
                   />
                   {isExpanded && (
-                    <tr>
-                      <td colSpan={colSpan} className="bg-gray-50 p-4">
-                        {detailLoading ? (
-                          <div className="flex py-4">
-                            <span className="h-4 w-4 animate-spin rounded-full border-2 border-gray-200 border-t-gray-900" />
-                          </div>
-                        ) : detail ? (
-                          <UserDetailPanel
-                            user={asAdminUser}
-                            detail={detail}
-                            editRole={editRole}
-                            editQuota={editQuota}
-                            editDisabledModels={editDisabledModels}
-                            editMaxConcurrent={editMaxConcurrent}
-                            editNote={editNote}
-                            editSuspensionMsg={editSuspensionMsg}
-                            availableModels={availableModels}
-                            saving={saving}
-                            savingNote={savingNote}
-                            savingSuspensionMsg={savingSuspensionMsg}
-                            busy={busy}
-                            onChangeRole={setEditRole}
-                            onChangeQuota={setEditQuota}
-                            onChangeDisabledModels={setEditDisabledModels}
-                            onChangeMaxConcurrent={setEditMaxConcurrent}
-                            onChangeNote={setEditNote}
-                            onChangeSuspensionMsg={setEditSuspensionMsg}
-                            onSave={doSave}
-                            onSaveNote={doSaveNote}
-                            onSaveSuspensionMsg={doSaveSuspensionMsg}
-                            onSuspend={doSuspend}
-                            onReactivate={doReactivate}
-                            onResume={doResume}
-                            onRequestDelete={(target) => {
-                              setDeleteTarget(target);
-                              setDeleteReason('');
-                            }}
-                            onRequestHardDelete={(target) => {
-                              setHardDeleteTarget(target);
-                              setHardDeleteReason('');
-                              setHardDeleteEmailConfirm('');
-                            }}
-                          />
-                        ) : null}
+                    <tr className="border-b border-gray-200">
+                      <td colSpan={colSpan} className="bg-gray-50 p-0">
+                        <div className="sticky left-0 w-[100cqw] p-4">
+                          {detailLoading ? (
+                            <div className="flex justify-center py-6">
+                              <span className="h-4 w-4 animate-spin rounded-full border-2 border-gray-200 border-t-gray-900" />
+                            </div>
+                          ) : detail ? (
+                            <UserDetailPanel
+                              user={asAdminUser}
+                              detail={detail}
+                              editRole={editRole}
+                              editQuota={editQuota}
+                              editDisabledModels={editDisabledModels}
+                              editMaxConcurrent={editMaxConcurrent}
+                              editNote={editNote}
+                              editSuspensionMsg={editSuspensionMsg}
+                              availableModels={availableModels}
+                              saving={saving}
+                              savingNote={savingNote}
+                              savingSuspensionMsg={savingSuspensionMsg}
+                              busy={busy}
+                              onChangeRole={setEditRole}
+                              onChangeQuota={setEditQuota}
+                              onChangeDisabledModels={setEditDisabledModels}
+                              onChangeMaxConcurrent={setEditMaxConcurrent}
+                              onChangeNote={setEditNote}
+                              onChangeSuspensionMsg={setEditSuspensionMsg}
+                              onSave={doSave}
+                              onSaveNote={doSaveNote}
+                              onSaveSuspensionMsg={doSaveSuspensionMsg}
+                              onSuspend={doSuspend}
+                              onReactivate={doReactivate}
+                              onResume={doResume}
+                              onRequestDelete={(target) => {
+                                setDeleteTarget(target);
+                                setDeleteReason('');
+                              }}
+                              onRequestHardDelete={(target) => {
+                                setHardDeleteTarget(target);
+                                setHardDeleteReason('');
+                                setHardDeleteEmailConfirm('');
+                              }}
+                            />
+                          ) : null}
+                        </div>
                       </td>
                     </tr>
                   )}
@@ -524,7 +595,9 @@ export function UserTable(props: UserTableProps) {
             }}
           />
           <div className="relative mx-4 w-full max-w-sm rounded-xl border border-gray-200 bg-white p-5 shadow-2xl">
-            <h3 className="text-[15px] font-semibold text-gray-900">Delete {deleteTarget.email}</h3>
+            <h3 className="text-[15px] font-semibold text-gray-900">
+              Delete {userAccountLabel(deleteTarget)}
+            </h3>
             <p className="mt-1 text-[12px] text-gray-400">
               This will revoke API keys, purge sessions, and set the account to deleted.
             </p>
@@ -569,7 +642,9 @@ export function UserTable(props: UserTableProps) {
             }}
           />
           <div className="relative mx-4 w-full max-w-sm rounded-xl border border-gray-200 bg-white p-5 shadow-2xl">
-            <h3 className="text-[15px] font-semibold text-gray-900">Reject {rejectTarget.email}</h3>
+            <h3 className="text-[15px] font-semibold text-gray-900">
+              Reject {userAccountLabel(rejectTarget)}
+            </h3>
             <p className="mt-1 text-[12px] text-gray-400">
               The user will see this reason in their pending-approval state.
             </p>
@@ -669,7 +744,7 @@ export function UserTable(props: UserTableProps) {
           />
           <div className="relative mx-4 w-full max-w-md rounded-xl border border-red-200 bg-white p-5 shadow-2xl">
             <h3 className="text-[15px] font-semibold text-red-700">
-              Permanently delete {hardDeleteTarget.email}
+              Permanently delete {hardDeleteConfirmTarget}
             </h3>
             <p className="mt-2 text-[12px] text-gray-600">
               This will <span className="font-semibold text-red-700">permanently wipe</span> the
@@ -677,13 +752,30 @@ export function UserTable(props: UserTableProps) {
               action <span className="font-semibold">cannot be undone</span>.
             </p>
             <p className="mt-3 text-[12px] text-gray-500">
-              Type the user&apos;s email address (
-              <span className="font-mono text-gray-700">{hardDeleteTarget.email}</span>) to confirm:
+              Type the user&apos;s{' '}
+              {hardDeleteConfirmKind === 'email'
+                ? 'email address'
+                : hardDeleteConfirmKind === 'login_name'
+                  ? 'username'
+                  : hardDeleteConfirmKind === 'phone'
+                    ? 'phone number'
+                    : 'user ID'}{' '}
+              (<span className="font-mono text-gray-700">{hardDeleteConfirmTarget}</span>) to
+              confirm:
             </p>
             <input
               type="text"
               className="mt-2 w-full rounded-md border border-gray-200 px-3 py-2 text-[13px] font-mono placeholder:text-gray-300 focus:border-red-400 focus:outline-none"
-              placeholder="email@example.com"
+              aria-label="Confirmation"
+              placeholder={
+                hardDeleteConfirmKind === 'email'
+                  ? 'email@example.com'
+                  : hardDeleteConfirmKind === 'login_name'
+                    ? 'username'
+                    : hardDeleteConfirmKind === 'phone'
+                      ? 'phone number'
+                      : 'user ID'
+              }
               value={hardDeleteEmailConfirm}
               onChange={(e) => setHardDeleteEmailConfirm(e.target.value)}
               autoFocus
@@ -709,7 +801,9 @@ export function UserTable(props: UserTableProps) {
               <button
                 onClick={doHardDelete}
                 disabled={
-                  hardDeleteEmailConfirm !== hardDeleteTarget.email || busy === hardDeleteTarget.id
+                  !hardDeleteConfirmTarget ||
+                  hardDeleteEmailConfirm !== hardDeleteConfirmTarget ||
+                  busy === hardDeleteTarget.id
                 }
                 className="rounded-md bg-red-600 px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-red-700 transition disabled:opacity-50"
               >
