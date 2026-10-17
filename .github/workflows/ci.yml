@@ -673,6 +673,7 @@ jobs:
           TEST_DB_NAME: hybridinference_test_db
           TEST_DB_USER: postgres
           TEST_DB_PASSWORD: postgres
+          ERASURE_FENCE_SECRET: test-fence-secret-not-for-production
         run: |
           set -euo pipefail
           uv run python - <<'PY'
@@ -729,6 +730,7 @@ jobs:
           PG_TEST_DSN: postgresql://postgres:postgres@localhost:${{ job.services.postgres.ports['5432'] }}/hybridinference_test_db
           USER_AUTH_ENABLED: "1"
           API_KEY_SECRET: integration-test-secret-for-ci-only
+          ERASURE_FENCE_SECRET: test-fence-secret-not-for-production
         run: |
           set -euo pipefail
           log_file="${RUNNER_TEMP}/pytest-database.log"
