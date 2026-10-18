@@ -445,17 +445,28 @@ create this account, so keep both as private as the host. Wrong codes are
 rate limited per client address, ten in 15 minutes; the right code is never
 refused.
 
-**Choose a username that is hard to guess.** Sign-in counts each attempt
-before it checks the password: five per username from one address in 15
-minutes (`LOGIN_RATE_LIMIT_PER_15MIN`), fifty per username from all addresses
-together (`LOGIN_ACCOUNT_RATE_LIMIT_PER_15MIN`, counting only the attempts the
-other limits let through), and twenty per address in an hour
+**Choose a username that is hard to guess.** Sign-in admits a limited
+number of attempts before it checks the password, recording each admitted
+attempt: five per username from one address in 15 minutes
+(`LOGIN_RATE_LIMIT_PER_15MIN`), fifty per username from all addresses
+together (`LOGIN_ACCOUNT_RATE_LIMIT_PER_15MIN`, counting only the attempts
+the other limits let through), and twenty per address in an hour
 (`LOGIN_RATE_LIMIT_PER_HOUR_PER_IP`). A browser that has signed in to the
 account before, including the one you used for setup, holds a device cookie
 (`<REFRESH_TOKEN_COOKIE_NAME>_device`, sent only to `/auth`, kept on sign-out,
 valid for 180 days) and gets five attempts per 15 minutes of its own, so other
 people's guesses never lock it out. Changing `JWT_SECRET_KEY` invalidates
 every device cookie until that browser's next sign-in.
+
+When no client address can be resolved — every browser behind the bundled
+Compose file's console proxy, without trusted-proxy settings — the sign-in is
+not attributed to a synthetic per-client address. It still gets the five per
+username in 15 minutes account/address window, the fifty per username
+account-wide window, and a separate coarse hourly budget shared by every
+unresolved client (`UNRESOLVED_LOGIN_RATE_LIMIT_PER_HOUR`, default twenty per
+hour per worker). Refused attempts do not extend any window, and the
+in-memory maps that hold the counts are bounded so a flooding source cannot
+lock out unrelated sign-ins by filling them.
 
 Other browsers share the limits with their address, and behind the bundled
 Compose file's console proxy every browser has the same address unless

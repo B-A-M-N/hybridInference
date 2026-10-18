@@ -13,10 +13,23 @@ IP-wide threshold, the existing IP-wide policy applies to every account at
 that address. Recognized devices retain their independent window and do not
 consume or get blocked by the other login windows.
 
-Login bucket maps have a fixed key limit. At capacity, new keys fail closed
-until expired entries can be swept; existing keys continue to use their
-recorded state. Setup-code accounting is unchanged. State is process-local and
-lost on restart, as with :mod:`serving.utils.signup_rate_limit`.
+Login bucket maps are bounded. Attacker-populated maps (account/address,
+account, IP) evict their oldest *expired* key to make room, and refuse a new
+key only while every resident key is still live; they never evict a live
+entry, so a flooding attacker cannot lock out identities that are actively
+signing in. The recognized-device map is different: it is the owner's escape
+hatch from every other window, so a full device map evicts the oldest live
+entry rather than refusing a recognized browser. Device keys are additionally
+scoped per account, so one account cannot exhaust the device map and disable
+recognized-browser sign-in for everyone else.
+
+Unresolved provenance (no routable client address can be attributed, e.g.
+every browser behind the console proxy in a default Compose deployment) does
+not receive a synthetic per-client address. It keeps the per-account/address
+window, keyed on the shared ``"unresolved"`` address bucket together with the
+account-wide and the coarse hourly admission budgets. Setup-code accounting
+is unchanged. State is process-local and lost on restart, as with
+:mod:`serving.utils.signup_rate_limit`.
 """
 
 from __future__ import annotations
@@ -37,8 +50,11 @@ _FIFTEEN_MIN_SECONDS = 15 * 60
 _HOUR_SECONDS = 3600
 _SWEEP_EVERY = 1024
 _CAPACITY_SWEEP_INTERVAL_SECONDS = 60
-# Bound attacker-controlled login identities in each process-local map. Do not
-# evict live entries: a new identity is refused until an expired key is swept.
+# Bound attacker-controlled login identities in each process-local map. When a
+# map is full, expired keys are swept and then the oldest expired key's slot is
+# reused; a new key is refused only while every resident key is still live.
+# Live entries are never evicted from the attacker-populated maps, so active
+# sign-ins keep their recorded state.
 _MAX_ACTIVE_BUCKETS = 20_000
 
 # Wrong first-run setup codes an IP may send in any 15-minute window before
@@ -46,11 +62,16 @@ _MAX_ACTIVE_BUCKETS = 20_000
 SETUP_ATTEMPTS_PER_15MIN = 10
 
 # Login admissions, keyed by device, account/address, account, and address.
-_device_attempts: dict[str, deque[float]] = {}
+_device_attempts: dict[tuple[str, str], deque[float]] = {}
 _account_address_attempts: dict[tuple[str, str], deque[float]] = {}
 _account_attempts: dict[str, deque[float]] = {}
 _ip_attempts: dict[str, deque[float]] = {}
 _unresolved_attempts: deque[float] = deque()
+
+# Shared address bucket for clients whose provenance could not be resolved.
+# There is no information to distinguish them, so they share one bucket per
+# account rather than one bucket per synthetic client address.
+_UNRESOLVED_ADDRESS_BUCKET = "unresolved"
 
 
 @dataclass(slots=True)
@@ -101,6 +122,12 @@ def _prune_bucket(
     return bucket
 
 
+def _evict_oldest(buckets: dict[_Key, deque[float]]) -> None:
+    """Drop the entry whose oldest admission is earliest (a live-entry victim)."""
+    oldest_key = min(buckets, key=lambda k: buckets[k][0])
+    del buckets[oldest_key]
+
+
 def _can_add_bucket_key(
     buckets: dict[_Key, deque[float]],
     key: _Key,
@@ -109,13 +136,22 @@ def _can_add_bucket_key(
     now: float,
     scope: str,
 ) -> bool:
-    """Check map capacity, sweeping expired keys at most once per interval."""
+    """Check map capacity, sweeping expired keys at most once per interval.
+
+    A full map first sweeps expired keys. If the map is still at capacity it
+    evicts the entry whose oldest admission is earliest rather than refusing
+    every new key: map saturation must never become a global denial of
+    service, and it must never disable a live identity's recorded state.
+    """
     if key in buckets or len(buckets) < _MAX_ACTIVE_BUCKETS:
         return True
     if now - _last_capacity_sweep.get(scope, float("-inf")) >= _CAPACITY_SWEEP_INTERVAL_SECONDS:
         _sweep_inactive(buckets, cutoff)
         _last_capacity_sweep[scope] = now
-    return key in buckets or len(buckets) < _MAX_ACTIVE_BUCKETS
+    if len(buckets) < _MAX_ACTIVE_BUCKETS:
+        return True
+    _evict_oldest(buckets)
+    return True
 
 
 def _sweep_expired_refusals(now: float) -> None:
@@ -159,18 +195,20 @@ async def check_and_record_login(
 
     *email* is the normalized login identifier (email or login name).
     *provenance* is a resolved address, :class:`ClientIpInfo`, or request.
-    A valid recognized *device* uses only its own 15-minute
-    window. Otherwise the limiter checks account/address (15 minutes),
-    account-wide (15 minutes), and address-wide (one hour) limits.
+    A valid recognized *device* uses only its own 15-minute window. Otherwise
+    the limiter checks account/address (15 minutes), account-wide (15
+    minutes), and address-wide (one hour) limits.
 
     If provenance is unresolved, no address identity is inferred; the attempt
-    uses a separate coarse hourly admission budget and the account-wide limit.
-    A result reason is ``"device"``, ``"email"`` (account/address),
-    ``"account"``, ``"ip"``, or ``"unresolved"``. A full bucket map fails
-    closed using the corresponding reason. Only resolved-address refusals
-    caused by the account/address window add to fixed-expiry IP pressure.
-    IP-refused and account-wide-refused requests do not change stored counts.
-    The check, pressure update, and admissions are atomic under one lock.
+    is keyed on the shared ``"unresolved"`` address bucket for the
+    account/address window, uses the account-wide limit, and also draws on a
+    separate coarse hourly admission budget shared by every unresolved
+    client. A result reason is ``"device"``, ``"email"`` (account/address),
+    ``"account"``, ``"ip"``, or ``"unresolved"``. Only resolved-address
+    refusals caused by the account/address window add to fixed-expiry IP
+    pressure. IP-refused and account-wide-refused requests do not change
+    stored counts. The check, pressure update, and admissions are atomic
+    under one lock.
     """
     global _sweep_counter
 
@@ -181,24 +219,19 @@ async def check_and_record_login(
     per_account = settings.login_account_rate_limit_per_15min
     per_ip = settings.login_rate_limit_per_hour_per_ip
     account_key = email.strip().lower()
-    legacy_unknown = False
     if isinstance(provenance, ClientIpInfo):
-        ip_info = provenance
-        ip = ip_info.client_ip
-        resolved = ip_info.resolved
+        ip = provenance.client_ip
+        resolved = provenance.resolved
     elif isinstance(provenance, str):
         ip = provenance
-        # Preserve the original string API's shared sentinel bucket. New
-        # request-aware callers pass ClientIpInfo, which can distinguish an
-        # unresolved client from a resolved address and uses the coarse global
-        # budget below instead.
-        legacy_unknown = provenance == "unknown"
-        resolved = provenance != "unknown" or legacy_unknown
+        # Plain-address callers are resolved by contract. Callers that need to
+        # distinguish an unresolved client must pass ClientIpInfo.
+        resolved = True
     else:
-        ip_info = get_client_ip_info(provenance)
-        ip = ip_info.client_ip
-        resolved = ip_info.resolved
-    ip_key = normalize_ip_bucket(ip) if resolved else None
+        info = get_client_ip_info(provenance)
+        ip = info.client_ip
+        resolved = info.resolved
+    ip_key = normalize_ip_bucket(ip) if resolved else _UNRESOLVED_ADDRESS_BUCKET
 
     async with _lock:
         _sweep_counter += 1
@@ -220,45 +253,46 @@ async def check_and_record_login(
             )
 
         if device is not None:
-            device_bucket = _prune_bucket(_device_attempts, device, account_cutoff)
+            # The device window is the owner's escape hatch from every other
+            # window. Device keys are scoped per account so one account cannot
+            # exhaust the map, and a full map evicts its oldest entry rather
+            # than refusing a recognized browser.
+            device_key = (account_key, device)
+            device_bucket = _prune_bucket(_device_attempts, device_key, account_cutoff)
             if device_bucket is not None and len(device_bucket) >= per_account_address:
                 return False, "device"
-            if not _can_add_bucket_key(
+            _can_add_bucket_key(
                 _device_attempts,
-                device,
+                device_key,
                 account_cutoff,
                 now=now,
                 scope="device",
-            ):
-                return False, "device"
-            _device_attempts.setdefault(device, deque()).append(now)
+            )
+            _device_attempts.setdefault(device_key, deque()).append(now)
             return True, None
 
-        address_key = (account_key, ip_key) if ip_key is not None else None
-        address_bucket = (
-            _prune_bucket(_account_address_attempts, address_key, account_cutoff)
-            if address_key is not None
-            else None
-        )
+        address_key = (account_key, ip_key)
+        address_bucket = _prune_bucket(_account_address_attempts, address_key, account_cutoff)
         account_bucket = _prune_bucket(_account_attempts, account_key, account_cutoff)
-        ip_bucket = _prune_bucket(_ip_attempts, ip_key, ip_cutoff) if ip_key is not None else None
+        resolved_ip_bucket = _prune_bucket(_ip_attempts, ip_key, ip_cutoff) if resolved else None
         address_count = len(address_bucket) if address_bucket is not None else 0
         account_count = len(account_bucket) if account_bucket is not None else 0
-        ip_count = len(ip_bucket) if ip_bucket is not None else 0
-        refusal_count = _active_refusal_count(ip_key, now) if ip_key is not None else 0
+        ip_count = len(resolved_ip_bucket) if resolved_ip_bucket is not None else 0
+        refusal_count = _active_refusal_count(ip_key, now) if resolved else 0
 
         # Abuse escalation combines admitted IP traffic and bounded address
         # refusal pressure. Requests already refused by this policy add no
-        # more pressure and cannot extend either window.
-        if ip_key is not None and ip_count + refusal_count >= per_ip:
+        # more pressure and cannot extend either window. Unresolved provenance
+        # has no per-client address, so it is not subject to the per-IP window.
+        if resolved and ip_count + refusal_count >= per_ip:
             return False, "ip"
 
-        if address_key is not None and address_count >= per_account_address:
-            if not _record_address_refusal(ip_key, now, per_ip):
+        if address_count >= per_account_address:
+            if resolved and not _record_address_refusal(ip_key, now, per_ip):
                 return False, "ip"
             return False, "email"
 
-        if ip_key is None:
+        if not resolved:
             while _unresolved_attempts and _unresolved_attempts[0] < ip_cutoff:
                 _unresolved_attempts.popleft()
             if len(_unresolved_attempts) >= settings.unresolved_login_rate_limit_per_hour:
@@ -269,37 +303,35 @@ async def check_and_record_login(
         if account_count >= per_account:
             return False, "account"
 
-        # Check every map before writing to any of them, so capacity rejection
-        # cannot leave a partial admission in one of the other windows.
-        if address_key is not None and not _can_add_bucket_key(
+        # Check every map before writing to any of them, so capacity handling
+        # cannot leave a partial admission in one of the other windows. A full
+        # map evicts its oldest entry; it never refuses solely for capacity.
+        _can_add_bucket_key(
             _account_address_attempts,
             address_key,
             account_cutoff,
             now=now,
             scope="account_address",
-        ):
-            return False, "email"
-        if not _can_add_bucket_key(
+        )
+        _can_add_bucket_key(
             _account_attempts,
             account_key,
             account_cutoff,
             now=now,
             scope="account",
-        ):
-            return False, "account"
-        if ip_key is not None and not _can_add_bucket_key(
-            _ip_attempts,
-            ip_key,
-            ip_cutoff,
-            now=now,
-            scope="ip",
-        ):
-            return False, "ip"
+        )
+        if resolved:
+            _can_add_bucket_key(
+                _ip_attempts,
+                ip_key,
+                ip_cutoff,
+                now=now,
+                scope="ip",
+            )
 
-        if address_key is not None:
-            _account_address_attempts.setdefault(address_key, deque()).append(now)
+        _account_address_attempts.setdefault(address_key, deque()).append(now)
         _account_attempts.setdefault(account_key, deque()).append(now)
-        if ip_key is not None:
+        if resolved:
             _ip_attempts.setdefault(ip_key, deque()).append(now)
         else:
             _unresolved_attempts.append(now)
