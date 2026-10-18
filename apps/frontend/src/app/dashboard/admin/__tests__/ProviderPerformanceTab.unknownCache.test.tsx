@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
+import { getProviderObservability } from '@/lib/api/admin';
 import { ProviderPerformanceTab } from '../ProviderPerformanceTab';
 
 vi.mock('recharts', () => ({
@@ -66,6 +67,8 @@ describe('ProviderPerformanceTab cache-hit rate with no reported cache usage', (
     // has cache_eligible_count == 0. Rendering that as 0.00% would claim it
     // demonstrably missed every lookup; it must read as "no data" instead.
     render(<ProviderPerformanceTab />);
+
+    await waitFor(() => expect(getProviderObservability).toHaveBeenCalled());
 
     await screen.findByRole('heading', { name: 'Cache' });
 
