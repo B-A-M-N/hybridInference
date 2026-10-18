@@ -941,6 +941,77 @@ async def test_auth_ip_blocked_wiring_from_the_real_blocklist(monkeypatch):
         reset_auth_failure_block_state()
 
 
+async def test_unresolved_auth_block_transition_reaches_alert(monkeypatch):
+    """The coarse unresolved block is visible to the existing block alert."""
+    monkeypatch.setenv("SLACK_ALERTS_WEBHOOK_URL", "https://x")
+    from serving.config.settings import settings
+    from serving.observability.alerts import reset_dedupe_state
+    from serving.utils.auth_failure_blocklist import (
+        record_auth_failure,
+        reset_auth_failure_block_state,
+    )
+    from serving.utils.request_ip import ClientIpInfo
+
+    reset_dedupe_state()
+    reset_auth_failure_block_state()
+
+    monkeypatch.setattr(settings, "auth_failure_block_enabled", True)
+    monkeypatch.setattr(settings, "unresolved_auth_failure_block_threshold", 2)
+    monkeypatch.setattr(settings, "unresolved_auth_failure_block_window_sec", 100)
+    monkeypatch.setattr(settings, "unresolved_auth_failure_block_duration_sec", 1000)
+
+    cfg = AlertConfig()
+    cfg.rules.auth_ip_blocked.cooldown_sec = 1
+    cfg.rules.failed_request_rate.enabled = False
+    cfg.rules.fivexx_rate.enabled = False
+    cfg.rules.p95_latency_per_provider.enabled = False
+
+    handler = AlertingLogHandler(maxsize=1000)
+    engine = AlertEngine(
+        handler=handler,
+        config=cfg,
+        scheduler=None,
+        op_store=None,
+        log_store=None,
+    )
+    unresolved = ClientIpInfo(
+        client_ip="unknown",
+        peer_ip="10.0.0.2",
+        source="unknown",
+        trusted_proxy_headers=False,
+        resolved=False,
+    )
+
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        with patch(
+            "serving.observability.alerts.alert_slack",
+            new=AsyncMock(),
+        ) as mock_alert:
+            await engine.start()
+            try:
+                assert await record_auth_failure(unresolved) is False
+                assert await record_auth_failure(unresolved) is True
+
+                await _drain_until(handler, mock_alert)
+                blocked = [
+                    call
+                    for call in mock_alert.await_args_list
+                    if call.args[1] == "Auth-failure blocklist refusing a source"
+                ]
+                assert blocked, mock_alert.await_args_list
+                context = blocked[-1].args[2]
+                assert context["ip_bucket"] == "unresolved-global"
+                assert "trusted-proxy" in context["remedy"]
+                assert "not listed" in context["all_active_blocks"]
+            finally:
+                await engine.stop()
+    finally:
+        root.removeHandler(handler)
+        reset_auth_failure_block_state()
+
+
 async def test_concurrency_rejected_never_alerts(monkeypatch):
     """A user exhausting its quota/concurrency must never page Slack.
 
@@ -1031,10 +1102,11 @@ async def test_user_cost_overrun_job_fires(monkeypatch):
 
     cfg = AlertConfig()
     cfg.cost.user_overrun.cooldown_sec = 1
-    # (user_id, role, spend, their own key's cap) — 19.99 against a 20.00 cap
+    # (user_id, role, spend, their own key's cap) — 19.991 against a 20.00 cap
     # is what the gate refusing a request actually looks like, since it
-    # pre-charges the estimate.
-    op_store = _FakeOpStore([("u1", "free", 19.99, 20.0)])
+    # pre-charges the estimate. Exactly 19.99 is not refused: 19.99 + 0.01
+    # equals the cap.
+    op_store = _FakeOpStore([("u1", "free", 19.991, 20.0)])
 
     job = UserCostOverrunJob(cfg.cost.user_overrun, op_store)
 
@@ -1214,7 +1286,7 @@ async def test_user_cost_overrun_job_never_claims_inactive_when_the_recheck_fail
 
 
 async def test_user_cost_overrun_boundary_card_is_not_self_contradictory(monkeypatch):
-    """$19.99 against a $20.00 cap is a refusal, and must not read as "-$0.01".
+    """$19.991 against a $20.00 cap is a refusal, and must not read as "-$0.01".
 
     The predicate that selects these users includes the gate's optimistic
     pre-charge, so the boundary row is genuinely *under* the cap in raw spend.
@@ -1228,7 +1300,7 @@ async def test_user_cost_overrun_boundary_card_is_not_self_contradictory(monkeyp
     reset_dedupe_state()
 
     cfg = AlertConfig()
-    op_store = _FakeOpStore([("u1", "free", 19.99, 20.0)])
+    op_store = _FakeOpStore([("u1", "free", 19.991, 20.0)])
     job = UserCostOverrunJob(cfg.cost.user_overrun, op_store)
 
     with patch(

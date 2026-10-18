@@ -6,16 +6,11 @@ and a user with one more request left must not. That is a question about SQL
 semantics (numeric vs float, the day key's TEXT comparison, the key join), so
 it is asked of a real database rather than a mock.
 
-Marked ``dbtest``: excluded from the default suite, run with
-``pytest -m dbtest tests/integration/``.
+Marked ``dbtest``: excluded from the default ``make test`` suite, run locally
+with ``pytest -m dbtest tests/integration/``. CI runs it against PostgreSQL in
+the dedicated ``db`` test shard.
 
-**Unproven in this environment.** These tests have never been executed here —
-no Postgres test database is wired up on this host, and the default ``make
-test`` deselects the ``dbtest`` marker, so nothing in this file has run even
-once. Read every assertion below as *intent*, not as evidence. Anyone with a
-test database should run them before trusting the claims they make.
-
-That matters because three behaviours have no other cover anywhere in the
+Three behaviours have no other cover anywhere in the
 suite. The unit tests in ``tests/unit/storage/test_users_at_daily_quota.py``
 mock asyncpg, so they can only check the shape of the SQL string, never what it
 selects. These are the cases that only a real database can decide, and only
@@ -163,9 +158,9 @@ def _ids(rows) -> list[str]:
 
 
 async def test_user_the_gate_refuses_is_reported(postgres_op_store):
-    """19.99 spent against a 20.00 cap: the next request is already refused."""
+    """A fully consumed 20.00 cap is reported as already refused."""
     at_cap = await _seed(
-        postgres_op_store, suffix="atcap", role="free", cap=Decimal("20.00"), spend=Decimal("19.99")
+        postgres_op_store, suffix="atcap", role="free", cap=Decimal("20.00"), spend=Decimal("20.00")
     )
 
     rows = await postgres_op_store.query_users_at_daily_quota()
@@ -173,7 +168,7 @@ async def test_user_the_gate_refuses_is_reported(postgres_op_store):
     assert _ids(rows) == [at_cap]
     _, role, spend, cap = rows[0]
     assert role == "free"
-    assert spend == pytest.approx(19.99)
+    assert spend == pytest.approx(20.00)
     assert cap == pytest.approx(20.00)
     # Belt and braces: the row is here for exactly the reason quota.check
     # would raise on this account's next request.

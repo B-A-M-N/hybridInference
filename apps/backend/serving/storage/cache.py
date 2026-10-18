@@ -989,12 +989,36 @@ class CachedOperationalStore(OperationalStore):
         """Delegate to wrapped store."""
         return await self._store.get_user_preferences(user_id)
 
-    async def update_user_preferences(self, user_id: str, preferences: dict[str, Any]) -> None:
-        """Delegate then invalidate user and auth caches."""
-        await self._store.update_user_preferences(user_id, preferences)
+    async def _invalidate_preferences(self, user_id: str) -> None:
+        # The auth contexts carry preferences (disabled models), so every
+        # preference write drops them along with the user row.
         await self._cache.delete(self._user_key(user_id))
         await self._cache.delete_pattern("auth:*")
         await self._cache.delete_pattern("auth_light:*")
+
+    async def set_user_preference(self, user_id: str, key: str, value: Any) -> bool:
+        """Delegate then invalidate user and auth caches."""
+        found = await self._store.set_user_preference(user_id, key, value)
+        await self._invalidate_preferences(user_id)
+        return found
+
+    async def delete_user_preference(self, user_id: str, key: str) -> bool:
+        """Delegate then invalidate user and auth caches."""
+        found = await self._store.delete_user_preference(user_id, key)
+        await self._invalidate_preferences(user_id)
+        return found
+
+    async def set_user_preference_if_newer(
+        self,
+        user_id: str,
+        key: str,
+        value: dict[str, Any],
+        chosen_at: datetime,
+    ) -> dict[str, Any] | None:
+        """Delegate then invalidate user and auth caches."""
+        stored = await self._store.set_user_preference_if_newer(user_id, key, value, chosen_at)
+        await self._invalidate_preferences(user_id)
+        return stored
 
     async def get_user_avatar(self, user_id: str) -> str | None:
         """Delegate to wrapped store; portraits are not cached."""
@@ -1051,6 +1075,19 @@ class CachedOperationalStore(OperationalStore):
     async def delete_setting(self, key: str) -> bool:
         """Delegate to wrapped store."""
         return await self._store.delete_setting(key)
+
+    async def compare_and_set_setting(
+        self,
+        key: str,
+        expected: str | None,
+        value: str,
+        value_type: str,
+        updated_by: str | None,
+    ) -> bool:
+        """Delegate atomic publication without a process-local cache."""
+        return await self._store.compare_and_set_setting(
+            key, expected, value, value_type, updated_by
+        )
 
     async def list_settings(self) -> list[Row]:
         """Delegate to wrapped store."""
