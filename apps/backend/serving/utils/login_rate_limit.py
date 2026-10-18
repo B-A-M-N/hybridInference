@@ -314,7 +314,7 @@ def _record_address_refusal(ip_key: str, now: float, per_ip: int) -> bool:
 async def check_and_record_login(
     email: str, provenance: str | ClientIpInfo | Request, *, device: str | None = None
 ) -> tuple[bool, str | None]:
-    """Return whether a login may proceed, recording only admitted attempts.
+    """Return whether a login may proceed while bounding its attempt state.
 
     *email* is the normalized login identifier (email or login name).
     *provenance* is a resolved address, :class:`ClientIpInfo`, or request.
@@ -325,8 +325,9 @@ async def check_and_record_login(
     If provenance is unresolved, no address identity is inferred; the attempt
     is keyed on the shared ``"unresolved"`` address bucket for the
     account/address window, uses the account-wide limit, and also draws on a
-    separate coarse hourly admission budget shared by every unresolved
-    client. A result reason is ``"device"``, ``"email"`` (account/address),
+    separate coarse hourly attempt budget shared by every unresolved client.
+    Unresolved attempts consume that bounded budget even when an account
+    window refuses them. A result reason is ``"device"``, ``"email"`` (account/address),
     ``"account"``, ``"ip"``, or ``"unresolved"``. Only resolved-address
     refusals caused by the account/address window add to fixed-expiry IP
     pressure. IP-refused and account-wide-refused requests do not change
@@ -416,6 +417,17 @@ async def check_and_record_login(
             _device_keys_by_account.setdefault(account_key, set()).add(device_key)
             return True, None
 
+        if not resolved:
+            # There is no per-client address to hold responsible for traffic
+            # behind an untrusted proxy. Count every request against the
+            # shared hourly budget, even when a narrower account window will
+            # refuse it, and saturate at the configured bound.
+            while _unresolved_attempts and _unresolved_attempts[0] < ip_cutoff:
+                _unresolved_attempts.popleft()
+            if len(_unresolved_attempts) >= settings.unresolved_login_rate_limit_per_hour:
+                return False, "unresolved"
+            _unresolved_attempts.append(now)
+
         address_key = (account_key, ip_key)
         address_bucket = _prune_bucket(_account_address_attempts, address_key, account_cutoff)
         account_bucket = _prune_bucket(_account_attempts, account_key, account_cutoff)
@@ -436,12 +448,6 @@ async def check_and_record_login(
             if resolved and not _record_address_refusal(ip_key, now, per_ip):
                 return False, "ip"
             return False, "email"
-
-        if not resolved:
-            while _unresolved_attempts and _unresolved_attempts[0] < ip_cutoff:
-                _unresolved_attempts.popleft()
-            if len(_unresolved_attempts) >= settings.unresolved_login_rate_limit_per_hour:
-                return False, "unresolved"
 
         # Account-wide checks apply after the address-specific limit. A
         # refusal here does not contribute to the IP-wide abuse counter.
@@ -514,9 +520,6 @@ async def check_and_record_login(
                 _record_overflow_attempt("ip", ip_key, now)
             else:
                 _ip_attempts.setdefault(ip_key, deque()).append(now)
-        else:
-            _unresolved_attempts.append(now)
-
     return True, None
 
 
