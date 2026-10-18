@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -14,7 +15,7 @@ if TYPE_CHECKING:
 
 from llm_routewise.core import CheckpointBackupDispatch, CheckpointBackupSelector
 
-from routing.completion_outcome import CompletionOutcome
+from routing.completion_outcome import CompletionOutcome, classify_completion_outcome
 from routing.endpoints import endpoint_id_for_adapter
 from routing.streaming import has_non_empty_content
 from routing.telemetry import failed_attempt, routing_chunk
@@ -34,6 +35,53 @@ class HedgeBackupUnavailable(RuntimeError):
 
 class HedgeStreamRaceTimeout(TimeoutError):
     """Raised when no stream produces race-winning output before the deadline."""
+
+
+def _classify_stream_buffer_outcome(buffer: list[str]) -> CompletionOutcome:
+    """Classify the buffered stream chunks that won the race."""
+    text_parts: list[str] = []
+    for chunk in buffer:
+        if not isinstance(chunk, str | bytes):
+            continue
+        text = chunk.decode("utf-8", errors="surrogatepass") if isinstance(chunk, bytes) else chunk
+        prefix = "data: "
+        if not text.startswith(prefix):
+            continue
+        try:
+            obj = json.loads(text[len(prefix) :].strip())
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        choices = obj.get("choices") or []
+        delta = (choices[0] or {}).get("delta") or {} if choices else {}
+        content = delta.get("content") or delta.get("reasoning_content")
+        if isinstance(content, str) and content:
+            text_parts.append(content)
+    return classify_completion_outcome(
+        content="".join(text_parts) or None,
+        http_status=200,
+        terminal=True,
+    )
+
+
+def _classify_result_outcome(result: Any) -> CompletionOutcome:
+    """Classify a non-streaming hedge winner's completion result."""
+    content: str | None = None
+    usage: dict[str, Any] | None = None
+    if isinstance(result, dict):
+        choices = result.get("choices") or [{}]
+        message = (choices[0] or {}).get("message") or {}
+        raw_content = message.get("content") or message.get("reasoning_content")
+        content = raw_content if isinstance(raw_content, str) else None
+        raw_usage = result.get("usage")
+        usage = raw_usage if isinstance(raw_usage, dict) else None
+    return classify_completion_outcome(
+        content=content,
+        usage=usage,
+        http_status=200,
+        terminal=True,
+    )
 
 
 @runtime_checkable
@@ -437,11 +485,7 @@ class HedgedAdapter(BaseAdapter):
                         if task is primary_task:
                             self.event_sink.record_success(
                                 primary_endpoint,
-                                outcome=(
-                                    CompletionOutcome.PROGRESS
-                                    if has_non_empty_content(str(winner_result))
-                                    else CompletionOutcome.EMPTY
-                                ),
+                                outcome=_classify_result_outcome(winner_result),
                             )
                             # self.config stays as primary.config (already correct).
                             if backup_task in pending:
@@ -451,11 +495,7 @@ class HedgedAdapter(BaseAdapter):
                         else:
                             self.event_sink.record_success(
                                 _endpoint_id_from_adapter(self.backup),
-                                outcome=(
-                                    CompletionOutcome.PROGRESS
-                                    if has_non_empty_content(str(winner_result))
-                                    else CompletionOutcome.EMPTY
-                                ),
+                                outcome=_classify_result_outcome(winner_result),
                             )
                             # Swap config so RouteWise attributes to the real winner.
                             assert self.backup is not None
@@ -791,7 +831,7 @@ class HedgedAdapter(BaseAdapter):
                     # Tiebreaker: primary wins.
                     self.event_sink.record_success(
                         primary_endpoint,
-                        outcome=CompletionOutcome.PROGRESS,
+                        outcome=_classify_stream_buffer_outcome(primary_buffer),
                     )
                     # self.config stays as primary.config (already correct).
                     self._schedule_stream_backup_cleanup(
@@ -804,7 +844,7 @@ class HedgedAdapter(BaseAdapter):
                 elif primary_has_content:
                     self.event_sink.record_success(
                         primary_endpoint,
-                        outcome=CompletionOutcome.PROGRESS,
+                        outcome=_classify_stream_buffer_outcome(primary_buffer),
                     )
                     self._schedule_stream_backup_cleanup(
                         next_task=backup_next_task,
@@ -819,7 +859,7 @@ class HedgedAdapter(BaseAdapter):
                     endpoint = backup_endpoint or _endpoint_id_from_adapter(self.backup)
                     self.event_sink.record_success(
                         endpoint,
-                        outcome=CompletionOutcome.PROGRESS,
+                        outcome=_classify_stream_buffer_outcome(backup_buffer),
                     )
                     # Swap config so RouteWise attributes to the real winner.
                     assert self.backup is not None
