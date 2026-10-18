@@ -185,8 +185,19 @@ host keeps only the keys `AUTH_MESSAGE_KEYS` declares, with string values, and
 drops everything else before a page reads it, so wording for a console page —
 `auth.authorize.*` for `/authorize`, `chat.*` for `/chat` — has no effect.
 Missing keys retain the shared defaults. Preserve each message's interpolation
-variables. A module may localize its own pages and supported keys, but this
-does not translate every console page.
+variables.
+
+The console has translations of its own, and the reader picks the language (see
+[Translating the Console](console-translations.md)). A module's `authMessages`
+are written in the module's language — its descriptor `locale`, or English when
+that is empty — and apply only to a page in that language. A reader who chose a
+different console language gets the console's translation of those pages, not
+the module's sentences mixed into it.
+
+The login method selector uses `auth.login.method_label`,
+`auth.login.password_method`, and `auth.login.sms_method` for password and SMS
+code login. Signup retains `auth.phone.method_label`, `auth.phone.email_method`,
+and `auth.phone.phone_method` for its email and phone account choices.
 
 ## Document language and page titles
 
@@ -194,8 +205,10 @@ The server entry's optional `locale` sets `<html lang>` on the routes the module
 renders: `/` when it exports `Landing`, the five account pages when it exports
 `AuthFrame`, and `/terms` when it exports the legal set. Every other route — the
 console, and a public route whose export the module leaves out — is the
-console's, in `en`. An empty or omitted `locale` keeps `en` everywhere. The
-attribute follows client-side navigation as well as the first response.
+console's, in the reader's console language: English unless they chose
+another, or their browser asks for one the console ships. An empty or omitted
+`locale` gives the module's routes the reader's language too. The attribute
+follows client-side navigation as well as the first response.
 
 The optional `metaMessages` words the titles and descriptions of the seven
 public routes. Its keys are `meta.<page>.title` and `meta.<page>.description`,
@@ -355,7 +368,7 @@ API v1.
 | `data-auth="notice"` | an info, error or success notice; a button inside one is `[data-auth="notice"] button` |
 | `data-auth="submit"` | the page's primary button, or the link that stands in for it |
 | `data-auth="field-action"` | the wrapper around a field's own action, such as the forgot-password link |
-| `data-auth="secondary-actions"` | the row of alternative links on `/verify-email` |
+| `data-auth="secondary-actions"` | alternative actions, including the method selector and links on `/verify-email` |
 | `data-auth="consent"` | each sign-up confirmation: the label holding its checkbox and sentence |
 | `data-auth="consent-section"` | each section of the sign-up consent step |
 | `data-auth="loading"` | the resolving-session region |
@@ -364,6 +377,10 @@ State is carried by the attributes the application already sets — `aria-invali
 `disabled`, `aria-busy`, `data-auth-error`, `data-auth-tone` — so a stylesheet
 never has to infer "this field is in error" from a class name. The set is part
 of the contract: an attribute is added, never repurposed.
+
+The login and signup method group additionally exposes `data-auth-method-selector`
+for scoped styling, while keeping its `data-auth="secondary-actions"` hook.
+Its buttons use `aria-pressed` to identify the selected method.
 
 The host describes each control itself. Before a `fieldLayout` sees the control,
 `AuthField` gives it `aria-describedby` naming the field's hint (`<id>-hint`) and

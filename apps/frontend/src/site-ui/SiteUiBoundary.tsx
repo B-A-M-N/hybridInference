@@ -3,6 +3,7 @@
 import { usePathname } from 'next/navigation';
 
 import { TermsContent as ConsoleTerms } from '@/app/terms/TermsContent';
+import { ConsoleCopyProvider, ModuleRendersRouteProvider } from '@/site-ui/appearance';
 import { NeutralAuthCard } from '@/site-ui/neutral/body';
 import { SITE_UI_CLIENT } from '@/site-ui/module';
 import { SiteUiProvider } from '@/site-ui/SiteUiCore';
@@ -66,7 +67,19 @@ export function useModuleRendersRoute(): boolean {
  * take the whole application down with it rather than one page.
  */
 export function SiteUiBoundary({ children }: { children: React.ReactNode }) {
-  return <SiteUiProvider>{children}</SiteUiProvider>;
+  // A console route keeps the neutral appearance and the console's copy even
+  // when it mounts a shared form. Every public route keeps the module's
+  // styling: its `Landing` and legal frame may read `useAuthAppearance` through
+  // the host.
+  const route = usePublicRoute();
+  if (route === null) {
+    return <ConsoleCopyProvider value={true}>{children}</ConsoleCopyProvider>;
+  }
+  return (
+    <ModuleRendersRouteProvider value={moduleRendersRoute(route)}>
+      <SiteUiProvider>{children}</SiteUiProvider>
+    </ModuleRendersRouteProvider>
+  );
 }
 
 /**
@@ -125,6 +138,7 @@ export function AuthPageFrame({
   subtitle,
   topbar,
   legal,
+  wide = false,
   children,
 }: {
   page: 'login' | 'signup' | 'forgot-password' | 'reset-password' | 'verify-email';
@@ -133,6 +147,11 @@ export function AuthPageFrame({
   subtitle: string;
   topbar?: React.ReactNode;
   legal?: React.ReactNode;
+  /**
+   * The body is reading matter — the sign-up terms — and wants a wider column.
+   * Only the console's own card reads it; a module frame sizes its own body.
+   */
+  wide?: boolean;
   children: React.ReactNode;
 }) {
   // Straight from the module rather than through the route: an account page
@@ -141,7 +160,7 @@ export function AuthPageFrame({
   const Frame = SITE_UI_CLIENT.AuthFrame ?? null;
   if (!Frame) {
     return (
-      <NeutralAuthCard title={title} subtitle={subtitle} topbar={topbar}>
+      <NeutralAuthCard title={title} subtitle={subtitle} topbar={topbar} wide={wide}>
         {children}
       </NeutralAuthCard>
     );

@@ -1,5 +1,6 @@
 import { fetchWithAuth, jsonOrThrow } from './client';
 import { config } from '@/config/env';
+import type { AccountLocaleChoice } from '@/lib/i18n/choice';
 
 const API_BASE = config.apiBase;
 
@@ -12,11 +13,14 @@ export interface User {
   phone_verified?: boolean;
   has_password?: boolean;
   user_name?: string;
+  avatar_url?: string | null;
   role: string;
   status: string;
   email_verified: boolean;
   is_admin: boolean;
   created_at: string;
+  /** The interface language this account last chose; absent when it never chose. */
+  locale?: AccountLocaleChoice | null;
 }
 
 export interface ApiKeyResponse {
@@ -95,6 +99,27 @@ export async function getMe(): Promise<User> {
   return jsonOrThrow<User>(resp);
 }
 
+/**
+ * Store the account's interface language.
+ *
+ * `chosenAt` is passed only when the choice was made earlier, signed out, and
+ * is being carried into the account; the server takes the current time
+ * otherwise, and never a time later than its own clock.
+ */
+export async function updateLocalePreference(
+  locale: string,
+  chosenAt?: number,
+): Promise<AccountLocaleChoice> {
+  const resp = await fetchWithAuth(API_BASE, '/user/preferences/locale', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(
+      chosenAt === undefined ? { locale } : { locale, chosen_at: new Date(chosenAt).toISOString() },
+    ),
+  });
+  return jsonOrThrow<AccountLocaleChoice>(resp);
+}
+
 export async function getModels(): Promise<ModelCatalogResponse> {
   const resp = await fetchWithAuth(API_BASE, '/user/models');
   return jsonOrThrow<ModelCatalogResponse>(resp);
@@ -133,7 +158,10 @@ export async function getUsage(period: 'today' | 'month' | 'all' = 'today'): Pro
   return jsonOrThrow<UsageStats>(resp);
 }
 
-export async function updateProfile(data: { user_name?: string }): Promise<User> {
+export async function updateProfile(data: {
+  user_name?: string;
+  avatar_url?: string | null;
+}): Promise<User> {
   const resp = await fetchWithAuth(API_BASE, '/user/profile', {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
@@ -142,14 +170,23 @@ export async function updateProfile(data: { user_name?: string }): Promise<User>
   return jsonOrThrow<User>(resp);
 }
 
+/**
+ * Change the password, or set a first one. An account without a password
+ * confirms its owner with `phoneCode`, a `set_password` code.
+ */
 export async function updatePassword(
   currentPassword: string,
   newPassword: string,
+  phoneCode?: string,
 ): Promise<{ message: string }> {
   const resp = await fetchWithAuth(API_BASE, '/user/change-password', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ old_password: currentPassword, new_password: newPassword }),
+    body: JSON.stringify({
+      old_password: currentPassword,
+      new_password: newPassword,
+      ...(phoneCode ? { phone_code: phoneCode } : {}),
+    }),
   });
   return jsonOrThrow<{ message: string }>(resp);
 }

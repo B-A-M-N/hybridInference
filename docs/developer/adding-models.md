@@ -91,8 +91,9 @@ A value in `.env` also reaches a gateway with a database: at startup the
 backend copies it into the database, unless the database already has a value
 of that name.
 
-If a `${VAR}` used for `api_key`, `api_keys` or `base_url` is unset or empty,
-the gateway skips the whole model and logs which variable was missing. Mark a route `optional: true` to
+If a `${VAR}` used for `api_key`, `api_keys` or `base_url` is empty, or unset
+with no default registered for that setting, the gateway skips the whole model
+and logs which variable was missing. Mark a route `optional: true` to
 skip only that route instead. Until such a variable has a value, the console
 also reports it as a missing setting to every signed-in user, so mark a route
 you leave unconfigured on purpose `optional: true` as well.
@@ -187,12 +188,57 @@ itself and are read only at the model level.
 | `priority_scheduling` | bool | No | The endpoint runs an sglang server started with `--enable-priority-scheduling`; see [Prioritizing decode on an sglang route](add-local-model.md#prioritizing-decode-on-an-sglang-route). Normally set per route, not per model |
 | `route_metadata` | dict | No | Free-form per-route metadata consumed by routing strategies |
 | `pricing` | dict | No | Base cost information. `prompt`, `completion`, `input_cache_reads` and `input_cache_writes` are USD per 1M tokens; `request` is USD per request and `image` USD per image |
-| `pricing_schedule` | dict | No | UTC-only activation time plus recurring daily price windows: `pricing` stays active before `effective_at`; afterwards `default` applies outside each half-open `[start, end)` window, and a window's own `pricing` overrides the base fields |
+| `pricing_schedule` | dict | No | UTC-only activation time plus recurring price windows: `pricing` stays active before `effective_at`; afterwards `default` applies outside each half-open `[start, end)` window, and a window's own `pricing` overrides the base fields. Optional `weekdays` (ISO integers 1=Monday through 7=Sunday) and `excluded_dates` (`YYYY-MM-DD`) restrict which UTC dates can use windows |
+| `pricing_source` | dict | No | Automatically follow a supported provider: `{provider: deepseek, model: deepseek-flash}` or `deepseek-v4-pro`. Requires PostgreSQL; cannot be combined with `pricing_schedule`. Set to `null` on a route to use its own prices |
 
 A model entry also accepts `route` (below), `router` and `router_params` (see
 [Choosing a router per model](routing.md#choosing-a-router-per-model)), and
 `required_role`, the lowest user role that can see and call the model
 (`admin_only: true` is an older way to write `required_role: admin`).
+
+### Automatic DeepSeek prices
+
+To follow DeepSeek prices automatically, configure the official API model id as a pricing source. The source is independent of the inference endpoint, so a self-hosted route can use these reference prices too. PostgreSQL stores the last validated snapshot; no API key is sent to the pricing or calendar sources.
+
+```yaml
+pricing_source:
+  provider: deepseek
+  model: deepseek-flash
+```
+
+The gateway checks the [official English price page](https://api-docs.deepseek.com/quick_start/pricing/) every five minutes for USD input, output and cache-hit prices and UTC peak windows. It reads the current and following year from [holiday-cn](https://github.com/NateScarlet/holiday-cn), a third-party dataset generated from State Council notices. This calendar is not a DeepSeek API. Published future-year dates are picked up automatically; an empty placeholder is not treated as a year without holidays.
+
+Validated snapshots replace the stored tariff atomically. Workers reload it every ten seconds; each request keeps the snapshot and time captured at its start, including streaming requests. Peak/off-peak switching happens locally at the configured boundaries, without waiting for a network poll. This is periodic synchronization, not a real-time guarantee that all workers observe an official price change simultaneously.
+
+Fetch or parsing failures retain the last validated snapshot and are logged. A first startup needs either a usable stored snapshot or a successful fetch. Unknown calendars and unrecognized price-page rules cannot silently become zero prices or an empty holiday list. The parser currently accepts the documented weekday schedule only while its UTC peak windows stay within the same Chinese calendar day.
+
+### Calendar-aware prices
+
+For example, apply higher prices on weekdays except configured public holidays:
+
+```yaml
+pricing: {prompt: "0.15", completion: "0.60", input_cache_reads: "0.003"}
+pricing_schedule:
+  effective_at: "2026-10-17T00:00:00Z"
+  timezone: UTC
+  weekdays: [1, 2, 3, 4, 5]
+  excluded_dates: ["2026-12-25"]  # Example only; supply the provider's calendar.
+  default: {prompt: "0.15", completion: "0.60", input_cache_reads: "0.003"}
+  windows:
+    - start: "01:00"
+      end: "04:00"
+      pricing: {prompt: "0.30", completion: "1.20", input_cache_reads: "0.006"}
+    - start: "06:00"
+      end: "10:00"
+      pricing: {prompt: "0.30", completion: "1.20", input_cache_reads: "0.006"}
+```
+
+Omitting the calendar fields preserves daily schedules. On excluded dates and
+non-selected weekdays, all windows are skipped and `default` applies. Overnight
+windows use the current UTC date for both restrictions. For these manually
+configured schedules, deployment owners maintain holiday exclusions and prices;
+use `pricing_source` above for automatic updates. A request keeps the prices
+selected at its start, even if a stream finishes across a boundary.
 
 ### Route configuration
 
