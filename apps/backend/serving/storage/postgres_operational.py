@@ -208,6 +208,9 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         """
         self._pool = pool
         self.fence_secret = fence_secret
+        # Hard-delete recovery metadata is usable only after this instance has
+        # verified the required columns during initialize().
+        self._hard_delete_claim_recovery_schema_ready = False
         # Which account columns the users table has, read from the catalog
         # by initialize(); until then, the schema this release creates.
         self._set_account_schema(COMPLETE_ACCOUNT_SCHEMA)
@@ -1766,7 +1769,9 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                     row["hard_delete_claim_token"],
                 )
                 if updated is None:
-                    raise UserStateChanged(f"Account {user_id} changed during stale-claim recovery.")
+                    raise UserStateChanged(
+                        f"Account {user_id} changed during stale-claim recovery."
+                    )
             elif not row["hard_delete_pending"]:
                 updated = await conn.fetchrow(
                     "UPDATE users SET status = 'active' WHERE id = $1 "

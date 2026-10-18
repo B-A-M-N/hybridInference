@@ -1166,7 +1166,12 @@ async def resume_user(
             "An explicit recovery requires an expired lease and no erasure fence.",
         ) from None
     except UserNotFoundError:
-        raise HTTPException(404, f"User '{user_id}' not found") from None
+        # The route read this account before the store mutation. If it vanished
+        # before that mutation, report a state race rather than a fresh miss.
+        raise HTTPException(
+            409,
+            "User state changed before it could be resumed. Refresh and try again.",
+        ) from None
     except UserStateChanged:
         raise HTTPException(
             409,
@@ -1384,11 +1389,7 @@ async def hard_delete_user(
             claim_token=claim.token,
         )
     except BaseException as exc:
-        if (
-            claim is not None
-            and claim.newly_acquired
-            and not fence_established
-        ):
+        if claim is not None and claim.newly_acquired and not fence_established:
             # A LogStore transaction normally rolls back its fence before
             # raising. Check explicitly so an ambiguous post-commit failure
             # cannot clear a claim that protects an already-erased account.

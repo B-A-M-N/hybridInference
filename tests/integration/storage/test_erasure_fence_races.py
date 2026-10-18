@@ -25,6 +25,7 @@ import pytest_asyncio
 from serving.exceptions import (
     HardDeleteRecoveryAvailable,
     HardDeleteStateChanged,
+    UserNotFoundError,
     UserStateChanged,
 )
 from serving.storage.base import (
@@ -52,6 +53,7 @@ _OWNER = "u-fence-owner"
 _BYSTANDER = "u-fence-bystander"
 
 _ALLOWED_TEST_DB_PATTERN = "_test_"
+_INITIALIZED_OPERATIONAL_STORES: dict[int, PostgresOperationalStore] = {}
 
 
 def _test_db_config() -> dict[str, object]:
@@ -88,6 +90,7 @@ async def fence_store():
     await store.initialize()
     operational_store = PostgresOperationalStore(pool)
     await operational_store.initialize()
+    _INITIALIZED_OPERATIONAL_STORES[id(pool)] = operational_store
 
     async def _wipe() -> None:
         async with pool.acquire() as conn:
@@ -113,8 +116,14 @@ async def fence_store():
         await _seed_deleted_user(_BYSTANDER)
         yield store, pool
     finally:
+        _INITIALIZED_OPERATIONAL_STORES.pop(id(pool), None)
         await _wipe()
         await pool.close()
+
+
+def _initialized_operational_store(pool) -> PostgresOperationalStore:
+    """Return the store initialized by ``fence_store`` for this pool."""
+    return _INITIALIZED_OPERATIONAL_STORES[id(pool)]
 
 
 async def _seed_row(
@@ -161,7 +170,7 @@ async def _count_all(pool) -> int:
 async def test_patch_status_guard_preserves_concurrent_soft_delete(fence_store):
     """A stale PATCH validation cannot reactivate an account soft-deleted meanwhile."""
     _log_store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
     async with pool.acquire() as conn:
         await conn.execute("UPDATE users SET status = 'suspended' WHERE id = $1", _OWNER)
 
@@ -747,9 +756,7 @@ async def test_resume_race_resume_wins(fence_store):
             _OWNER,
         )
 
-    from serving.storage.postgres_operational import PostgresOperationalStore
-
-    op_store = PostgresOperationalStore(pool, fence_secret=_SECRET)
+    op_store = _initialized_operational_store(pool)
     await op_store.resume_user(
         _OWNER, admin_ip="127.0.0.1", admin_id="admin", reason="test", email="a@b.com"
     )
@@ -782,7 +789,7 @@ async def test_resume_race_hard_delete_wins(fence_store):
             _OWNER,
         )
 
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
     await op_store.begin_hard_delete_user(_OWNER)
     await store.hard_delete_user_data(_OWNER)
     assert await store.account_has_erasure_fence(_OWNER) is True
@@ -814,7 +821,7 @@ async def test_resume_endpoint_delete_wins_after_preflight_returns_conflict(
     from serving.schemas_admin import HardDeleteUserRequest, ResumeUserRequest
 
     log_store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
     resume_ready = asyncio.Event()
     allow_resume = asyncio.Event()
 
@@ -895,7 +902,7 @@ async def test_resume_endpoint_delete_wins_after_preflight_returns_conflict(
 async def test_missing_user_mutations_fail_without_resume_audit(fence_store):
     """Status mutations fail closed when hard-delete already removed the row."""
     _store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
     user_id = "u-fence-missing-status"
 
     async with pool.acquire() as conn:
@@ -906,18 +913,18 @@ async def test_missing_user_mutations_fail_without_resume_audit(fence_store):
         )
         await conn.execute("DELETE FROM users WHERE id = $1", user_id)
 
-    with pytest.raises(HardDeleteStateChanged):
+    with pytest.raises(UserNotFoundError):
         await op_store.update_user_fields(user_id, status="suspended")
-    with pytest.raises(HardDeleteStateChanged):
+    with pytest.raises(UserNotFoundError):
         await op_store.resume_user(
             user_id,
             admin_ip="127.0.0.1",
             admin_id="admin",
             reason="test",
         )
-    with pytest.raises(HardDeleteStateChanged):
+    with pytest.raises(UserNotFoundError):
         await op_store.approve_user(user_id, admin_id="admin")
-    with pytest.raises(HardDeleteStateChanged):
+    with pytest.raises(UserNotFoundError):
         await op_store.reject_user(user_id, admin_id="admin", reason="test")
 
     async with pool.acquire() as conn:
@@ -932,7 +939,7 @@ async def test_missing_user_mutations_fail_without_resume_audit(fence_store):
 async def test_approval_mutations_require_pending_approval(fence_store):
     """Approve/reject cannot overwrite a status changed after the route read."""
     _store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
     user_id = "u-fence-no-longer-pending"
 
     async with pool.acquire() as conn:
@@ -942,9 +949,9 @@ async def test_approval_mutations_require_pending_approval(fence_store):
             user_id,
         )
 
-    with pytest.raises(HardDeleteStateChanged):
+    with pytest.raises(UserStateChanged):
         await op_store.approve_user(user_id, admin_id="admin")
-    with pytest.raises(HardDeleteStateChanged):
+    with pytest.raises(UserStateChanged):
         await op_store.reject_user(user_id, admin_id="admin", reason="test")
 
     async with pool.acquire() as conn:
@@ -955,7 +962,7 @@ async def test_approval_mutations_require_pending_approval(fence_store):
 async def test_failed_hard_delete_claim_can_be_released(fence_store):
     """Concurrent claims are rejected and released claims can be retried."""
     _store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
 
     first_claim = await op_store.begin_hard_delete_user(_OWNER)
     assert first_claim.provenance is HardDeleteClaimProvenance.NEW
@@ -1032,7 +1039,7 @@ async def test_failed_hard_delete_claim_can_be_released(fence_store):
 async def test_approval_cannot_activate_claimed_account(fence_store):
     """Approval cannot activate an account claimed by hard-delete."""
     _store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -1056,7 +1063,7 @@ async def test_approval_cannot_activate_claimed_account(fence_store):
 async def test_status_update_cannot_activate_claimed_account(fence_store):
     """Generic admin status updates cannot activate a claimed account."""
     _store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -1079,7 +1086,7 @@ async def test_status_update_cannot_activate_claimed_account(fence_store):
 async def test_stale_claim_can_be_explicitly_recovered_without_releasing_safety(fence_store):
     """A crashed pre-fence owner can be taken over without opening resume."""
     _store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
 
     first_claim = await op_store.begin_hard_delete_user(_OWNER)
     assert first_claim.provenance is HardDeleteClaimProvenance.NEW
@@ -1121,14 +1128,12 @@ async def test_stale_claim_can_be_explicitly_recovered_without_releasing_safety(
 async def test_resume_explicitly_recovers_only_stale_unfenced_claim(fence_store):
     """An operator can restore an account after fencing work is confirmed stopped."""
     log_store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
     assert await log_store.account_has_erasure_fence(_OWNER) is False
 
     await op_store.begin_hard_delete_user(_OWNER)
     async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET hard_delete_claimed_at = NOW() WHERE id = $1", _OWNER
-        )
+        await conn.execute("UPDATE users SET hard_delete_claimed_at = NOW() WHERE id = $1", _OWNER)
 
     with pytest.raises(HardDeleteStateChanged, match="has not reached recovery grace"):
         await op_store.resume_user(
@@ -1140,8 +1145,7 @@ async def test_resume_explicitly_recovers_only_stale_unfenced_claim(fence_store)
 
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE users SET hard_delete_claimed_at = NOW() - INTERVAL '2 hours' "
-            "WHERE id = $1",
+            "UPDATE users SET hard_delete_claimed_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
             _OWNER,
         )
 
@@ -1172,7 +1176,7 @@ async def test_resume_explicitly_recovers_only_stale_unfenced_claim(fence_store)
 async def test_legacy_pending_claims_get_a_recovery_grace_period(fence_store):
     """Migration anchors old claims before allowing pre- or post-fence takeover."""
     store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -1238,7 +1242,7 @@ async def test_legacy_pending_claims_get_a_recovery_grace_period(fence_store):
 async def test_post_fence_retry_recovers_stale_claim_without_sharing_ownership(fence_store):
     """Only an abandoned post-fence claim can be recovered for completion."""
     store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
 
     first_claim = await op_store.begin_hard_delete_user(_OWNER)
     await store.hard_delete_user_data(_OWNER)
@@ -1280,7 +1284,7 @@ async def test_post_fence_retry_recovers_stale_claim_without_sharing_ownership(f
 async def test_superseded_worker_cannot_continue_after_fence(fence_store):
     """A worker paused after fencing fails before its next delete stage."""
     store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
 
     first_claim = await op_store.begin_hard_delete_user(_OWNER)
     await store.hard_delete_user_data(_OWNER)
@@ -1324,7 +1328,7 @@ async def test_hard_delete_route_stops_after_claim_recovery_between_stages(
     from serving.schemas_admin import HardDeleteUserRequest
 
     inner_log_store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
     fence_written = asyncio.Event()
     resume_original_worker = asyncio.Event()
     response_deletions: list[str] = []
@@ -1431,7 +1435,7 @@ async def test_hard_delete_route_cancellation_stops_before_the_next_stage(
     from serving.schemas_admin import HardDeleteUserRequest
 
     inner_log_store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
     stage_started = asyncio.Event()
     resume_stage = asyncio.Event()
     response_started: list[str] = []
@@ -1536,7 +1540,7 @@ async def test_log_store_error_after_fence_commit_retains_claim_and_stops(fence_
     from serving.schemas_admin import HardDeleteUserRequest
 
     inner_log_store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
     response_deletions: list[str] = []
     operational_deletions: list[str] = []
     original_hard_delete = op_store.hard_delete_user
@@ -1608,7 +1612,7 @@ async def test_status_reactivation_after_admin_read_blocks_hard_delete(fence_sto
     from serving.schemas_admin import HardDeleteUserRequest
 
     inner_log_store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
     initial_read_complete = asyncio.Event()
     allow_route_to_continue = asyncio.Event()
     fence_calls: list[str] = []
@@ -1701,7 +1705,7 @@ async def test_status_reactivation_after_admin_read_blocks_hard_delete(fence_sto
 async def test_concurrent_stale_post_fence_recovery_has_one_owner(fence_store):
     """Concurrent stale retries renew ownership instead of sharing a token."""
     store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
 
     first_claim = await op_store.begin_hard_delete_user(_OWNER)
     await store.hard_delete_user_data(_OWNER)
@@ -1744,7 +1748,7 @@ async def test_concurrent_stale_post_fence_recovery_has_one_owner(fence_store):
 async def test_active_post_fence_retry_cannot_race_completion(fence_store):
     """An active retry is rejected while the owner completes deletion."""
     store, pool = fence_store
-    op_store = PostgresOperationalStore(pool)
+    op_store = _initialized_operational_store(pool)
 
     owner_claim = await op_store.begin_hard_delete_user(_OWNER)
     await store.hard_delete_user_data(_OWNER)
