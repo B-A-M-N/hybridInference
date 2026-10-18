@@ -224,7 +224,8 @@ async def _buffer_streaming_response_for_non_stream_client(
         response_id = chunk_json.get("id") or response_id
         created = int(chunk_json.get("created") or created)
         if chunk_json.get("usage"):
-            usage = normalize_usage(chunk_json.get("usage")) or chunk_json.get("usage")
+            normalized = normalize_usage(chunk_json.get("usage"))
+            usage = normalized if normalized is not None else chunk_json.get("usage")
 
         choices = chunk_json.get("choices") or []
         if not choices:
