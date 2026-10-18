@@ -305,8 +305,54 @@ async def test_streaming_first_content_closes_open_breaker():
     router = FixedRouter.__new__(FixedRouter)
     router._health_registry = registry
 
-    chunk = 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
-    router._on_stream_first_content(_ENDPOINT, chunk)
+    chunks = ['data: {"choices":[{"delta":{"content":"hello"}}]}\n\n']
+    router._on_stream_first_content(_ENDPOINT, chunks)
+
+    assert registry._circuits[_ENDPOINT].consecutive_failures == 0
+    assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED
+
+
+async def test_fragmented_warmup_stream_does_not_close_breaker():
+    """A warmup notice split across chunks must not record semantic success."""
+    from routing.routers import FixedRouter
+
+    registry = EndpointHealthRegistry()
+    import pytest as _pytest
+
+    _trip(_pytest.MonkeyPatch(), registry)
+
+    router = FixedRouter.__new__(FixedRouter)
+    router._health_registry = registry
+
+    # The same warmup notice as WARMUP_NOTICE above, split across three SSE chunks.
+    chunks = [
+        'data: {"choices":[{"delta":{"content":"The model"}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":" is starting up - this takes"}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":" about 120 seconds. Please wait..."}}]}\n\n',
+    ]
+    router._on_stream_first_content(_ENDPOINT, chunks)
+
+    assert registry._circuits[_ENDPOINT].consecutive_failures == 3
+    assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.OPEN
+
+
+async def test_fragmented_genuine_stream_closes_breaker():
+    """A genuine answer split across chunks must still close the breaker."""
+    from routing.routers import FixedRouter
+
+    registry = EndpointHealthRegistry()
+    import pytest as _pytest
+
+    _trip(_pytest.MonkeyPatch(), registry)
+
+    router = FixedRouter.__new__(FixedRouter)
+    router._health_registry = registry
+
+    chunks = [
+        'data: {"choices":[{"delta":{"content":"Applied the fix"}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":" and verified it."}}]}\n\n',
+    ]
+    router._on_stream_first_content(_ENDPOINT, chunks)
 
     assert registry._circuits[_ENDPOINT].consecutive_failures == 0
     assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED

@@ -43,7 +43,11 @@ from routing.prefill_load import (
     priority_for_prefill,
     prompt_anchor,
 )
-from routing.response_text import chunk_text, response_text, response_usage
+from routing.response_text import (
+    accumulate_stream_prefix,
+    response_text,
+    response_usage,
+)
 from routing.route_table import EffectiveRoute, RouteTableSnapshot
 from routing.streaming import has_non_empty_content
 from routing.telemetry import failed_attempt, routing_chunk
@@ -807,19 +811,17 @@ class FixedRouter:
             ),
         )
 
-    def _on_stream_first_content(self, endpoint_id: str, chunk: Any) -> None:
-        """Record serving health for the first content-bearing stream chunk.
+    def _on_stream_first_content(self, endpoint_id: str, chunks: list[Any]) -> None:
+        """Record serving health from the first content-bearing stream chunks.
 
-        The streaming path previously recorded liveness only, so successful
-        streams could not reset consecutive failures or close a breaker. The
-        first content-bearing chunk is the same evidence the non-streaming path
-        classifies from accumulated output: it proves the provider produced
-        something, not merely that the socket accepted the request.
+        A warmup notice can be split across multiple SSE chunks; classifying
+        only the first one would read a fragment as PROGRESS. The accumulated
+        prefix is bounded so the classifier can decide without unbounded work.
         """
         self._health_registry.record_success(
             endpoint_id,
             outcome=classify_completion_outcome(
-                content=chunk_text(chunk),
+                content=accumulate_stream_prefix(chunks),
                 http_status=200,
                 terminal=True,
             ),
@@ -2651,6 +2653,7 @@ class FixedRouter:
         # For every stream of this request, whatever its offload plan says.
         engine_queue_limit = self._engine_queue_limit(model_id)
         chunks_yielded = False
+        stream_prefix: list[Any] = []
         try:
             primary_endpoint_id = endpoint_id_for_adapter(primary)
             if primary_plan.reason is not None:
@@ -2686,7 +2689,8 @@ class FixedRouter:
                         # The loop below's first-token bookkeeping, for a
                         # first token that arrived while it was being awaited.
                         first = False
-                        self._on_stream_first_content(primary_endpoint_id, held[-1])
+                        stream_prefix.extend(held)
+                        self._on_stream_first_content(primary_endpoint_id, stream_prefix)
                         self._prefill_load.release(lease, prefill_confirmed=True)
                     for chunk in held:
                         yield chunk
@@ -2695,8 +2699,8 @@ class FixedRouter:
                     if first and has_non_empty_content(chunk):
                         # Providers may emit keep-alives or empty terminal chunks.
                         first = False
-                        # Consider first non-empty token as a success signal for availability.
-                        self._on_stream_first_content(primary_endpoint_id, chunk)
+                        stream_prefix.append(chunk)
+                        self._on_stream_first_content(primary_endpoint_id, stream_prefix)
                         # First token means the prompt is resident and this
                         # endpoint is decoding, not prefilling. Holding the
                         # lease for the whole stream would let a long cheap
@@ -2863,7 +2867,8 @@ class FixedRouter:
                             held = await self._await_first_token(stream, fallback_watch)
                             if held and has_non_empty_content(held[-1]):
                                 first = False
-                                self._on_stream_first_content(adapter_endpoint_id, held[-1])
+                                stream_prefix.extend(held)
+                                self._on_stream_first_content(adapter_endpoint_id, stream_prefix)
                                 self._prefill_load.release(lease, prefill_confirmed=True)
                             for chunk in held:
                                 yield chunk
@@ -2871,7 +2876,8 @@ class FixedRouter:
                         async for chunk in stream:
                             if first and has_non_empty_content(chunk):
                                 first = False
-                                self._on_stream_first_content(adapter_endpoint_id, chunk)
+                                stream_prefix.append(chunk)
+                                self._on_stream_first_content(adapter_endpoint_id, stream_prefix)
                                 self._prefill_load.release(lease, prefill_confirmed=True)
                             yield chunk
                             chunks_yielded = True

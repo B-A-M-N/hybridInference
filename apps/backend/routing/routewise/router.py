@@ -58,7 +58,7 @@ from routing.dispatch import DispatchMismatchError, binding_for_adapter, executi
 from routing.endpoint_health import EndpointHealthRegistry
 from routing.endpoints import endpoint_id_for_adapter
 from routing.prefill_load import PrefillLoadTracker, estimate_prefill_tokens
-from routing.response_text import chunk_text, response_text, response_usage
+from routing.response_text import accumulate_stream_prefix, response_text, response_usage
 from routing.route_scope import adapter_in_endpoint_scope
 from routing.routers import (
     AllCircuitsOpenError,
@@ -523,15 +523,28 @@ class RouteWiseRouter:
             ),
         )
 
-    def _on_stream_first_content(self, endpoint_id: str, chunk: Any) -> None:
-        """Record serving health for the first content-bearing stream chunk."""
+    def _on_stream_first_content(self, endpoint_id: str, chunks: list[Any]) -> None:
+        """Record serving health from the first content-bearing stream chunks."""
         self._health_registry.record_success(
             endpoint_id,
             outcome=classify_completion_outcome(
-                content=chunk_text(chunk),
+                content=accumulate_stream_prefix(chunks),
                 http_status=200,
                 terminal=True,
             ),
+        )
+
+    @staticmethod
+    def _stream_prefix_is_transient(chunks: list[Any]) -> bool:
+        """Return whether the accumulated stream prefix still reads as a warmup notice."""
+        return classify_completion_outcome(
+            content=accumulate_stream_prefix(chunks),
+            http_status=200,
+            terminal=True,
+        ) == classify_completion_outcome(
+            content="the model is starting up",
+            http_status=200,
+            terminal=True,
         )
 
     def _on_liveness(self, endpoint_id: str) -> None:
@@ -3380,12 +3393,20 @@ class RouteWiseRouter:
                         if lease is None
                         else lambda lease=lease: self._prefill_load.release(lease)
                     )
+                    stream_prefix: list[Any] = []
                     async for chunk in adapter.stream_chat_completion(
                         messages,
                         primary_prefill_release=primary_prefill_release,
                         **params,
                     ):
-                        if first and has_non_empty_content(chunk):
+                        if first:
+                            if not has_non_empty_content(chunk):
+                                yield chunk
+                                continue
+                            stream_prefix.append(chunk)
+                            if self._stream_prefix_is_transient(stream_prefix):
+                                yield chunk
+                                continue
                             first = False
                             # First token arrived: prefill complete for the serving
                             # endpoint. A HedgedAdapter confirms a backup leg itself;
@@ -3403,12 +3424,20 @@ class RouteWiseRouter:
                             # in case the adapter swapped its serving config.
                             if not getattr(adapter, "reports_leg_outcomes", False):
                                 self._on_stream_first_content(
-                                    endpoint_id_for_adapter(adapter), chunk
+                                    endpoint_id_for_adapter(adapter), stream_prefix
                                 )
                         yield chunk
                 else:
+                    stream_prefix: list[Any] = []
                     async for chunk in adapter.stream_chat_completion(messages, **params):
-                        if first and has_non_empty_content(chunk):
+                        if first:
+                            if not has_non_empty_content(chunk):
+                                yield chunk
+                                continue
+                            stream_prefix.append(chunk)
+                            if self._stream_prefix_is_transient(stream_prefix):
+                                yield chunk
+                                continue
                             first = False
                             # First token arrived: prefill complete for the serving
                             # endpoint. A HedgedAdapter confirms a backup leg itself;
@@ -3426,7 +3455,7 @@ class RouteWiseRouter:
                             # in case the adapter swapped its serving config.
                             if not getattr(adapter, "reports_leg_outcomes", False):
                                 self._on_stream_first_content(
-                                    endpoint_id_for_adapter(adapter), chunk
+                                    endpoint_id_for_adapter(adapter), stream_prefix
                                 )
                         yield chunk
         finally:

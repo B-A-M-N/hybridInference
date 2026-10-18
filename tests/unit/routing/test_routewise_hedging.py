@@ -2946,3 +2946,45 @@ class TestHedgedWinnerOutcomeClassification:
             "a cap-only win recorded something other than EMPTY"
         )
         assert "test:cap-only-primary" not in sink.liveness
+
+
+@pytest.mark.unit
+class TestFragmentedWarmupStreaming:
+    """A warmup notice split across SSE chunks must not close the breaker."""
+
+    @pytest.mark.asyncio
+    async def test_streaming_fragmented_warmup_records_transient_not_progress(self):
+        sink = _FakeEventSink()
+        warmup_chunks = [
+            'data: {"choices":[{"delta":{"content":"The model"}}]}\n\n',
+            'data: {"choices":[{"delta":{"content":" is starting up - this takes"}}]}\n\n',
+            'data: {"choices":[{"delta":{"content":" about 120 seconds. Please wait..."}}]}\n\n',
+        ]
+        primary = _make_fake_adapter(
+            provider="fragmented-warmup-primary", stream_chunks=warmup_chunks
+        )
+        backup = _make_fake_adapter(provider="backup", stream_delay=10.0)
+        hedged = HedgedAdapter(
+            primary=primary,
+            backup=backup,
+            hedge_threshold_sec=10.0,
+            event_sink=sink,
+            stream_race_deadline_sec=0.05,
+        )
+
+        stream = hedged.stream_chat_completion([{"role": "user", "content": "hi"}])
+        try:
+            # The race keeps pulling while the accumulated prefix could still
+            # be a warmup notice, so consume every chunk and let the stream
+            # finish before asserting.
+            while True:
+                try:
+                    await asyncio.wait_for(stream.__anext__(), timeout=0.2)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    break
+        finally:
+            await stream.aclose()
+
+        assert sink.success_outcomes == [], "a fragmented warmup must not record a serving success"

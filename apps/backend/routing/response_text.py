@@ -50,3 +50,26 @@ def chunk_text(chunk: Any) -> str | None:
     delta = (choices[0] or {}).get("delta") or {} if choices else {}
     content = delta.get("content") or delta.get("reasoning_content")
     return content if isinstance(content, str) and content else None
+
+
+def accumulate_stream_prefix(chunks: list[Any], max_chars: int = 512) -> str | None:
+    """Accumulate generated text from the first content-bearing stream chunks.
+
+    A warmup notice can be split across multiple SSE chunks. Classifying the
+    first content-bearing chunk alone would read "The" as PROGRESS before the
+    remaining text reveals the response is a warmup notice. This returns the
+    concatenated text from the chunks seen so far, bounded to avoid unbounded
+    accumulation, so the classifier can decide from the response prefix.
+    """
+    parts: list[str] = []
+    total = 0
+    for chunk in chunks:
+        text = chunk_text(chunk)
+        if text:
+            parts.append(text)
+            total += len(text)
+            if total >= max_chars:
+                break
+    if not parts:
+        return None
+    return "".join(parts)

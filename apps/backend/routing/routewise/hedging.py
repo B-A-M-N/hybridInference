@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import time
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -37,29 +36,50 @@ class HedgeStreamRaceTimeout(TimeoutError):
     """Raised when no stream produces race-winning output before the deadline."""
 
 
+def _could_still_become_warmup(text: str) -> bool:
+    """Return whether *text* is a strict prefix of a warmup marker phrase.
+
+    While the accumulated content could still become a warmup notice, the race
+    must keep pulling so the full phrase (or its absence) can classify the
+    response. Once the text diverges from every warmup marker, it is safe to
+    decide.
+    """
+    from routing.completion_outcome import _DEFAULT_TRANSIENT_MARKERS
+
+    normalized = text.strip().lower()
+    if not normalized:
+        return True
+    stripped = (marker.removeprefix("^") for marker in _DEFAULT_TRANSIENT_MARKERS)
+    return any(pattern.startswith(normalized) for pattern in stripped)
+
+
+def _accumulated_text_exceeds_warmup_window(buffer: list[str]) -> bool:
+    """Return whether accumulated stream text is safe to classify as real work.
+
+    A warmup notice split across chunks must not win the race while the
+    accumulated text is still a prefix of a warmup phrase, because a longer
+    continuation would classify TRANSIENT. Once the text diverges from every
+    warmup marker -- or the accumulated prefix is empty/no text at all -- the
+    classification is stable.
+    """
+    from routing.response_text import accumulate_stream_prefix
+
+    text = accumulate_stream_prefix(buffer)
+    if text is None:
+        return True
+    return not _could_still_become_warmup(text)
+
+
 def _classify_stream_buffer_outcome(buffer: list[str]) -> CompletionOutcome:
-    """Classify the buffered stream chunks that won the race."""
-    text_parts: list[str] = []
-    for chunk in buffer:
-        if not isinstance(chunk, str | bytes):
-            continue
-        text = chunk.decode("utf-8", errors="surrogatepass") if isinstance(chunk, bytes) else chunk
-        prefix = "data: "
-        if not text.startswith(prefix):
-            continue
-        try:
-            obj = json.loads(text[len(prefix) :].strip())
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(obj, dict):
-            continue
-        choices = obj.get("choices") or []
-        delta = (choices[0] or {}).get("delta") or {} if choices else {}
-        content = delta.get("content") or delta.get("reasoning_content")
-        if isinstance(content, str) and content:
-            text_parts.append(content)
+    """Classify the buffered stream chunks that won the race.
+
+    A warmup notice can be split across chunks; the accumulated bounded prefix
+    lets the classifier decide from the response start rather than a fragment.
+    """
+    from routing.response_text import accumulate_stream_prefix
+
     return classify_completion_outcome(
-        content="".join(text_parts) or None,
+        content=accumulate_stream_prefix(buffer),
         http_status=200,
         terminal=True,
     )
@@ -763,7 +783,17 @@ class HedgedAdapter(BaseAdapter):
                             primary_buffer_bytes,
                             leg="primary",
                         ):
-                            primary_has_content = True
+                            # A warmup notice can be split across chunks, so
+                            # the race outcome is decided from the accumulated
+                            # prefix rather than a fragment.
+                            primary_outcome = _classify_stream_buffer_outcome(primary_buffer)
+                            primary_has_content = (
+                                primary_outcome is not CompletionOutcome.TRANSIENT_NO_PROGRESS
+                                and _accumulated_text_exceeds_warmup_window(primary_buffer)
+                            )
+                            if primary_has_content:
+                                _cancel_task(race_deadline_task)
+                                _cancel_task(hedge_timer_task)
                     except StopAsyncIteration:
                         primary_done = True
                         primary_next_task = None
@@ -808,7 +838,12 @@ class HedgedAdapter(BaseAdapter):
                             backup_buffer_bytes,
                             leg="backup",
                         ):
-                            backup_has_content = True
+                            # Same accumulated-prefix classification as primary.
+                            backup_outcome = _classify_stream_buffer_outcome(backup_buffer)
+                            backup_has_content = (
+                                backup_outcome is not CompletionOutcome.TRANSIENT_NO_PROGRESS
+                                and _accumulated_text_exceeds_warmup_window(backup_buffer)
+                            )
                     except StopAsyncIteration:
                         await self._finish_stream_backup(
                             next_task=backup_next_task,

@@ -558,32 +558,42 @@ class SessionProviderPrefixMemory:
         *,
         generation: int,
         now: float | None = None,
+        lock_held: bool = False,
     ) -> bool:
         """Atomically validate a generation and refresh the associated entry.
 
-        The coordinator validates the dispatch generation while holding the
-        generation guard, then this method rechecks it under the memory lock. A
-        stale completion from an older generation must not extend a newer
-        entry's lifetime. The entry itself may carry a previous request's
-        generation, so the comparison is against the coordinator's current
-        reserved generation, not the entry's stored one.
+        When ``lock_held`` is true the coordinator is calling under its own
+        generation guard and this method does not re-acquire it; the entry's
+        stored generation is validated against the caller's reservation and
+        never written back, so a superseded completion cannot extend a newer
+        entry's lifetime. When ``lock_held`` is false (public API for callers
+        that have no coordinator guard) the memory lock alone protects the
+        entry mutation, and the caller is responsible for generation validity.
         """
         ts = self._time() if now is None else now
+        if lock_held:
+            with self._lock:
+                return self._refresh_locked(scope, generation, ts)
         with self._lock:
-            entry = self._entries.get(scope)
-            if entry is None:
-                return False
-            # A refresh is valid only for the generation the entry already
-            # carries. A completion from a superseded generation must not
-            # extend a newer entry's lifetime, so the caller's generation is
-            # validated against the entry's stored one and never written back.
-            if entry.generation != generation:
-                return False
-            if self._ttl_sec > 0 and (ts - entry.last_seen_at) > self._ttl_sec:
-                return False
-            entry.last_seen_at = ts
-            self._entries.move_to_end(scope)
-            return True
+            return self._refresh_locked(scope, generation, ts)
+
+    def _refresh_locked(
+        self,
+        scope: CacheScope,
+        generation: int,
+        ts: float,
+    ) -> bool:
+        """Refresh under the memory lock only; generation must already be validated."""
+        entry = self._entries.get(scope)
+        if entry is None:
+            return False
+        if entry.generation != generation:
+            return False
+        if self._ttl_sec > 0 and (ts - entry.last_seen_at) > self._ttl_sec:
+            return False
+        entry.last_seen_at = ts
+        self._entries.move_to_end(scope)
+        return True
 
     def observe(
         self,
@@ -1022,17 +1032,21 @@ class PrefixCacheCoordinator:
             # established.
             #
             # The entry stores the generation that created it; the reservation
-            # belongs to this completion. Reconcile before refreshing so the
-            # refresh is valid under the current reservation and a strictly
-            # older completion still cannot refresh it afterwards.
-            with self._memory._lock:
-                entry = self._memory._entries.get(scope)
-                if entry is not None and entry.generation != generation:
-                    entry.generation = generation
-            self._memory.refresh_liveness_for_generation(
-                scope,
-                generation=generation,
-            )
+            # belongs to this completion. Reconciliation and refresh are both
+            # under the generation guard so a concurrent reservation cannot
+            # supersede this completion between validation and mutation.
+            with self._generation_lock:
+                if self._scope_generations.get(scope) != generation:
+                    return False
+                with self._memory._lock:
+                    entry = self._memory._entries.get(scope)
+                    if entry is not None and entry.generation != generation:
+                        entry.generation = generation
+                self._memory.refresh_liveness_for_generation(
+                    scope,
+                    generation=generation,
+                    lock_held=True,
+                )
             return False
 
         if not self.remember(scope, tuple(blocks), generation=generation):

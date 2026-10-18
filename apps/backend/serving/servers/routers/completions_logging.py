@@ -118,17 +118,14 @@ class CompletionsLogger:
         success path the upstream status is necessarily 2xx (a failure would have
         raised), so the status is known without re-reading the response. The
         failure path has no body worth trusting and reports as a provider error.
+
+        The shared ``response_text`` helper handles the tool-call sentinel, so
+        this method and the router success paths extract identically.
         """
         if not success:
             return CompletionOutcome.PROVIDER_ERROR
-
-        # The shared helper returns a non-empty sentinel for tool-call-only
-        # completions, so the classifier treats a structured call as real work
-        # even with no prose and no reported usage.
-        content = response_text(response_body)
-
         return classify_completion_outcome(
-            content=content,
+            content=response_text(response_body),
             usage=usage,
             http_status=200,
             terminal=True,

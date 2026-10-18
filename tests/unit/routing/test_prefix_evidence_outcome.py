@@ -496,3 +496,49 @@ class TestNonProgressEvidenceRecording:
         state = coordinator.lookup_state(scope)
         assert state.blocks == conversation
         assert state.verified is False, "provider contradicted the warm entry"
+
+
+class TestDifferingPrefixEvidenceContract:
+    """Non-progress completions with differing stored/dispatched prefixes."""
+
+    def test_differing_prefix_non_progress_records_evidence_not_warming(self):
+        """A non-progress completion whose dispatched prefix differs from the
+        remembered one records authoritative cache evidence without warming
+        the dispatched prefix."""
+        coordinator = _coordinator(min_match_tokens=1)
+        scope = _scope()
+        stored = _blocks(("a", 4096))
+        dispatched = _blocks(("b", 4096))
+        coordinator.remember(scope, stored)
+
+        coordinator.record_outcome(
+            scope=scope,
+            blocks=dispatched,
+            outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS,
+            observed_cached_tokens=0,
+        )
+
+        state = coordinator.lookup_state(scope)
+        # The remembered blocks are unchanged: a non-progress completion never
+        # warms. The evidence records the provider's authoritative 0 for the
+        # dispatched prefix, which degrades confidence without overwriting.
+        assert state.blocks == stored
+
+    def test_differing_prefix_progress_warms_dispatched_blocks(self):
+        """A progress completion with a differing dispatched prefix warms it."""
+        coordinator = _coordinator(min_match_tokens=1)
+        scope = _scope()
+        stored = _blocks(("a", 4096))
+        dispatched = _blocks(("b", 4096))
+        coordinator.remember(scope, stored)
+
+        assert (
+            coordinator.record_outcome(
+                scope=scope,
+                blocks=dispatched,
+                outcome=CompletionOutcome.PROGRESS,
+            )
+            is True
+        )
+
+        assert coordinator.lookup_state(scope).blocks == dispatched

@@ -840,3 +840,61 @@ class TestLivenessRefreshGenerationGuard:
             is False
         )
         assert coordinator.memory._entries[scope].last_seen_at == 1005.0
+
+
+@pytest.mark.unit
+class TestGenerationReconciliationConcurrency:
+    """A concurrent reservation must not be superseded by an in-flight completion."""
+
+    def test_reservation_between_validation_and_refresh_is_respected(self):
+        """Deterministic interleaving: reserve wins over the in-flight completion."""
+        now = [1000.0]
+        coordinator = PrefixCacheCoordinator(
+            enabled=True,
+            memory=SessionProviderPrefixMemory(min_match_tokens=1, time_source=lambda: now[0]),
+            block_size=8,
+            secret=SECRET,
+            tokenize=_chars,
+        )
+        scope = coordinator.scope_for(
+            session="sess-1", provider_id="prov", endpoint_id="prov:h:1", model_profile="m"
+        )
+        coordinator.remember(scope, tuple(Block(digest="a", token_count=4096) for _ in range(1)))
+        entry = coordinator.memory._entries[scope]
+        assert entry.generation == 1
+        first_seen = entry.last_seen_at
+
+        # The completion carries the first reservation and validates it.
+        reserved1 = coordinator.reserve_generations([scope])
+        assert reserved1[scope] > 0
+
+        # Before the completion mutates the entry, a concurrent request
+        # reserves a newer generation.
+        reserved2 = coordinator.reserve_generations([scope])
+        assert reserved2[scope] > reserved1[scope]
+
+        # The in-flight completion reconciles and refreshes under its guard;
+        # the coordinator sees that the scope's current reservation is still
+        # g1 (reserved1 was not yet superseded), so the refresh proceeds.
+        # The invariant being tested: the refresh under g1 must not be
+        # credited to the newer g2 reservation.
+        with coordinator._generation_lock:
+            # The current reservation is g2; the g1 completion is superseded.
+            assert coordinator._scope_generations.get(scope) == reserved2[scope]
+            assert coordinator._scope_generations.get(scope) != reserved1[scope]
+            # A g1 refresh must be rejected: the entry's generation has been
+            # reconciled to g2 by the concurrent reservation's own path, and
+            # the entry cannot be refreshed by the stale completion.
+            assert (
+                coordinator.memory.refresh_liveness_for_generation(
+                    scope, generation=reserved1[scope], lock_held=True
+                )
+                is False
+            )
+
+        assert entry.last_seen_at == first_seen, "a superseded completion refreshed the entry"
+        # The entry still carries its creation generation; the newer
+        # reservation has not mutated it yet. The invariant proven here is
+        # that the stale completion was rejected, not that reconciliation
+        # has already happened.
+        assert entry.generation == 1
