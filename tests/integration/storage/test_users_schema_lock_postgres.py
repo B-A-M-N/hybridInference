@@ -348,8 +348,16 @@ async def test_erasure_works_before_the_upgrade(pool) -> None:
         await _start_deferred(store)
         await store.delete_user("u-old", admin_ip="203.0.113.7", admin_id="admin")
         claim = await store.begin_hard_delete_user("u-old")
+        await store.renew_hard_delete_user_claim("u-old", claim.token)
+        await store.release_hard_delete_user_claim("u-old", claim.token)
+        async with pool.acquire() as conn:
+            assert not await conn.fetchval(
+                "SELECT hard_delete_pending FROM users WHERE id = 'u-old'"
+            )
+        claim = await store.begin_hard_delete_user("u-old")
+        await store.renew_hard_delete_user_claim("u-old", claim.token)
         counts = await store.hard_delete_user(
-            "u-old", claim_token=claim, admin_ip="203.0.113.7", admin_id="admin"
+            "u-old", claim_token=claim.token, admin_ip="203.0.113.7", admin_id="admin"
         )
 
     assert counts["users"] == 1
