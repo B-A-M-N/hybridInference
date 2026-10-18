@@ -1004,19 +1004,29 @@ class PrefixCacheCoordinator:
           exactly as they are, so a warmup notice or an indeterminate result can
           neither overwrite nor age out strong locality evidence.
         """
-        # Claim a generation first and thread it through both calls. remember()
+        # Claim a generation first and thread it through every call. remember()
         # validates the claimed generation and silently returns False without
-        # one, which would drop an older completion's blocks on the floor.
-        if generation is None:
-            generation = self._claim_generation(scope, None)
+        # one, which would drop an older completion's blocks on the floor. The
+        # claim mutates _next_generation and the LRU, so it must run under the
+        # generation lock like every other generation reader/writer.
+        with self._generation_lock:
+            if generation is None:
+                generation = self._claim_generation(scope, None)
         if generation is None:
             return False
 
-        # Only a *known-negative* outcome suppresses warming. An unclassified
-        # observation (UNKNOWN) is not evidence that nothing was served, so it
-        # must keep the long-standing behavior of warming on a plain success --
-        # otherwise adding this type would silently disable prefix warming for
-        # every caller that has not been wired to classify yet.
+        # Only a *known-negative* outcome suppresses warming. The two outcome
+        # policies are deliberately different and this is the reconciliation:
+        # ``RoutingObservation.admits_real_work`` decides whether an observation
+        # may be used as *positive evidence of useful work* (learning); UNKNOWN
+        # never admits there. ``record_outcome`` decides whether an observation
+        # may *overwrite remembered blocks* (locality); UNKNOWN keeps the
+        # long-standing warm-on-success behaviour there, because an unclassified
+        # observation is not evidence that nothing was served, and treating it
+        # as suppressing would silently disable prefix warming for every caller
+        # that has not been wired to classify yet. A known-negative (a warmup
+        # notice, the incident that motivated all this) suppresses in both
+        # places.
         #
         # A warmup notice, the incident that motivated all this, classifies as
         # TRANSIENT_NO_PROGRESS: a known negative. That is the case worth
@@ -1025,11 +1035,23 @@ class PrefixCacheCoordinator:
         suppresses_warming = outcome in _NON_WARMING_OUTCOMES
         if suppresses_warming:
             # The provider answered, so the scope is provably live and a
-            # transient hiccup must not age strong evidence out through the TTL.
-            # But the stored blocks are left exactly as they are: a short
+            # transient hiccup must not age strong evidence out through the
+            # TTL. The stored blocks are left exactly as they are: a short
             # transient response must not overwrite what a warm conversation
-            # established.
+            # established. Positive evidence is still recorded when the
+            # provider reported cached tokens for the *currently remembered*
+            # prefix: record_evidence itself ignores a mismatched prefix, so
+            # the measurement can only attach to blocks this scope actually
+            # remembers, never to the stub's own few blocks.
             self._memory.refresh_liveness(scope)
+            if observed_cached_tokens is not None and observed_cached_tokens > 0:
+                self.record_evidence(
+                    scope,
+                    observed_cached_tokens,
+                    generation=generation,
+                    blocks=tuple(blocks),
+                    materialization_candidate=True,
+                )
             return False
 
         if not self.remember(scope, tuple(blocks), generation=generation):
