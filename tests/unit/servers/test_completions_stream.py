@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import time
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1507,68 +1506,47 @@ async def test_arguments_json_loads_cannot_handle_still_finish_the_stream():
 
 
 @pytest.mark.anyio
-async def test_stream_warmup_notice_classifies_transient_through_finalizer():
-    """The streaming finalizer must hand the real text to the classifier.
-
-    Regression for the review's C1 follow-up: the handler used to pass no
-    response body at all, so a warmup notice streamed with output tokens
-    classified PROGRESS and warmed prefix memory. This drives the real
-    StreamSession._finalize_success path and asserts the observation the
-    router receives is TRANSIENT_NO_PROGRESS.
-    """
+async def test_stream_finalizer_routes_semantic_outcomes_from_real_chunks():
+    """Warmup text stays transient; answer text and tool calls establish progress."""
     from routing.completion_outcome import CompletionOutcome
 
-    session = _make_session()
-    session._final_text = "The model is starting up - this takes about 120 seconds. Please wait..."
-    session._final_reasoning = ""
-    session._finish_reason_for_db = "stop"
-    session._usage_data = {"prompt_tokens": 10, "completion_tokens": 20}
-    session._messages = [{"role": "user", "content": "hi"}]
-    session._params = {"stream": True}
-    session._metadata = {}
-    session._request_payload = None
-    session._get_adapter_config_for_provider = lambda _p, _b: None
-    session._adapter_routing = False
-    session._log_store = None  # skip DB scheduling
-    session._suppress_synthetic_logging = True  # skip DB log
-    session._response_model = None
+    class Recorder:
+        def __init__(self) -> None:
+            self.observations = []
 
-    captured: dict[str, Any] = {}
+        def record_observation(self, observation) -> None:
+            self.observations.append(observation)
 
-    def _record(
-        active_router,
-        model_id,
-        routing,
-        *,
-        request_id,
-        ttft_ms,
-        total_latency_ms,
-        prompt_tokens,
-        completion_tokens,
-        success,
-        cached_tokens=None,
-        response_body=None,
-    ):
-        captured.update(
-            success=success,
-            response_body=response_body,
-            completion_tokens=completion_tokens,
-        )
+    async def observe(chunks: list[str]):
+        router = Recorder()
+        session = _make_session(completions_logger=CompletionsLogger(log_store=None))
+        session._active_router = router
+        session._log_store = None
+        session._suppress_synthetic_logging = True
+        await _consume(session.stream(_aiter(chunks)))
+        assert len(router.observations) == 1
+        return router.observations[0]
 
-    session._completions_logger = SimpleNamespace(
-        record_routing_observation=_record,
-        schedule_log=lambda *a, **k: None,
-        build_db_params=lambda params, provider, base_url, get_cfg: params,
+    usage = _usage_chunk("gpt-4", {"prompt_tokens": 10, "completion_tokens": 20})
+    warmup = await observe(
+        [
+            _content_chunk(
+                "gpt-4",
+                "The model is starting up - this takes about 120 seconds. Please wait...",
+                finish="stop",
+            ),
+            usage,
+        ]
     )
+    assert warmup.success is True
+    assert warmup.completion_tokens == 20
+    assert warmup.outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
+    assert warmup.admits_real_work is False
 
-    await session._finalize_success()
+    answer = await observe([_content_chunk("gpt-4", "The answer is 42.", finish="stop"), usage])
+    assert answer.outcome is CompletionOutcome.PROGRESS
+    assert answer.admits_real_work is True
 
-    body = captured["response_body"]
-    assert isinstance(body, dict), "finalizer must pass the structured body"
-    message = body["choices"][0]["message"]
-    assert "starting up" in (message.get("content") or "")
-
-    outcome = CompletionsLogger.classify_outcome(
-        success=captured["success"], response_body=body, usage={"completion_tokens": 20}
-    )
-    assert outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
+    tool_call = await observe([*_tool_call_stream("{}"), usage])
+    assert tool_call.outcome is CompletionOutcome.PROGRESS
+    assert tool_call.admits_real_work is True
