@@ -31,6 +31,7 @@ from serving.exceptions import scrub_error_for_user
 from serving.grant_auth import ledger_attribution
 from serving.model_access import ModelAccessDenial, model_access_denial
 from serving.openai_chat_serializer import resolve_mode, sanitize_response
+from serving.pricing import require_route_pricing
 from serving.schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -64,7 +65,7 @@ from serving.storage.utils import billable_output_tokens, json_safe
 from serving.utils import context as req_ctx
 from serving.utils.errors import format_exception_for_db
 from serving.utils.logging import get_logger
-from serving.utils.request_ip import derive_affinity_key, get_client_ip
+from serving.utils.request_ip import derive_affinity_key, get_client_ip, get_client_ip_info
 from serving.utils.session_identity import session_identity
 from serving.utils.synthetic_probe import is_trusted_probe
 from serving.utils.token_utils import normalize_usage, optional_token_count
@@ -784,6 +785,8 @@ async def chat_completions(
         req_ctx.mark_model_not_found()
         raise HTTPException(404, model_not_found_detail(model, user_ctx=user_ctx))
 
+    require_route_pricing(route)
+
     # Extract parameters
     params: dict[str, Any] = {"stream": effective_stream}
     if payload.temperature is not None:
@@ -826,9 +829,10 @@ async def chat_completions(
     # hyi-xxx key in use (not user_id, since a user may have multiple keys),
     # or to the grant for a sandbox, which presents no key hash.
     auth_key_hash = user_ctx.get("auth_key_hash")
+    ip_info = get_client_ip_info(request)
     affinity_key = derive_affinity_key(
         auth_key_hash,
-        get_client_ip(request),
+        ip_info,
         grant_id=user_ctx.get("agent_grant_id"),
     )
     req_ctx.update(

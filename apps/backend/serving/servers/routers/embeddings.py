@@ -15,7 +15,7 @@ from routing.endpoints import endpoint_id_for_config
 from serving.config.runtime_settings import get_runtime_settings
 from serving.grant_auth import ledger_attribution
 from serving.observability.tracked_tasks import tracked_task
-from serving.pricing import effective_pricing
+from serving.pricing import effective_pricing, require_embedding_pricing
 from serving.schemas import EmbeddingRequest, EmbeddingResponse, ErrorResponse
 from serving.servers.auth import verify_api_key
 from serving.servers.concurrency import enforce_user_concurrency
@@ -29,7 +29,7 @@ from serving.servers.model_availability import model_not_found_detail
 from serving.storage.utils import calculate_cost
 from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
-from serving.utils.request_ip import derive_affinity_key, get_client_ip
+from serving.utils.request_ip import derive_affinity_key, get_client_ip_info
 from serving.utils.session_identity import session_identity
 from serving.utils.synthetic_probe import is_trusted_probe
 from serving.utils.token_utils import normalize_usage
@@ -184,12 +184,12 @@ async def create_embeddings(
     # several), or the caller's IP bucket when unauthenticated. Without it every
     # caller on this surface shared one process-wide ``_anon`` binding, so nobody
     # kept a stable upstream key.
-    client_ip = get_client_ip(http_request)
+    ip_info = get_client_ip_info(http_request)
     auth_key_hash = user_ctx.get("auth_key_hash")
     req_ctx.update(
         {
             "auth_key_hash": auth_key_hash or "_anon",
-            "affinity_key": derive_affinity_key(auth_key_hash, client_ip),
+            "affinity_key": derive_affinity_key(auth_key_hash, ip_info),
             # Trusted-probe verdict for downstream readers that never see
             # user_ctx: RequestLogMiddleware demotes probe request lines to
             # DEBUG from this, mirroring the chat-completions publish.
@@ -201,7 +201,9 @@ async def create_embeddings(
         "request_type": "embedding",
         "user_agent": http_request.headers.get("user-agent"),
         "referer": http_request.headers.get("referer"),
-        "ip": client_ip,
+        "ip": ip_info.client_ip,
+        "peer_ip": ip_info.peer_ip,
+        "ip_source": ip_info.source,
         "authorization": bool(authorization) or is_authenticated,
         "authenticated": is_authenticated,
         "user_id": user_ctx.get("user_id"),
@@ -272,6 +274,7 @@ async def create_embeddings(
         )
 
     adapter = embedding_adapters[model]
+    require_embedding_pricing(adapter)
     adapter_config = getattr(adapter, "config", None)
     provider = getattr(adapter_config, "provider", None) or "unknown"
     endpoint_id = endpoint_id_for_config(adapter_config)
