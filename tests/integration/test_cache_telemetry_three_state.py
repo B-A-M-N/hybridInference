@@ -23,7 +23,7 @@ from httpx import ASGITransport, AsyncClient
 
 from serving.servers.deps import AppServices, get_db_logger, verify_admin_access
 from serving.servers.routers import admin as admin_router
-from serving.storage.database import DatabaseLogger
+from serving.storage.log_schema import ensure_api_logs_schema
 from tests.fixtures.auth_helpers import assert_test_db_name
 
 pytestmark = [pytest.mark.integration, pytest.mark.dbtest]
@@ -41,25 +41,13 @@ class _Pool:
 
 
 def _dsn() -> str:
-    cache_test_port = os.getenv("CACHE_TELEMETRY_TEST_DB_PORT")
-    if cache_test_port:
-        host = os.getenv("DB_HOST", "localhost")
-        name = os.getenv("CACHE_TELEMETRY_TEST_DB_NAME", "hybridinference_test_db")
-        user = os.getenv("DB_USER", "postgres")
-        password = os.getenv("DB_PASSWORD", "postgres")
-        return f"postgresql://{user}:{password}@{host}:{cache_test_port}/{name}"
+    """Resolve the test DSN with the sibling suites' precedence: TEST_PG_DSN first.
 
-    # Prefer an explicit DB_* connection over TEST_PG_DSN when both are set.
-    # CI uses DB_PORT for the dynamically mapped Postgres service; a runner's
-    # TEST_PG_DSN can point at a different port or database.
-    if os.getenv("DB_HOST") or os.getenv("DB_PORT"):
-        host = os.getenv("DB_HOST", "localhost")
-        port = os.getenv("DB_PORT", "5432")
-        name = os.getenv("DB_NAME", "hybridinference_test_db")
-        user = os.getenv("DB_USER", "postgres")
-        password = os.getenv("DB_PASSWORD", "postgres")
-        return f"postgresql://{user}:{password}@{host}:{port}/{name}"
-
+    The suite once preferred DB_* over TEST_PG_DSN with two bespoke
+    CACHE_TELEMETRY_* env vars; that sent a runner exporting both to the
+    gateway's database and is the reverse of what every sibling Postgres test
+    does. TEST_PG_DSN wins, then DB_*, then defaults -- one convention.
+    """
     dsn = os.getenv("TEST_PG_DSN")
     if dsn:
         return dsn
@@ -106,21 +94,46 @@ def pg_dsn() -> str:
 
 @pytest_asyncio.fixture
 async def pool(pg_dsn: str):
-    logger = DatabaseLogger({"dsn": pg_dsn}, store_full_prompts=False)
-    await logger.initialize()
-    assert logger.pool is not None
-    # Refuse a non-test database before touching anything: the cleanup below
-    # deletes rows, and a stray staging/production DSN must not be destroyed.
-    async with logger.pool.acquire() as conn:
-        assert_test_db_name(await conn.fetchval("SELECT current_database()"), "cache three-state")
-    # Unique per fixture instance so cleanup deletes only this file's rows and
-    # never another database-backed test's rows under concurrent runs.
+    """A pool scoped to a private schema holding a fresh ``api_logs``.
+
+    Schema-per-worker rather than DELETE on the shared ``public.api_logs``: a
+    run that dies before teardown (timeout, SIGKILL, Ctrl-C) used to leave its
+    ``cache3s-*`` rows behind and poison the next run's exact-count assertions.
+    A crashed run leaves a schema that the next run of the same worker drops
+    and recreates, so counts stay deterministic. ``assert_test_db_name`` still
+    refuses a non-test database before any DDL.
+    """
+    import hashlib
+
+    worker = os.getenv("PYTEST_XDIST_WORKER", "master")
+    schema = f"cache3s_{worker}_{hashlib.sha1(pg_dsn.encode()).hexdigest()[:8]}"
+
+    admin_conn = await asyncpg.connect(pg_dsn)
+    try:
+        assert_test_db_name(
+            await admin_conn.fetchval("SELECT current_database()"), "cache three-state"
+        )
+        await admin_conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        await admin_conn.execute(f'CREATE SCHEMA "{schema}"')
+    finally:
+        await admin_conn.close()
+
+    pool = await asyncpg.create_pool(
+        pg_dsn, min_size=1, max_size=3, server_settings={"search_path": schema}
+    )
+    assert pool is not None
+    async with pool.acquire() as conn:
+        await ensure_api_logs_schema(conn)
+
+    # Unique per fixture instance so assertions about exact counts hold per
+    # test even if a future test in this module runs concurrently.
     prefix = f"cache3s-{uuid.uuid4().hex[:12]}"
     try:
-        yield logger.pool, prefix
+        yield pool, prefix
     finally:
-        await logger.pool.execute("DELETE FROM api_logs WHERE request_id LIKE $1", f"{prefix}%")
-        await logger.cleanup()
+        await pool.execute("DELETE FROM api_logs WHERE request_id LIKE $1", f"{prefix}%")
+        await pool.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        await pool.close()
 
 
 async def _seed(pool: asyncpg.Pool, prefix: str, cache_read_tokens: list[int | None]) -> None:
