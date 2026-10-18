@@ -13,15 +13,14 @@ IP-wide threshold, the existing IP-wide policy applies to every account at
 that address. Recognized devices retain their independent window and do not
 consume or get blocked by the other login windows.
 
-Login bucket maps are bounded. Attacker-populated maps (account/address,
-account, IP) evict their oldest *expired* key to make room, and refuse a new
-key only while every resident key is still live; they never evict a live
-entry, so a flooding attacker cannot lock out identities that are actively
-signing in. The recognized-device map is different: it is the owner's escape
-hatch from every other window, so a full device map evicts the oldest live
-entry rather than refusing a recognized browser. Device keys are additionally
-scoped per account, so one account cannot exhaust the device map and disable
-recognized-browser sign-in for everyone else.
+Login bucket maps are bounded. Expired keys are reclaimed first; when a map
+is full of live keys, new keys use fixed-size overflow windows selected by a
+process-randomized hash. Collisions can conservatively rate-limit unrelated
+keys for the remainder of a window, but overflow requests are never admitted
+without accounting. Live entries are never evicted. Recognized devices keep
+their independent escape hatch: existing device keys retain their own window,
+while new device keys beyond the per-account tracking cap share that account's
+bounded overflow window.
 
 Unresolved provenance (no routable client address can be attributed, e.g.
 every browser behind the console proxy in a default Compose deployment) does
@@ -35,6 +34,7 @@ is unchanged. State is process-local and lost on restart, as with
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -51,11 +51,14 @@ _HOUR_SECONDS = 3600
 _SWEEP_EVERY = 1024
 _CAPACITY_SWEEP_INTERVAL_SECONDS = 60
 # Bound attacker-controlled login identities in each process-local map. When a
-# map is full, expired keys are swept and then the oldest expired key's slot is
-# reused; a new key is refused only while every resident key is still live.
-# Live entries are never evicted from the attacker-populated maps, so active
-# sign-ins keep their recorded state.
+# map is full, expired keys are swept first; new keys then use fixed-cardinality
+# hashed overflow windows rather than being admitted without accounting.
+# Live entries are never evicted from the attacker-populated maps.
 _MAX_ACTIVE_BUCKETS = 20_000
+_MAX_DEVICES_PER_ACCOUNT = 64
+_OVERFLOW_BUCKET_COUNT = 4096
+_MAX_CAPACITY_PRESSURE_COUNT = 2**31 - 1
+_CAPACITY_PRESSURE_LOG_INTERVAL_SECONDS = 60
 
 # Wrong first-run setup codes an IP may send in any 15-minute window before
 # further wrong ones are answered 429.
@@ -63,10 +66,12 @@ SETUP_ATTEMPTS_PER_15MIN = 10
 
 # Login admissions, keyed by device, account/address, account, and address.
 _device_attempts: dict[tuple[str, str], deque[float]] = {}
+_device_keys_by_account: dict[str, set[tuple[str, str]]] = {}
 _account_address_attempts: dict[tuple[str, str], deque[float]] = {}
 _account_attempts: dict[str, deque[float]] = {}
 _ip_attempts: dict[str, deque[float]] = {}
 _unresolved_attempts: deque[float] = deque()
+_overflow_attempts: dict[tuple[str, int], deque[float]] = {}
 
 # Shared address bucket for clients whose provenance could not be resolved.
 # There is no information to distinguish them, so they share one bucket per
@@ -85,11 +90,18 @@ class _RefusalPressure:
 # Refusal pressure is separate from every admission queue. Its count is capped
 # at the configured IP limit, and repeated refusals never move started_at.
 _ip_refusal_pressure: dict[str, _RefusalPressure] = {}
+_ip_refusal_overflow: dict[int, _RefusalPressure] = {}
 _setup_attempts: dict[str, deque[float]] = {}
 _lock = asyncio.Lock()
 _sweep_counter = 0
 _setup_sweep_counter = 0
 _last_capacity_sweep: dict[str, float] = {}
+_capacity_pressure_counts = dict.fromkeys(
+    ("device", "account_address", "account", "ip", "refusal"),
+    0,
+)
+_last_capacity_pressure_log: dict[str, float] = {}
+logger = logging.getLogger(__name__)
 
 _Key = TypeVar("_Key")
 
@@ -122,6 +134,103 @@ def _prune_bucket(
     return bucket
 
 
+def _overflow_slot(scope: str, identity: object) -> tuple[str, int]:
+    """Return a fixed-cardinality slot using this process's randomized hash."""
+    return scope, hash(identity) % _OVERFLOW_BUCKET_COUNT
+
+
+def _prune_overflow_bucket(scope: str, identity: object, cutoff: float) -> deque[float] | None:
+    return _prune_bucket(_overflow_attempts, _overflow_slot(scope, identity), cutoff)
+
+
+def _record_overflow_attempt(scope: str, identity: object, now: float) -> None:
+    _overflow_attempts.setdefault(_overflow_slot(scope, identity), deque()).append(now)
+
+
+def _note_capacity_pressure(scope: str, now: float) -> None:
+    """Increment a fixed-scope counter and rate-limit capacity warning logs."""
+    if scope not in _capacity_pressure_counts:
+        return
+    _capacity_pressure_counts[scope] = min(
+        _capacity_pressure_counts[scope] + 1,
+        _MAX_CAPACITY_PRESSURE_COUNT,
+    )
+    last_log = _last_capacity_pressure_log.get(scope, float("-inf"))
+    if now - last_log >= _CAPACITY_PRESSURE_LOG_INTERVAL_SECONDS:
+        logger.warning(
+            "login rate-limit bucket capacity reached; using bounded overflow window",
+            extra={
+                "capacity_scope": scope,
+                "bucket_capacity": _MAX_ACTIVE_BUCKETS,
+                "overflow_bucket_count": _OVERFLOW_BUCKET_COUNT,
+                "capacity_pressure_count": _capacity_pressure_counts[scope],
+            },
+        )
+        _last_capacity_pressure_log[scope] = now
+
+
+def get_login_rate_limit_capacity_pressure_counts() -> dict[str, int]:
+    """Return the bounded per-scope count of requests routed through overflow."""
+    return dict(_capacity_pressure_counts)
+
+
+def _prune_device_bucket(device_key: tuple[str, str], cutoff: float) -> deque[float] | None:
+    bucket = _device_attempts.get(device_key)
+    if bucket is None:
+        return None
+    while bucket and bucket[0] < cutoff:
+        bucket.popleft()
+    if not bucket:
+        del _device_attempts[device_key]
+        account_devices = _device_keys_by_account.get(device_key[0])
+        if account_devices is not None:
+            account_devices.discard(device_key)
+            if not account_devices:
+                del _device_keys_by_account[device_key[0]]
+        return None
+    return bucket
+
+
+def _prune_account_devices(account_key: str, cutoff: float) -> set[tuple[str, str]]:
+    account_devices = _device_keys_by_account.get(account_key)
+    if account_devices is None:
+        return set()
+    for device_key in tuple(account_devices):
+        _prune_device_bucket(device_key, cutoff)
+    return _device_keys_by_account.get(account_key, set())
+
+
+def _sweep_device_attempts(cutoff: float) -> None:
+    for device_key in tuple(_device_attempts):
+        _prune_device_bucket(device_key, cutoff)
+
+
+def _needs_overflow(
+    buckets: dict[_Key, deque[float]],
+    key: _Key,
+    scope: str,
+    identity: object,
+    cutoff: float,
+    *,
+    now: float,
+) -> bool:
+    """Use stable overflow accounting for a new key that cannot use its map."""
+    if key in buckets:
+        return False
+    overflow_bucket = _prune_overflow_bucket(scope, identity, cutoff)
+    can_add = _can_add_bucket_key(
+        buckets,
+        key,
+        cutoff,
+        now=now,
+        scope=scope,
+    )
+    use_overflow = not can_add or overflow_bucket is not None
+    if use_overflow:
+        _note_capacity_pressure(scope, now)
+    return use_overflow
+
+
 def _can_add_bucket_key(
     buckets: dict[_Key, deque[float]],
     key: _Key,
@@ -132,15 +241,9 @@ def _can_add_bucket_key(
 ) -> bool:
     """Check map capacity, sweeping expired keys at most once per interval.
 
-    Security policy for a saturated map: a live entry is NEVER evicted, so an
-    attacker cannot reset an active identity's admission window by filling the
-    map, and the oldest expired key's slot is reused so memory stays bounded.
-    When the map is full of live keys the caller admits the new identity
-    WITHOUT recording it: map saturation must not become a global login DoS,
-    and an unrecorded admission costs no memory and resets nobody's state.
-    The admission is still subject to the other windows (account-wide, IP) on
-    its next attempt, matching the pre-bounded-map behaviour for identities
-    the maps cannot remember.
+    A live entry is never evicted. Callers route a new key to a fixed-size
+    hashed overflow window when this returns false, keeping the attempt
+    accounted without growing the identity map.
     """
     if key in buckets or len(buckets) < _MAX_ACTIVE_BUCKETS:
         return True
@@ -154,31 +257,55 @@ def _sweep_expired_refusals(now: float) -> None:
     for ip_key, pressure in list(_ip_refusal_pressure.items()):
         if now - pressure.started_at >= _HOUR_SECONDS:
             del _ip_refusal_pressure[ip_key]
+    for slot, pressure in list(_ip_refusal_overflow.items()):
+        if now - pressure.started_at >= _HOUR_SECONDS:
+            del _ip_refusal_overflow[slot]
 
 
 def _active_refusal_count(ip_key: str, now: float) -> int:
     pressure = _ip_refusal_pressure.get(ip_key)
+    if pressure is not None and now - pressure.started_at >= _HOUR_SECONDS:
+        del _ip_refusal_pressure[ip_key]
+        pressure = None
+    if pressure is not None:
+        return pressure.count
+
+    overflow_slot = _overflow_slot("refusal", ip_key)[1]
+    pressure = _ip_refusal_overflow.get(overflow_slot)
     if pressure is None:
         return 0
     if now - pressure.started_at >= _HOUR_SECONDS:
-        del _ip_refusal_pressure[ip_key]
+        del _ip_refusal_overflow[overflow_slot]
         return 0
     return pressure.count
 
 
 def _record_address_refusal(ip_key: str, now: float, per_ip: int) -> bool:
-    """Record one address-limit refusal; return False if its map is full."""
+    """Record one refusal without turning pressure-map saturation global."""
     pressure = _ip_refusal_pressure.get(ip_key)
+    overflow_slot = _overflow_slot("refusal", ip_key)[1]
+    overflow_pressure = _ip_refusal_overflow.get(overflow_slot)
+    if overflow_pressure is not None and now - overflow_pressure.started_at >= _HOUR_SECONDS:
+        del _ip_refusal_overflow[overflow_slot]
+        overflow_pressure = None
     if pressure is None:
-        if len(_ip_refusal_pressure) >= _MAX_ACTIVE_BUCKETS:
-            last_sweep = _last_capacity_sweep.get("refusal", float("-inf"))
-            if now - last_sweep >= _CAPACITY_SWEEP_INTERVAL_SECONDS:
-                _sweep_expired_refusals(now)
-                _last_capacity_sweep["refusal"] = now
-        if len(_ip_refusal_pressure) >= _MAX_ACTIVE_BUCKETS:
-            return False
-        pressure = _RefusalPressure(started_at=now)
-        _ip_refusal_pressure[ip_key] = pressure
+        if overflow_pressure is not None:
+            pressure = overflow_pressure
+        else:
+            if len(_ip_refusal_pressure) >= _MAX_ACTIVE_BUCKETS:
+                last_sweep = _last_capacity_sweep.get("refusal", float("-inf"))
+                if now - last_sweep >= _CAPACITY_SWEEP_INTERVAL_SECONDS:
+                    _sweep_expired_refusals(now)
+                    _last_capacity_sweep["refusal"] = now
+            if len(_ip_refusal_pressure) < _MAX_ACTIVE_BUCKETS:
+                pressure = _RefusalPressure(started_at=now)
+                _ip_refusal_pressure[ip_key] = pressure
+            else:
+                _note_capacity_pressure("refusal", now)
+                pressure = _ip_refusal_overflow.setdefault(
+                    overflow_slot,
+                    _RefusalPressure(started_at=now),
+                )
 
     pressure.count = min(pressure.count + 1, per_ip)
     return True
@@ -233,10 +360,14 @@ async def check_and_record_login(
         _sweep_counter += 1
         if _sweep_counter >= _SWEEP_EVERY:
             _sweep_counter = 0
-            _sweep_inactive(_device_attempts, account_cutoff)
+            _sweep_device_attempts(account_cutoff)
             _sweep_inactive(_account_address_attempts, account_cutoff)
             _sweep_inactive(_account_attempts, account_cutoff)
             _sweep_inactive(_ip_attempts, ip_cutoff)
+            for overflow_key in tuple(_overflow_attempts):
+                scope, _ = overflow_key
+                cutoff = ip_cutoff if scope == "ip" else account_cutoff
+                _prune_bucket(_overflow_attempts, overflow_key, cutoff)
             while _unresolved_attempts and _unresolved_attempts[0] < ip_cutoff:
                 _unresolved_attempts.popleft()
             _sweep_expired_refusals(now)
@@ -249,25 +380,40 @@ async def check_and_record_login(
             )
 
         if device is not None:
-            # The device window is the owner's escape hatch from every other
-            # window. Device keys are scoped per account so one account cannot
-            # exhaust the map, and a full map evicts its oldest entry rather
-            # than refusing a recognized browser.
+            # Existing recognized devices retain their independent escape
+            # hatch. New device IDs are bounded per account; excess IDs share
+            # an account-scoped overflow window rather than gaining a fresh
+            # independent allowance or evicting a live device.
             device_key = (account_key, device)
-            device_bucket = _prune_bucket(_device_attempts, device_key, account_cutoff)
+            device_bucket = _prune_device_bucket(device_key, account_cutoff)
             if device_bucket is not None and len(device_bucket) >= per_account_address:
                 return False, "device"
-            # Same no-live-eviction policy as the other maps: a saturated
-            # device map admits unrecorded rather than dropping a live
-            # browser's window (the device path is the owner's escape hatch).
-            if _can_add_bucket_key(
-                _device_attempts,
-                device_key,
-                account_cutoff,
-                now=now,
-                scope="device",
-            ):
-                _device_attempts.setdefault(device_key, deque()).append(now)
+            if device_bucket is not None:
+                device_bucket.append(now)
+                return True, None
+
+            account_devices = _prune_account_devices(account_key, account_cutoff)
+            device_overflow = _prune_overflow_bucket("device", account_key, account_cutoff)
+            use_overflow = (
+                len(account_devices) >= _MAX_DEVICES_PER_ACCOUNT
+                or device_overflow is not None
+                or not _can_add_bucket_key(
+                    _device_attempts,
+                    device_key,
+                    account_cutoff,
+                    now=now,
+                    scope="device",
+                )
+            )
+            if use_overflow:
+                _note_capacity_pressure("device", now)
+                if device_overflow is not None and len(device_overflow) >= per_account_address:
+                    return False, "device"
+                _record_overflow_attempt("device", account_key, now)
+                return True, None
+
+            _device_attempts[device_key] = deque([now])
+            _device_keys_by_account.setdefault(account_key, set()).add(device_key)
             return True, None
 
         address_key = (account_key, ip_key)
@@ -302,43 +448,71 @@ async def check_and_record_login(
         if account_count >= per_account:
             return False, "account"
 
-        # Check every map before writing to any of them, so capacity handling
-        # cannot leave a partial admission in one of the other windows. A full
-        # map of live keys admits WITHOUT recording (bounded memory, no live-
-        # entry eviction, no global DoS); a map with an expired key reuses the
-        # expired slot as usual.
-        record_address = _can_add_bucket_key(
+        # Check every map before writing to any of them, so a refusal in one
+        # window cannot leave a partial admission in another. New keys that
+        # cannot use a full map are still counted by its fixed-size overflow
+        # window; hash collisions can conservatively share a limit.
+        spill_address = _needs_overflow(
             _account_address_attempts,
+            address_key,
+            "account_address",
             address_key,
             account_cutoff,
             now=now,
-            scope="account_address",
         )
-        record_account = _can_add_bucket_key(
+        spill_account = _needs_overflow(
             _account_attempts,
+            account_key,
+            "account",
             account_key,
             account_cutoff,
             now=now,
-            scope="account",
         )
-        record_ip = (
-            _can_add_bucket_key(
+        spill_ip = (
+            _needs_overflow(
                 _ip_attempts,
+                ip_key,
+                "ip",
                 ip_key,
                 ip_cutoff,
                 now=now,
-                scope="ip",
             )
             if resolved
             else False
         )
 
-        if record_address:
+        overflow_address = (
+            _prune_overflow_bucket("account_address", address_key, account_cutoff)
+            if spill_address
+            else None
+        )
+        overflow_account = (
+            _prune_overflow_bucket("account", account_key, account_cutoff)
+            if spill_account
+            else None
+        )
+        overflow_ip = _prune_overflow_bucket("ip", ip_key, ip_cutoff) if spill_ip else None
+        if overflow_address is not None and len(overflow_address) >= per_account_address:
+            if resolved and not _record_address_refusal(ip_key, now, per_ip):
+                return False, "ip"
+            return False, "email"
+        if overflow_account is not None and len(overflow_account) >= per_account:
+            return False, "account"
+        if overflow_ip is not None and len(overflow_ip) >= per_ip:
+            return False, "ip"
+
+        if spill_address:
+            _record_overflow_attempt("account_address", address_key, now)
+        else:
             _account_address_attempts.setdefault(address_key, deque()).append(now)
-        if record_account:
+        if spill_account:
+            _record_overflow_attempt("account", account_key, now)
+        else:
             _account_attempts.setdefault(account_key, deque()).append(now)
         if resolved:
-            if record_ip:
+            if spill_ip:
+                _record_overflow_attempt("ip", ip_key, now)
+            else:
                 _ip_attempts.setdefault(ip_key, deque()).append(now)
         else:
             _unresolved_attempts.append(now)
@@ -379,12 +553,18 @@ def reset_login_rate_limit_state() -> None:
     """Wipe all recorded attempts (login and setup). Test-only helper."""
     global _sweep_counter, _setup_sweep_counter
     _device_attempts.clear()
+    _device_keys_by_account.clear()
     _account_address_attempts.clear()
     _account_attempts.clear()
     _ip_attempts.clear()
     _unresolved_attempts.clear()
+    _overflow_attempts.clear()
     _ip_refusal_pressure.clear()
+    _ip_refusal_overflow.clear()
     _setup_attempts.clear()
     _last_capacity_sweep.clear()
+    for scope in _capacity_pressure_counts:
+        _capacity_pressure_counts[scope] = 0
+    _last_capacity_pressure_log.clear()
     _sweep_counter = 0
     _setup_sweep_counter = 0

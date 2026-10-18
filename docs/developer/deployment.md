@@ -464,9 +464,15 @@ not attributed to a synthetic per-client address. It still gets the five per
 username in 15 minutes account/address window, the fifty per username
 account-wide window, and a separate coarse hourly budget shared by every
 unresolved client (`UNRESOLVED_LOGIN_RATE_LIMIT_PER_HOUR`, default twenty per
-hour per worker). Refused attempts do not extend any window, and the
-in-memory maps that hold the counts are bounded so a flooding source cannot
-lock out unrelated sign-ins by filling them.
+hour per worker). Refused attempts do not extend any window. When a limiter
+map fills, expired windows are reclaimed first and additional identities use
+fixed-size overflow buckets selected by a randomized per-process hash. A hash
+collision can conservatively make unrelated identities share a limit until
+their window expires, but admitted attempts remain counted. Existing device
+cookies keep their independent windows; at most 64 active device windows per
+account are stored directly, and additional device IDs share the account's
+overflow window. Capacity pressure is counted per limiter scope and warning
+logs are rate-limited.
 
 Other browsers share the limits with their address, and behind the bundled
 Compose file's console proxy every browser has the same address unless

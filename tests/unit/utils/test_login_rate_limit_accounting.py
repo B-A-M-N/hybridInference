@@ -103,9 +103,9 @@ async def test_distributed_guessing_trips_account_limit_without_poisoning_shared
 
 
 @pytest.mark.asyncio
-async def test_address_refusal_escalates_to_ip_and_exposes_shared_ip_collateral():
-    settings.login_rate_limit_per_15min = 1
-    settings.login_rate_limit_per_hour_per_ip = 3
+async def test_address_refusal_escalates_to_ip_and_exposes_shared_ip_collateral(monkeypatch):
+    monkeypatch.setattr(settings, "login_rate_limit_per_15min", 1)
+    monkeypatch.setattr(settings, "login_rate_limit_per_hour_per_ip", 3)
 
     assert await limiter.check_and_record_login("admin", ATTACKER) == (True, None)
     assert await limiter.check_and_record_login("admin", ATTACKER) == (False, "email")
@@ -129,8 +129,8 @@ async def test_address_refusal_escalates_to_ip_and_exposes_shared_ip_collateral(
 async def test_refusal_pressure_expires_from_first_refusal_and_login_recovers(monkeypatch):
     now = [2_000.0]
     monkeypatch.setattr(limiter, "_now", lambda: now[0])
-    settings.login_rate_limit_per_15min = 2
-    settings.login_rate_limit_per_hour_per_ip = 4
+    monkeypatch.setattr(settings, "login_rate_limit_per_15min", 2)
+    monkeypatch.setattr(settings, "login_rate_limit_per_hour_per_ip", 4)
 
     for _ in range(2):
         assert await limiter.check_and_record_login("admin", ATTACKER) == (True, None)
@@ -191,22 +191,21 @@ async def test_refusal_pressure_map_is_bounded(monkeypatch):
     monkeypatch.setattr(limiter, "_MAX_ACTIVE_BUCKETS", 2)
 
     # These attempts are against existing account/address keys, but begin a
-    # separate refusal record for each source IP. The third IP still gets the
-    # ordinary account/address refusal; the refusal map stays bounded by
-    # evicting its oldest entry instead of silently reclassifying the reason.
-    # First refusal is reported at the account/address layer and begins the
-    # refusal record; the second refusal reaches the IP threshold.
+    # separate refusal record for each source IP. The third IP uses bounded
+    # refusal overflow accounting instead of making map saturation a global
+    # IP refusal.
     assert await limiter.check_and_record_login("user0", ips[0]) == (False, "email")
     assert await limiter.check_and_record_login("user1", ips[1]) == (False, "email")
-    assert await limiter.check_and_record_login("user2", ips[2]) == (False, "ip")
+    assert await limiter.check_and_record_login("user2", ips[2]) == (False, "email")
     assert len(limiter._ip_refusal_pressure) <= 2
+    assert len(limiter._ip_refusal_overflow) <= 1
 
 
 @pytest.mark.asyncio
-async def test_concurrent_requests_cannot_exceed_admission_limit():
-    settings.login_rate_limit_per_15min = 5
-    settings.login_account_rate_limit_per_15min = 100
-    settings.login_rate_limit_per_hour_per_ip = 1_000
+async def test_concurrent_requests_cannot_exceed_admission_limit(monkeypatch):
+    monkeypatch.setattr(settings, "login_rate_limit_per_15min", 5)
+    monkeypatch.setattr(settings, "login_account_rate_limit_per_15min", 100)
+    monkeypatch.setattr(settings, "login_rate_limit_per_hour_per_ip", 1_000)
 
     results = await asyncio.gather(
         *(limiter.check_and_record_login("admin", ATTACKER) for _ in range(100))
@@ -259,9 +258,9 @@ async def test_unresolved_login_budget_is_global_bounded_and_recovers(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_unresolved_account_and_recognized_device_protections_remain():
-    settings.login_account_rate_limit_per_15min = 1
-    settings.unresolved_login_rate_limit_per_hour = 10
+async def test_unresolved_account_and_recognized_device_protections_remain(monkeypatch):
+    monkeypatch.setattr(settings, "login_account_rate_limit_per_15min", 1)
+    monkeypatch.setattr(settings, "unresolved_login_rate_limit_per_hour", 10)
     unknown = _unresolved_provenance()
 
     assert await limiter.check_and_record_login("owner", unknown) == (True, None)
@@ -300,41 +299,54 @@ async def test_full_bucket_maps_do_not_deny_unrelated_users(monkeypatch):
         True,
         None,
     )
-    # Her third attempt is ADMITTED UNRECORDED: the saturated maps cannot
-    # count it, so it neither consumes her window nor resets it. Map
-    # saturation is not a global login DoS.
+    # Saturated maps use overflow accounting, so her third attempt is refused
+    # at the ordinary account/address limit rather than becoming untracked.
     assert await limiter.check_and_record_login("alice@example.com", OWNER) == (
-        True,
-        None,
+        False,
+        "email",
     )
     assert ("alice@example.com", OWNER) not in limiter._account_address_attempts
+    now[0] += 15 * 60 + 1
+    assert await limiter.check_and_record_login("alice@example.com", OWNER) == (True, None)
 
 
 @pytest.mark.asyncio
 async def test_one_account_cannot_exhaust_the_device_escape_hatch(monkeypatch):
-    # security: device keys are scoped per account and a full device map
-    # evicts its oldest entry, so a single account cannot disable the
-    # recognized-browser escape hatch for everyone else.
+    # security: one account cannot create independent live limiter windows
+    # without bound or disable an existing administrator device.
     now = [6_000.0]
     monkeypatch.setattr(limiter, "_now", lambda: now[0])
-    monkeypatch.setattr(limiter, "_MAX_ACTIVE_BUCKETS", 2)
+    monkeypatch.setattr(limiter, "_MAX_ACTIVE_BUCKETS", 3)
+    monkeypatch.setattr(limiter, "_MAX_DEVICES_PER_ACCOUNT", 2)
 
     # One account floods device sign-ins from its own address; its IP window
     # stays at zero because the device path never touches the IP buckets.
-    for i in range(5):
+    for i in range(2):
         assert await limiter.check_and_record_login(
             "attacker@example.com", ATTACKER, device=f"nonce-{i}"
         ) == (True, None)
-    assert ATTACKER not in limiter._ip_attempts
-    # Device keys are scoped per account: the attacker's devices did not
-    # consume slots from other accounts.
-    assert all(key[0] == "attacker@example.com" for key in limiter._device_attempts)
-    assert len(limiter._device_attempts) <= 2
-
-    # The victim's recognized browser is still admitted through the device
-    # window even though the attacker saturated the shared device map.
     assert await limiter.check_and_record_login(
-        "victim@example.com", ATTACKER, device="victim-browser"
+        "admin@example.com", OWNER, device="admin-browser"
+    ) == (True, None)
+    for i in range(2, 4):
+        assert await limiter.check_and_record_login(
+            "attacker@example.com", ATTACKER, device=f"nonce-{i}"
+        ) == (True, None)
+    assert await limiter.check_and_record_login(
+        "attacker@example.com", ATTACKER, device="nonce-4"
+    ) == (False, "device")
+    assert ATTACKER not in limiter._ip_attempts
+    # The account cap leaves the admin's existing key intact.
+    assert len(limiter._device_attempts) == 3
+    assert {account_key for account_key, _device_key in limiter._device_attempts} == {
+        "attacker@example.com",
+        "admin@example.com",
+    }
+
+    # The existing administrator browser retains its independent window even
+    # though the attacker saturated the shared device map.
+    assert await limiter.check_and_record_login(
+        "admin@example.com", OWNER, device="admin-browser"
     ) == (True, None)
 
 
@@ -372,16 +384,7 @@ async def test_unresolved_caller_keeps_per_account_address_cap(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_saturation_does_not_evict_live_state_and_bypass_is_bounded(monkeypatch):
-    """Pin the saturation policy: live entries are never evicted.
-
-    At map capacity the attacker-populated admission maps admit a new identity
-    WITHOUT recording it. The accepted trade-off is that a saturated map can
-    no longer count a new identity's admissions against the per-account/
-    per-address windows it cannot remember -- but it never resets an active
-    identity's recorded window, so an attacker cannot refill someone's budget
-    by flooding, and a protected account under active guessing (whose key is
-    refreshed on every admitted attempt) keeps its full recorded state.
-    """
+    """Pin bounded overflow accounting without live-key eviction."""
     now = [7_000.0]
     monkeypatch.setattr(limiter, "_now", lambda: now[0])
     monkeypatch.setattr(settings, "login_rate_limit_per_15min", 2)
@@ -402,8 +405,8 @@ async def test_saturation_does_not_evict_live_state_and_bypass_is_bounded(monkey
     assert len(limiter._account_address_attempts) == 2
     now[0] += 1
 
-    # A third attacker identity is admitted but NOT recorded (map full of
-    # live keys): bounded memory, and no live entry was dropped.
+    # A third attacker identity uses bounded overflow counters: map memory
+    # remains fixed, no live entry is dropped, and its attempts still count.
     assert await limiter.check_and_record_login("atk3", "198.51.100.3") == (True, None)
     assert len(limiter._account_address_attempts) == 2
     assert ("atk3", "198.51.100.3") not in limiter._account_address_attempts
@@ -411,8 +414,55 @@ async def test_saturation_does_not_evict_live_state_and_bypass_is_bounded(monkey
     assert ("victim", "198.51.100.50") in limiter._account_address_attempts
     assert await limiter.check_and_record_login("victim", "198.51.100.50") == (False, "email")
 
-    # The unrecorded identity is not tracked, so it can attempt again; the
-    # bypass costs memory nothing and never touches recorded state.
+    # The same overflow identity stays tracked and cannot reset its window.
     now[0] += 1
     assert await limiter.check_and_record_login("atk3", "198.51.100.3") == (True, None)
+    assert await limiter.check_and_record_login("atk3", "198.51.100.3") == (False, "email")
     assert len(limiter._account_address_attempts) == 2
+
+
+@pytest.mark.asyncio
+async def test_capacity_pressure_logs_and_diagnostic_counts_are_bounded(monkeypatch, caplog):
+    now = [8_000.0]
+    monkeypatch.setattr(limiter, "_now", lambda: now[0])
+    monkeypatch.setattr(limiter, "_MAX_ACTIVE_BUCKETS", 1)
+    monkeypatch.setattr(limiter, "_MAX_CAPACITY_PRESSURE_COUNT", 3)
+
+    assert await limiter.check_and_record_login("first", "198.51.100.1") == (True, None)
+    assert await limiter.check_and_record_login("second", "198.51.100.2") == (True, None)
+    assert await limiter.check_and_record_login("second", "198.51.100.2") == (True, None)
+    assert await limiter.check_and_record_login("second", "198.51.100.2") == (False, "email")
+
+    counts = limiter.get_login_rate_limit_capacity_pressure_counts()
+    assert set(counts) == {"device", "account_address", "account", "ip", "refusal"}
+    assert counts["account_address"] == 3
+    assert counts["account"] == 3
+    assert counts["ip"] == 3
+    assert all(count <= 3 for count in counts.values())
+    warnings = [
+        record
+        for record in caplog.records
+        if "login rate-limit bucket capacity reached" in record.getMessage()
+    ]
+    assert {record.capacity_scope for record in warnings} >= {
+        "account_address",
+        "account",
+        "ip",
+    }
+
+
+@pytest.mark.asyncio
+async def test_refusal_pressure_overflow_does_not_block_unrelated_addresses(monkeypatch):
+    now = [9_000.0]
+    monkeypatch.setattr(limiter, "_now", lambda: now[0])
+    monkeypatch.setattr(limiter, "_MAX_ACTIVE_BUCKETS", 1)
+    monkeypatch.setattr(settings, "login_rate_limit_per_15min", 1)
+    monkeypatch.setattr(settings, "login_rate_limit_per_hour_per_ip", 3)
+
+    assert await limiter.check_and_record_login("first", "198.51.100.1") == (True, None)
+    assert await limiter.check_and_record_login("first", "198.51.100.1") == (False, "email")
+    assert await limiter.check_and_record_login("second", "198.51.100.2") == (True, None)
+    assert await limiter.check_and_record_login("second", "198.51.100.2") == (False, "email")
+    assert await limiter.check_and_record_login("third", "198.51.100.3") == (True, None)
+    assert await limiter.check_and_record_login("third", "198.51.100.3") == (False, "email")
+    assert limiter.get_login_rate_limit_capacity_pressure_counts()["refusal"] > 0
