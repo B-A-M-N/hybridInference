@@ -427,7 +427,6 @@ async def admin_provider_observability(
                 COUNT(*) FILTER (
                     WHERE status_code >= 200 AND status_code < 400
                       AND COALESCE(prompt_tokens, 0) > 0
-                      AND cache_read_tokens IS NOT NULL
                       AND cache_read_tokens > 0
                 )::BIGINT AS cache_hit_count,
                 COALESCE(SUM(prompt_tokens) FILTER (
@@ -497,7 +496,6 @@ async def admin_provider_observability(
                     COUNT(*) FILTER (
                         WHERE status_code >= 200 AND status_code < 400
                           AND COALESCE(prompt_tokens, 0) > 0
-                          AND cache_read_tokens IS NOT NULL
                           AND cache_read_tokens > 0
                     )::BIGINT AS cache_hit_count,
                     COALESCE(SUM(cache_read_tokens) FILTER (

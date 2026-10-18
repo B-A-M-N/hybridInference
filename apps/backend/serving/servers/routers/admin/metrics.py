@@ -659,7 +659,7 @@ async def admin_get_ttft_scatter(
                     timestamp,
                     ROW_NUMBER() OVER (
                         PARTITION BY
-                            model_id, provider, (COALESCE(cache_read_tokens, 0) > 0)
+                            model_id, provider, (cache_read_tokens > 0)
                         ORDER BY timestamp DESC
                     ) AS rn
                 FROM api_logs
