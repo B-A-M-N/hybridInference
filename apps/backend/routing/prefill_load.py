@@ -696,7 +696,9 @@ class PrefillLoadTracker:
         Route selection must observe the same load state that its primary
         reservation updates.  Callers should hold this context only around
         local candidate construction/selection and lease acquisition; it must
-        not span an upstream request.
+        not span an upstream request. Lease releases may run outside this
+        transaction: the accounting lock keeps those mutations coherent, and
+        a concurrent release only reduces the outstanding load snapshot.
         """
         with self._routing_lock:
             yield
