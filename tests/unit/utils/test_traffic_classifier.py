@@ -1029,7 +1029,10 @@ def test_human_reason_codes_are_directional():
             inter_arrival_ms=5000,
             session_continuity=True,
             is_authenticated=True,
-            user_agent="browser/1.0",
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+            ),
             request_count=5,
         )
     )
