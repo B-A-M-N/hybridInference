@@ -61,7 +61,7 @@ from serving.grant_auth import ledger_attribution
 from serving.model_access import model_access_denial
 from serving.observability.rejection_log import log_rejection
 from serving.observability.tracked_tasks import tracked_task
-from serving.pricing import effective_pricing
+from serving.pricing import effective_pricing, require_source_pricing
 from serving.servers.auth import (
     _next_utc_midnight,
     verify_api_key,
@@ -563,10 +563,12 @@ async def _resolve(
         adapter, _ = route.adapters[0]
         return canonical, route, adapter
     user_role = (user_ctx or {}).get("role", "free")
+    adapter = _pick_dispatch_adapter(model_id, canonical, router_exec, user_role, size_prompt)
+    require_source_pricing(adapter.config)
     return (
         canonical,
         route,
-        _pick_dispatch_adapter(model_id, canonical, router_exec, user_role, size_prompt),
+        adapter,
     )
 
 
@@ -1460,7 +1462,7 @@ async def anthropic_messages(
             "auth_key_hash": auth_key_hash or "_anon",
             "affinity_key": derive_affinity_key(
                 auth_key_hash,
-                ip_info.client_ip,
+                ip_info,
                 grant_id=user_ctx.get("agent_grant_id"),
             ),
         }
