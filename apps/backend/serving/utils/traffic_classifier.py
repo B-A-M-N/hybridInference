@@ -382,17 +382,7 @@ def classify_traffic(evidence: TrafficEvidence) -> TrafficClassification:
     confidence = base_confidence
 
     # Derive class from score and confidence
-    class_hint = _derive_class(score, confidence)
-    # A positively identified raw HTTP client is strong automation evidence.
-    # It can deny a human scheduling preference, but the public class must not
-    # contradict that evidence when slower behavioral signals pull the score
-    # into the human band. Unknown or ambiguous user-agent labels stay governed
-    # by the behavioral score.
-    if (
-        class_hint is TrafficClass.LIKELY_HUMAN
-        and classify_client(evidence.user_agent) in SCRIPT_CLIENTS
-    ):
-        class_hint = TrafficClass.UNKNOWN
+    class_hint = _derive_class(score, confidence, evidence)
 
     # Generate stable reason codes
     reasons = _generate_reasons(evidence, signals, class_hint)
@@ -416,14 +406,26 @@ def _is_interactive_client(user_agent: str | None) -> bool:
     return label is not None and label in INTERACTIVE_CLIENTS
 
 
-def _derive_class(score: float, confidence: float) -> TrafficClass:
+def _derive_class(
+    score: float,
+    confidence: float,
+    evidence: TrafficEvidence,
+) -> TrafficClass:
     """Derive classification from score and confidence.
 
     Low confidence always preserves UNKNOWN regardless of score.
+
+    A raw HTTP client contradicts a human-band score. Keep that public
+    classification UNKNOWN even when slow sequential cadence pulls the numeric
+    score into the human range. Unrecognized clients remain governed by the
+    behavioral evidence because their labels do not establish automation.
     """
     if confidence < MIN_CONFIDENCE_FOR_CLASSIFICATION:
         return TrafficClass.UNKNOWN
     if score <= HUMAN_THRESHOLD:
+        client = classify_client(evidence.user_agent)
+        if client in SCRIPT_CLIENTS:
+            return TrafficClass.UNKNOWN
         return TrafficClass.LIKELY_HUMAN
     if score >= AUTOMATED_THRESHOLD:
         return TrafficClass.LIKELY_AUTOMATED

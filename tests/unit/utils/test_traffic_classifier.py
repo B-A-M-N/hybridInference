@@ -252,6 +252,41 @@ def test_script_or_unknown_agent_cannot_receive_human_hint(user_agent, request_c
     )
 
 
+@pytest.mark.parametrize(
+    ("user_agent", "inter_arrival_ms", "request_count", "expected_class"),
+    [
+        ("httpx/0.27", 3000, 6, TrafficClass.UNKNOWN),
+        ("python-requests/2.31", 3000, 6, TrafficClass.UNKNOWN),
+        ("unknown-client/1.0", 60_000, 8, TrafficClass.LIKELY_HUMAN),
+        (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+            3000,
+            6,
+            TrafficClass.LIKELY_HUMAN,
+        ),
+    ],
+    ids=["httpx", "python-requests", "unknown-agent", "browser"],
+)
+def test_public_class_hint_reconciles_script_and_behavior_evidence(
+    user_agent, inter_arrival_ms, request_count, expected_class
+):
+    """Classify sequential scripts, unknown agents, and browsers consistently."""
+    classification = classify_traffic(
+        TrafficEvidence(
+            inter_arrival_ms=inter_arrival_ms,
+            concurrent_requests=1,
+            shape_repeat_count=1,
+            session_continuity=None,
+            is_authenticated=True,
+            user_agent=user_agent,
+            request_count=request_count,
+        )
+    )
+
+    assert classification.class_hint is expected_class
+
+
 @pytest.mark.parametrize("user_agent", ["httpx/0.27", "python-requests/2.31"])
 def test_identified_script_client_is_not_classified_as_likely_human(user_agent):
     """Slow sequential traffic cannot override a positively identified script UA."""
