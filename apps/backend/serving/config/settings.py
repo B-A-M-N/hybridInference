@@ -149,6 +149,11 @@ class Settings(BaseSettings):
     # Rate limiting
     signup_rate_limit_per_hour: int = 5
     signup_rate_limit_per_day: int = 10
+    # Public signups without established client provenance share coarse
+    # process-local budgets; deployments can fail closed instead.
+    signup_require_resolved_client_ip: bool = False
+    unresolved_signup_rate_limit_per_hour: int = 5
+    unresolved_signup_rate_limit_per_day: int = 10
     # Sign-in windows. Per account per client address (default 5 attempts /
     # 15 min, IPv6 bucketed to /64): whoever guesses from their own address
     # cannot lock the owner out of the account from another. Per account from
@@ -171,6 +176,13 @@ class Settings(BaseSettings):
     auth_failure_block_threshold: int = 200
     auth_failure_block_window_sec: int = 86400
     auth_failure_block_duration_sec: int = 86400
+    # When client provenance is unresolved, use one coarse process-local
+    # circuit breaker. It sheds anonymous failure floods without attributing
+    # them to the transport peer; every unresolved client shares its brief
+    # block, so a trusted proxy configuration is still needed to isolate users.
+    unresolved_auth_failure_block_threshold: int = 200
+    unresolved_auth_failure_block_window_sec: int = 60
+    unresolved_auth_failure_block_duration_sec: int = 60
     # Comma-separated IPs or CIDR ranges (e.g. "140.247.173.97,128.103.0.0/16")
     # that are exempt from auth-failure blocking: their failures are never
     # counted and an existing block never applies to them. For trusted shared
