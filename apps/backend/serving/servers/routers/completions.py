@@ -371,7 +371,11 @@ async def _streaming_response_with_keepalive(
             response_id = chunk_json.get("id") or response_id
             created = int(chunk_json.get("created") or created)
             if chunk_json.get("usage"):
-                usage = normalize_usage(chunk_json.get("usage")) or chunk_json.get("usage")
+                # An explicit None check, not a truthiness fallback: normalize_usage
+                # can return {} when every direct count was invalid, and restoring
+                # the raw mapping would put the invalid counts back into persistence.
+                normalized = normalize_usage(chunk_json.get("usage"))
+                usage = normalized if normalized is not None else chunk_json.get("usage")
 
             choices = chunk_json.get("choices") or []
             if not choices:

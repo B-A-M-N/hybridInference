@@ -875,7 +875,13 @@ class StreamSession:
         if self._tool_calls:
             response_for_db["choices"][0]["message"]["tool_calls"] = self._tool_calls.to_list()
         if self._usage_data:
-            response_for_db["usage"] = normalize_usage(self._usage_data) or self._usage_data
+            # An explicit None check, not a truthiness fallback: normalize_usage can
+            # return {} when every direct count was invalid, and restoring the raw
+            # mapping would put the invalid counts back into persistence.
+            normalized_usage = normalize_usage(self._usage_data)
+            response_for_db["usage"] = (
+                normalized_usage if normalized_usage is not None else self._usage_data
+            )
         return response_for_db
 
     async def _finalize_success(self) -> None:
