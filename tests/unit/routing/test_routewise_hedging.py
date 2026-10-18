@@ -23,6 +23,7 @@ from routing.routewise.hedging import (
     HedgeStreamRaceTimeout,
     ProviderEventSink,
 )
+from serving.utils import context as req_ctx
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -138,6 +139,7 @@ def _make_model_config(
     cfg.base_url = f"https://{provider}.example/v1"
     cfg.pricing = {"prompt": "3.0", "completion": "15.0"}
     cfg.provider_type = "on_demand"
+    cfg.priority_scheduling = False
     return cfg
 
 
@@ -1153,6 +1155,160 @@ class TestHedgedAdapterStreaming:
         await stream.aclose()
         assert events.count("prefill") == 1
         assert events.count("capacity") == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("chat", "stream"))
+async def test_hedged_primary_priority_is_scoped_when_backup_never_starts(operation):
+    """A primary-only hedge still stamps its priority and restores caller context."""
+    sink = _FakeEventSink()
+    seen: list[Any] = []
+    backup_calls: list[str] = []
+    primary = _make_fake_adapter(provider="primary")
+    backup = _make_fake_adapter(provider="backup")
+    primary.config.priority_scheduling = True
+    backup.config.priority_scheduling = True
+
+    async def _primary_chat(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        seen.append(req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY))
+        return {"choices": [{"message": {"content": "primary"}}]}
+
+    async def _primary_stream(*_args: Any, **_kwargs: Any) -> AsyncGenerator[str, None]:
+        seen.append(req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY))
+        yield 'data: {"choices":[{"delta":{"content":"primary"}}]}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def _backup_chat(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        backup_calls.append("chat")
+        return {"choices": [{"message": {"content": "unexpected"}}]}
+
+    async def _backup_stream(*_args: Any, **_kwargs: Any) -> AsyncGenerator[str, None]:
+        backup_calls.append("stream")
+        yield "unexpected"
+
+    primary.chat_completion = _primary_chat
+    primary.stream_chat_completion = _primary_stream
+    backup.chat_completion = _backup_chat
+    backup.stream_chat_completion = _backup_stream
+    hedged = HedgedAdapter(
+        primary=primary,
+        backup=backup,
+        hedge_threshold_sec=60.0,
+        event_sink=sink,
+        primary_priority=6,
+    )
+
+    with req_ctx.push(**{req_ctx.UPSTREAM_PRIORITY: 99}):
+        if operation == "chat":
+            await hedged.chat_completion([{"role": "user", "content": "hi"}])
+        else:
+            async for _chunk in hedged.stream_chat_completion([{"role": "user", "content": "hi"}]):
+                pass
+        assert req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY) == 99
+
+    assert seen == [6]
+    assert backup_calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("chat", "stream"))
+async def test_hedged_legs_use_their_own_priority(operation):
+    """A launched backup uses its lease priority instead of the primary's."""
+    sink = _FakeEventSink()
+    seen: list[tuple[str, Any]] = []
+    primary = _make_fake_adapter(provider="primary")
+    backup = _make_fake_adapter(provider="backup")
+    primary.config.priority_scheduling = True
+    backup.config.priority_scheduling = True
+
+    async def _primary_chat(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        seen.append(("primary", req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY)))
+        raise ConnectionError("primary failed before a response")
+
+    async def _primary_stream(*_args: Any, **_kwargs: Any) -> AsyncGenerator[str, None]:
+        seen.append(("primary", req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY)))
+        raise ConnectionError("primary failed before a response")
+        yield "unreachable"
+
+    async def _backup_chat(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        seen.append(("backup", req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY)))
+        return {"choices": [{"message": {"content": "backup"}}]}
+
+    async def _backup_stream(*_args: Any, **_kwargs: Any) -> AsyncGenerator[str, None]:
+        seen.append(("backup", req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY)))
+        yield 'data: {"choices":[{"delta":{"content":"backup"}}]}\n\n'
+        yield "data: [DONE]\n\n"
+
+    primary.chat_completion = _primary_chat
+    primary.stream_chat_completion = _primary_stream
+    backup.chat_completion = _backup_chat
+    backup.stream_chat_completion = _backup_stream
+    dispatch = CheckpointBackupDispatch(
+        backup=backup,
+        elapsed_sec=0.0,
+        metadata={"upstream_priority": 2},
+    )
+    hedged = HedgedAdapter(
+        primary=primary,
+        event_sink=sink,
+        checkpoint_backup_selector=lambda _elapsed, _timestamp: dispatch,
+        hedge_checkpoints_sec=(60.0,),
+        primary_priority=6,
+    )
+
+    with req_ctx.push(**{req_ctx.UPSTREAM_PRIORITY: 99}):
+        if operation == "chat":
+            await hedged.chat_completion([{"role": "user", "content": "hi"}])
+        else:
+            async for _chunk in hedged.stream_chat_completion([{"role": "user", "content": "hi"}]):
+                pass
+        assert req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY) == 99
+
+    assert seen == [("primary", 6), ("backup", 2)]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parallel_hedged_requests_do_not_share_primary_priority():
+    """Overlapping primary tasks retain the priority from their own request."""
+    sink = _FakeEventSink()
+    seen: dict[str, Any] = {}
+    both_started = asyncio.Event()
+    arrivals = 0
+
+    def _hedged(provider: str, priority: int) -> HedgedAdapter:
+        adapter = _make_fake_adapter(provider=provider)
+        adapter.config.priority_scheduling = True
+
+        async def _chat(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            nonlocal arrivals
+            arrivals += 1
+            if arrivals == 2:
+                both_started.set()
+            await both_started.wait()
+            seen[provider] = req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY)
+            return {"choices": [{"message": {"content": provider}}]}
+
+        adapter.chat_completion = _chat
+        return HedgedAdapter(
+            primary=adapter,
+            event_sink=sink,
+            checkpoint_backup_selector=lambda _elapsed, _timestamp: None,
+            primary_priority=priority,
+        )
+
+    first = _hedged("first", 6)
+    second = _hedged("second", 2)
+    with req_ctx.push(**{req_ctx.UPSTREAM_PRIORITY: 99}):
+        await asyncio.gather(
+            first.chat_completion([{"role": "user", "content": "one"}]),
+            second.chat_completion([{"role": "user", "content": "two"}]),
+        )
+        assert req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY) == 99
+
+    assert seen == {"first": 6, "second": 2}
 
     @pytest.mark.asyncio
     async def test_stream_losing_backup_releases_capacity_when_close_is_cancelled(self):

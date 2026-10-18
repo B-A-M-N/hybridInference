@@ -126,6 +126,7 @@ def _make_model_config(
     cfg.id = model_id
     cfg.provider = provider
     cfg.provider_type = provider_type
+    cfg.priority_scheduling = False
     cfg.endpoint_id = endpoint_id or f"{model_id}:{provider}:{next(_ADAPTER_COUNTER)}"
     # Concrete (JSON-serializable) base_url so the synthetic _routing chunk
     # emitted by FixedRouter.stream_chat_completion can be json.dumps()'d.
@@ -4002,6 +4003,7 @@ class TestUpstreamPriority:
     async def test_disabled_dispatch_publishes_no_priority(self, operation):
         seen: list[Any] = []
         adapter = _make_adapter(provider="sglang", endpoint_id="test-model:local-8003")
+        adapter.config.priority_scheduling = False
         adapter.reports_leg_outcomes = False
 
         async def _chat(messages, **params):
@@ -4037,6 +4039,87 @@ class TestUpstreamPriority:
     @pytest.mark.unit
     @pytest.mark.asyncio
     @pytest.mark.parametrize("operation", ("chat", "stream"))
+    async def test_priority_dispatch_is_independent_of_lp_routing(self, operation):
+        seen: list[Any] = []
+        adapter = _make_adapter(provider="sglang", endpoint_id="test-model:priority-only")
+        adapter.config.priority_scheduling = True
+        adapter.reports_leg_outcomes = False
+
+        async def _chat(messages, **params):
+            seen.append(req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY))
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        async def _stream(messages, **params):
+            seen.append(req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY))
+            yield json.dumps({"choices": [{"delta": {"content": "ok"}}]})
+
+        adapter.chat_completion = _chat
+        adapter.stream_chat_completion = _stream
+        router = RouteWiseRouter(
+            config=RouteWiseConfig(
+                db_bootstrap_enabled=False,
+                prefill_load_routing_enabled=False,
+            )
+        )
+
+        with (
+            patch.object(routewise_router_module, "estimate_prefill_tokens", return_value=200_000),
+            req_ctx.push(**{req_ctx.UPSTREAM_PRIORITY: 99}),
+        ):
+            if operation == "chat":
+                await router._execute_adapter(
+                    _unreserved_decision(adapter), "test-model", [{"role": "user", "content": "x"}]
+                )
+            else:
+                async for _chunk in router._execute_stream_adapter(
+                    _unreserved_decision(adapter),
+                    "test-model",
+                    [{"role": "user", "content": "x"}],
+                ):
+                    pass
+
+            assert req_ctx.get().get(req_ctx.UPSTREAM_PRIORITY) == 99
+
+        assert seen == [PRIORITY_ELEPHANT]
+
+    @pytest.mark.unit
+    def test_default_off_route_skips_prompt_anchor_work(self):
+        adapter = _make_adapter(provider="sglang", endpoint_id="test-model:default-off")
+        route_table = _FakeRouteTable()
+        route_table.add("test-model", [(adapter, 1.0)])
+        router = RouteWiseRouter(
+            route_table=route_table,
+            config=RouteWiseConfig(
+                db_bootstrap_enabled=False,
+                prefill_load_routing_enabled=False,
+            ),
+        )
+        messages = [{"role": "user", "content": "x" * 4000}]
+
+        with (
+            patch.object(
+                routewise_router_module,
+                "conversation_fingerprint",
+                side_effect=AssertionError("default-off route hashed the conversation"),
+            ),
+            patch.object(
+                routewise_router_module,
+                "prompt_anchor",
+                side_effect=AssertionError("default-off route computed a prompt anchor"),
+            ),
+        ):
+            decision = router._select_decision(
+                "test-model",
+                {"messages": messages, "params": {}},
+                reserve_prefill=True,
+            )
+
+        assert decision is not None
+        assert decision.prefill_lease is None
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ("chat", "stream"))
     @pytest.mark.parametrize(
         ("estimated_tokens", "expected_priority"),
         (
@@ -4049,6 +4132,7 @@ class TestUpstreamPriority:
     ):
         seen: list[Any] = []
         adapter = _make_adapter(provider="sglang", endpoint_id="test-model:local-8003")
+        adapter.config.priority_scheduling = True
         adapter.reports_leg_outcomes = False
 
         async def _chat(messages, **params):
@@ -4096,6 +4180,7 @@ class TestUpstreamPriority:
     async def test_warm_continuation_uses_uncached_delta(self, operation):
         seen: list[Any] = []
         adapter = _make_adapter(provider="sglang", endpoint_id="test-model:local-8003")
+        adapter.config.priority_scheduling = True
         adapter.reports_leg_outcomes = False
 
         async def _chat(messages, **params):
@@ -4151,6 +4236,7 @@ class TestUpstreamPriority:
     async def test_same_api_key_different_conversation_stays_cold(self):
         seen: list[Any] = []
         adapter = _make_adapter(provider="sglang", endpoint_id="test-model:local-8003")
+        adapter.config.priority_scheduling = True
         adapter.reports_leg_outcomes = False
 
         async def _chat(messages, **params):
@@ -4195,6 +4281,8 @@ class TestUpstreamPriority:
         fallback_endpoint = "test-model:priority-fallback"
         primary = _make_adapter(provider="sglang", endpoint_id=primary_endpoint)
         fallback = _make_adapter(provider="sglang", endpoint_id=fallback_endpoint)
+        primary.config.priority_scheduling = True
+        fallback.config.priority_scheduling = True
         primary.reports_leg_outcomes = False
         fallback.reports_leg_outcomes = False
         route_table = _FakeRouteTable()
@@ -4512,6 +4600,7 @@ class TestPrefillLoadPenalty:
 
         endpoint_id = "test-model:queued-prefill"
         adapter = _make_adapter(endpoint_id=endpoint_id)
+        adapter.config.priority_scheduling = True
         route_table = _FakeRouteTable()
         route_table.add("test-model", [(adapter, 1.0)])
         router = RouteWiseRouter(
@@ -5484,3 +5573,119 @@ def test_direct_fallback_waits_for_shared_selection_transaction():
         assert dispatch_future.result(timeout=2.0) == {"choices": [{"message": {"content": "ok"}}]}
 
     assert shared_prefill.backlog("test-model:shared-prefill") == 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("chat", "stream"))
+async def test_fixed_fallback_prefill_acquire_uses_routing_transaction(monkeypatch, operation):
+    """Fallback admission waits for the shared route snapshot/lease transaction."""
+    router = FixedRouter()
+    tracker = PrefillLoadTracker()
+    router._prefill_load = tracker
+    primary_endpoint = "test-model:primary"
+    fallback_endpoint = "test-model:fallback"
+    primary = _make_adapter(endpoint_id=primary_endpoint)
+    fallback = _make_adapter(endpoint_id=fallback_endpoint)
+    router.register_route("test-model", [(primary, 1.0), (fallback, 1.0)])
+    monkeypatch.setattr(
+        router,
+        "_select_and_claim_adapter",
+        lambda *_args, **_kwargs: (primary, None),
+    )
+
+    primary_started = threading.Event()
+    transaction_held = threading.Event()
+    fallback_failed_primary = threading.Event()
+    fallback_transaction_requested = threading.Event()
+    fallback_acquire_attempted = threading.Event()
+    fallback_acquired = threading.Event()
+    release_time: list[float] = []
+    acquire_time: list[float] = []
+    original_transaction = tracker.routing_transaction
+    original_acquire = tracker.acquire
+
+    async def _primary_failure(*_args: Any, **_kwargs: Any):
+        primary_started.set()
+        assert await asyncio.to_thread(transaction_held.wait, 2)
+        fallback_failed_primary.set()
+        raise ConnectionError("primary failed before a response")
+
+    primary.chat_completion = _primary_failure
+
+    async def _primary_stream(*_args: Any, **_kwargs: Any):
+        primary_started.set()
+        assert await asyncio.to_thread(transaction_held.wait, 2)
+        fallback_failed_primary.set()
+        raise ConnectionError("primary failed before a response")
+        yield "unreachable"
+
+    primary.stream_chat_completion = _primary_stream
+
+    async def _fallback_chat(*_args: Any, **_kwargs: Any):
+        return {"choices": [{"message": {"content": "fallback"}}]}
+
+    fallback.chat_completion = _fallback_chat
+
+    async def _fallback_stream(*_args: Any, **_kwargs: Any):
+        yield 'data: {"choices":[{"delta":{"content":"fallback"}}]}\n\n'
+        yield "data: [DONE]\n\n"
+
+    fallback.stream_chat_completion = _fallback_stream
+
+    @contextlib.contextmanager
+    def _observed_transaction():
+        if fallback_failed_primary.is_set():
+            fallback_transaction_requested.set()
+        with original_transaction():
+            yield
+
+    def _observed_acquire(endpoint_id: str, *args: Any, **kwargs: Any):
+        if endpoint_id == fallback_endpoint and fallback_failed_primary.is_set():
+            fallback_acquire_attempted.set()
+            lease = original_acquire(endpoint_id, *args, **kwargs)
+            acquire_time.append(time.monotonic())
+            fallback_acquired.set()
+            return lease
+        return original_acquire(endpoint_id, *args, **kwargs)
+
+    monkeypatch.setattr(tracker, "routing_transaction", _observed_transaction)
+    monkeypatch.setattr(tracker, "acquire", _observed_acquire)
+
+    def _hold_route_transaction_until_fallback():
+        assert primary_started.wait(2)
+        with original_transaction():
+            transaction_held.set()
+            deadline = time.monotonic() + 2
+            while not (
+                fallback_transaction_requested.is_set() or fallback_acquire_attempted.is_set()
+            ):
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.001)
+            release_time.append(time.monotonic())
+
+    holder = threading.Thread(target=_hold_route_transaction_until_fallback, daemon=True)
+    holder.start()
+
+    if operation == "chat":
+        result = await asyncio.wait_for(
+            router.chat_completion("test-model", [{"role": "user", "content": "hello"}]),
+            timeout=3,
+        )
+        assert result["choices"][0]["message"]["content"] == "fallback"
+    else:
+        chunks = [
+            chunk
+            async for chunk in router.stream_chat_completion(
+                "test-model", [{"role": "user", "content": "hello"}]
+            )
+        ]
+        assert any('"fallback": true' in chunk for chunk in chunks)
+
+    await asyncio.to_thread(holder.join, 2)
+    assert not holder.is_alive()
+    assert fallback_transaction_requested.is_set()
+    assert fallback_acquire_attempted.is_set()
+    assert fallback_acquired.is_set()
+    assert release_time and acquire_time and acquire_time[0] >= release_time[0]
