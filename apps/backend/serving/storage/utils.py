@@ -634,9 +634,16 @@ def calculate_cost(
         return None
 
     try:
-        prompt_tokens = float(usage.get("prompt_tokens", 0))
-        completion_tokens = float(usage.get("completion_tokens", 0))
-        reasoning_tokens = float(usage.get("reasoning_tokens", 0))
+        # Treat every token field uniformly: an explicit ``None`` (provider
+        # reported the key with no value) means "not reported" and coerces to
+        # 0 for billing, exactly like an absent key, instead of raising
+        # ``TypeError`` on ``float(None)``.
+        prompt_raw = usage.get("prompt_tokens")
+        prompt_tokens = float(prompt_raw) if prompt_raw is not None else 0.0
+        completion_raw = usage.get("completion_tokens")
+        completion_tokens = float(completion_raw) if completion_raw is not None else 0.0
+        reasoning_raw = usage.get("reasoning_tokens")
+        reasoning_tokens = float(reasoning_raw) if reasoning_raw is not None else 0.0
         total_raw = usage.get("total_tokens")
         total_tokens = float(total_raw) if total_raw is not None else None
         # ``None`` (or absent) means the provider did not report cache usage,

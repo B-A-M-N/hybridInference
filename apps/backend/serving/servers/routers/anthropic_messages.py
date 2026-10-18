@@ -79,6 +79,7 @@ from serving.storage.utils import calculate_cost
 from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
 from serving.utils.request_ip import derive_affinity_key, get_client_ip_info
+from serving.utils.token_utils import optional_token_count
 from serving.utils.session_identity import consume_session_fields, session_identity
 from serving.utils.tokens import estimate_prompt_tokens, estimate_text_tokens
 
@@ -996,21 +997,30 @@ def _schedule_log_store_task(
         metadata = {**(metadata or {}), "operator_error": operator_error}
     input_tokens = int(usage.get("input_tokens", 0) or 0)
     output_tokens = int(usage.get("output_tokens", 0) or 0)
-    cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
-    cache_write = int(usage.get("cache_creation_input_tokens", 0) or 0)
-    prompt_tokens = input_tokens + cache_read + cache_write
+    # ``None`` means the upstream reported no cache usage, which is distinct
+    # from a reported 0 (a measured miss). Preserve that distinction here so
+    # the api_logs ``cache_read_tokens`` / ``cache_write_tokens`` columns stay
+    # NULL for an unreported value instead of being persisted as a fabricated
+    # 0; :func:`calculate_cost` already coerces ``None`` to 0 for billing.
+    cache_read = optional_token_count(usage.get("cache_read_input_tokens"))
+    cache_write = optional_token_count(usage.get("cache_creation_input_tokens"))
+    prompt_tokens = input_tokens + (cache_read or 0) + (cache_write or 0)
     total_tokens = prompt_tokens + output_tokens
     prompt_for_log: list[dict[str, Any]] | str = prompt if prompt is not None else []
 
     # OpenAI-shaped usage, shared verbatim by the api_logs row and the quota
     # counter increment below so the logged cost_usd and the billed amount agree.
+    # Cache keys are omitted entirely when the provider did not report them, so
+    # the columns are stored NULL (unknown) rather than 0 (measured miss).
     usage_for_cost = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": output_tokens,
         "total_tokens": total_tokens,
-        "cache_read_tokens": cache_read,
-        "cache_write_tokens": cache_write,
     }
+    if cache_read is not None:
+        usage_for_cost["cache_read_tokens"] = cache_read
+    if cache_write is not None:
+        usage_for_cost["cache_write_tokens"] = cache_write
 
     async def _log() -> None:
         try:
