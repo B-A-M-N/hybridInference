@@ -160,9 +160,9 @@ _TRANSIENT_MARKERS: tuple[re.Pattern[str], ...] = tuple(
 
 def _looks_transient_text(text: str) -> bool:
     """Return whether *text* is a short response that starts with a warmup marker."""
-    stripped = text.strip()
-    if len(stripped) > _TRANSIENT_TEXT_MAX_CHARS:
+    if len(text) > _TRANSIENT_TEXT_MAX_CHARS:
         return False
+    stripped = text.strip()
     return any(marker.match(stripped) for marker in _TRANSIENT_MARKERS)
 
 
@@ -242,14 +242,15 @@ def classify_completion_outcome(
     if not terminal:
         return CompletionOutcome.ABORTED
 
-    text = (content or "").strip()
+    text = content or ""
 
     # 1. Structured provider signal first: transient text beats everything else.
-    if text and _looks_transient_text(text):
-        return CompletionOutcome.TRANSIENT_NO_PROGRESS
+    if text and not text.isspace():
+        if _looks_transient_text(text):
+            return CompletionOutcome.TRANSIENT_NO_PROGRESS
 
-    # 2. Genuine content.
-    if text:
+        # 2. Genuine content. Warmup detection is bounded to short responses;
+        # large answers do not incur a full-body trim or repeated regex scan.
         return CompletionOutcome.PROGRESS
 
     # 3. No content. If the provider reported output tokens, something was
