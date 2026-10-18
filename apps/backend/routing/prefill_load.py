@@ -652,9 +652,10 @@ class PrefillLease:
 class PrefillLoadTracker:
     """Per-endpoint in-flight prefill accounting and load-aware selection.
 
-    Thread safety: all mutable state is guarded by a single lock. Critical
-    sections do no I/O and hold no awaits, matching the router-owned lock
-    pattern used elsewhere in ``routing/``.
+    Thread safety: ``_lock`` protects the accounting maps, while
+    ``_routing_lock`` serializes a route's load snapshot and lease reservation
+    across routers that share this tracker. Routing transactions contain only
+    synchronous local work; no upstream I/O or await is allowed inside them.
 
     What is counted is *un-cached* prefill, not prompt size. Nearly all large
     prompts here are warm continuations -- the production fleet runs above 90%
