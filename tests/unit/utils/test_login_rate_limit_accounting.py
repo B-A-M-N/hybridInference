@@ -154,15 +154,15 @@ async def test_login_bucket_key_cardinality_is_bounded_and_new_keys_still_admit(
     monkeypatch,
 ):
     # A full attacker-populated map must not fail closed: map saturation is
-    # not a global login denial of service. The oldest entry is evicted to
-    # make room, so a new identity keeps the ordinary per-account allowance.
+    # not a global login denial of service. New identities use bounded
+    # overflow accounting, so a live identity is never evicted to make room.
     now = [3_000.0]
     monkeypatch.setattr(limiter, "_now", lambda: now[0])
     monkeypatch.setattr(limiter, "_MAX_ACTIVE_BUCKETS", 2)
 
     assert await limiter.check_and_record_login("first", "198.51.100.1") == (True, None)
     assert await limiter.check_and_record_login("second", "198.51.100.2") == (True, None)
-    # Third identity: the maps evict the oldest entry instead of refusing.
+    # Third identity: the maps use bounded overflow instead of refusing.
     assert await limiter.check_and_record_login("third", "198.51.100.3") == (True, None)
     assert len(limiter._account_address_attempts) <= 2
     assert len(limiter._account_attempts) <= 2
@@ -173,10 +173,31 @@ async def test_login_bucket_key_cardinality_is_bounded_and_new_keys_still_admit(
     assert await limiter.check_and_record_login("fourth", "198.51.100.4") == (True, None)
     assert len(limiter._account_address_attempts) <= 2
 
-    # The evicted "first" identity behaves as a fresh identity: it is not
-    # refused merely because the map had been full.
+    # After its old window expires, "first" is admitted with a fresh window.
     now[0] += 3_601
     assert await limiter.check_and_record_login("first", "198.51.100.1") == (True, None)
+
+
+@pytest.mark.asyncio
+async def test_primary_map_overflow_collisions_are_conservative_and_bounded(monkeypatch):
+    """Distinct saturated keys sharing a hash slot remain accounted."""
+    monkeypatch.setattr(settings, "login_rate_limit_per_15min", 1)
+    monkeypatch.setattr(limiter, "_MAX_ACTIVE_BUCKETS", 1)
+    monkeypatch.setattr(limiter, "_OVERFLOW_BUCKET_COUNT", 1)
+
+    assert await limiter.check_and_record_login("resident", OWNER) == (True, None)
+    assert await limiter.check_and_record_login("overflow-a", ATTACKER) == (True, None)
+
+    # Every overflow identity hashes to the same bounded slot. It is
+    # conservatively rate limited after the first identity used that slot.
+    assert await limiter.check_and_record_login("overflow-b", "192.0.2.18") == (
+        False,
+        "email",
+    )
+    assert len(limiter._account_address_attempts) == 1
+    assert len(limiter._account_attempts) == 1
+    assert len(limiter._ip_attempts) == 1
+    assert len(limiter._overflow_attempts) <= 3
 
 
 @pytest.mark.asyncio
