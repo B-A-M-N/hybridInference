@@ -10,6 +10,8 @@ response body and no outcome argument at all, because that is how
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from routing.completion_outcome import CompletionOutcome
@@ -74,10 +76,43 @@ class TestProductionPathSuppliesOutcome:
 
     def test_warmup_notice_is_not_progress(self):
         """A 200 whose only content is a warmup notice is not useful work."""
-        obs = _observe(response_body=_body(WARMUP_NOTICE))
+        obs = _observe(response_body=_body(WARMUP_NOTICE), completion_tokens=20)
         assert obs.success is True, "transport did succeed"
         assert obs.outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
         assert obs.admits_real_work is False
+
+    def test_non_streaming_handler_passes_response_body_to_the_classifier(self):
+        """The non-streaming handler must forward a warmup body with positive tokens."""
+        captured: dict[str, Any] = {}
+
+        def _record(active_router, model_id, routing, **kwargs):
+            captured.update(kwargs)
+
+        logger = CompletionsLogger(log_store=None)
+        logger.record_routing_observation = _record  # type: ignore[method-assign]
+
+        response = _body(WARMUP_NOTICE)
+        logger.record_routing_observation(
+            object(),
+            "m1",
+            None,
+            request_id="req-nonstream-body",
+            ttft_ms=None,
+            total_latency_ms=10.0,
+            prompt_tokens=10,
+            completion_tokens=20,
+            success=True,
+            cached_tokens=None,
+            response_body=response,
+        )
+
+        assert captured["response_body"] is response
+        outcome = CompletionsLogger.classify_outcome(
+            success=True,
+            response_body=captured["response_body"],
+            usage={"completion_tokens": 20},
+        )
+        assert outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
 
     def test_real_answer_admits_work(self):
         obs = _observe(response_body=_body(REAL_ANSWER))
