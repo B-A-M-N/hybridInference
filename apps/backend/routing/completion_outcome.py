@@ -88,16 +88,20 @@ class CompletionOutcome(str, Enum):
 #: Provider warmup / placeholder notices. Patterns, not a hard dependency on any
 #: one provider's wording; deployments can extend ``register_transient_markers``
 #: without touching the classification logic.
+#: Warmup notices are short provider boilerplate. Match only near the start of
+#: a bounded response so a genuine answer that merely mentions warmup (e.g. an
+#: agent writing a UI string) is not misclassified.
+_TRANSIENT_TEXT_MAX_CHARS = 200
 _DEFAULT_TRANSIENT_MARKERS: tuple[str, ...] = (
-    r"the model is starting up",
-    r"model is starting up",
-    r"model is warming up",
-    r"warming up the model",
-    r"model is loading,? please wait",
-    r"loading the model,? please wait",
-    r"please wait while the model (loads|starts)",
-    r"the model is not ready",
-    r"model is initializing",
+    r"^the model is starting up",
+    r"^model is starting up",
+    r"^model is warming up",
+    r"^warming up the model",
+    r"^model is loading,? please wait",
+    r"^loading the model,? please wait",
+    r"^please wait while the model (loads|starts)",
+    r"^the model is not ready",
+    r"^model is initializing",
 )
 
 _TRANSIENT_MARKERS: list[re.Pattern[str]] = [
@@ -115,7 +119,11 @@ def register_transient_marker(pattern: str) -> None:
 
 
 def _looks_transient_text(text: str) -> bool:
-    return any(marker.search(text) for marker in _TRANSIENT_MARKERS)
+    """Return whether *text* is a short response that starts with a warmup marker."""
+    stripped = text.strip()
+    if len(stripped) > _TRANSIENT_TEXT_MAX_CHARS:
+        return False
+    return any(marker.search(stripped) for marker in _TRANSIENT_MARKERS)
 
 
 def _output_token_count(usage: dict[str, Any] | None) -> int | None:

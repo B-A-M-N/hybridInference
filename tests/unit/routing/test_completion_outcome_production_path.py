@@ -10,6 +10,8 @@ response body and no outcome argument at all, because that is how
 
 from __future__ import annotations
 
+import pytest
+
 from routing.completion_outcome import CompletionOutcome
 from routing.routers import RoutingObservation
 from serving.servers.routers.completions_logging import CompletionsLogger
@@ -117,3 +119,36 @@ class TestUnclassifiedObservationIsInert:
         )
         assert obs.success is True
         assert obs.admits_real_work is False
+
+
+class TestWarmupMarkerAnchoring:
+    """The warmup regex must not flag genuine answers that mention warmup."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Applied the fix. Note that the model is initializing on cold start.",
+            'UI copy: "Model is loading, please wait..." with a progress spinner.',
+            "That vLLM error means the model is not ready yet; retry after it loads.",
+            "I wrote a function that retries while the model is warming up.",
+        ],
+    )
+    def test_long_or_mid_text_containing_warmup_is_progress(self, text):
+        from routing.completion_outcome import CompletionOutcome, classify_completion_outcome
+
+        outcome = classify_completion_outcome(content=text, http_status=200, terminal=True)
+        assert outcome is CompletionOutcome.PROGRESS, text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "The model is starting up - this takes about 120 seconds. Please wait...",
+            "Model is warming up.",
+            "model is initializing...",
+        ],
+    )
+    def test_short_leading_warmup_is_transient(self, text):
+        from routing.completion_outcome import CompletionOutcome, classify_completion_outcome
+
+        outcome = classify_completion_outcome(content=text, http_status=200, terminal=True)
+        assert outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS, text
