@@ -14,7 +14,7 @@ from serving.config.site_identity import get_site_identity
 if TYPE_CHECKING:
     from serving.config.runtime_settings import RuntimeSettings
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
 from serving.exceptions import (
     UserNotFoundError,
@@ -34,6 +34,8 @@ from serving.schemas_auth import (
     ChangePasswordResponse,
     LLMProberLayoutResponse,
     LLMProberLayoutState,
+    LocalePreference,
+    LocalePreferenceUpdate,
     QuotaInfo,
     RecentRequestItem,
     RecentRequestsResponse,
@@ -59,8 +61,10 @@ from serving.servers.deps import (
     get_router,
 )
 from serving.servers.routers.models import _build_model_list_async
+from serving.servers.routers.reauth import confirm_account_owner
 from serving.storage.utils import coerce_json_object
 from serving.utils import password as password_utils
+from serving.utils.email import is_email_enabled, send_password_changed_email
 from serving.utils.logging import get_logger
 from serving.utils.phone_auth import phone_identity_unverified
 from serving.utils.request_ip import get_client_ip
@@ -68,6 +72,7 @@ from serving.utils.request_ip import get_client_ip
 router = APIRouter(prefix="/user", tags=["User Dashboard"])
 logger = get_logger(__name__)
 LLM_PROBER_LAYOUT_KEY = "llm_prober_layout"
+LOCALE_PREFERENCE_KEY = "locale"
 
 
 def _quota_contact() -> str:
@@ -180,6 +185,34 @@ def _extract_llm_prober_layout(preferences: dict[str, Any]) -> LLMProberLayoutSt
         return LLMProberLayoutState()
 
 
+def _extract_locale_preference(preferences: dict[str, Any]) -> LocalePreference | None:
+    """Parse the stored interface language, or ``None`` when there is none to show.
+
+    A value this build cannot render (a language since removed, a malformed
+    entry) reads as "never chose", so the console falls back to the browser's
+    language instead of failing the profile request.
+    """
+    raw = preferences.get(LOCALE_PREFERENCE_KEY)
+    if raw is None:
+        return None
+    try:
+        return LocalePreference.model_validate(raw)
+    except Exception:
+        return None
+
+
+def _as_utc(moment: datetime) -> datetime:
+    """Return *moment* as an aware UTC datetime; a naive one is taken as UTC."""
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def _iso_utc(moment: datetime) -> str:
+    """ISO 8601 in UTC with a fixed width, e.g. ``2026-10-17T08:00:00.000000Z``."""
+    return _as_utc(moment).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 async def get_default_daily_quota_for_role(
     role: str,
     runtime_settings: "RuntimeSettings | None",
@@ -269,12 +302,14 @@ async def get_current_user_info(
         phone_verified=user_row.get("phone_verified", False),
         has_password=bool(user_row.get("password_hash")),
         user_name=user_row["user_name"],
+        avatar_url=await op_store.get_user_avatar(user_row["id"]),
         role=user_row["role"] or "free",
         status=user_row["status"],
         email_verified=user_row["email_verified"],
         is_admin=current_user.get("is_admin", False),
         created_at=user_row["created_at"],
         last_login_at=user_row["last_login_at"],
+        locale=_extract_locale_preference(_coerce_preferences(user_row.get("preferences"))),
     )
 
 
@@ -326,12 +361,10 @@ async def update_llm_prober_layout(
     if not op_store:
         raise HTTPException(status_code=500, detail="Database not available")
 
-    preferences = await op_store.get_user_preferences(current_user["user_id"])
-    if not preferences and not await op_store.get_user_by_id(current_user["user_id"]):
+    if not await op_store.set_user_preference(
+        current_user["user_id"], LLM_PROBER_LAYOUT_KEY, body.model_dump()
+    ):
         raise UserNotFoundError(current_user["user_id"])
-
-    preferences[LLM_PROBER_LAYOUT_KEY] = body.model_dump()
-    await op_store.update_user_preferences(current_user["user_id"], preferences)
 
     logger.info("llm_prober_layout_updated user_id=%s", current_user["user_id"])
     return LLMProberLayoutResponse(layout=body)
@@ -346,15 +379,55 @@ async def reset_llm_prober_layout(
     if not op_store:
         raise HTTPException(status_code=500, detail="Database not available")
 
-    preferences = await op_store.get_user_preferences(current_user["user_id"])
-    if not preferences and not await op_store.get_user_by_id(current_user["user_id"]):
+    if not await op_store.delete_user_preference(current_user["user_id"], LLM_PROBER_LAYOUT_KEY):
         raise UserNotFoundError(current_user["user_id"])
-
-    preferences.pop(LLM_PROBER_LAYOUT_KEY, None)
-    await op_store.update_user_preferences(current_user["user_id"], preferences)
 
     logger.info("llm_prober_layout_reset user_id=%s", current_user["user_id"])
     return LLMProberLayoutResponse(layout=LLMProberLayoutState())
+
+
+@router.put("/preferences/locale", response_model=LocalePreference)
+async def update_locale_preference(
+    body: LocalePreferenceUpdate,
+    current_user=Depends(get_current_user),
+    op_store=Depends(get_operational_store),
+) -> LocalePreference:
+    """Store the account's interface language; the most recent choice wins.
+
+    A choice carried in from a signed-out browser keeps the time it was made,
+    never later than now. If the account already holds a choice at least as
+    recent — made on another browser meanwhile — that one is kept and
+    returned, and the console shows it instead. The comparison happens in the
+    database, in the same statement as the write, so overlapping requests
+    cannot leave the older choice stored; and only this one key is written,
+    so the account's other preferences are untouched.
+    """
+    if not op_store:
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    user_id = current_user["user_id"]
+    now = datetime.now(timezone.utc)
+    chosen_at = now if body.chosen_at is None else min(_as_utc(body.chosen_at), now)
+    choice = LocalePreference(value=body.locale, chosen_at=chosen_at)
+    value = {"value": choice.value, "chosen_at": _iso_utc(chosen_at)}
+
+    stored = await op_store.set_user_preference_if_newer(
+        user_id, LOCALE_PREFERENCE_KEY, value, chosen_at
+    )
+    if stored is None:
+        raise UserNotFoundError(user_id)
+
+    kept = _extract_locale_preference({LOCALE_PREFERENCE_KEY: stored})
+    if kept is None:
+        # A newer entry this build cannot read (written outside the API) is
+        # "no choice" everywhere else; replace it rather than report it.
+        await op_store.set_user_preference(user_id, LOCALE_PREFERENCE_KEY, value)
+        kept = choice
+
+    logger.info(
+        "locale_preference_updated user_id=%s locale=%s kept=%s", user_id, body.locale, kept.value
+    )
+    return kept
 
 
 @router.post("/api-keys", response_model=APIKeyResponse, status_code=201)
@@ -802,6 +875,9 @@ async def update_profile(
             current_user["user_id"], user_name=update_data["user_name"]
         )
 
+    if "avatar_url" in update_data:
+        await op_store.set_user_avatar(current_user["user_id"], update_data["avatar_url"] or None)
+
     user_row = await op_store.get_user_by_id(current_user["user_id"])
     if not user_row:
         raise HTTPException(status_code=404, detail="User not found")
@@ -816,6 +892,7 @@ async def update_profile(
         phone_verified=user_row.get("phone_verified", False),
         has_password=bool(user_row.get("password_hash")),
         user_name=user_row["user_name"],
+        avatar_url=await op_store.get_user_avatar(user_row["id"]),
         role=user_row["role"] or "free",
         status=user_row["status"],
         email_verified=user_row["email_verified"],
@@ -827,13 +904,20 @@ async def update_profile(
 
 @router.post("/change-password", response_model=ChangePasswordResponse)
 async def change_password(
+    request: Request,
     body: ChangePasswordRequest,
+    background_tasks: BackgroundTasks,
     current_user=Depends(get_current_user),
     op_store=Depends(get_operational_store),
 ) -> ChangePasswordResponse:
-    """Change password for logged-in user.
+    """Change the signed-in account's password, or give it a first one.
 
-    Requires old password verification for security.
+    An account with a password must give it, and the attempt counts against
+    the login rate limit. One without (a phone account) must give a
+    ``set_password`` code sent to its verified phone.
+
+    Every other session of the account is then revoked, as a password reset
+    does, and its verified email is told.
     """
     if not op_store:
         raise HTTPException(status_code=500, detail="Database not available")
@@ -846,23 +930,42 @@ async def change_password(
     if not user_row:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if not user_row.get("password_hash"):
-        raise HTTPException(400, "This account uses phone verification and has no password.")
-
-    if not password_utils.verify_password(body.old_password, user_row["password_hash"]):
-        raise HTTPException(status_code=400, detail="Current password is incorrect.")
-
-    if body.new_password == body.old_password:
+    first_password = not user_row.get("password_hash")
+    # The current password, or for a first password (a new way in, which the
+    # session alone cannot add) a code sent to the account's phone.
+    await confirm_account_owner(
+        request,
+        op_store,
+        user_row,
+        password=body.old_password,
+        phone_code=body.phone_code,
+        purpose="set_password",
+    )
+    if not first_password and body.new_password == body.old_password:
         raise HTTPException(
             status_code=400, detail="New password must be different from current password."
         )
 
     new_password_hash = password_utils.hash_password(body.new_password)
     await op_store.update_user_fields(current_user["user_id"], password_hash=new_password_hash)
+    # Whoever else holds a session (the reason to change a password, often)
+    # loses it; this one stays signed in.
+    revoked = await op_store.revoke_user_sessions(
+        current_user["user_id"], except_sid=current_user.get("sid")
+    )
 
-    logger.info(f"Password changed for user: {current_user['user_id']}")
+    if user_row.get("email") and user_row.get("email_verified") and is_email_enabled():
+        background_tasks.add_task(
+            send_password_changed_email, user_row["email"], first_password=first_password
+        )
 
-    return ChangePasswordResponse(message="Password changed successfully.")
+    logger.info(
+        f"Password changed for user: {current_user['user_id']} (revoked {revoked} other sessions)"
+    )
+
+    return ChangePasswordResponse(
+        message="Password changed successfully. Other devices have been signed out."
+    )
 
 
 @router.get("/recent-requests", response_model=RecentRequestsResponse)

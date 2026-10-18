@@ -8,6 +8,8 @@ import { isSetupPath } from '@/components/features/setup/SetupGate';
 import { useAuth } from '@/components/providers';
 import { useSiteConfig } from '@/components/providers/SiteConfigProvider';
 import { publicRouteFor } from '@/site-ui/routes';
+import { useConsoleWidth } from '@/components/ui/consoleWidth';
+import { useT } from '@/components/providers/useT';
 
 /**
  * "Required settings are missing", in the console chrome.
@@ -39,10 +41,12 @@ export function ConfigurationBanner(): JSX.Element | null {
 
 function MissingConfigurationNotice(): JSX.Element | null {
   const { state } = useAuth();
+  const consoleWidth = useConsoleWidth();
+  const t = useT();
   if (!state.isAuthenticated || !state.user) return null;
 
   return (
-    <div className="mx-auto w-full max-w-5xl px-6">
+    <div className={`mx-auto w-full ${consoleWidth} px-6`}>
       <div
         role="status"
         className="w-full rounded-2xl border border-amber-200 bg-amber-50 px-5 py-3 text-sm text-amber-900 shadow-subtle"
@@ -60,8 +64,10 @@ function MissingConfigurationNotice(): JSX.Element | null {
           </p>
         ) : (
           <p>
-            This service is missing required configuration, so some features may not work. Please
-            contact your administrator.
+            {t(
+              'chrome.configuration.user_notice',
+              'This service is missing required configuration, so some features may not work. Please contact your administrator.',
+            )}
           </p>
         )}
       </div>

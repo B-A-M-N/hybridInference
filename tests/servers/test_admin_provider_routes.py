@@ -630,6 +630,7 @@ async def test_openrouter_endpoint_price_clears_inherited_schedule(monkeypatch):
     cfg = {
         "pricing": RUNTIME_PRICING,
         "pricing_schedule": {"inherited": True},
+        "pricing_source": {"provider": "deepseek", "model": "deepseek-flash"},
         "route_metadata": {},
     }
 
@@ -642,6 +643,7 @@ async def test_openrouter_endpoint_price_clears_inherited_schedule(monkeypatch):
 
     assert cfg["pricing"] == OPENROUTER_DEEPINFRA_PRICING
     assert cfg["pricing_schedule"] is None
+    assert cfg["pricing_source"] is None
 
 
 @pytest.mark.asyncio
@@ -654,6 +656,7 @@ async def test_openrouter_pricing_failure_drops_inherited_schedule(monkeypatch):
     cfg = {
         "pricing": OPENROUTER_DEEPINFRA_PRICING,
         "pricing_schedule": {"inherited": True},
+        "pricing_source": {"provider": "deepseek", "model": "deepseek-flash"},
         "route_metadata": {
             "pricing_source": "openrouter_endpoint",
             "pricing_provider": "deepinfra/fp8",
@@ -672,6 +675,7 @@ async def test_openrouter_pricing_failure_drops_inherited_schedule(monkeypatch):
     # surviving schedule would layer real per-token prices back onto those zeros.
     assert "pricing" not in cfg
     assert "pricing_schedule" not in cfg
+    assert "pricing_source" not in cfg
     assert "pricing_source" not in cfg["route_metadata"]
 
 
@@ -2080,6 +2084,8 @@ async def test_runtime_candidate_pricing_schedule_survives_restart(admin_client,
         {
             "effective_at": "2026-08-16T16:00:00Z",
             "timezone": "UTC",
+            "weekdays": [1, 2, 3, 4, 5],
+            "excluded_dates": ["2026-08-18"],
             "default": {"prompt": "0.22", "completion": "0.66"},
             "windows": [{"start": "01:00", "end": "04:00", "pricing": {"prompt": "0.44"}}],
         }
@@ -2155,6 +2161,12 @@ async def test_runtime_candidate_pricing_schedule_survives_restart(admin_client,
     assert restored_adapter.config.pricing_schedule == schedule
     assert effective_pricing(restored_adapter.config, at=_PEAK_INSTANT) == effective_pricing(
         created_adapter.config, at=_PEAK_INSTANT
+    )
+    assert (
+        effective_pricing(
+            restored_adapter.config, at=datetime(2026, 8, 18, 2, tzinfo=timezone.utc)
+        )["prompt"]
+        == "0.22"
     )
 
 

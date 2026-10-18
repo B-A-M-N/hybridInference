@@ -409,6 +409,156 @@ If you believe this was a mistake, please contact the administrator.
     )
 
 
+def send_account_deleted_email(to_email: str) -> bool:
+    """Tell an account's owner that the account was deleted from its settings.
+
+    Sent after the deletion, so someone who did not ask for it hears about it.
+
+    Args:
+        to_email: The deleted account's email address.
+
+    Returns:
+        True if email sent successfully, False otherwise.
+    """
+    identity = get_site_identity()
+    site_name = identity.name
+    subject = f"Your {site_name} account has been deleted"
+    contact = (
+        f"contact {identity.support_email}"
+        if identity.support_email
+        else "contact the administrator"
+    )
+    safe_email = html_lib.escape(to_email)
+    safe_contact = html_lib.escape(contact)
+
+    html_body = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #ef4444;">Account Deleted</h2>
+            <p>The {site_name} account {safe_email} was deleted from its account settings.
+               Its API keys were revoked and it was signed out everywhere.</p>
+            <p>If you did not do this, please {safe_contact} right away.</p>
+        </div>
+    </body>
+    </html>
+    """
+
+    text_body = f"""
+Account Deleted
+
+The {site_name} account {to_email} was deleted from its account settings.
+Its API keys were revoked and it was signed out everywhere.
+
+If you did not do this, please {contact} right away.
+    """
+
+    return send_email(to_email, subject, html_body, text_body)
+
+
+def send_email_changed_email(old_email: str, new_email: str) -> bool:
+    """Tell an account's previous address that its sign-in email was replaced.
+
+    Sent to the address that lost the account, so an owner whose session was
+    used to change it hears about it.
+
+    Args:
+        old_email: The address the account used to have.
+        new_email: The address it has now.
+
+    Returns:
+        True if email sent successfully, False otherwise.
+    """
+    identity = get_site_identity()
+    site_name = identity.name
+    subject = f"Your {site_name} sign-in email was changed"
+    contact = (
+        f"contact {identity.support_email}"
+        if identity.support_email
+        else "contact the administrator"
+    )
+    safe_old = html_lib.escape(old_email)
+    safe_new = html_lib.escape(new_email)
+    safe_contact = html_lib.escape(contact)
+
+    html_body = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #ef4444;">Sign-in Email Changed</h2>
+            <p>The {site_name} account that used {safe_old} now signs in with {safe_new}.
+               This address will no longer receive its password resets.</p>
+            <p>If you did not do this, please {safe_contact} right away.</p>
+        </div>
+    </body>
+    </html>
+    """
+
+    text_body = f"""
+Sign-in Email Changed
+
+The {site_name} account that used {old_email} now signs in with {new_email}.
+This address will no longer receive its password resets.
+
+If you did not do this, please {contact} right away.
+    """
+
+    return send_email(old_email, subject, html_body, text_body)
+
+
+def send_password_changed_email(to_email: str, *, first_password: bool = False) -> bool:
+    """Tell an account's owner that its password was changed, or first set.
+
+    Sent after a change made from a signed-in session, so an owner whose
+    session was used to do it hears about it.
+
+    Args:
+        to_email: The account's verified email address.
+        first_password: Whether the account had no password before.
+
+    Returns:
+        True if email sent successfully, False otherwise.
+    """
+    identity = get_site_identity()
+    site_name = identity.name
+    verb = "set" if first_password else "changed"
+    subject = f"Your {site_name} password was {verb}"
+    contact = (
+        f"contact {identity.support_email}"
+        if identity.support_email
+        else "contact the administrator"
+    )
+    reset_url = f"{settings.frontend_url}/forgot-password"
+    safe_contact = html_lib.escape(contact)
+    safe_reset_url = html_lib.escape(reset_url)
+
+    html_body = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #ef4444;">Password {verb.capitalize()}</h2>
+            <p>The password of your {site_name} account was {verb}.
+               Every other device signed in to it has been signed out.</p>
+            <p>If you did not do this, <a href="{safe_reset_url}">reset your password</a>
+               and {safe_contact} right away.</p>
+        </div>
+    </body>
+    </html>
+    """
+
+    text_body = f"""
+Password {verb.capitalize()}
+
+The password of your {site_name} account was {verb}.
+Every other device signed in to it has been signed out.
+
+If you did not do this, reset your password at {reset_url}
+and {contact} right away.
+    """
+
+    return send_email(to_email, subject, html_body, text_body)
+
+
 def send_new_registration_admin_email(
     to_email: str,
     user_email: str,

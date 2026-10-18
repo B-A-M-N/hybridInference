@@ -114,6 +114,19 @@ async def models_client(models_app: FastAPI) -> AsyncGenerator[AsyncClient, None
 
 
 @pytest.mark.asyncio
+async def test_unavailable_official_quote_does_not_remove_models_or_report_zero(
+    models_client, models_app
+):
+    config = models_app.state.services.router.routes["canonical-model"].adapters[0][0].config
+    config.pricing_source = {"provider": "deepseek", "model": "deepseek-flash"}
+    with req_ctx.push(pricing_snapshot=None):
+        response = await models_client.get("/v1/models")
+    assert response.status_code == 200
+    entry = next(item for item in response.json()["data"] if item["id"] == "canonical-model")
+    assert entry["pricing"] == {}
+
+
+@pytest.mark.asyncio
 async def test_models_aggregation_and_slug(models_client: AsyncClient):
     resp = await models_client.get("/v1/models")
     assert resp.status_code == status.HTTP_200_OK
@@ -265,19 +278,29 @@ async def test_models_pricing_primary_config_behavior():
 
 
 @pytest.mark.asyncio
-async def test_models_pricing_resolves_current_schedule_window():
+@pytest.mark.parametrize(
+    ("day", "expected"),
+    [
+        (17, ("0.44", "1.32", "0.014")),
+        (18, ("0.22", "0.66", "0.007")),
+        (22, ("0.22", "0.66", "0.007")),
+    ],
+)
+async def test_models_pricing_resolves_current_schedule_window(day, expected):
     router = RouteExecutor()
     adapter = _Adapter(_cfg(id="scheduled-price", provider="deepseek"))
     adapter.config.pricing = {"prompt": "0.14", "completion": "0.28"}
     adapter.config.pricing_schedule = {
         "effective_at": "2026-08-16T16:00:00Z",
         "timezone": "UTC",
-        "default": {"prompt": "0.22", "completion": "0.66"},
+        "weekdays": [1, 2, 3, 4, 5],
+        "excluded_dates": ["2026-08-18"],
+        "default": {"prompt": "0.22", "completion": "0.66", "input_cache_reads": "0.007"},
         "windows": [
             {
                 "start": "01:00",
                 "end": "04:00",
-                "pricing": {"prompt": "0.44", "completion": "1.32"},
+                "pricing": {"prompt": "0.44", "completion": "1.32", "input_cache_reads": "0.014"},
             }
         ],
     }
@@ -287,13 +310,15 @@ async def test_models_pricing_resolves_current_schedule_window():
     app.include_router(models.router)
     transport = ASGITransport(app=app)
 
-    with req_ctx.push(pricing_time=dt.datetime(2026, 8, 17, 2, tzinfo=dt.timezone.utc)):
+    with req_ctx.push(pricing_time=dt.datetime(2026, 8, day, 2, tzinfo=dt.timezone.utc)):
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/v1/models")
 
     item = next(model for model in response.json()["data"] if model["id"] == "scheduled-price")
-    assert item["pricing"]["prompt"] == "0.44"
-    assert item["pricing"]["completion"] == "1.32"
+    assert (
+        tuple(item["pricing"][key] for key in ("prompt", "completion", "input_cache_reads"))
+        == expected
+    )
 
 
 @pytest.mark.asyncio

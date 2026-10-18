@@ -4,10 +4,14 @@ import Link from 'next/link';
 import { Fragment } from 'react';
 import { BuildInfo } from '@/components/ui/BuildInfo';
 import { useBranding, useSiteConfig } from '@/components/providers/SiteConfigProvider';
+import { useT } from '@/components/providers/useT';
+import { useConsoleWidth } from '@/components/ui/consoleWidth';
 
 export function SiteFooter(): JSX.Element {
+  const consoleWidth = useConsoleWidth();
   const branding = useBranding();
   const { features } = useSiteConfig();
+  const t = useT();
 
   // Built as a list so a deployment that has no operating organization, docs
   // site or status page simply shows fewer entries — rendering an empty href
@@ -42,7 +46,7 @@ export function SiteFooter(): JSX.Element {
           target="_blank"
           rel="noopener noreferrer"
         >
-          Docs
+          {t('chrome.footer.docs', 'Docs')}
         </a>
       ),
     });
@@ -58,7 +62,7 @@ export function SiteFooter(): JSX.Element {
           target="_blank"
           rel="noopener noreferrer"
         >
-          Status
+          {t('chrome.footer.status', 'Status')}
         </a>
       ),
     });
@@ -68,7 +72,7 @@ export function SiteFooter(): JSX.Element {
     key: 'terms',
     node: (
       <Link href="/terms" prefetch={false} className="hover:text-crimson">
-        Terms
+        {t('chrome.footer.terms', 'Terms')}
       </Link>
     ),
   });
@@ -78,7 +82,7 @@ export function SiteFooter(): JSX.Element {
       key: 'stats',
       node: (
         <Link href="/stats" prefetch={false} className="hover:text-crimson">
-          Stats
+          {t('chrome.footer.stats', 'Stats')}
         </Link>
       ),
     });
@@ -89,7 +93,7 @@ export function SiteFooter(): JSX.Element {
       key: 'team',
       node: (
         <Link href="/team" prefetch={false} className="hover:text-crimson">
-          Team
+          {t('chrome.footer.team', 'Team')}
         </Link>
       ),
     });
@@ -114,7 +118,9 @@ export function SiteFooter(): JSX.Element {
   entries.push({ key: 'build', node: <BuildInfo /> });
 
   return (
-    <footer className="mx-auto w-full max-w-5xl px-6 py-6 text-center text-sm text-gray-400">
+    <footer
+      className={`mx-auto w-full ${consoleWidth} px-6 py-6 text-center text-sm text-gray-400`}
+    >
       <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1">
         {entries.map((entry, index) => (
           <Fragment key={entry.key}>

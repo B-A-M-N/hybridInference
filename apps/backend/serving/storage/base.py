@@ -121,6 +121,14 @@ class OperationalStore(ABC):
 
     # -- phone authentication (optional for legacy store implementations) ----
 
+    async def require_phone_accounts(self) -> None:  # noqa: B027
+        """Raise ``AccountSchemaPending`` while the database cannot hold phone accounts yet.
+
+        An upgrade adds the phone columns from the background when it cannot
+        get the users table's lock at startup; until then phone routes answer
+        503. The base implementation has nothing pending.
+        """
+
     async def get_user_by_phone(self, phone: str) -> Row | None:
         """Fetch an account by its canonical phone number."""
         raise RuntimeError("Phone authentication is unavailable in this store")
@@ -132,6 +140,10 @@ class OperationalStore(ABC):
     async def bind_user_phone(self, user_id: str, phone: str) -> bool:
         """Bind a verified phone atomically without replacing or merging identities."""
         raise RuntimeError("Phone authentication is unavailable in this store")
+
+    async def bind_user_email(self, user_id: str, email: str) -> bool:
+        """Bind or update a verified email atomically without merging identities."""
+        raise RuntimeError("Email binding is unavailable in this store")
 
     async def reserve_phone_code(self, **fields: Any) -> int:
         """Reserve a send within shared quotas and install an inactive challenge."""
@@ -274,11 +286,16 @@ class OperationalStore(ABC):
         admin_id: str,
         reason: str | None = None,
         email: str | None = None,
+        self_service: bool = False,
     ) -> None:
         """Soft-delete: set status='deleted', revoke keys, purge sessions/tokens.
 
         All mutations and the audit-log insert must be atomic (single
-        transaction).
+        transaction). *self_service* marks the audit entry as the account
+        owner's own deletion rather than an administrator's, and must raise
+        ``SelfDeleteRefused`` without changing anything unless the account,
+        read under the same transaction's row lock, is still active and not
+        an administrator.
         """
 
     @abstractmethod
@@ -618,6 +635,13 @@ class OperationalStore(ABC):
     async def delete_user_sessions(self, user_id: str) -> None:
         """Delete all sessions for a user (used during user deletion)."""
 
+    @abstractmethod
+    async def revoke_user_sessions(self, user_id: str, *, except_sid: str | None = None) -> int:
+        """Revoke every live session of *user_id* but the one whose sid is *except_sid*.
+
+        Returns how many sessions were revoked.
+        """
+
     # -- browser sessions ----------------------------------------------------
     #
     # A browser holds one cookie naming one browser session, and that session
@@ -664,10 +688,11 @@ class OperationalStore(ABC):
     @abstractmethod
     async def attach_browser_session_account(
         self, browser_session_id: str, *, user_id: str, auth_session_id: str
-    ) -> None:
+    ) -> bool:
         """Make *auth_session_id* the browser's session for *user_id* and its active account.
 
         Revokes the session the browser held for that account before, if any.
+        Returns False, changing nothing, when the browser session is retired.
         """
 
     @abstractmethod
@@ -680,8 +705,10 @@ class OperationalStore(ABC):
     async def detach_browser_session_account(self, browser_session_id: str, user_id: str) -> int:
         """Revoke and remove one account's session in a browser.
 
-        Clears the active account when it was this one. Returns how many
-        accounts remain signed in to the browser.
+        Clears the active account when it was this one, and retires the
+        browser session in the same transaction when no account remains, so a
+        concurrent attach either precedes it or sees the browser retired.
+        Returns how many accounts remain signed in to the browser.
         """
 
     @abstractmethod
@@ -733,6 +760,7 @@ class OperationalStore(ABC):
         token: str,
         user_id: str,
         expires_at: datetime,
+        pending_email: str | None = None,
     ) -> None:
         """Insert a new email verification token."""
 
@@ -1009,13 +1037,46 @@ class OperationalStore(ABC):
     async def get_user_preferences(self, user_id: str) -> dict[str, Any]:
         """Return the preferences JSONB column for *user_id*, parsed as dict."""
 
+    # Preferences are written one key at a time, in the database. A whole-column
+    # write from a value read earlier loses whatever another request wrote to a
+    # different key in between, so there is deliberately no such method.
+
     @abstractmethod
-    async def update_user_preferences(
+    async def set_user_preference(self, user_id: str, key: str, value: Any) -> bool:
+        """Set one preference key atomically; return False when there is no such user."""
+
+    @abstractmethod
+    async def delete_user_preference(self, user_id: str, key: str) -> bool:
+        """Remove one preference key atomically; return False when there is no such user."""
+
+    @abstractmethod
+    async def set_user_preference_if_newer(
         self,
         user_id: str,
-        preferences: dict[str, Any],
-    ) -> None:
-        """Atomically replace the full preferences JSONB column."""
+        key: str,
+        value: dict[str, Any],
+        chosen_at: datetime,
+    ) -> dict[str, Any] | None:
+        """Set a timestamped preference unless the stored one is at least as recent.
+
+        ``value`` carries its own ``chosen_at`` (ISO 8601). The comparison and
+        the write are one statement, so of two overlapping requests the more
+        recent choice is the one kept whichever lands last. Returns the value
+        now stored — this one, or the newer one already there — or ``None``
+        when there is no such user.
+        """
+
+    @abstractmethod
+    async def get_user_avatar(self, user_id: str) -> str | None:
+        """Return the user's portrait data URL, or None.
+
+        Kept out of the user row the hot paths read, so a portrait never
+        travels with an authentication lookup.
+        """
+
+    @abstractmethod
+    async def set_user_avatar(self, user_id: str, avatar_data_url: str | None) -> None:
+        """Replace the user's portrait; None removes it."""
 
     # -- signup domain allowlist --------------------------------------------
 
@@ -1088,6 +1149,17 @@ class OperationalStore(ABC):
         self, key: str, value: str, value_type: str, updated_by: str | None
     ) -> None:
         """Upsert a site_settings row."""
+
+    async def compare_and_set_setting(
+        self,
+        key: str,
+        expected: str | None,
+        value: str,
+        value_type: str,
+        updated_by: str | None,
+    ) -> bool:
+        """Publish only if the row still has *expected* (None means absent)."""
+        raise NotImplementedError("This operational store does not support atomic settings")
 
     @abstractmethod
     async def delete_setting(self, key: str) -> bool:

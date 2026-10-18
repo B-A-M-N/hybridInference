@@ -90,7 +90,9 @@ def op_store(users: dict[str, dict[str, Any]]) -> MagicMock:
     store.record_login_event = AsyncMock()
     store.update_user_last_login = AsyncMock()
     store.update_user_fields = AsyncMock()
-    store.update_user_preferences = AsyncMock()
+    store.set_user_preference = AsyncMock(return_value=True)
+    store.get_user_avatar = AsyncMock(return_value=None)
+    store.set_user_avatar = AsyncMock()
     store.create_session = AsyncMock()
     store.rotate_session = AsyncMock()
     store.get_active_key_by_account = AsyncMock(return_value=None)
@@ -221,7 +223,9 @@ class TestLogin:
     async def test_login_rate_limit_is_keyed_by_login_name(self, client, monkeypatch):
         seen: list[str] = []
 
-        async def _record(identifier: str, ip: str) -> tuple[bool, str | None]:
+        async def _record(
+            identifier: str, ip: str, *, device: str | None = None
+        ) -> tuple[bool, str | None]:
             seen.append(identifier)
             return True, None
 
