@@ -34,6 +34,7 @@ vi.mock('@/lib/api/admin', async () => {
     cache_eligible_count: 0,
     cache_hit_count: 0,
     input_tokens: 1200,
+    cache_eligible_input_tokens: 0,
     cache_read_tokens: 0,
     cache_write_tokens: 0,
   };

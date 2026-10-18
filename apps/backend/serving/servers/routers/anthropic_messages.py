@@ -1281,7 +1281,7 @@ def _accumulated_output_text(response_acc: dict | None) -> str:
 
 
 def _resolve_stream_usage(
-    request_usage: dict[str, int],
+    request_usage: dict[str, Any],
     response_acc: dict | None,
     request_payload: dict[str, Any] | None,
 ) -> tuple[dict[str, int], bool]:
@@ -1309,14 +1309,14 @@ def _resolve_stream_usage(
     Returns ``(usage, estimated)`` where ``usage`` is the Anthropic-shaped dict
     and ``estimated`` is True when any field was filled by estimation.
     """
-    base = {
+    base: dict[str, int] = {
         "input_tokens": int(request_usage.get("input_tokens", 0) or 0),
         "output_tokens": int(request_usage.get("output_tokens", 0) or 0),
-        "cache_read_input_tokens": int(request_usage.get("cache_read_input_tokens", 0) or 0),
-        "cache_creation_input_tokens": int(
-            request_usage.get("cache_creation_input_tokens", 0) or 0
-        ),
     }
+    for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        value = optional_token_count(request_usage.get(key))
+        if value is not None:
+            base[key] = value
     # Adapter flushed real usage (normal completion) -> trust it as-is.
     if base["input_tokens"] or base["output_tokens"]:
         return base, False
@@ -1330,8 +1330,13 @@ def _resolve_stream_usage(
     if isinstance(acc_usage, dict):
         for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
             value = acc_usage.get(key)
-            if isinstance(value, int) and value > 0:
-                base[key] = value
+            if key == "input_tokens":
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    base[key] = value
+            else:
+                cache_count = optional_token_count(value)
+                if cache_count is not None:
+                    base[key] = cache_count
 
     # 2. Estimate input from the request when still unknown (translator path, or
     #    a disconnect before message_start was forwarded).
@@ -1843,8 +1848,6 @@ async def anthropic_messages(
             request_usage = {
                 "input_tokens": 0,
                 "output_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
             }
             stream_failed = False
             stream_status_code: int = 200
@@ -2433,9 +2436,11 @@ async def anthropic_messages(
     usage_for_log = {
         "input_tokens": int(usage.get("input_tokens", 0)),
         "output_tokens": int(usage.get("output_tokens", 0)),
-        "cache_read_input_tokens": int(usage.get("cache_read_input_tokens", 0)),
-        "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens", 0)),
     }
+    for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        cache_count = optional_token_count(usage.get(key))
+        if cache_count is not None:
+            usage_for_log[key] = cache_count
     latency_ms = int((time.time() - start) * 1000)
     provider = adapter.config.provider
     if log_store:

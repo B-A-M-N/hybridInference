@@ -435,6 +435,7 @@ async def admin_provider_observability(
                 ), 0)::BIGINT AS input_tokens,
                 COALESCE(SUM(prompt_tokens) FILTER (
                     WHERE status_code >= 200 AND status_code < 400
+                      AND COALESCE(prompt_tokens, 0) > 0
                       AND cache_read_tokens IS NOT NULL
                 ), 0)::BIGINT AS cache_eligible_input_tokens,
                 COALESCE(SUM(cache_read_tokens) FILTER (
@@ -507,6 +508,7 @@ async def admin_provider_observability(
                     ), 0)::BIGINT AS input_tokens,
                     COALESCE(SUM(prompt_tokens) FILTER (
                         WHERE status_code >= 200 AND status_code < 400
+                          AND COALESCE(prompt_tokens, 0) > 0
                           AND cache_read_tokens IS NOT NULL
                     ), 0)::BIGINT AS cache_eligible_input_tokens
                 FROM api_logs

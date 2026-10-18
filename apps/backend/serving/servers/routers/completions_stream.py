@@ -877,6 +877,9 @@ class StreamSession:
     async def _finalize_success(self) -> None:
         """Schedule cost increment, DB log, and routing observation."""
         response_for_db = self._build_response_for_db()
+        usage_for_log = response_for_db.get("usage")
+        if usage_for_log is None:
+            usage_for_log = self._usage_data
         is_empty_completion = _is_empty_completion(response_for_db)
         if is_empty_completion:
             self._metadata["empty_completion"] = True
@@ -932,7 +935,7 @@ class StreamSession:
                     "provider": provider,
                     "prompt": self._messages,
                     "response": response_for_db,
-                    "usage": response_for_db.get("usage") or self._usage_data,
+                    "usage": usage_for_log,
                     "latency_ms": int((time.time() - self._start_time) * 1000),
                     "status_code": 200,
                     "params": self._completions_logger.build_db_params(
@@ -1105,6 +1108,9 @@ class StreamSession:
         metadata_for_log["terminal_state"] = terminal_state
 
         response_for_db = self._build_response_for_db()
+        usage_for_log = response_for_db.get("usage")
+        if usage_for_log is None:
+            usage_for_log = self._usage_data
         self._completions_logger.schedule_log(
             self._request_id,
             {
@@ -1113,7 +1119,7 @@ class StreamSession:
                 "provider": provider,
                 "prompt": self._messages,
                 "response": response_for_db,
-                "usage": response_for_db.get("usage") or self._usage_data,
+                "usage": usage_for_log,
                 "latency_ms": int((time.time() - self._start_time) * 1000),
                 "status_code": status_code,
                 "error": error_text,

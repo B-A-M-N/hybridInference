@@ -688,12 +688,13 @@ async def admin_get_ttft_scatter(
     """Return TTFT vs input length scatter data per (model, provider).
 
     For each (model_id, provider) pair, returns up to the last 1000 successful
-    streaming requests *per cache-hit class* (so up to 1000 cached and 1000
-    uncached) with a recorded TTFT and a non-empty prompt. Partitioning by
-    cache class keeps the rarer uncached series well-populated instead of
-    being crowded out by cache hits. The query is bounded to the last 90 days
-    so the `ROW_NUMBER()` scan stays bounded as `api_logs` grows. `cache_hit`
-    is true iff `cache_read_tokens > 0`.
+    streaming requests *per measured cache-hit class* (so up to 1000 cached
+    and 1000 measured misses) with a recorded TTFT and a non-empty prompt.
+    Requests without a cache measurement are excluded from this comparison.
+    Partitioning by cache class keeps the rarer uncached series well-populated
+    instead of being crowded out by cache hits. The query is bounded to the
+    last 90 days so the `ROW_NUMBER()` scan stays bounded as `api_logs` grows.
+    `cache_hit` is true iff `cache_read_tokens > 0`.
     """
     if not db_logger or not db_logger.pool:
         raise HTTPException(500, "Database not configured")
@@ -719,6 +720,7 @@ async def admin_get_ttft_scatter(
                   AND ttft_ms IS NOT NULL
                   AND prompt_tokens IS NOT NULL
                   AND prompt_tokens > 0
+                  AND cache_read_tokens IS NOT NULL
                   AND status_code BETWEEN 200 AND 399
                   AND stream = TRUE
             )

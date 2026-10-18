@@ -449,7 +449,9 @@ async def _streaming_response_with_keepalive(
             response_id = chunk_json.get("id") or response_id
             created = int(chunk_json.get("created") or created)
             if chunk_json.get("usage"):
-                usage = normalize_usage(chunk_json.get("usage")) or chunk_json.get("usage")
+                raw_usage = chunk_json.get("usage")
+                normalized_usage = normalize_usage(raw_usage)
+                usage = normalized_usage if normalized_usage is not None else raw_usage
 
             choices = chunk_json.get("choices") or []
             if not choices:
@@ -1196,7 +1198,8 @@ async def chat_completions(
         # Emit token counters when usage is available, with anomaly checks
         # Normalize usage to extract reasoning_tokens from nested locations
         raw_usage = response.get("usage", {}) if isinstance(response, dict) else {}
-        usage = normalize_usage(raw_usage) or {}
+        normalized_usage = normalize_usage(raw_usage)
+        usage = normalized_usage if normalized_usage is not None else {}
         if usage and not is_synthetic_probe:
             prompt_tokens_raw = usage.get("prompt_tokens")
             completion_tokens_raw = usage.get("completion_tokens")
@@ -1228,7 +1231,8 @@ async def chat_completions(
 
         # Record routing observation for online learning (RouteWise)
         if not is_synthetic_probe:
-            ns_usage = normalize_usage(raw_usage) or {}
+            normalized_usage = normalize_usage(raw_usage)
+            ns_usage = normalized_usage if normalized_usage is not None else {}
             # Authoritative observed cache usage from the provider, through the
             # canonical helper so this path shares one validation rule with
             # cost and persistence. None means "provider did not report" (NOT
