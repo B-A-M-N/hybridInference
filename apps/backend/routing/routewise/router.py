@@ -2619,32 +2619,24 @@ class RouteWiseRouter:
                 self.envelope.snapshot(pool) if model_id in self._quota_bearing_models else None
             )
             now = time.time()
-            if reserve_prefill and self.config.prefill_load_routing_enabled:
-                with self._prefill_load.routing_transaction():
-                    prefill_backlog = self._prefill_backlog_snapshot(model_id)
-                    return self._select_decision_locked(
-                        model_id,
-                        context,
-                        trace,
-                        prompt_tokens=prompt_tokens,
-                        prediction=prediction,
-                        envelope=envelope,
-                        now=now,
-                        prefill_backlog=prefill_backlog,
-                        reserve_prefill=reserve_prefill,
-                    )
-            prefill_backlog = self._prefill_backlog_snapshot(model_id)
-            return self._select_decision_locked(
-                model_id,
-                context,
-                trace,
-                prompt_tokens=prompt_tokens,
-                prediction=prediction,
-                envelope=envelope,
-                now=now,
-                prefill_backlog=prefill_backlog,
-                reserve_prefill=reserve_prefill,
+            tracker_transaction = (
+                self._prefill_load.routing_transaction()
+                if reserve_prefill and self.config.prefill_load_routing_enabled
+                else contextlib.nullcontext()
             )
+            with tracker_transaction:
+                prefill_backlog = self._prefill_backlog_snapshot(model_id)
+                return self._select_decision_locked(
+                    model_id,
+                    context,
+                    trace,
+                    prompt_tokens=prompt_tokens,
+                    prediction=prediction,
+                    envelope=envelope,
+                    now=now,
+                    prefill_backlog=prefill_backlog,
+                    reserve_prefill=reserve_prefill,
+                )
 
     def _select_decision_locked(
         self,
