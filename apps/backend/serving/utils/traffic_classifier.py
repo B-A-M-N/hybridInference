@@ -256,14 +256,6 @@ def _score_shape_repetition(shape_repeat_count: int) -> float:
         return 0.05
 
 
-def _score_session_continuity(session_continuity: bool) -> float:
-    """Score session continuity. Continuity suggests interactive use.
-
-    Session continuity is a weak signal — it only reduces automation score slightly.
-    """
-    return 0.10 if session_continuity else 0.30
-
-
 def classify_traffic(evidence: TrafficEvidence) -> TrafficClassification:
     """Classify traffic based on available evidence.
 
