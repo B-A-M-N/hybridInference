@@ -5016,7 +5016,15 @@ def test_direct_fallback_waits_for_shared_selection_transaction():
 
         selected = selection_future.result(timeout=2.0)
         assert selected is not None
-        assert shared_prefill.backlog("test-model:shared-prefill") == 200_000
+        # The fallback can acquire immediately after the selection transaction
+        # exits, so its lease may already be in the shared backlog here. Assert
+        # on the selection's captured snapshot: zero-load candidates are
+        # omitted, so the concurrent fallback reservation was not visible to
+        # the selection that committed its own lease first.
+        assert (
+            "test-model:shared-prefill"
+            not in selected.metadata["candidate_outstanding_prefill_tokens"]
+        )
         selected.release()
         assert dispatch_future.result(timeout=2.0) == {"choices": [{"message": {"content": "ok"}}]}
 
