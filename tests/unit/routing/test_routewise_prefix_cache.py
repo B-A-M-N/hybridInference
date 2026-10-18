@@ -893,7 +893,7 @@ class TestGenerationReconciliationConcurrency:
             # the entry cannot be refreshed by the stale completion.
             assert (
                 coordinator.memory.refresh_liveness_for_generation(
-                    scope, generation=reserved1[scope], lock_held=True
+                    scope, generation=reserved1[scope]
                 )
                 is False
             )

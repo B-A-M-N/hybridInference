@@ -19,7 +19,7 @@ from routing.completion_outcome import (
     classify_stream_prefix,
     could_still_be_transient_prefix,
 )
-from routing.response_text import chunk_text
+from routing.response_text import chunk_text, response_text
 from routing.routers import RoutingObservation
 from serving.servers.routers.completions_logging import CompletionsLogger
 
@@ -271,3 +271,16 @@ class TestStreamingOutcomePrefixes:
 
         assert chunk_text(tool_call) == "[tool_call]"
         assert chunk_text(thinking) == "reasoning here"
+
+    def test_legacy_function_call_is_semantic_output_in_stream_and_response(self):
+        function_call = {"name": "lookup", "arguments": "{}"}
+        chunk = (
+            'data: {"choices":[{"delta":{"function_call":'
+            '{"name":"lookup","arguments":"{}"}}}] }\n\n'
+        )
+
+        assert chunk_text(chunk) == "[tool_call]"
+        assert (
+            response_text({"choices": [{"message": {"function_call": function_call}}]})
+            == "[tool_call]"
+        )

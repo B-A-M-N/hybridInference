@@ -25,6 +25,7 @@ useful *serving*.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -400,22 +401,31 @@ def test_fixed_and_routewise_health_recorders_defer_partial_warmup_prefix(monkey
 class _StreamingAdapter:
     """Minimal endpoint adapter used to exercise both public stream paths."""
 
-    def __init__(self, chunks: list[str]) -> None:
+    def __init__(
+        self,
+        chunks: list[str],
+        *,
+        endpoint_id: str = _ENDPOINT,
+        delay_sec: float = 0.0,
+    ) -> None:
         self.config = SimpleNamespace(
             id="stream-model",
             name="stream-model",
             provider="stream-provider",
             base_url="https://stream.example/v1",
-            endpoint_id=_ENDPOINT,
+            endpoint_id=endpoint_id,
             context_length=8192,
             input_modalities=["text"],
             output_modalities=["text"],
             supports_tools=False,
         )
         self.chunks = chunks
+        self.delay_sec = delay_sec
 
     async def stream_chat_completion(self, messages, **params):
         for chunk in self.chunks:
+            if self.delay_sec:
+                await asyncio.sleep(self.delay_sec)
             yield chunk
 
 
@@ -429,10 +439,14 @@ def _stream_chunks(contents: list[str]) -> list[str]:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("router_kind", ["fixed", "routewise"])
 @pytest.mark.parametrize(
-    ("contents", "expected_failure_counts"),
+    ("contents", "expected_failure_counts", "expected_outcome"),
     [
-        (["The", " model is starting up - this takes about 120 seconds. Please wait..."], [2, 2]),
-        (["The", " answer is 42"], [2, 0]),
+        (
+            ["The", " model is starting up - this takes about 120 seconds. Please wait..."],
+            [2, 2],
+            CompletionOutcome.TRANSIENT_NO_PROGRESS,
+        ),
+        (["The", " answer is 42"], [2, 0], CompletionOutcome.PROGRESS),
     ],
     ids=["warmup-prefix", "substantive-continuation"],
 )
@@ -441,8 +455,10 @@ async def test_router_stream_entrypoints_defer_health_until_prefix_resolves(
     router_kind,
     contents,
     expected_failure_counts,
+    expected_outcome,
 ):
     """Only the resolved semantic prefix may reset serving failures."""
+    from routing.completion_outcome import classify_stream_prefix
     from routing.routers import FixedRouter
     from routing.routewise.config import RouteWiseConfig
     from routing.routewise.decisions import ProviderReservation, RoutingDecision, RoutingTrace
@@ -453,6 +469,7 @@ async def test_router_stream_entrypoints_defer_health_until_prefix_resolves(
     registry.record_failure(_ENDPOINT, reason="upstream_502")
     registry.record_failure(_ENDPOINT, reason="upstream_502")
     adapter = _StreamingAdapter(_stream_chunks(contents))
+    assert classify_stream_prefix("".join(contents), terminal=True) is expected_outcome
 
     if router_kind == "fixed":
         router = FixedRouter(health_registry=registry)
@@ -484,3 +501,257 @@ async def test_router_stream_entrypoints_defer_health_until_prefix_resolves(
         assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED
     else:
         assert registry._circuits[_ENDPOINT].consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_routewise_partial_warmup_prefix_does_not_record_success_on_error(monkeypatch):
+    """A provider error after an undecided prefix records failure, never success."""
+    from routing.completion_outcome import classify_stream_prefix
+    from routing.routewise.config import RouteWiseConfig
+    from routing.routewise.decisions import ProviderReservation, RoutingDecision, RoutingTrace
+    from routing.routewise.router import RouteWiseRouter
+
+    monkeypatch.setenv(_THRESHOLD_ENV, "3")
+    registry = EndpointHealthRegistry()
+    registry.record_failure(_ENDPOINT, reason="upstream_502")
+    registry.record_failure(_ENDPOINT, reason="upstream_502")
+
+    class _FailingAfterPrefix(_StreamingAdapter):
+        async def stream_chat_completion(self, messages, **params):
+            yield _stream_chunks(["The"])[0]
+            raise ConnectionError("stream interrupted after a possible warmup prefix")
+
+    adapter = _FailingAfterPrefix([])
+    router = RouteWiseRouter(
+        config=RouteWiseConfig(db_bootstrap_enabled=False),
+        health_registry=registry,
+    )
+    decision = RoutingDecision(
+        adapter=adapter,
+        reservation=ProviderReservation(),
+        metadata={},
+        trace=RoutingTrace(request_id="routewise-prefix-error-test"),
+    )
+    router._select_decision = lambda *args, **kwargs: decision
+
+    assert classify_stream_prefix("The") is None
+    with pytest.raises(ConnectionError):
+        async for _ in router.stream_chat_completion(
+            "stream-model",
+            [{"role": "user", "content": "question"}],
+            request_id="routewise-prefix-error-test",
+        ):
+            pass
+
+    assert registry._circuits[_ENDPOINT].consecutive_failures == 3
+    assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.OPEN
+
+
+@pytest.mark.asyncio
+async def test_routewise_cancelled_partial_warmup_prefix_does_not_record_success(monkeypatch):
+    """Client cancellation leaves a partial possible-warmup outcome undecided."""
+    from routing.completion_outcome import classify_stream_prefix
+    from routing.routewise.config import RouteWiseConfig
+    from routing.routewise.decisions import ProviderReservation, RoutingDecision, RoutingTrace
+    from routing.routewise.router import RouteWiseRouter
+
+    monkeypatch.setenv(_THRESHOLD_ENV, "3")
+    registry = EndpointHealthRegistry()
+    registry.record_failure(_ENDPOINT, reason="upstream_502")
+    registry.record_failure(_ENDPOINT, reason="upstream_502")
+    waiting = asyncio.Event()
+
+    class _WaitingAfterPrefix(_StreamingAdapter):
+        async def stream_chat_completion(self, messages, **params):
+            yield _stream_chunks(["The"])[0]
+            await waiting.wait()
+
+    adapter = _WaitingAfterPrefix([])
+    router = RouteWiseRouter(
+        config=RouteWiseConfig(db_bootstrap_enabled=False),
+        health_registry=registry,
+    )
+    decision = RoutingDecision(
+        adapter=adapter,
+        reservation=ProviderReservation(),
+        metadata={},
+        trace=RoutingTrace(request_id="routewise-prefix-cancel-test"),
+    )
+    router._select_decision = lambda *args, **kwargs: decision
+
+    stream = router.stream_chat_completion(
+        "stream-model",
+        [{"role": "user", "content": "question"}],
+        request_id="routewise-prefix-cancel-test",
+    )
+    while True:
+        chunk = await stream.__anext__()
+        if '"content"' in chunk:
+            break
+    assert classify_stream_prefix("The") is None
+    await stream.aclose()
+
+    assert registry._circuits[_ENDPOINT].consecutive_failures == 2
+    assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_hedged_routewise_stream_keeps_fragmented_warmup_non_progress(monkeypatch):
+    """The hedge race and RouteWise wrapper both preserve a split warmup outcome."""
+    from llm_routewise.core import CheckpointBackupDispatch
+
+    from routing.completion_outcome import classify_stream_prefix
+    from routing.response_text import accumulate_stream_prefix
+    from routing.routewise.config import RouteWiseConfig
+    from routing.routewise.decisions import ProviderReservation, RoutingDecision, RoutingTrace
+    from routing.routewise.hedging import HedgedAdapter
+    from routing.routewise.router import RouteWiseRouter
+
+    monkeypatch.setenv(_THRESHOLD_ENV, "3")
+    primary_endpoint = "primary:stream.example:443"
+    backup_endpoint = "backup:stream.example:443"
+    warmup_chunks = _stream_chunks(
+        [
+            "The",
+            " model is starting up - this takes",
+            " about 120 seconds. Please wait...",
+        ]
+    )
+    registry = EndpointHealthRegistry()
+    for endpoint in (primary_endpoint, backup_endpoint):
+        for _ in range(3):
+            registry.record_failure(endpoint, reason="upstream_502")
+
+    primary = _StreamingAdapter(warmup_chunks, endpoint_id=primary_endpoint)
+    backup = _StreamingAdapter(warmup_chunks, endpoint_id=backup_endpoint)
+    hedged = HedgedAdapter(
+        primary=primary,
+        event_sink=registry,
+        hedge_checkpoints_sec=(0.0,),
+        checkpoint_backup_selector=lambda elapsed, _ts: CheckpointBackupDispatch(
+            backup=backup,
+            elapsed_sec=elapsed,
+            release=lambda: None,
+        ),
+    )
+    router = RouteWiseRouter(
+        config=RouteWiseConfig(db_bootstrap_enabled=False),
+        health_registry=registry,
+    )
+    decision = RoutingDecision(
+        adapter=hedged,
+        reservation=ProviderReservation(),
+        metadata={},
+        trace=RoutingTrace(request_id="hedged-warmup-stream-test"),
+    )
+    router._select_decision = lambda *args, **kwargs: decision
+
+    output_chunks = [
+        chunk
+        async for chunk in router.stream_chat_completion(
+            "stream-model",
+            [{"role": "user", "content": "question"}],
+            request_id="hedged-warmup-stream-test",
+        )
+    ]
+
+    assert (
+        classify_stream_prefix(accumulate_stream_prefix(output_chunks), terminal=True)
+        is CompletionOutcome.TRANSIENT_NO_PROGRESS
+    )
+    for endpoint in (primary_endpoint, backup_endpoint):
+        assert registry.snapshot()[endpoint]["circuit_state"] == _CircuitState.OPEN
+        assert registry._circuits[endpoint].consecutive_failures == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("router_kind", ["fixed", "routewise", "routewise_hedged"])
+@pytest.mark.parametrize(
+    "delta",
+    [
+        {"tool_calls": [{"id": "call-1", "function": {"name": "lookup"}}]},
+        {"function_call": {"name": "lookup", "arguments": "{}"}},
+        {"reasoning_content": "thinking before visible text"},
+        {"thinking": "thinking before visible text"},
+    ],
+    ids=["tool-calls", "legacy-function-call", "reasoning-content", "thinking"],
+)
+async def test_router_stream_entrypoints_record_structured_progress(
+    monkeypatch, router_kind, delta
+):
+    """Structured first deltas reach the real health owner on every stream path."""
+    from routing.completion_outcome import classify_completion_outcome
+    from routing.response_text import chunk_text
+    from routing.routers import FixedRouter
+    from routing.routewise.config import RouteWiseConfig
+    from routing.routewise.decisions import ProviderReservation, RoutingDecision, RoutingTrace
+    from routing.routewise.router import RouteWiseRouter
+
+    monkeypatch.setenv(_THRESHOLD_ENV, "3")
+    primary_endpoint = "primary:stream.example:443"
+    backup_endpoint = "backup:stream.example:443"
+    chunk = f"data: {json.dumps({'choices': [{'delta': delta}]})}\n\n"
+    registry = EndpointHealthRegistry()
+    serving_endpoint = _ENDPOINT
+    for endpoint in (_ENDPOINT,):
+        for _ in range(2):
+            registry.record_failure(endpoint, reason="upstream_502")
+
+    adapter = _StreamingAdapter([chunk])
+    if router_kind == "fixed":
+        router = FixedRouter(health_registry=registry)
+        router.register_route("stream-model", [(adapter, 1.0)])
+    else:
+        decision_adapter = adapter
+        if router_kind == "routewise_hedged":
+            from llm_routewise.core import CheckpointBackupDispatch
+
+            from routing.routewise.hedging import HedgedAdapter
+
+            serving_endpoint = backup_endpoint
+            for endpoint in (primary_endpoint, backup_endpoint):
+                for _ in range(2):
+                    registry.record_failure(endpoint, reason="upstream_502")
+            backup = _StreamingAdapter([chunk], endpoint_id=backup_endpoint)
+            decision_adapter = HedgedAdapter(
+                primary=_StreamingAdapter(
+                    _stream_chunks(["delayed primary"]),
+                    endpoint_id=primary_endpoint,
+                    delay_sec=0.05,
+                ),
+                event_sink=registry,
+                hedge_checkpoints_sec=(0.0,),
+                checkpoint_backup_selector=lambda elapsed, _ts: CheckpointBackupDispatch(
+                    backup=backup,
+                    elapsed_sec=elapsed,
+                    release=lambda: None,
+                ),
+            )
+
+        router = RouteWiseRouter(
+            config=RouteWiseConfig(db_bootstrap_enabled=False),
+            health_registry=registry,
+        )
+        decision = RoutingDecision(
+            adapter=decision_adapter,
+            reservation=ProviderReservation(),
+            metadata={},
+            trace=RoutingTrace(request_id="structured-stream-health-test"),
+        )
+        router._select_decision = lambda *args, **kwargs: decision
+
+    outcome = classify_completion_outcome(content=chunk_text(chunk), http_status=200, terminal=True)
+    assert outcome is CompletionOutcome.PROGRESS
+
+    async for _ in router.stream_chat_completion(
+        "stream-model",
+        [{"role": "user", "content": "question"}],
+        request_id="structured-stream-health-test",
+    ):
+        pass
+
+    assert registry.snapshot()[serving_endpoint]["circuit_state"] == _CircuitState.CLOSED
+    assert registry._circuits[serving_endpoint].consecutive_failures == 0
+    if router_kind == "routewise_hedged":
+        assert registry.snapshot()[primary_endpoint]["circuit_state"] == _CircuitState.CLOSED
+        assert registry._circuits[primary_endpoint].consecutive_failures == 2

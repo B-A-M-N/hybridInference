@@ -558,24 +558,37 @@ class SessionProviderPrefixMemory:
         *,
         generation: int,
         now: float | None = None,
-        lock_held: bool = False,
     ) -> bool:
-        """Atomically validate a generation and refresh the associated entry.
-
-        When ``lock_held`` is true the coordinator is calling under its own
-        generation guard and this method does not re-acquire it; the entry's
-        stored generation is validated against the caller's reservation and
-        never written back, so a superseded completion cannot extend a newer
-        entry's lifetime. When ``lock_held`` is false (public API for callers
-        that have no coordinator guard) the memory lock alone protects the
-        entry mutation, and the caller is responsible for generation validity.
-        """
+        """Refresh only when the entry already belongs to ``generation``."""
         ts = self._time() if now is None else now
-        if lock_held:
-            with self._lock:
-                return self._refresh_locked(scope, generation, ts)
         with self._lock:
             return self._refresh_locked(scope, generation, ts)
+
+    def adopt_generation_and_refresh_liveness(
+        self,
+        scope: CacheScope,
+        *,
+        generation: int,
+        now: float | None = None,
+    ) -> bool:
+        """Adopt a current reservation and refresh its existing entry.
+
+        The coordinator calls this while holding its generation guard. Keeping
+        both entry mutation and TTL validation behind the memory lock prevents
+        callers from reaching into this store's private lock and entries.
+        A stale generation may not move an entry backwards.
+        """
+        ts = self._time() if now is None else now
+        with self._lock:
+            entry = self._entries.get(scope)
+            if entry is None or entry.generation > generation:
+                return False
+            if self._ttl_sec > 0 and (ts - entry.last_seen_at) > self._ttl_sec:
+                return False
+            entry.generation = generation
+            entry.last_seen_at = ts
+            self._entries.move_to_end(scope)
+            return True
 
     def _refresh_locked(
         self,
@@ -1040,14 +1053,9 @@ class PrefixCacheCoordinator:
             with self._generation_lock:
                 if self._scope_generations.get(scope) != generation:
                     return False
-                with self._memory._lock:
-                    entry = self._memory._entries.get(scope)
-                    if entry is not None and entry.generation != generation:
-                        entry.generation = generation
-                self._memory.refresh_liveness_for_generation(
+                self._memory.adopt_generation_and_refresh_liveness(
                     scope,
                     generation=generation,
-                    lock_held=True,
                 )
             return False
 

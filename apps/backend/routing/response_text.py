@@ -24,7 +24,7 @@ def response_text(response: Any) -> str | None:
     )
     if isinstance(content, str) and content:
         return content
-    if message.get("tool_calls"):
+    if message.get("tool_calls") or message.get("function_call"):
         return "[tool_call]"
     return None
 
@@ -61,7 +61,7 @@ def chunk_text(chunk: Any) -> str | None:
     )
     if isinstance(content, str) and content:
         return content
-    if delta.get("tool_calls"):
+    if delta.get("tool_calls") or delta.get("function_call"):
         return "[tool_call]"
     return None
 
