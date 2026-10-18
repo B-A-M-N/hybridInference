@@ -5605,9 +5605,15 @@ async def test_fixed_fallback_prefill_acquire_uses_routing_transaction(monkeypat
     original_transaction = tracker.routing_transaction
     original_acquire = tracker.acquire
 
+    async def _wait_for_transaction_held() -> None:
+        deadline = time.monotonic() + 2
+        while not transaction_held.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.001)
+        assert transaction_held.is_set()
+
     async def _primary_failure(*_args: Any, **_kwargs: Any):
         primary_started.set()
-        assert await asyncio.to_thread(transaction_held.wait, 2)
+        await _wait_for_transaction_held()
         fallback_failed_primary.set()
         raise ConnectionError("primary failed before a response")
 
@@ -5615,7 +5621,7 @@ async def test_fixed_fallback_prefill_acquire_uses_routing_transaction(monkeypat
 
     async def _primary_stream(*_args: Any, **_kwargs: Any):
         primary_started.set()
-        assert await asyncio.to_thread(transaction_held.wait, 2)
+        await _wait_for_transaction_held()
         fallback_failed_primary.set()
         raise ConnectionError("primary failed before a response")
         yield "unreachable"
@@ -5683,7 +5689,7 @@ async def test_fixed_fallback_prefill_acquire_uses_routing_transaction(monkeypat
         ]
         assert any('"fallback": true' in chunk for chunk in chunks)
 
-    await asyncio.to_thread(holder.join, 2)
+    holder.join(timeout=2)
     assert not holder.is_alive()
     assert fallback_transaction_requested.is_set()
     assert fallback_acquire_attempted.is_set()
