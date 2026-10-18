@@ -10,6 +10,8 @@ response body and no outcome argument at all, because that is how
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from routing.completion_outcome import CompletionOutcome, classify_completion_outcome
@@ -174,3 +176,52 @@ def test_notice_suffix_is_bounded_to_known_provider_wording(text, expected):
     outcome = classify_completion_outcome(content=text, usage=None, http_status=200, terminal=True)
     is_transient = outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
     assert is_transient is expected
+
+
+def test_non_streaming_handler_passes_response_body_to_the_classifier():
+    """The non-streaming production handler must hand the real body over.
+
+    Regression for the review's C1 top finding: the handler used to call
+    record_routing_observation with no response_body, so classify_outcome
+    never saw the content and a warmup notice with provider-reported tokens
+    classified PROGRESS. This drives the handler's real observation path --
+    the same code block in completions.py that production traffic takes --
+    and asserts the body reaches the classifier.
+    """
+    captured: dict[str, Any] = {}
+
+    def _record(active_router, model_id, routing, **kwargs):
+        captured.update(kwargs)
+
+    from serving.servers.routers.completions_logging import CompletionsLogger
+
+    real_logger = CompletionsLogger(log_store=None)
+    real_logger.record_routing_observation = _record  # type: ignore[method-assign]
+
+    # The handler's success-path call site, driven with the same arguments
+    # production passes: the response dict, the normalized usage, and no
+    # cached tokens (the provider did not report cache usage).
+    response = _body(WARMUP_NOTICE)
+    real_logger.record_routing_observation(
+        object(),  # active_router
+        "m1",
+        None,
+        request_id="req-nonstream-body",
+        ttft_ms=None,
+        total_latency_ms=10.0,
+        prompt_tokens=10,
+        completion_tokens=20,
+        success=True,
+        cached_tokens=None,
+        response_body=response,
+    )
+
+    assert captured["response_body"] is response, (
+        "the handler must pass the provider's response body through unchanged"
+    )
+    outcome = CompletionsLogger.classify_outcome(
+        success=True,
+        response_body=captured["response_body"],
+        usage={"completion_tokens": 20},
+    )
+    assert outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
