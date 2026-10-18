@@ -85,16 +85,14 @@ class CompletionOutcome(str, Enum):
         )
 
 
-#: Provider warmup / placeholder notices. Patterns, not a hard dependency on any
-#: one provider's wording; deployments can extend ``register_transient_markers``
-#: without touching the classification logic.
-#: Warmup notices are short provider boilerplate. Match only near the start of
-#: a bounded response so a genuine answer that merely mentions warmup (e.g. an
-#: agent writing a UI string) is not misclassified.
+#: Provider warmup notices are short and appear at the start of the response.
+#: Keep both their total length and permitted trailing wording bounded so a
+#: genuine answer that quotes one is not mistaken for a transient response.
 _TRANSIENT_TEXT_MAX_CHARS = 200
 _DEFAULT_TRANSIENT_MARKERS: tuple[str, ...] = (
     r"^the model is starting up",
     r"^model is starting up",
+    r"^the model is warming up",
     r"^model is warming up",
     r"^warming up the model",
     r"^model is loading,? please wait",
@@ -104,18 +102,25 @@ _DEFAULT_TRANSIENT_MARKERS: tuple[str, ...] = (
     r"^model is initializing",
 )
 
-_TRANSIENT_MARKERS: list[re.Pattern[str]] = [
-    re.compile(pattern, re.IGNORECASE) for pattern in _DEFAULT_TRANSIENT_MARKERS
-]
-
-#: Statuses that indicate a retryable provider condition rather than a bad
-#: request from this gateway.
-_TRANSIENT_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
-
-
-def register_transient_marker(pattern: str) -> None:
-    """Register an additional provider-specific no-progress marker."""
-    _TRANSIENT_MARKERS.append(re.compile(pattern, re.IGNORECASE))
+_NOTICE_SUFFIX = (
+    r"(?:"
+    r"[\s.!\u2026,;:-]*"
+    r"(?:"
+    r"this (?:takes|will take) about \d{1,4} (?:seconds?|minutes?)"
+    r"|please wait(?: while (?:the )?model (?:loads|starts|initializes))?"
+    r"|hold on"
+    r"|try again(?: (?:soon|later|shortly))?"
+    r"|please try again(?: (?:soon|later|shortly))?"
+    r"|give it another (?:second|\d{1,2} seconds?)"
+    r"|shortly"
+    r"|yet"
+    r"|now"
+    r")?"
+    r")*$"
+)
+_TRANSIENT_MARKERS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern + _NOTICE_SUFFIX, re.IGNORECASE) for pattern in _DEFAULT_TRANSIENT_MARKERS
+)
 
 
 def _looks_transient_text(text: str) -> bool:
@@ -123,7 +128,7 @@ def _looks_transient_text(text: str) -> bool:
     stripped = text.strip()
     if len(stripped) > _TRANSIENT_TEXT_MAX_CHARS:
         return False
-    return any(marker.search(stripped) for marker in _TRANSIENT_MARKERS)
+    return any(marker.match(stripped) for marker in _TRANSIENT_MARKERS)
 
 
 def _output_token_count(usage: dict[str, Any] | None) -> int | None:
@@ -151,8 +156,6 @@ def classify_completion_outcome(
     tokens -- that combination is precisely the incident signature.
     """
     if http_status is not None and http_status >= 400:
-        if http_status in _TRANSIENT_STATUSES:
-            return CompletionOutcome.PROVIDER_ERROR
         return CompletionOutcome.PROVIDER_ERROR
     if http_status is None:
         return CompletionOutcome.UNKNOWN

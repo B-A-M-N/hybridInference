@@ -43,6 +43,7 @@ from routing.completion_outcome import CompletionOutcome
 from routing.routers import RoutingObservation
 from routing.routewise.prefix_cache import (
     Block,
+    CacheLocalityEvidenceState,
     CacheScope,
     PrefixCacheCoordinator,
     SessionProviderPrefixMemory,
@@ -176,16 +177,9 @@ class TestCompletionOutcome:
         )
         assert outcome is CompletionOutcome.ABORTED
 
-    def test_unknown_transient_wording_is_also_transient(self):
-        """
-        The architecture must not depend on one provider's exact wording.
-        Registering an unknown-but-repeating notice works the same way.
-        """
-        from routing.completion_outcome import register_transient_marker
-
-        register_transient_marker(r"synthetic queue notice \d+")
+    def test_known_wait_notice_is_transient(self):
         outcome = CompletionOutcome.from_response(
-            content="SYNTHETIC QUEUE NOTICE 42 - retry shortly",
+            content="Model is loading, please wait",
             usage={"output_tokens": 12},
             http_status=200,
             terminal=True,
@@ -347,6 +341,23 @@ class TestEvidenceIsNotWholesaleReplaced:
             is False
         )
         assert coordinator.lookup_state(scope).blocks is None
+
+    def test_unknown_outcome_keeps_matching_cache_evidence(self):
+        coordinator = _coordinator(min_match_tokens=1)
+        scope = _scope()
+        conversation = _blocks(("a", 4096), ("b", 4096))
+        coordinator.remember(scope, conversation)
+
+        coordinator.record_outcome(
+            scope=scope,
+            blocks=conversation,
+            outcome=CompletionOutcome.UNKNOWN,
+            observed_cached_tokens=2048,
+        )
+
+        state = coordinator.lookup_state(scope)
+        assert state.blocks == conversation
+        assert state.evidence == CacheLocalityEvidenceState.VERIFIED_REUSABLE
 
 
 class TestRouterCommitPath:

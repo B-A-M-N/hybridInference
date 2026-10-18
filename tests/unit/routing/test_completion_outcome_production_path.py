@@ -89,6 +89,21 @@ class TestProductionPathSuppliesOutcome:
         assert obs.outcome is CompletionOutcome.EMPTY
         assert obs.admits_real_work is False
 
+    def test_tool_call_only_response_is_progress(self):
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{"id": "call-1", "type": "function"}],
+                    }
+                }
+            ]
+        }
+        obs = _observe(response_body=response)
+        assert obs.outcome is CompletionOutcome.PROGRESS
+        assert obs.admits_real_work is True
+
     def test_failure_path_reports_provider_error(self):
         obs = _observe(response_body=None, success=False)
         assert obs.outcome is CompletionOutcome.PROVIDER_ERROR

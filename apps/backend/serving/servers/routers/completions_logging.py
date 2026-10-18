@@ -124,8 +124,9 @@ class CompletionsLogger:
         """
         if not success:
             return CompletionOutcome.PROVIDER_ERROR
+        content = response_body if isinstance(response_body, str) else response_text(response_body)
         return classify_completion_outcome(
-            content=response_text(response_body),
+            content=content,
             usage=usage,
             http_status=200,
             terminal=True,

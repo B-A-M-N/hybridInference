@@ -37,20 +37,40 @@ class HedgeStreamRaceTimeout(TimeoutError):
 
 
 def _could_still_become_warmup(text: str) -> bool:
-    """Return whether *text* is a strict prefix of a warmup marker phrase.
+    """Return whether *text* can still become a bounded warmup notice.
 
     While the accumulated content could still become a warmup notice, the race
-    must keep pulling so the full phrase (or its absence) can classify the
-    response. Once the text diverges from every warmup marker, it is safe to
-    decide.
+    must keep pulling so the full marker and any known provider suffix can be
+    classified together. A marker followed by an incomplete duration suffix
+    must not win the race as ordinary progress.
     """
     from routing.completion_outcome import _DEFAULT_TRANSIENT_MARKERS
 
     normalized = text.strip().lower()
     if not normalized:
         return True
-    stripped = (marker.removeprefix("^") for marker in _DEFAULT_TRANSIENT_MARKERS)
-    return any(pattern.startswith(normalized) for pattern in stripped)
+    suffix_prefixes = (
+        "this takes about",
+        "this will take about",
+        "please wait",
+        "hold on",
+        "try again",
+        "please try again",
+        "give it another",
+        "shortly",
+        "yet",
+        "now",
+    )
+    for marker in _DEFAULT_TRANSIENT_MARKERS:
+        phrase = marker.removeprefix("^")
+        if phrase.startswith(normalized):
+            return True
+        if not normalized.startswith(phrase):
+            continue
+        tail = normalized[len(phrase) :].strip(" \t.!…,:;-")
+        if not tail or any(prefix.startswith(tail) for prefix in suffix_prefixes):
+            return True
+    return False
 
 
 def _accumulated_text_exceeds_warmup_window(buffer: list[str]) -> bool:

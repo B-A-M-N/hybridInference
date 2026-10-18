@@ -323,9 +323,15 @@ def _obs(
         total_latency_ms=1.0,
         token_count=1,
         success=success,
+        outcome=(
+            CompletionOutcome.PROGRESS
+            if success and terminal
+            else CompletionOutcome.PROVIDER_ERROR
+            if not success
+            else CompletionOutcome.ABORTED
+        ),
         request_id=request_id,
         terminal=terminal,
-        outcome=CompletionOutcome.PROGRESS,
         strategy_metadata={"routewise": {"quota_committed": 0.0}},
     )
 
