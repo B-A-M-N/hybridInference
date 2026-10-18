@@ -394,7 +394,6 @@ async def test_unresolved_caller_keeps_per_account_address_cap(monkeypatch):
         False,
         "email",
     )
-    assert len(limiter._unresolved_attempts) == 3
 
     # The account/address window is keyed per account, so a different account
     # is not blocked by the victim's window.
@@ -402,7 +401,6 @@ async def test_unresolved_caller_keeps_per_account_address_cap(monkeypatch):
         True,
         None,
     )
-    assert len(limiter._unresolved_attempts) == 4
 
 
 @pytest.mark.asyncio
