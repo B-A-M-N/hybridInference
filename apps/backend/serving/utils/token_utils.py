@@ -160,6 +160,43 @@ def extract_reasoning_tokens(usage: dict[str, Any] | None) -> int | None:
     return None
 
 
+def optional_token_count(value: Any) -> int | None:
+    """Coerce a reported token count to ``int``, preserving "not reported".
+
+    A provider that omits a cache-token field is *not* reporting a measured
+    zero, and the two must not be conflated: ``None`` flows through to a NULL
+    ``api_logs`` column and an "unknown" cache state, whereas ``0`` is a
+    measured miss that a dashboard renders as 0% and a cost model reads as
+    "no discount earned". Collapsing ``None`` to ``0`` at a call site is how a
+    silent provider comes to look like a cache miss.
+
+    Returns ``None`` for a missing key, ``None``, a non-numeric value, a
+    negative count, a fractional value, or a non-finite one (``inf``/``nan``,
+    which ``int()`` would otherwise raise on or silently truncate); otherwise
+    the value as ``int``. A reported ``0`` stays ``0`` -- it is a real
+    measurement. Accepting a bare ``int`` fast-path keeps the common case off
+    the float path.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        # ``bool`` is an ``int`` subclass; a boolean is never a token count.
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    if number != int(number):
+        # A fractional token count is not a real measurement; treat it as
+        # unreported rather than silently truncating.
+        return None
+    return int(number)
+
+
 def extract_cache_tokens(
     usage: dict[str, Any] | None,
     *,
@@ -211,15 +248,10 @@ def extract_cache_tokens(
         "cache_read_tokens",
         "prompt_cache_hit_tokens",
     ):
-        val = usage.get(field)
-        if val is not None:
-            try:
-                val = int(val)
-                if val >= 0:
-                    cache_read = val
-                    break
-            except (TypeError, ValueError):
-                pass
+        count = optional_token_count(usage.get(field))
+        if count is not None:
+            cache_read = count
+            break
 
     # Nested: OpenAI/Azure use prompt_tokens_details; MiniMax may use input token details.
     #
@@ -253,16 +285,10 @@ def extract_cache_tokens(
             continue
         if isinstance(details, dict):
             for nested_field in ("cached_tokens", "cache_read_tokens", "cache_hit_tokens"):
-                val = details.get(nested_field)
-                if val is None:
-                    continue
-                try:
-                    val = int(val)
-                    if val >= 0:
-                        cache_read = val
-                        break
-                except (TypeError, ValueError):
-                    pass
+                count = optional_token_count(details.get(nested_field))
+                if count is not None:
+                    cache_read = count
+                    break
             if cache_read is not None:
                 break
 
@@ -276,54 +302,14 @@ def extract_cache_tokens(
     cache_write: int | None = None
 
     for field in ("cache_creation_input_tokens", "cache_write_tokens"):
-        val = usage.get(field)
-        if val is not None:
-            try:
-                val = int(val)
-                if val >= 0:
-                    cache_write = val
-                    break
-            except (TypeError, ValueError):
-                pass
+        count = optional_token_count(usage.get(field))
+        if count is not None:
+            cache_write = count
+            break
 
     return cache_read, cache_write
 
 
-def optional_token_count(value: Any) -> int | None:
-    """Coerce a reported token count to ``int``, preserving "not reported".
-
-    A provider that omits a cache-token field is *not* reporting a measured
-    zero, and the two must not be conflated: ``None`` flows through to a NULL
-    ``api_logs`` column and an "unknown" cache state, whereas ``0`` is a
-    measured miss that a dashboard renders as 0% and a cost model reads as
-    "no discount earned". Collapsing ``None`` to ``0`` at a call site is how a
-    silent provider comes to look like a cache miss.
-
-    Returns ``None`` for a missing key, ``None``, a non-numeric value, a
-    negative count, a fractional value, or a non-finite one (``inf``/``nan``,
-    which ``int()`` would otherwise raise on or silently truncate); otherwise
-    the value as ``int``. A reported ``0`` stays ``0`` -- it is a real
-    measurement. Accepting a bare ``int`` fast-path keeps the common case off
-    the float path.
-    """
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        # ``bool`` is an ``int`` subclass; a boolean is never a token count.
-        return None
-    if isinstance(value, int):
-        return value if value >= 0 else None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(number) or number < 0:
-        return None
-    if number != int(number):
-        # A fractional token count is not a real measurement; treat it as
-        # unreported rather than silently truncating.
-        return None
-    return int(number)
 
 
 def normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
