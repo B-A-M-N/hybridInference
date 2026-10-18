@@ -464,11 +464,14 @@ not attributed to a synthetic per-client address. It still gets the five per
 username in 15 minutes account/address window, the fifty per username
 account-wide window, and a separate coarse hourly budget shared by every
 unresolved client (`UNRESOLVED_LOGIN_RATE_LIMIT_PER_HOUR`, default twenty per
-hour per worker). Refused attempts do not extend any window. When a limiter
-map fills, expired windows are reclaimed first and additional identities use
-fixed-size overflow buckets selected by a randomized per-process hash. A hash
-collision can conservatively make unrelated identities share a limit until
-their window expires, but admitted attempts remain counted. Existing device
+hour per worker). Refused requests do not enter the admitted account windows.
+Resolved address and account refusals add bounded pressure to the source IP's
+hourly window; repeated refusals can therefore apply the IP-wide limit to
+other accounts from that address. When a limiter map fills, expired windows
+are reclaimed first and additional identities use fixed-size overflow buckets
+selected by a randomized per-process hash. A hash collision can conservatively
+make unrelated identities share a limit until their window expires, but
+admitted attempts remain counted. Existing device
 cookies keep their independent windows; at most 64 active device windows per
 account are stored directly, and additional device IDs share the account's
 overflow window. Capacity pressure is counted per limiter scope and warning

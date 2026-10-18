@@ -68,9 +68,7 @@ async def test_sustained_address_flood_does_not_grow_admission_buckets(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_distributed_guessing_trips_account_limit_without_poisoning_shared_ip(
-    monkeypatch,
-):
+async def test_account_limit_refusals_eventually_trip_source_ip_pressure(monkeypatch):
     now = [1_500.0]
     monkeypatch.setattr(limiter, "_now", lambda: now[0])
     monkeypatch.setattr(settings, "login_account_rate_limit_per_15min", 6)
@@ -82,23 +80,27 @@ async def test_distributed_guessing_trips_account_limit_without_poisoning_shared
             assert await limiter.check_and_record_login("admin", ip) == (True, None)
 
     new_source = "198.51.100.44"
-    for _ in range(500):
+    for _ in range(20):
         assert await limiter.check_and_record_login("admin", new_source) == (
             False,
             "account",
         )
     assert len(limiter._account_attempts["admin"]) == 6
 
-    # Account-wide refusals do not enter the shared IP admission window or
-    # refusal-pressure map, so another account behind that address can proceed.
+    # Refusals do not enter the admitted-login window, but repeated polling
+    # reaches the separate hourly pressure threshold for this source IP.
     assert new_source not in limiter._ip_attempts
-    assert new_source not in limiter._ip_refusal_pressure
-    assert await limiter.check_and_record_login("other@example.com", new_source) == (
-        True,
-        None,
-    )
+    assert limiter._ip_refusal_pressure[new_source].count == 20
+    assert await limiter.check_and_record_login("admin", new_source) == (False, "ip")
+    assert await limiter.check_and_record_login("other@example.com", new_source) == (False, "ip")
 
     now[0] += 15 * 60 + 1
+    # The account window expires, but the IP's refusal pressure keeps its
+    # fixed hourly expiry. A different source can use the recovered account.
+    assert await limiter.check_and_record_login("admin", new_source) == (False, "ip")
+    assert await limiter.check_and_record_login("admin", OWNER) == (True, None)
+
+    now[0] += 45 * 60
     assert await limiter.check_and_record_login("admin", new_source) == (True, None)
 
 

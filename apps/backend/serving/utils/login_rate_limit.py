@@ -7,11 +7,12 @@ account/address window increments a separate, saturating per-IP counter. The
 IP check combines that pressure with admitted IP attempts, preserving abuse
 escalation without growing admission queues or extending account-wide windows.
 
-Account-wide refusals do not add IP pressure, which limits collateral effects
-for other accounts behind a shared address. Once address refusals reach the
-IP-wide threshold, the existing IP-wide policy applies to every account at
-that address. Recognized devices retain their independent window and do not
-consume or get blocked by the other login windows.
+Account-wide refusals add to a separate, fixed-expiry per-IP pressure count.
+Repeated polling of a locked account therefore reaches the existing IP-wide
+threshold without extending the account's admission window. Once address or
+account refusals reach that threshold, the IP-wide policy applies to every
+account at that address. Recognized devices retain their independent window
+and do not consume or get blocked by the other login windows.
 
 Login bucket maps are bounded. Expired keys are reclaimed first; when a map
 is full of live keys, new keys use fixed-size overflow windows selected by a
@@ -280,8 +281,8 @@ def _active_refusal_count(ip_key: str, now: float) -> int:
     return pressure.count
 
 
-def _record_address_refusal(ip_key: str, now: float, per_ip: int) -> bool:
-    """Record one refusal without turning pressure-map saturation global."""
+def _record_ip_refusal_pressure(ip_key: str, now: float, per_ip: int) -> bool:
+    """Record bounded refusal pressure without turning map saturation global."""
     pressure = _ip_refusal_pressure.get(ip_key)
     overflow_slot = _overflow_slot("refusal", ip_key)[1]
     overflow_pressure = _ip_refusal_overflow.get(overflow_slot)
@@ -329,8 +330,9 @@ async def check_and_record_login(
     client. A result reason is ``"device"``, ``"email"`` (account/address),
     ``"account"``, ``"ip"``, or ``"unresolved"``. Only resolved-address
     refusals caused by the account/address window add to fixed-expiry IP
-    pressure. IP-refused and account-wide-refused requests do not change
-    stored counts. The check, pressure update, and admissions are atomic
+    pressure. Refusals do not change admitted-attempt counts. Resolved
+    account/address and account-wide refusals add bounded, fixed-expiry pressure
+    to that source IP. The check, pressure update, and admissions are atomic
     under one lock.
     """
     global _sweep_counter
@@ -433,7 +435,7 @@ async def check_and_record_login(
             return False, "ip"
 
         if address_count >= per_account_address:
-            if resolved and not _record_address_refusal(ip_key, now, per_ip):
+            if resolved and not _record_ip_refusal_pressure(ip_key, now, per_ip):
                 return False, "ip"
             return False, "email"
 
@@ -443,9 +445,12 @@ async def check_and_record_login(
             if len(_unresolved_attempts) >= settings.unresolved_login_rate_limit_per_hour:
                 return False, "unresolved"
 
-        # Account-wide checks apply after the address-specific limit. A
-        # refusal here does not contribute to the IP-wide abuse counter.
+        # Account-wide checks apply after the address-specific limit. Count
+        # resolved refusals against the source IP's bounded, fixed-expiry
+        # pressure so polling one locked account cannot bypass the IP policy.
         if account_count >= per_account:
+            if resolved:
+                _record_ip_refusal_pressure(ip_key, now, per_ip)
             return False, "account"
 
         # Check every map before writing to any of them, so a refusal in one
@@ -493,7 +498,7 @@ async def check_and_record_login(
         )
         overflow_ip = _prune_overflow_bucket("ip", ip_key, ip_cutoff) if spill_ip else None
         if overflow_address is not None and len(overflow_address) >= per_account_address:
-            if resolved and not _record_address_refusal(ip_key, now, per_ip):
+            if resolved and not _record_ip_refusal_pressure(ip_key, now, per_ip):
                 return False, "ip"
             return False, "email"
         if overflow_account is not None and len(overflow_account) >= per_account:
