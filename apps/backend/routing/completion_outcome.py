@@ -85,9 +85,7 @@ class CompletionOutcome(str, Enum):
         )
 
 
-#: Provider warmup / placeholder notices. Patterns, not a hard dependency on any
-#: one provider's wording; deployments can extend ``register_transient_markers``
-#: without touching the classification logic.
+#: Provider warmup / placeholder notices recognized by the shared classifier.
 _DEFAULT_TRANSIENT_MARKERS: tuple[str, ...] = (
     r"the model is starting up",
     r"model is starting up",
@@ -101,35 +99,21 @@ _DEFAULT_TRANSIENT_MARKERS: tuple[str, ...] = (
     r"model is initializing",
 )
 
-# Each marker is anchored so the pattern only matches when the transient notice
-# is the whole message (possibly repeated with whitespace/ellipses), not when the
-# phrase appears incidentally inside a genuine answer (e.g. a model quoting or
-# discussing "the model is starting up"). A response is transient only if every
-# non-empty line matches a marker.
-# A response is transient only when a marker dominates the whole message. Each
-# marker is paired with a whole-message-anchored variant that permits a bounded
-# trailing tail (the provider's own "please wait"/duration wording); a genuine
-# answer that merely mentions a marker mid-text does not match the anchored
-# form, so it stays PROGRESS. The bare pattern keeps an exact marker match
-# transient even when a trailing word falls outside the bounded tail.
-# A response is transient only when a marker leads the message and everything
-# after it is a known provider-notice suffix: punctuation, a short duration
-# phrase ("this takes about 120 seconds"), a wait phrase ("please wait",
-# "hold on", "try again soon"), or a plain trailing word such as "now". The
-# suffix set is deliberately narrow -- free-form prose after the marker is a
-# genuine answer that quotes a startup message, not a transient notice, so it
-# stays PROGRESS.
+# Match a marker only at the beginning, and allow only a small set of known
+# provider-notice tails. This avoids classifying a genuine answer as transient
+# just because it quotes a warmup phrase in the middle or continues the phrase
+# with free-form explanation.
 _NOTICE_SUFFIX = (
     r"(?:"
-    r"[\s.!\u2026,;-]*"  # punctuation / spacing
+    r"[\s.!\u2026,;:-]*"  # punctuation / spacing
     r"(?:"
-    r"this (?:takes|will take) about \d+ (?:seconds?|minutes?)"  # duration
-    r"|[\w\s]*please wait"
-    r"|[\w\s]*hold on"
-    r"|[\w\s]*try again (?:soon|later|shortly)"
-    r"|[\w\s]*please try again"
-    r"|[\w\s]*shortly"
-    r"|[\w\s]*yet"
+    r"this (?:takes|will take) about \d{1,4} (?:seconds?|minutes?)"
+    r"|please wait(?: while (?:the )?model (?:loads|starts|initializes))?"
+    r"|hold on"
+    r"|try again(?: (?:soon|later|shortly))?"
+    r"|please try again(?: (?:soon|later|shortly))?"
+    r"|shortly"
+    r"|yet"
     r"|now"
     r")?"
     r")*$"
@@ -137,15 +121,6 @@ _NOTICE_SUFFIX = (
 _TRANSIENT_MARKERS: list[re.Pattern[str]] = [
     re.compile(pattern + _NOTICE_SUFFIX, re.IGNORECASE) for pattern in _DEFAULT_TRANSIENT_MARKERS
 ]
-
-#: Statuses that indicate a retryable provider condition rather than a bad
-#: request from this gateway.
-_TRANSIENT_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
-
-
-def register_transient_marker(pattern: str) -> None:
-    """Register an additional provider-specific no-progress marker."""
-    _TRANSIENT_MARKERS.append(re.compile(pattern + _NOTICE_SUFFIX, re.IGNORECASE))
 
 
 def _looks_transient_text(text: str) -> bool:
@@ -177,8 +152,6 @@ def classify_completion_outcome(
     tokens -- that combination is precisely the incident signature.
     """
     if http_status is not None and http_status >= 400:
-        if http_status in _TRANSIENT_STATUSES:
-            return CompletionOutcome.PROVIDER_ERROR
         return CompletionOutcome.PROVIDER_ERROR
     if http_status is None:
         return CompletionOutcome.UNKNOWN

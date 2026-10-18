@@ -43,6 +43,7 @@ from routing.completion_outcome import CompletionOutcome
 from routing.routers import RoutingObservation
 from routing.routewise.prefix_cache import (
     Block,
+    CacheLocalityEvidenceState,
     CacheScope,
     PrefixCacheCoordinator,
     SessionProviderPrefixMemory,
@@ -176,16 +177,9 @@ class TestCompletionOutcome:
         )
         assert outcome is CompletionOutcome.ABORTED
 
-    def test_unknown_transient_wording_is_also_transient(self):
-        """
-        The architecture must not depend on one provider's exact wording.
-        Registering an unknown-but-repeating notice works the same way.
-        """
-        from routing.completion_outcome import register_transient_marker
-
-        register_transient_marker(r"synthetic queue notice \d+")
+    def test_known_wait_notice_is_transient(self):
         outcome = CompletionOutcome.from_response(
-            content="SYNTHETIC QUEUE NOTICE 42 - retry shortly",
+            content="Model is loading, please wait",
             usage={"output_tokens": 12},
             http_status=200,
             terminal=True,
@@ -334,13 +328,8 @@ class TestEvidenceIsNotWholesaleReplaced:
         )
         assert coordinator.lookup_state(scope).blocks == conversation
 
-    def test_unclassified_outcome_still_warms(self):
-        """UNKNOWN is not evidence that nothing was served.
-
-        Callers that have not been wired to classify yet must keep the
-        long-standing behavior, or adding this type would silently disable
-        prefix warming for them.
-        """
+    def test_unclassified_outcome_does_not_warm_locality(self):
+        """UNKNOWN cannot create positive locality evidence without real work."""
         coordinator = _coordinator(min_match_tokens=1)
         scope = _scope()
         conversation = _blocks(("a", 4096), ("b", 4096))
@@ -350,9 +339,27 @@ class TestEvidenceIsNotWholesaleReplaced:
                 blocks=conversation,
                 outcome=CompletionOutcome.UNKNOWN,
             )
-            is True
+            is False
         )
-        assert coordinator.lookup_state(scope).blocks == conversation
+        assert coordinator.lookup_state(scope).present is False
+
+    def test_unknown_outcome_keeps_matching_cache_evidence(self):
+        """Unknown content cannot warm blocks, but authoritative usage survives."""
+        coordinator = _coordinator(min_match_tokens=1)
+        scope = _scope()
+        conversation = _blocks(("a", 4096), ("b", 4096))
+        coordinator.remember(scope, conversation)
+
+        coordinator.record_outcome(
+            scope=scope,
+            blocks=conversation,
+            outcome=CompletionOutcome.UNKNOWN,
+            observed_cached_tokens=2048,
+        )
+
+        state = coordinator.lookup_state(scope)
+        assert state.blocks == conversation
+        assert state.evidence == CacheLocalityEvidenceState.VERIFIED_REUSABLE
 
 
 class TestRouterCommitPath:

@@ -36,7 +36,6 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-from routing.completion_outcome import CompletionOutcome
 from serving.utils.logging import get_logger
 from serving.utils.tokens import tokenize_text
 
@@ -743,18 +742,6 @@ class PrefixCacheCostRecord:
     """Confidence in the evidence (0..1)."""
 
 
-# Outcomes that must never warm prefix memory. UNKNOWN is deliberately absent: an
-# unclassified observation is not evidence that nothing was served.
-_NON_WARMING_OUTCOMES = frozenset(
-    {
-        CompletionOutcome.TRANSIENT_NO_PROGRESS,
-        CompletionOutcome.EMPTY,
-        CompletionOutcome.REPEATED_NOOP,
-        CompletionOutcome.ABORTED,
-    }
-)
-
-
 class PrefixCacheCoordinator:
     """Router-facing coordinator for session-scoped prefix-cache estimates.
 
@@ -1015,24 +1002,11 @@ class PrefixCacheCoordinator:
         if generation is None:
             return False
 
-        # Only a *known-negative* outcome suppresses warming. The two outcome
-        # policies are deliberately different and this is the reconciliation:
-        # ``RoutingObservation.admits_real_work`` decides whether an observation
-        # may be used as *positive evidence of useful work* (learning); UNKNOWN
-        # never admits there. ``record_outcome`` decides whether an observation
-        # may *overwrite remembered blocks* (locality); UNKNOWN keeps the
-        # long-standing warm-on-success behaviour there, because an unclassified
-        # observation is not evidence that nothing was served, and treating it
-        # as suppressing would silently disable prefix warming for every caller
-        # that has not been wired to classify yet. A known-negative (a warmup
-        # notice, the incident that motivated all this) suppresses in both
-        # places.
-        #
-        # A warmup notice, the incident that motivated all this, classifies as
-        # TRANSIENT_NO_PROGRESS: a known negative. That is the case worth
-        # suppressing, and it is the case the production path now actually
-        # produces.
-        suppresses_warming = outcome in _NON_WARMING_OUTCOMES
+        # The observation's shared ``admits_real_work`` contract governs
+        # whether blocks can be replaced. Unknown and known-negative outcomes
+        # preserve existing memory, while provider-reported cache evidence is
+        # still handled below when it matches the currently remembered prefix.
+        suppresses_warming = not getattr(outcome, "admits_real_work", False)
         if suppresses_warming:
             # The provider answered, so the scope is provably live and a
             # transient hiccup must not age strong evidence out through the
