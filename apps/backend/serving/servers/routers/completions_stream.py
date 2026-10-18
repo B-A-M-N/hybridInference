@@ -970,13 +970,11 @@ class StreamSession:
                 # model for a response the user got nothing out of.
                 success=not is_empty_completion,
                 cached_tokens=cached_tokens,
-                # Pass the accumulated stream text so a warmup notice is
-                # classified TRANSIENT_NO_PROGRESS instead of PROGRESS.
-                response_body=(
-                    {"choices": [{"message": {"content": self._final_text}}]}
-                    if self._final_text
-                    else None
-                ),
+                # Pass the full structured response the finalizer already
+                # built (text, reasoning, tool_calls, finish_reason) so the
+                # classifier sees the same evidence the DB row will, including
+                # tool-call-only completions, which are real work.
+                response_body=response_for_db,
             )
 
     async def _finalize_failure(self, exc: BaseException) -> None:

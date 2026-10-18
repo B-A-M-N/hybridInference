@@ -141,3 +141,36 @@ def test_warmup_notice_is_transient_only_when_it_leads_the_message(text, expecte
     outcome = classify_completion_outcome(content=text, usage=None, http_status=200, terminal=True)
     is_transient = outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
     assert is_transient is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Answers that BEGIN with a marker but continue into an explanation:
+        # the bounded notice suffix must not swallow real prose.
+        (
+            "The model is starting up because the GPU was cold; that is why "
+            "latency spiked. Here is what I found.",
+            False,
+        ),
+        (
+            '"The model is starting up" is the warmup message; here is how to retry.',
+            False,
+        ),
+        (
+            "The model is starting up is a common log line. To fix it, restart "
+            "the worker and check the GPU pool.",
+            False,
+        ),
+        # Free-form prose after the marker is an answer, not a notice suffix.
+        ("Model is loading, please wait. Meanwhile, here is the summary you asked for.", False),
+        # Known notice suffixes stay transient.
+        ("The model is starting up - this takes about 120 seconds. Please wait...", True),
+        ("model is starting up, please try again shortly", True),
+        ("the model is not ready yet, hold on", True),
+    ],
+)
+def test_notice_suffix_is_bounded_to_known_provider_wording(text, expected):
+    outcome = classify_completion_outcome(content=text, usage=None, http_status=200, terminal=True)
+    is_transient = outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
+    assert is_transient is expected

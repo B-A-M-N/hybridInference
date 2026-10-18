@@ -437,3 +437,46 @@ class TestRouterCommitPath:
             )
         )
         assert "req-h" in router.pending_prefix_cache
+
+
+def test_verified_evidence_decays_from_observation_time_even_across_warmups():
+    """A warmup refresh must not extend verified cache residency.
+
+    ``refresh_liveness`` moves the *memory* entry's ``last_seen_at``, but the
+    VERIFIED_REUSABLE discount decays from the evidence record's own
+    ``observed_at``. Repeated transient notices therefore cannot keep strong
+    locality assumptions alive indefinitely.
+    """
+    coordinator = _coordinator()
+    scope = _scope()
+    conversation = _blocks(("a", 4096), ("b", 4096))
+    _remember_with_observed_hit(coordinator, scope, conversation)
+
+    before = coordinator.evaluate(scope, conversation, cold_cost=1.0, price_delta=0.5)
+    assert before.expected_cached_tokens == pytest.approx(2 * 4096, rel=1e-3)
+
+    # Feed repeated transient warmup notices, each refreshing liveness.
+    warmup = CompletionOutcome.from_response(
+        content=WARMUP_STUB, usage=None, http_status=200, terminal=True
+    )
+    assert warmup is CompletionOutcome.TRANSIENT_NO_PROGRESS
+    for _ in range(5):
+        coordinator.record_outcome(
+            scope=scope,
+            blocks=_blocks(("stub", 8)),
+            outcome=warmup,
+            observed_cached_tokens=0,
+        )
+
+    # The evidence's observed_at is unchanged: the same decay applies, so the
+    # expected discount falls with time exactly as it would have without the
+    # warmups.
+    ev = coordinator._evidence._evidence.get(scope)
+    observed_at = ev.observed_at
+    coordinator.record_outcome(
+        scope=scope,
+        blocks=_blocks(("stub", 8)),
+        outcome=warmup,
+        observed_cached_tokens=0,
+    )
+    assert coordinator._evidence._evidence.get(scope).observed_at == observed_at

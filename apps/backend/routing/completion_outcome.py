@@ -112,17 +112,30 @@ _DEFAULT_TRANSIENT_MARKERS: tuple[str, ...] = (
 # answer that merely mentions a marker mid-text does not match the anchored
 # form, so it stays PROGRESS. The bare pattern keeps an exact marker match
 # transient even when a trailing word falls outside the bounded tail.
-# A response is transient only when a marker leads the message. ``re.match``
-# anchors each marker at the start and the bounded tail absorbs the provider's
-# own "please wait"/duration wording; a marker appearing mid-answer never leads,
-# so a genuine response that merely mentions a marker stays PROGRESS. The tail
-# is capped so an arbitrarily long answer cannot ride on a leading marker.
-_TAIL = r"(?:[\s.!\u2026-]+(?:\w+\b(?:[\s.!\u2026-]+\w+\b){0,2}(?:.{0,80})?)?)?$"
+# A response is transient only when a marker leads the message and everything
+# after it is a known provider-notice suffix: punctuation, a short duration
+# phrase ("this takes about 120 seconds"), a wait phrase ("please wait",
+# "hold on", "try again soon"), or a plain trailing word such as "now". The
+# suffix set is deliberately narrow -- free-form prose after the marker is a
+# genuine answer that quotes a startup message, not a transient notice, so it
+# stays PROGRESS.
+_NOTICE_SUFFIX = (
+    r"(?:"
+    r"[\s.!\u2026,;-]*"  # punctuation / spacing
+    r"(?:"
+    r"this (?:takes|will take) about \d+ (?:seconds?|minutes?)"  # duration
+    r"|[\w\s]*please wait"
+    r"|[\w\s]*hold on"
+    r"|[\w\s]*try again (?:soon|later|shortly)"
+    r"|[\w\s]*please try again"
+    r"|[\w\s]*shortly"
+    r"|[\w\s]*yet"
+    r"|now"
+    r")?"
+    r")*$"
+)
 _TRANSIENT_MARKERS: list[re.Pattern[str]] = [
-    # ``\b`` after the marker keeps "the model is warming up" from also matching
-    # inside "the model is warming uphe ..." while still allowing a trailing word.
-    re.compile(pattern + r"\b" + _TAIL, re.IGNORECASE)
-    for pattern in _DEFAULT_TRANSIENT_MARKERS
+    re.compile(pattern + _NOTICE_SUFFIX, re.IGNORECASE) for pattern in _DEFAULT_TRANSIENT_MARKERS
 ]
 
 #: Statuses that indicate a retryable provider condition rather than a bad
@@ -132,7 +145,7 @@ _TRANSIENT_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
 
 def register_transient_marker(pattern: str) -> None:
     """Register an additional provider-specific no-progress marker."""
-    _TRANSIENT_MARKERS.append(re.compile(pattern + r"\b" + _TAIL, re.IGNORECASE))
+    _TRANSIENT_MARKERS.append(re.compile(pattern + _NOTICE_SUFFIX, re.IGNORECASE))
 
 
 def _looks_transient_text(text: str) -> bool:

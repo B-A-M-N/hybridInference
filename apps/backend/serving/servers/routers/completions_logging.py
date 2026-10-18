@@ -121,14 +121,32 @@ class CompletionsLogger:
         if not success:
             return CompletionOutcome.PROVIDER_ERROR
 
+        # A dict body carries structured evidence (text, reasoning, tool
+        # calls); a plain string body is the streaming finalizer's accumulated
+        # text. Both are real completion evidence; anything else is unknown
+        # shape and classifies on usage alone.
+        tool_calls: list[dict[str, Any]] | None = None
         content = ""
         if isinstance(response_body, dict):
             choices = response_body.get("choices") or [{}]
             message = (choices[0] or {}).get("message") or {}
-            content = message.get("content") or message.get("reasoning_content") or ""
+            raw_content = message.get("content") or message.get("reasoning_content") or ""
+            content = raw_content if isinstance(raw_content, str) else ""
+            raw_tools = message.get("tool_calls")
+            if isinstance(raw_tools, list) and raw_tools:
+                tool_calls = [t for t in raw_tools if isinstance(t, dict)]
+        elif isinstance(response_body, str):
+            content = response_body
+
+        if tool_calls:
+            # Completed tool calls are semantic work regardless of prose, and
+            # they must not be confused with a warmup notice: a tool-calling
+            # agent can quote any phrase. Classify on the tool evidence
+            # directly, bypassing the text-only warmup path.
+            return CompletionOutcome.PROGRESS
 
         return classify_completion_outcome(
-            content=content if isinstance(content, str) else None,
+            content=content or None,
             usage=usage,
             http_status=200,
             terminal=True,
