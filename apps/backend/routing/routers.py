@@ -124,6 +124,28 @@ def _response_text(response: Any) -> str | None:
     return content if isinstance(content, str) else None
 
 
+def _chunk_text(chunk: Any) -> str | None:
+    """Extract generated text from a stream chunk for outcome classification."""
+    if not isinstance(chunk, str | bytes):
+        return None
+    text = chunk.decode("utf-8", errors="surrogatepass") if isinstance(chunk, bytes) else chunk
+    prefix = "data: "
+    if not text.startswith(prefix):
+        return None
+    import json
+
+    try:
+        obj = json.loads(text[len(prefix) :].strip())
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    choices = obj.get("choices") or []
+    delta = (choices[0] or {}).get("delta") or {} if choices else {}
+    content = delta.get("content") or delta.get("reasoning_content")
+    return content if isinstance(content, str) and content else None
+
+
 def _response_usage(response: Any) -> dict[str, Any] | None:
     if not isinstance(response, dict):
         return None
@@ -820,6 +842,24 @@ class FixedRouter:
             outcome=classify_completion_outcome(
                 content=_response_text(response),
                 usage=_response_usage(response),
+                http_status=200,
+                terminal=True,
+            ),
+        )
+
+    def _on_stream_first_content(self, endpoint_id: str, chunk: Any) -> None:
+        """Record serving health for the first content-bearing stream chunk.
+
+        The streaming path previously recorded liveness only, so successful
+        streams could not reset consecutive failures or close a breaker. The
+        first content-bearing chunk is the same evidence the non-streaming path
+        classifies from accumulated output: it proves the provider produced
+        something, not merely that the socket accepted the request.
+        """
+        self._health_registry.record_success(
+            endpoint_id,
+            outcome=classify_completion_outcome(
+                content=_chunk_text(chunk),
                 http_status=200,
                 terminal=True,
             ),
@@ -2686,7 +2726,7 @@ class FixedRouter:
                         # The loop below's first-token bookkeeping, for a
                         # first token that arrived while it was being awaited.
                         first = False
-                        self._on_liveness(primary_endpoint_id)
+                        self._on_stream_first_content(primary_endpoint_id, held[-1])
                         self._prefill_load.release(lease, prefill_confirmed=True)
                     for chunk in held:
                         yield chunk
@@ -2696,7 +2736,7 @@ class FixedRouter:
                         # Providers may emit keep-alives or empty terminal chunks.
                         first = False
                         # Consider first non-empty token as a success signal for availability.
-                        self._on_liveness(primary_endpoint_id)
+                        self._on_stream_first_content(primary_endpoint_id, chunk)
                         # First token means the prompt is resident and this
                         # endpoint is decoding, not prefilling. Holding the
                         # lease for the whole stream would let a long cheap
@@ -2863,7 +2903,7 @@ class FixedRouter:
                             held = await self._await_first_token(stream, fallback_watch)
                             if held and has_non_empty_content(held[-1]):
                                 first = False
-                                self._on_liveness(adapter_endpoint_id)
+                                self._on_stream_first_content(adapter_endpoint_id, held[-1])
                                 self._prefill_load.release(lease, prefill_confirmed=True)
                             for chunk in held:
                                 yield chunk
@@ -2871,7 +2911,7 @@ class FixedRouter:
                         async for chunk in stream:
                             if first and has_non_empty_content(chunk):
                                 first = False
-                                self._on_liveness(adapter_endpoint_id)
+                                self._on_stream_first_content(adapter_endpoint_id, chunk)
                                 self._prefill_load.release(lease, prefill_confirmed=True)
                             yield chunk
                             chunks_yielded = True

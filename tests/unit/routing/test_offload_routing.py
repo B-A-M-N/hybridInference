@@ -1155,8 +1155,8 @@ async def test_a_primary_holding_the_half_open_probe_is_let_through_for_its_retr
         assert result["choices"][0]["message"]["content"] == "primary"
     assert primary.calls == 2
     if stream:
-        # First stream bytes are only liveness, not semantic serving recovery.
-        assert circuit.state == _CircuitState.HALF_OPEN
+        # First content-bearing stream bytes now record serving success, closing the breaker.
+        assert circuit.state == _CircuitState.CLOSED
     else:
         # The retry was the probe, and its answer closed the circuit.
         assert circuit.state == _CircuitState.CLOSED

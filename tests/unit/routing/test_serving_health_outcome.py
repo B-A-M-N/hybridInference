@@ -288,3 +288,38 @@ def test_router_on_success_without_a_response_records_liveness_not_success(monke
         router._on_success(_ENDPOINT)
 
         assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.OPEN, name
+
+
+# ---------------------------------------------------------------------------
+# Streaming success must close breakers
+# ---------------------------------------------------------------------------
+
+
+async def test_streaming_first_content_closes_open_breaker():
+    """A successful stream resets consecutive failures and closes the breaker."""
+    from routing.routers import FixedRouter
+
+    registry = EndpointHealthRegistry()
+    import pytest as _pytest
+
+    _trip(_pytest.MonkeyPatch(), registry)
+
+    class _StreamAdapter:
+        """Emit one content-bearing SSE chunk."""
+
+        class config:
+            provider = "stream-provider"
+            base_url = "https://stream.example/v1"
+            endpoint_id = _ENDPOINT
+
+        async def stream_chat_completion(self, messages, **params):
+            yield 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+
+    router = FixedRouter.__new__(FixedRouter)
+    router._health_registry = registry
+
+    chunk = 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+    router._on_stream_first_content(_ENDPOINT, chunk)
+
+    assert registry._circuits[_ENDPOINT].consecutive_failures == 0
+    assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED
