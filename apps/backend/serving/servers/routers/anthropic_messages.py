@@ -79,8 +79,8 @@ from serving.storage.utils import calculate_cost
 from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
 from serving.utils.request_ip import derive_affinity_key, get_client_ip_info
-from serving.utils.token_utils import optional_token_count
 from serving.utils.session_identity import consume_session_fields, session_identity
+from serving.utils.token_utils import optional_token_count
 from serving.utils.tokens import estimate_prompt_tokens, estimate_text_tokens
 
 if TYPE_CHECKING:
