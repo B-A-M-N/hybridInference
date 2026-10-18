@@ -300,12 +300,14 @@ async def test_full_bucket_maps_do_not_deny_unrelated_users(monkeypatch):
         True,
         None,
     )
-    # Her third attempt is refused by her own account/address window, not by
-    # map capacity.
+    # Her third attempt is ADMITTED UNRECORDED: the saturated maps cannot
+    # count it, so it neither consumes her window nor resets it. Map
+    # saturation is not a global login DoS.
     assert await limiter.check_and_record_login("alice@example.com", OWNER) == (
-        False,
-        "email",
+        True,
+        None,
     )
+    assert ("alice@example.com", OWNER) not in limiter._account_address_attempts
 
 
 @pytest.mark.asyncio
@@ -366,3 +368,51 @@ async def test_unresolved_caller_keeps_per_account_address_cap(monkeypatch):
         True,
         None,
     )
+
+
+@pytest.mark.asyncio
+async def test_saturation_does_not_evict_live_state_and_bypass_is_bounded(monkeypatch):
+    """Pin the saturation policy: live entries are never evicted.
+
+    At map capacity the attacker-populated admission maps admit a new identity
+    WITHOUT recording it. The accepted trade-off is that a saturated map can
+    no longer count a new identity's admissions against the per-account/
+    per-address windows it cannot remember -- but it never resets an active
+    identity's recorded window, so an attacker cannot refill someone's budget
+    by flooding, and a protected account under active guessing (whose key is
+    refreshed on every admitted attempt) keeps its full recorded state.
+    """
+    now = [7_000.0]
+    monkeypatch.setattr(limiter, "_now", lambda: now[0])
+    monkeypatch.setattr(settings, "login_rate_limit_per_15min", 2)
+    monkeypatch.setattr(limiter, "_MAX_ACTIVE_BUCKETS", 2)
+
+    # A protected account is actively near its per-address limit; every
+    # admitted attempt refreshes its key's recorded state.
+    assert await limiter.check_and_record_login("victim", "198.51.100.50") == (True, None)
+    now[0] += 1
+    assert await limiter.check_and_record_login("victim", "198.51.100.50") == (True, None)
+    assert await limiter.check_and_record_login("victim", "198.51.100.50") == (False, "email")
+    now[0] += 1
+
+    # The attacker saturates the map with fresh identities.
+    assert await limiter.check_and_record_login("atk1", "198.51.100.1") == (True, None)
+    now[0] += 1
+    assert await limiter.check_and_record_login("atk2", "198.51.100.2") == (True, None)
+    assert len(limiter._account_address_attempts) == 2
+    now[0] += 1
+
+    # A third attacker identity is admitted but NOT recorded (map full of
+    # live keys): bounded memory, and no live entry was dropped.
+    assert await limiter.check_and_record_login("atk3", "198.51.100.3") == (True, None)
+    assert len(limiter._account_address_attempts) == 2
+    assert ("atk3", "198.51.100.3") not in limiter._account_address_attempts
+    # The victim's recorded window survived the flood.
+    assert ("victim", "198.51.100.50") in limiter._account_address_attempts
+    assert await limiter.check_and_record_login("victim", "198.51.100.50") == (False, "email")
+
+    # The unrecorded identity is not tracked, so it can attempt again; the
+    # bypass costs memory nothing and never touches recorded state.
+    now[0] += 1
+    assert await limiter.check_and_record_login("atk3", "198.51.100.3") == (True, None)
+    assert len(limiter._account_address_attempts) == 2

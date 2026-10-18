@@ -122,12 +122,6 @@ def _prune_bucket(
     return bucket
 
 
-def _evict_oldest(buckets: dict[_Key, deque[float]]) -> None:
-    """Drop the entry whose oldest admission is earliest (a live-entry victim)."""
-    oldest_key = min(buckets, key=lambda k: buckets[k][0])
-    del buckets[oldest_key]
-
-
 def _can_add_bucket_key(
     buckets: dict[_Key, deque[float]],
     key: _Key,
@@ -138,20 +132,22 @@ def _can_add_bucket_key(
 ) -> bool:
     """Check map capacity, sweeping expired keys at most once per interval.
 
-    A full map first sweeps expired keys. If the map is still at capacity it
-    evicts the entry whose oldest admission is earliest rather than refusing
-    every new key: map saturation must never become a global denial of
-    service, and it must never disable a live identity's recorded state.
+    Security policy for a saturated map: a live entry is NEVER evicted, so an
+    attacker cannot reset an active identity's admission window by filling the
+    map, and the oldest expired key's slot is reused so memory stays bounded.
+    When the map is full of live keys the caller admits the new identity
+    WITHOUT recording it: map saturation must not become a global login DoS,
+    and an unrecorded admission costs no memory and resets nobody's state.
+    The admission is still subject to the other windows (account-wide, IP) on
+    its next attempt, matching the pre-bounded-map behaviour for identities
+    the maps cannot remember.
     """
     if key in buckets or len(buckets) < _MAX_ACTIVE_BUCKETS:
         return True
     if now - _last_capacity_sweep.get(scope, float("-inf")) >= _CAPACITY_SWEEP_INTERVAL_SECONDS:
         _sweep_inactive(buckets, cutoff)
         _last_capacity_sweep[scope] = now
-    if len(buckets) < _MAX_ACTIVE_BUCKETS:
-        return True
-    _evict_oldest(buckets)
-    return True
+    return key in buckets or len(buckets) < _MAX_ACTIVE_BUCKETS
 
 
 def _sweep_expired_refusals(now: float) -> None:
@@ -261,14 +257,17 @@ async def check_and_record_login(
             device_bucket = _prune_bucket(_device_attempts, device_key, account_cutoff)
             if device_bucket is not None and len(device_bucket) >= per_account_address:
                 return False, "device"
-            _can_add_bucket_key(
+            # Same no-live-eviction policy as the other maps: a saturated
+            # device map admits unrecorded rather than dropping a live
+            # browser's window (the device path is the owner's escape hatch).
+            if _can_add_bucket_key(
                 _device_attempts,
                 device_key,
                 account_cutoff,
                 now=now,
                 scope="device",
-            )
-            _device_attempts.setdefault(device_key, deque()).append(now)
+            ):
+                _device_attempts.setdefault(device_key, deque()).append(now)
             return True, None
 
         address_key = (account_key, ip_key)
@@ -305,22 +304,24 @@ async def check_and_record_login(
 
         # Check every map before writing to any of them, so capacity handling
         # cannot leave a partial admission in one of the other windows. A full
-        # map evicts its oldest entry; it never refuses solely for capacity.
-        _can_add_bucket_key(
+        # map of live keys admits WITHOUT recording (bounded memory, no live-
+        # entry eviction, no global DoS); a map with an expired key reuses the
+        # expired slot as usual.
+        record_address = _can_add_bucket_key(
             _account_address_attempts,
             address_key,
             account_cutoff,
             now=now,
             scope="account_address",
         )
-        _can_add_bucket_key(
+        record_account = _can_add_bucket_key(
             _account_attempts,
             account_key,
             account_cutoff,
             now=now,
             scope="account",
         )
-        if resolved:
+        record_ip = (
             _can_add_bucket_key(
                 _ip_attempts,
                 ip_key,
@@ -328,11 +329,17 @@ async def check_and_record_login(
                 now=now,
                 scope="ip",
             )
+            if resolved
+            else False
+        )
 
-        _account_address_attempts.setdefault(address_key, deque()).append(now)
-        _account_attempts.setdefault(account_key, deque()).append(now)
+        if record_address:
+            _account_address_attempts.setdefault(address_key, deque()).append(now)
+        if record_account:
+            _account_attempts.setdefault(account_key, deque()).append(now)
         if resolved:
-            _ip_attempts.setdefault(ip_key, deque()).append(now)
+            if record_ip:
+                _ip_attempts.setdefault(ip_key, deque()).append(now)
         else:
             _unresolved_attempts.append(now)
 
