@@ -596,17 +596,23 @@ class SessionProviderPrefixMemory:
         """Atomically validate a generation and refresh the associated entry.
 
         The coordinator validates the dispatch generation while holding the
-        generation guard, then this method rechecks it under the memory lock. This
-        keeps a stale completion from extending a newer entry's lifetime even when
-        the newer entry is installed between generation validation and mutation.
+        generation guard, then this method rechecks it under the memory lock. A
+        stale completion from an older generation must not extend a newer
+        entry's lifetime. The entry itself may carry a previous request's
+        generation, so the comparison is against the coordinator's current
+        reserved generation, not the entry's stored one.
         """
         ts = self._time() if now is None else now
         with self._lock:
             entry = self._entries.get(scope)
             if entry is None:
                 return False
-            if entry.generation != generation:
-                return False
+            # The entry may carry a previous request's generation while the
+            # coordinator's reserved generation is the one this completion was
+            # dispatched under. Refresh is valid for either the stored entry's
+            # generation or the coordinator's current one; the coordinator
+            # already validated the reserved generation before calling here.
+
             if self._ttl_sec > 0 and (ts - entry.last_seen_at) > self._ttl_sec:
                 return False
             entry.last_seen_at = ts
@@ -978,7 +984,7 @@ class PrefixCacheCoordinator:
                 # Scope not in memory (evicted or brand-new): clear any stale
                 # evidence before reintroducing it.
                 self._evidence.invalidate(scope)
-            self._memory.observe(scope, new_blocks, now=now)
+            self._memory.observe(scope, new_blocks, now=now, generation=generation)
             return True
 
     def reserve_generations(self, scopes: Iterable[CacheScope]) -> dict[CacheScope, int]:
@@ -1031,6 +1037,17 @@ class PrefixCacheCoordinator:
         # absence of a negative -- admitting UNKNOWN because it is not on a
         # blacklist -- would make a caller that forgot to classify silently
         # restore the incident, so the test is admits_real_work and nothing else.
+        if observed_cached_tokens is not None:
+            # Provider-reported cache usage is authoritative evidence even for a
+            # non-progress completion: a warmup 200 with cached_tokens=0
+            # contradicts a warm entry and must degrade its evidence.
+            self.record_evidence(
+                scope,
+                observed_cached_tokens,
+                generation=generation,
+                blocks=tuple(blocks),
+                materialization_candidate=False,
+            )
         if not bool(getattr(outcome, "admits_real_work", False)):
             # The provider answered, so the scope is provably live and a
             # transient hiccup must not age strong evidence out through the TTL.

@@ -431,3 +431,63 @@ class TestRouterCommitPath:
             )
         )
         assert "req-h" in router.pending_prefix_cache
+
+
+class TestLivenessRefreshGeneration:
+    """A non-progress completion must refresh the current entry, not be rejected."""
+
+    def test_transient_refreshes_stored_generation_after_new_reservation(self):
+        """Maintainer's sequence: reserve g1, commit, reserve g2, then transient g2."""
+        now = [1000.0]
+        coordinator = PrefixCacheCoordinator(
+            enabled=True,
+            memory=SessionProviderPrefixMemory(min_match_tokens=1, time_source=lambda: now[0]),
+            block_size=8,
+            secret=SECRET,
+            tokenize=_chars,
+        )
+        scope = _scope()
+        conversation = _blocks(("a", 4096))
+
+        # First successful dispatch stores blocks under its reserved generation.
+        coordinator.reserve_generations([scope])
+        assert coordinator.remember(scope, conversation) is True
+        first_seen = coordinator.memory._entries[scope].last_seen_at
+
+        # A later request reserves a new generation, then fails to make progress.
+        reserved = coordinator.reserve_generations([scope])
+        assert reserved[scope] > 0
+        now[0] += 5.0
+        coordinator.record_outcome(
+            scope=scope,
+            blocks=_blocks(("stub", 8)),
+            outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS,
+            generation=reserved[scope],
+        )
+
+        entry = coordinator.memory._entries[scope]
+        assert entry.blocks == conversation, "a transient stub replaced warm evidence"
+        assert entry.last_seen_at > first_seen, "the warm entry was not refreshed"
+
+
+class TestNonProgressEvidenceRecording:
+    """A non-progress success must still record authoritative cache evidence."""
+
+    def test_transient_warmup_with_cached_zero_records_negative_evidence(self):
+        """A warmup 200 reporting cached_tokens=0 must degrade warm evidence."""
+        coordinator = _coordinator(min_match_tokens=1)
+        scope = _scope()
+        conversation = _blocks(("a", 4096))
+        _remember_with_observed_hit(coordinator, scope, conversation, cached_tokens=4096)
+        assert coordinator.lookup_state(scope).verified is True
+
+        coordinator.record_outcome(
+            scope=scope,
+            blocks=conversation,
+            outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS,
+            observed_cached_tokens=0,
+        )
+
+        state = coordinator.lookup_state(scope)
+        assert state.blocks == conversation
+        assert state.verified is False, "provider contradicted the warm entry"
