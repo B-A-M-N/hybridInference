@@ -1444,30 +1444,30 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                 where_parts.append(f"status = ${len(params)}")
             where_parts.append("hard_delete_pending = FALSE")
         sql = f"UPDATE users SET {', '.join(set_parts)} WHERE {' AND '.join(where_parts)}"
-        async with self._pool.acquire() as conn, conn.transaction():
-            if "status" in fields:
-                # The route's preliminary read can race with either a
-                # hard-delete claim or soft-delete. Lock and re-check both
-                # predicates before updating any fields in this mutation.
-                row = await conn.fetchrow(
-                    "SELECT status, hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
-                    user_id,
-                )
-                if row is None:
-                    raise UserNotFoundError(user_id)
-                if row["hard_delete_pending"]:
-                    raise HardDeleteStateChanged(
-                        f"Account {user_id} has a hard-delete in progress."
-                    )
-                if expected_status is not None and row["status"] != expected_status:
-                    raise UserStateChanged(
-                        f"Account {user_id} changed from expected status {expected_status!r}."
-                    )
-                updated = await conn.fetchrow(f"{sql} RETURNING id", *params)
-                if updated is None:
-                    raise UserStateChanged(f"Account {user_id} changed during status update.")
-            else:
+        if "status" not in fields:
+            async with self._pool.acquire() as conn:
                 await conn.execute(sql, *params)
+            return
+
+        async with self._pool.acquire() as conn, conn.transaction():
+            # The route's preliminary read can race with either a
+            # hard-delete claim or soft-delete. Lock and re-check both
+            # predicates before updating any status fields.
+            row = await conn.fetchrow(
+                "SELECT status, hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
+                user_id,
+            )
+            if row is None:
+                raise UserNotFoundError(user_id)
+            if row["hard_delete_pending"]:
+                raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
+            if expected_status is not None and row["status"] != expected_status:
+                raise UserStateChanged(
+                    f"Account {user_id} changed from expected status {expected_status!r}."
+                )
+            updated = await conn.fetchrow(f"{sql} RETURNING id", *params)
+            if updated is None:
+                raise UserStateChanged(f"Account {user_id} changed during status update.")
 
     async def update_user_last_login(self, user_id: str) -> None:
         """Set ``last_login_at`` to the current timestamp."""
