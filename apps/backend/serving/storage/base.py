@@ -63,6 +63,13 @@ class HardDeleteClaimProvenance(str, Enum):
     RECOVERED = "recovered"
 
 
+class HardDeleteRecoveryMode(str, Enum):
+    """Server-verified basis for taking over a stale hard-delete claim."""
+
+    PRE_FENCE_OPERATOR = "pre_fence_operator"
+    POST_FENCE = "post_fence"
+
+
 @dataclass(frozen=True)
 class HardDeleteClaim:
     """Durable claim token plus its ownership provenance."""
@@ -141,6 +148,14 @@ class OperationalStore(ABC):
         """Return True if the store is reachable and healthy."""
 
     # -- phone authentication (optional for legacy store implementations) ----
+
+    async def require_phone_accounts(self) -> None:  # noqa: B027
+        """Raise ``AccountSchemaPending`` while the database cannot hold phone accounts yet.
+
+        An upgrade adds the phone columns from the background when it cannot
+        get the users table's lock at startup; until then phone routes answer
+        503. The base implementation has nothing pending.
+        """
 
     async def get_user_by_phone(self, phone: str) -> Row | None:
         """Fetch an account by its canonical phone number."""
@@ -278,12 +293,16 @@ class OperationalStore(ABC):
     async def update_user_fields(
         self,
         user_id: str,
+        *,
+        expected_status: str | None = None,
         **fields: Any,
     ) -> None:
         """Update one or more columns on the users table for *user_id*.
 
         Accepted keyword arguments map directly to column names, e.g.
         ``update_user_fields(uid, role="admin", status="active")``.
+        When changing ``status``, callers pass the status they validated so
+        the mutation cannot overwrite a concurrent soft-delete or review.
         """
 
     @abstractmethod
@@ -316,8 +335,7 @@ class OperationalStore(ABC):
         self,
         user_id: str,
         *,
-        allow_existing_fence: bool = False,
-        recover_stale_claim: bool = False,
+        recovery_mode: HardDeleteRecoveryMode | None = None,
     ) -> HardDeleteClaim:
         """Atomically claim a soft-deleted user for hard deletion.
 
@@ -325,14 +343,11 @@ class OperationalStore(ABC):
         resume even when the LogStore uses a different database. Repeating
         the claim for an already-pending deleted user is rejected so a
         concurrent attempt cannot take ownership from the active operation.
-        Once the caller has independently verified that the LogStore fence is
-        already durable, ``allow_existing_fence`` permits a retry to take over
-        a claim only after it is past the recovery grace period. The takeover
-        replaces and renews the claim token atomically; a live token is never
-        shared by concurrent destructive operations. An active claim remains
-        owned by its current worker and is rejected. ``recover_stale_claim``
-        is an explicit operator takeover for a claim left by a process that
-        exited before the fence transaction; it also requires the grace period.
+        ``recovery_mode`` is set only after the server verifies either an
+        existing durable LogStore fence or an explicit operator request for a
+        pre-fence recovery. In either mode, takeover is allowed only after the
+        recovery grace period and replaces the token atomically. A live token
+        is never shared by concurrent destructive operations.
         The returned claim token must be supplied to release or finish the
         claim. Its provenance tells callers whether this request may release
         it after a pre-fence failure.
@@ -362,11 +377,15 @@ class OperationalStore(ABC):
         admin_id: str,
         reason: str | None = None,
         email: str | None = None,
+        recover_stale_claim: bool = False,
     ) -> None:
         """Resume a soft-deleted user: set status='active' and audit.
 
         API keys remain ``revoked`` — the user must re-create one through
-        the normal flow.  All mutations and the audit-log insert are atomic.
+        the normal flow. All mutations and the audit-log insert are atomic.
+        ``recover_stale_claim`` is an explicit operator attestation; stores
+        must recheck the claim lease and clear it in the same transaction as
+        the status change.
         """
 
     @abstractmethod
@@ -1069,13 +1088,34 @@ class OperationalStore(ABC):
     async def get_user_preferences(self, user_id: str) -> dict[str, Any]:
         """Return the preferences JSONB column for *user_id*, parsed as dict."""
 
+    # Preferences are written one key at a time, in the database. A whole-column
+    # write from a value read earlier loses whatever another request wrote to a
+    # different key in between, so there is deliberately no such method.
+
     @abstractmethod
-    async def update_user_preferences(
+    async def set_user_preference(self, user_id: str, key: str, value: Any) -> bool:
+        """Set one preference key atomically; return False when there is no such user."""
+
+    @abstractmethod
+    async def delete_user_preference(self, user_id: str, key: str) -> bool:
+        """Remove one preference key atomically; return False when there is no such user."""
+
+    @abstractmethod
+    async def set_user_preference_if_newer(
         self,
         user_id: str,
-        preferences: dict[str, Any],
-    ) -> None:
-        """Atomically replace the full preferences JSONB column."""
+        key: str,
+        value: dict[str, Any],
+        chosen_at: datetime,
+    ) -> dict[str, Any] | None:
+        """Set a timestamped preference unless the stored one is at least as recent.
+
+        ``value`` carries its own ``chosen_at`` (ISO 8601). The comparison and
+        the write are one statement, so of two overlapping requests the more
+        recent choice is the one kept whichever lands last. Returns the value
+        now stored — this one, or the newer one already there — or ``None``
+        when there is no such user.
+        """
 
     @abstractmethod
     async def get_user_avatar(self, user_id: str) -> str | None:
@@ -1160,6 +1200,17 @@ class OperationalStore(ABC):
         self, key: str, value: str, value_type: str, updated_by: str | None
     ) -> None:
         """Upsert a site_settings row."""
+
+    async def compare_and_set_setting(
+        self,
+        key: str,
+        expected: str | None,
+        value: str,
+        value_type: str,
+        updated_by: str | None,
+    ) -> bool:
+        """Publish only if the row still has *expected* (None means absent)."""
+        raise NotImplementedError("This operational store does not support atomic settings")
 
     @abstractmethod
     async def delete_setting(self, key: str) -> bool:

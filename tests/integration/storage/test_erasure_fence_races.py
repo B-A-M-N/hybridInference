@@ -22,8 +22,16 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
-from serving.exceptions import HardDeleteStateChanged
-from serving.storage.base import HardDeleteClaim, HardDeleteClaimProvenance
+from serving.exceptions import (
+    HardDeleteRecoveryAvailable,
+    HardDeleteStateChanged,
+    UserStateChanged,
+)
+from serving.storage.base import (
+    HardDeleteClaim,
+    HardDeleteClaimProvenance,
+    HardDeleteRecoveryMode,
+)
 from serving.storage.log_schema import (
     ErasureFenceUnavailable,
     check_erasure_fence,
@@ -148,6 +156,34 @@ async def _count_all(pool) -> int:
             "SELECT COUNT(*) AS n FROM api_logs WHERE request_id LIKE 'req-fence-%'"
         )
     return row["n"]
+
+
+async def test_patch_status_guard_preserves_concurrent_soft_delete(fence_store):
+    """A stale PATCH validation cannot reactivate an account soft-deleted meanwhile."""
+    _log_store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE users SET status = 'suspended' WHERE id = $1", _OWNER)
+
+    # Admin A read and validated this state before admin B committed the
+    # soft-delete. Admin A's later status write must compare against that read.
+    await op_store.delete_user(
+        _OWNER,
+        admin_ip="127.0.0.1",
+        admin_id="admin-b",
+        reason="concurrent soft-delete",
+        email=f"{_OWNER}@example.com",
+    )
+    with pytest.raises(UserStateChanged):
+        await op_store.update_user_fields(
+            _OWNER,
+            expected_status="suspended",
+            status="active",
+        )
+
+    async with pool.acquire() as conn:
+        status = await conn.fetchval("SELECT status FROM users WHERE id = $1", _OWNER)
+    assert status == "deleted"
 
 
 # ---------------------------------------------------------------------------
@@ -1048,7 +1084,10 @@ async def test_stale_claim_can_be_explicitly_recovered_without_releasing_safety(
     first_claim = await op_store.begin_hard_delete_user(_OWNER)
     assert first_claim.provenance is HardDeleteClaimProvenance.NEW
     with pytest.raises(HardDeleteStateChanged, match="already has a hard-delete"):
-        await op_store.begin_hard_delete_user(_OWNER, recover_stale_claim=True)
+        await op_store.begin_hard_delete_user(
+            _OWNER,
+            recovery_mode=HardDeleteRecoveryMode.PRE_FENCE_OPERATOR,
+        )
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -1058,7 +1097,7 @@ async def test_stale_claim_can_be_explicitly_recovered_without_releasing_safety(
 
     recovered_claim = await op_store.begin_hard_delete_user(
         _OWNER,
-        recover_stale_claim=True,
+        recovery_mode=HardDeleteRecoveryMode.PRE_FENCE_OPERATOR,
     )
     assert recovered_claim.provenance is HardDeleteClaimProvenance.RECOVERED
     assert recovered_claim.token != first_claim.token
@@ -1077,6 +1116,57 @@ async def test_stale_claim_can_be_explicitly_recovered_without_releasing_safety(
     assert row["hard_delete_pending"] is True
     assert row["hard_delete_claim_token"] == recovered_claim.token
     assert row["hard_delete_claim_recovered"] is True
+
+
+async def test_resume_explicitly_recovers_only_stale_unfenced_claim(fence_store):
+    """An operator can restore an account after fencing work is confirmed stopped."""
+    log_store, pool = fence_store
+    op_store = PostgresOperationalStore(pool)
+    assert await log_store.account_has_erasure_fence(_OWNER) is False
+
+    await op_store.begin_hard_delete_user(_OWNER)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET hard_delete_claimed_at = NOW() WHERE id = $1", _OWNER
+        )
+
+    with pytest.raises(HardDeleteStateChanged, match="has not reached recovery grace"):
+        await op_store.resume_user(
+            _OWNER,
+            admin_ip="127.0.0.1",
+            admin_id="admin",
+            recover_stale_claim=True,
+        )
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET hard_delete_claimed_at = NOW() - INTERVAL '2 hours' "
+            "WHERE id = $1",
+            _OWNER,
+        )
+
+    with pytest.raises(HardDeleteRecoveryAvailable, match="stale hard-delete claim"):
+        await op_store.resume_user(_OWNER, admin_ip="127.0.0.1", admin_id="admin")
+
+    await op_store.resume_user(
+        _OWNER,
+        admin_ip="127.0.0.1",
+        admin_id="admin",
+        reason="operator confirmed prior workers stopped",
+        recover_stale_claim=True,
+    )
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, hard_delete_pending, hard_delete_claim_token, "
+            "hard_delete_claimed_at, hard_delete_claim_recovered FROM users WHERE id = $1",
+            _OWNER,
+        )
+    assert row["status"] == "active"
+    assert row["hard_delete_pending"] is False
+    assert row["hard_delete_claim_token"] is None
+    assert row["hard_delete_claimed_at"] is None
+    assert row["hard_delete_claim_recovered"] is False
 
 
 async def test_legacy_pending_claims_get_a_recovery_grace_period(fence_store):
@@ -1105,7 +1195,10 @@ async def test_legacy_pending_claims_get_a_recovery_grace_period(fence_store):
     assert claimed_at is not None
 
     with pytest.raises(HardDeleteStateChanged, match="not yet eligible"):
-        await op_store.begin_hard_delete_user(_OWNER, recover_stale_claim=True)
+        await op_store.begin_hard_delete_user(
+            _OWNER,
+            recovery_mode=HardDeleteRecoveryMode.PRE_FENCE_OPERATOR,
+        )
 
     # Explicit pre-fence recovery remains available only after the migration
     # anchor has aged past the normal grace period.
@@ -1116,7 +1209,7 @@ async def test_legacy_pending_claims_get_a_recovery_grace_period(fence_store):
         )
     pre_fence_claim = await op_store.begin_hard_delete_user(
         _OWNER,
-        recover_stale_claim=True,
+        recovery_mode=HardDeleteRecoveryMode.PRE_FENCE_OPERATOR,
     )
     assert pre_fence_claim.provenance is HardDeleteClaimProvenance.RECOVERED
 
@@ -1124,7 +1217,10 @@ async def test_legacy_pending_claims_get_a_recovery_grace_period(fence_store):
     # is durable, but still not before its refreshed lease becomes stale.
     await store.hard_delete_user_data(_OWNER)
     with pytest.raises(HardDeleteStateChanged, match="not yet eligible"):
-        await op_store.begin_hard_delete_user(_OWNER, recover_stale_claim=True)
+        await op_store.begin_hard_delete_user(
+            _OWNER,
+            recovery_mode=HardDeleteRecoveryMode.POST_FENCE,
+        )
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -1133,7 +1229,7 @@ async def test_legacy_pending_claims_get_a_recovery_grace_period(fence_store):
         )
     post_fence_claim = await op_store.begin_hard_delete_user(
         _OWNER,
-        recover_stale_claim=True,
+        recovery_mode=HardDeleteRecoveryMode.POST_FENCE,
     )
     assert post_fence_claim.provenance is HardDeleteClaimProvenance.RECOVERED
     assert post_fence_claim.token != pre_fence_claim.token
@@ -1149,7 +1245,10 @@ async def test_post_fence_retry_recovers_stale_claim_without_sharing_ownership(f
     assert await store.account_has_erasure_fence(_OWNER) is True
 
     with pytest.raises(HardDeleteStateChanged, match="already has a hard-delete"):
-        await op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True)
+        await op_store.begin_hard_delete_user(
+            _OWNER,
+            recovery_mode=HardDeleteRecoveryMode.POST_FENCE,
+        )
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -1157,7 +1256,10 @@ async def test_post_fence_retry_recovers_stale_claim_without_sharing_ownership(f
             _OWNER,
         )
 
-    retry_claim = await op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True)
+    retry_claim = await op_store.begin_hard_delete_user(
+        _OWNER,
+        recovery_mode=HardDeleteRecoveryMode.POST_FENCE,
+    )
     assert first_claim.provenance is HardDeleteClaimProvenance.NEW
     assert retry_claim.provenance is HardDeleteClaimProvenance.RECOVERED
     assert retry_claim.token != first_claim.token
@@ -1193,7 +1295,7 @@ async def test_superseded_worker_cannot_continue_after_fence(fence_store):
         )
     recovered_claim = await op_store.begin_hard_delete_user(
         _OWNER,
-        recover_stale_claim=True,
+        recovery_mode=HardDeleteRecoveryMode.POST_FENCE,
     )
     assert recovered_claim.token != first_claim.token
 
@@ -1287,7 +1389,7 @@ async def test_hard_delete_route_stops_after_claim_recovery_between_stages(
             )
         recovered_claim = await op_store.begin_hard_delete_user(
             _OWNER,
-            allow_existing_fence=True,
+            recovery_mode=HardDeleteRecoveryMode.POST_FENCE,
         )
 
         resume_original_worker.set()
@@ -1611,8 +1713,14 @@ async def test_concurrent_stale_post_fence_recovery_has_one_owner(fence_store):
         )
 
     results = await asyncio.gather(
-        op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True),
-        op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True),
+        op_store.begin_hard_delete_user(
+            _OWNER,
+            recovery_mode=HardDeleteRecoveryMode.POST_FENCE,
+        ),
+        op_store.begin_hard_delete_user(
+            _OWNER,
+            recovery_mode=HardDeleteRecoveryMode.POST_FENCE,
+        ),
         return_exceptions=True,
     )
     recovered = [result for result in results if isinstance(result, HardDeleteClaim)]
@@ -1642,7 +1750,12 @@ async def test_active_post_fence_retry_cannot_race_completion(fence_store):
     await store.hard_delete_user_data(_OWNER)
     assert await store.account_has_erasure_fence(_OWNER) is True
 
-    retry = asyncio.create_task(op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True))
+    retry = asyncio.create_task(
+        op_store.begin_hard_delete_user(
+            _OWNER,
+            recovery_mode=HardDeleteRecoveryMode.POST_FENCE,
+        )
+    )
     with pytest.raises(HardDeleteStateChanged, match="already has a hard-delete"):
         await retry
 
@@ -1656,7 +1769,10 @@ async def test_active_post_fence_retry_cannot_race_completion(fence_store):
     assert counts["users"] == 1
 
     with pytest.raises(HardDeleteStateChanged, match="no longer eligible"):
-        await op_store.begin_hard_delete_user(_OWNER, allow_existing_fence=True)
+        await op_store.begin_hard_delete_user(
+            _OWNER,
+            recovery_mode=HardDeleteRecoveryMode.POST_FENCE,
+        )
     assert await store.account_has_erasure_fence(_OWNER) is True
 
 

@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from .base import (
     HardDeleteClaim,
-    HardDeleteClaimProvenance,
+    HardDeleteRecoveryMode,
     OperationalStore,
     ProviderDefinitionRow,
     ProviderKeyRow,
@@ -286,9 +286,22 @@ class CachedOperationalStore(OperationalStore):
 
     # -- user writes (invalidate user cache) ---------------------------------
 
-    async def update_user_fields(self, user_id: str, **fields: Any) -> None:
+    async def update_user_fields(
+        self,
+        user_id: str,
+        *,
+        expected_status: str | None = None,
+        **fields: Any,
+    ) -> None:
         """Delegate then invalidate user cache (and auth caches if role/status changed)."""
-        await self._store.update_user_fields(user_id, **fields)
+        if expected_status is None:
+            await self._store.update_user_fields(user_id, **fields)
+        else:
+            await self._store.update_user_fields(
+                user_id,
+                expected_status=expected_status,
+                **fields,
+            )
         await self._cache.delete(self._user_key(user_id))
         if fields.keys() & {"role", "status"}:
             await self._cache.delete_pattern("auth:*")
@@ -327,23 +340,20 @@ class CachedOperationalStore(OperationalStore):
         self,
         user_id: str,
         *,
-        allow_existing_fence: bool = False,
-        recover_stale_claim: bool = False,
+        recovery_mode: HardDeleteRecoveryMode | None = None,
     ) -> HardDeleteClaim:
         """Claim a hard-delete and invalidate caches.
 
-        A caller may take over an abandoned existing claim only after
-        independently proving that the LogStore fence is already durable.
-        The durable store atomically replaces the stale token before returning
-        the recovered claim.
+        The server supplies a recovery mode only after verifying a durable
+        fence or an explicit operator request. The durable store atomically
+        replaces a stale token before returning the recovered claim.
         """
-        claim_task = asyncio.create_task(
-            self._store.begin_hard_delete_user(
-                user_id,
-                allow_existing_fence=allow_existing_fence,
-                recover_stale_claim=recover_stale_claim,
+        if recovery_mode is None:
+            claim_task = asyncio.create_task(self._store.begin_hard_delete_user(user_id))
+        else:
+            claim_task = asyncio.create_task(
+                self._store.begin_hard_delete_user(user_id, recovery_mode=recovery_mode)
             )
-        )
 
         def _release_completed_claim(task: asyncio.Task[HardDeleteClaim]) -> None:
             if task.cancelled():
@@ -379,7 +389,7 @@ class CachedOperationalStore(OperationalStore):
 
     async def _release_claim_safely(self, user_id: str, claim: HardDeleteClaim) -> None:
         """Release a claim after a cancelled/failed claim wrapper operation."""
-        if claim.provenance is not HardDeleteClaimProvenance.NEW:
+        if not claim.newly_acquired:
             return
         try:
             await asyncio.shield(self._store.release_hard_delete_user_claim(user_id, claim.token))
@@ -408,11 +418,22 @@ class CachedOperationalStore(OperationalStore):
         admin_id: str,
         reason: str | None = None,
         email: str | None = None,
+        recover_stale_claim: bool = False,
     ) -> None:
         """Delegate then invalidate user + auth caches."""
-        await self._store.resume_user(
-            user_id, admin_ip=admin_ip, admin_id=admin_id, reason=reason, email=email
-        )
+        if recover_stale_claim:
+            await self._store.resume_user(
+                user_id,
+                admin_ip=admin_ip,
+                admin_id=admin_id,
+                reason=reason,
+                email=email,
+                recover_stale_claim=True,
+            )
+        else:
+            await self._store.resume_user(
+                user_id, admin_ip=admin_ip, admin_id=admin_id, reason=reason, email=email
+            )
         await self._cache.delete(self._user_key(user_id))
         await self._cache.delete_pattern("auth:*")
         await self._cache.delete_pattern("auth_light:*")
@@ -797,6 +818,10 @@ class CachedOperationalStore(OperationalStore):
         """Delegate to wrapped store."""
         return await self._store.revoke_browser_session(browser_session_id)
 
+    async def require_phone_accounts(self) -> None:
+        """Delegate to wrapped store."""
+        await self._store.require_phone_accounts()
+
     async def get_user_by_phone(self, phone: str) -> Row | None:
         """Fetch an account by its canonical phone number."""
         return await self._store.get_user_by_phone(phone)
@@ -1056,12 +1081,36 @@ class CachedOperationalStore(OperationalStore):
         """Delegate to wrapped store."""
         return await self._store.get_user_preferences(user_id)
 
-    async def update_user_preferences(self, user_id: str, preferences: dict[str, Any]) -> None:
-        """Delegate then invalidate user and auth caches."""
-        await self._store.update_user_preferences(user_id, preferences)
+    async def _invalidate_preferences(self, user_id: str) -> None:
+        # The auth contexts carry preferences (disabled models), so every
+        # preference write drops them along with the user row.
         await self._cache.delete(self._user_key(user_id))
         await self._cache.delete_pattern("auth:*")
         await self._cache.delete_pattern("auth_light:*")
+
+    async def set_user_preference(self, user_id: str, key: str, value: Any) -> bool:
+        """Delegate then invalidate user and auth caches."""
+        found = await self._store.set_user_preference(user_id, key, value)
+        await self._invalidate_preferences(user_id)
+        return found
+
+    async def delete_user_preference(self, user_id: str, key: str) -> bool:
+        """Delegate then invalidate user and auth caches."""
+        found = await self._store.delete_user_preference(user_id, key)
+        await self._invalidate_preferences(user_id)
+        return found
+
+    async def set_user_preference_if_newer(
+        self,
+        user_id: str,
+        key: str,
+        value: dict[str, Any],
+        chosen_at: datetime,
+    ) -> dict[str, Any] | None:
+        """Delegate then invalidate user and auth caches."""
+        stored = await self._store.set_user_preference_if_newer(user_id, key, value, chosen_at)
+        await self._invalidate_preferences(user_id)
+        return stored
 
     async def get_user_avatar(self, user_id: str) -> str | None:
         """Delegate to wrapped store; portraits are not cached."""
@@ -1118,6 +1167,19 @@ class CachedOperationalStore(OperationalStore):
     async def delete_setting(self, key: str) -> bool:
         """Delegate to wrapped store."""
         return await self._store.delete_setting(key)
+
+    async def compare_and_set_setting(
+        self,
+        key: str,
+        expected: str | None,
+        value: str,
+        value_type: str,
+        updated_by: str | None,
+    ) -> bool:
+        """Delegate atomic publication without a process-local cache."""
+        return await self._store.compare_and_set_setting(
+            key, expected, value, value_type, updated_by
+        )
 
     async def list_settings(self) -> list[Row]:
         """Delegate to wrapped store."""

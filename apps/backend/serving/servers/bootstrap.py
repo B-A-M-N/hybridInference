@@ -156,6 +156,12 @@ async def _initialize_operational_store(pg_operational: PostgresOperationalStore
     ``initialize`` is catalog-gated and idempotent, so the retry re-issues only
     what is still missing.
 
+    That includes the account columns an upgrade adds to ``users`` (login
+    names, phone numbers): the store reads which of them exist and queries
+    only those, so sign-in by email and API keys keep working while first-run
+    setup and phone sign-in answer 503 until the retry lands them. Only the
+    hard-delete claim columns are required up front.
+
     Anything other than a lock timeout still propagates — startup must not
     mask a genuinely broken schema.
     """
@@ -164,8 +170,8 @@ async def _initialize_operational_store(pg_operational: PostgresOperationalStore
     except RequiredOperationalSchemaUnavailable:
         logger.error(
             "Operational store cannot start until the required users columns "
-            "(hard-delete claim, login name) are installed; refusing to serve "
-            "against an unsafe schema."
+            "(hard-delete claim) are installed; refusing to serve against an "
+            "unsafe schema."
         )
         raise
     except SchemaLockUnavailable as lock_exc:
@@ -1536,6 +1542,17 @@ async def initialize() -> AppServices:
 
     auto_mode = _load_auto_mode(router)
 
+    from serving.pricing import bind_pricing_snapshot_provider
+    from serving.pricing_sources.sync import PricingSyncService, configured_source_models
+
+    pricing_sync = None
+    source_models = configured_source_models(router, embedding_adapters)
+    bind_pricing_snapshot_provider(None)
+    if source_models:
+        pricing_sync = PricingSyncService(operational_store, source_models)
+        await pricing_sync.initialize()
+        bind_pricing_snapshot_provider(pricing_sync.snapshot)
+
     # Start managed router lifecycle hooks only after the rest of bootstrap has
     # succeeded, so a later startup failure cannot leave background tasks
     # running without a matching shutdown.
@@ -1579,6 +1596,8 @@ async def initialize() -> AppServices:
     # Every worker re-reads the stored configuration and the runtime settings,
     # so a write made through one of them reaches the others.
     app_config.start_refresh()
+    if pricing_sync is not None:
+        pricing_sync.start()
     if runtime_settings is not None:
         runtime_settings.start_refresh()
 
@@ -1603,6 +1622,7 @@ async def initialize() -> AppServices:
         runtime_settings=runtime_settings,
         completions_logger=completions_logger,
         pricing_lookup=pricing_lookup,
+        pricing_sync=pricing_sync,
         cost_tracker=cost_tracker,
         responses_store=responses_store,
         auto_mode=auto_mode,
@@ -1619,6 +1639,12 @@ async def shutdown(services: AppServices) -> None:
     Args:
         services: The services container returned by :func:`initialize`.
     """
+    if services.pricing_sync is not None:
+        await services.pricing_sync.stop()
+        from serving.pricing import bind_pricing_snapshot_provider
+
+        bind_pricing_snapshot_provider(None)
+
     if services.routewise_settings_refresh_task is not None:
         services.routewise_settings_refresh_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

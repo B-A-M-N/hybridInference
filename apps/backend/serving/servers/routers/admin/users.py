@@ -12,7 +12,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from serving.config.provider_labels import resolve_display_names
 from serving.config.settings import get_settings
-from serving.exceptions import HardDeleteStateChanged
+from serving.exceptions import (
+    HardDeleteRecoveryAvailable,
+    HardDeleteSchemaPending,
+    HardDeleteStateChanged,
+    UserNotFoundError,
+    UserStateChanged,
+)
 from serving.model_access import (
     DISABLED_MODELS_PREFERENCE_KEY,
     get_disabled_models_from_preferences,
@@ -66,7 +72,7 @@ from serving.servers.deps import (
 )
 from serving.servers.routers.admin._common import _serialize_for_audit
 from serving.servers.routers.admin.providers import _enumerate_routable_providers
-from serving.storage.base import HardDeleteClaim, HardDeleteClaimProvenance
+from serving.storage.base import HardDeleteClaim, HardDeleteRecoveryMode
 from serving.utils.request_ip import get_client_ip
 
 router = APIRouter(prefix="/admin")
@@ -78,6 +84,8 @@ if TYPE_CHECKING:
 # The claim recovery grace period is one hour. Renew substantially sooner so
 # a slow destructive store operation cannot outlive its ownership lease.
 _HARD_DELETE_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 300.0
+_HARD_DELETE_CLAIM_HEARTBEAT_RETRY_SECONDS = 1.0
+_HARD_DELETE_CLAIM_HEARTBEAT_MAX_RETRIES = 3
 
 
 async def _run_hard_delete_stage_with_heartbeat(
@@ -98,7 +106,22 @@ async def _run_hard_delete_stage_with_heartbeat(
     async def _heartbeat() -> None:
         while True:
             await asyncio.sleep(_HARD_DELETE_CLAIM_HEARTBEAT_INTERVAL_SECONDS)
-            await op_store.renew_hard_delete_user_claim(user_id, claim_token)
+            for attempt in range(_HARD_DELETE_CLAIM_HEARTBEAT_MAX_RETRIES + 1):
+                try:
+                    await op_store.renew_hard_delete_user_claim(user_id, claim_token)
+                except HardDeleteStateChanged:
+                    # This is an authoritative token mismatch. Stop the stage
+                    # immediately so a superseded worker cannot enter its next
+                    # destructive boundary.
+                    raise
+                except Exception as exc:
+                    if attempt >= _HARD_DELETE_CLAIM_HEARTBEAT_MAX_RETRIES:
+                        raise RuntimeError(
+                            "hard-delete claim renewal failed after bounded retries"
+                        ) from exc
+                    await asyncio.sleep(_HARD_DELETE_CLAIM_HEARTBEAT_RETRY_SECONDS)
+                else:
+                    break
 
     stage_task = asyncio.create_task(stage)
     heartbeat_task = asyncio.create_task(_heartbeat())
@@ -107,10 +130,14 @@ async def _run_hard_delete_stage_with_heartbeat(
             (stage_task, heartbeat_task),
             return_when=asyncio.FIRST_COMPLETED,
         )
+        # A stage completion is authoritative. In particular, the final
+        # operational purge deletes the row that the heartbeat would renew;
+        # a simultaneous heartbeat mismatch must not mask its commit result.
+        if stage_task in done:
+            return await stage_task
         if heartbeat_task in done:
             heartbeat_task.result()
             raise RuntimeError("hard-delete claim heartbeat stopped unexpectedly")
-        return await stage_task
     except BaseException:
         if not stage_task.done():
             stage_task.cancel()
@@ -564,6 +591,13 @@ async def approve_user(
             409,
             "This account has a hard-delete in progress and cannot be approved.",
         ) from None
+    except UserNotFoundError:
+        raise HTTPException(404, f"User '{user_id}' not found") from None
+    except UserStateChanged:
+        raise HTTPException(
+            409,
+            "This user is no longer pending approval. Refresh the user record and try again.",
+        ) from None
 
     await log_admin_action(
         op_store,
@@ -622,6 +656,13 @@ async def reject_user(
         raise HTTPException(
             409,
             "This account has a hard-delete in progress and cannot be rejected.",
+        ) from None
+    except UserNotFoundError:
+        raise HTTPException(404, f"User '{user_id}' not found") from None
+    except UserStateChanged:
+        raise HTTPException(
+            409,
+            "This user is no longer pending approval. Refresh the user record and try again.",
         ) from None
 
     await log_admin_action(
@@ -867,11 +908,21 @@ async def update_user(
         updated.append("suspension_message")
     if user_table_updates:
         try:
-            await op_store.update_user_fields(user_id, **user_table_updates)
+            update_kwargs: dict[str, object] = {}
+            if new_status is not None:
+                update_kwargs["expected_status"] = current_status
+            await op_store.update_user_fields(user_id, **update_kwargs, **user_table_updates)
         except HardDeleteStateChanged:
             raise HTTPException(
                 409,
                 "This account has a hard-delete in progress and cannot change status.",
+            ) from None
+        except UserNotFoundError:
+            raise HTTPException(404, f"User '{user_id}' not found") from None
+        except UserStateChanged:
+            raise HTTPException(
+                409,
+                "User state changed before the update was applied. Refresh and try again.",
             ) from None
 
     # Post-write side-effects that depend on the new status
@@ -900,15 +951,13 @@ async def update_user(
             if getattr(adapter, "config", None) is not None
         }
         normalized_disabled_models = normalize_disabled_models(payload_dict["disabled_models"])
-        # Reuse the already-fetched, JSONB-decoded preferences from user_row to
-        # avoid an extra DB round-trip.
-        raw_preferences = user_row.get("preferences")
-        preferences = dict(raw_preferences) if isinstance(raw_preferences, dict) else {}
-        preferences[DISABLED_MODELS_PREFERENCE_KEY] = [
+        disabled_models = [
             model_id for model_id in normalized_disabled_models if model_id in known_model_ids
         ]
-        await op_store.update_user_preferences(user_id, preferences)
-        payload_dict["disabled_models"] = preferences[DISABLED_MODELS_PREFERENCE_KEY]
+        # One key, written in the database: the user's own preferences (their
+        # language, their prober layout) may change while this request runs.
+        await op_store.set_user_preference(user_id, DISABLED_MODELS_PREFERENCE_KEY, disabled_models)
+        payload_dict["disabled_models"] = disabled_models
         updated.append("disabled_models")
 
     await log_admin_action(
@@ -1047,6 +1096,11 @@ async def resume_user(
     new identifying rows from being created — reactivating it would produce
     an active account whose logs silently disappear.
 
+    A stale pre-fence claim can be cleared only when an admin explicitly
+    confirms prior deletion workers are stopped. The route verifies that no
+    LogStore erasure fence exists, and the operational store rechecks the
+    lease while atomically clearing the claim and restoring the account.
+
     Requires: Admin authentication (JWT or ADMIN_TOKEN)
     """
     if not op_store:
@@ -1063,6 +1117,12 @@ async def resume_user(
             "Only soft-deleted users can be resumed.",
         )
 
+    if payload.recover_stale_claim and log_store is None:
+        raise HTTPException(
+            503,
+            "Stale-claim recovery is unavailable until a LogStore can verify the erasure fence.",
+        )
+
     if log_store is not None and await log_store.account_has_erasure_fence(user_id):
         raise HTTPException(
             409,
@@ -1070,19 +1130,47 @@ async def resume_user(
             "be resumed. Create a new account instead.",
         )
 
+    resume_kwargs: dict[str, object] = {
+        "admin_ip": get_client_ip(request),
+        "admin_id": admin_id,
+        "reason": payload.reason,
+        "email": user_row["email"],
+    }
+    if payload.recover_stale_claim:
+        resume_kwargs["recover_stale_claim"] = True
     try:
-        await op_store.resume_user(
-            user_id,
-            admin_ip=get_client_ip(request),
-            admin_id=admin_id,
-            reason=payload.reason,
-            email=user_row["email"],
-        )
+        await op_store.resume_user(user_id, **resume_kwargs)
+    except HardDeleteSchemaPending as exc:
+        raise HTTPException(503, str(exc)) from None
+    except HardDeleteRecoveryAvailable:
+        if log_store is None:
+            raise HTTPException(
+                503,
+                "Stale-claim recovery is unavailable until a LogStore can verify the erasure fence.",
+            ) from None
+        raise HTTPException(
+            409,
+            detail={
+                "code": "hard_delete_resume_recovery_available",
+                "recovery_available": True,
+                "message": (
+                    "The hard-delete claim is stale and no erasure fence exists. Confirm that "
+                    "all prior deletion workers are stopped before restoring this account."
+                ),
+            },
+        ) from None
     except HardDeleteStateChanged:
         raise HTTPException(
             409,
-            "This account has a hard-delete in progress and cannot be "
-            "resumed. Retry after the hard-delete completes or fails.",
+            "This account has a hard-delete in progress and cannot be resumed. "
+            "An explicit recovery requires an expired lease and no erasure fence.",
+        ) from None
+    except UserNotFoundError:
+        raise HTTPException(404, f"User '{user_id}' not found") from None
+    except UserStateChanged:
+        raise HTTPException(
+            409,
+            "User state changed before it could be resumed. Refresh and try again.",
         ) from None
 
     return ResumeUserResponse(
@@ -1126,20 +1214,16 @@ async def hard_delete_user(
     erased.
 
     Failure modes:
-    - LogStore wipe fails: operational state and audit log are untouched;
-      the pre-fence claim is released when this request still owns it, the
-      user remains soft-deleted (``status='deleted'``), and the admin can
-      retry the hard-delete. The fence is NOT established (the whole
-      LogStore transaction is rolled back), so a retry can re-attempt both
-      the fence and the purge. A retry takes ownership with a fresh token,
-      so an older in-flight attempt cannot release or complete the newer
-      claim.
+    - LogStore wipe fails before the fence: a newly acquired claim is released
+      only after the route verifies that no fence committed. The user remains
+      soft-deleted and can be retried. A recovered claim stays pending because
+      the previous worker may still be unwinding.
     - LogStore wipe succeeds but op_store wipe fails: log rows are gone and
       the fence is established, but the user row + prior audit entries
       remain — the user is still soft-deleted. An immediate retry is rejected
       while the existing claim is active or within its recovery grace period;
-      after that period, a retry can explicitly take over the stale claim,
-      re-attempt the operational purge, and complete the deletion.
+      after that period, the fenced recovery path can take over the stale
+      claim, re-attempt the operational purge, and complete the deletion.
 
     Requires: Admin authentication (JWT or ADMIN_TOKEN)
     """
@@ -1178,7 +1262,9 @@ async def hard_delete_user(
     claim: HardDeleteClaim | None = None
     try:
         claim = await op_store.begin_hard_delete_user(user_id)
-    except HardDeleteStateChanged:
+    except HardDeleteSchemaPending as exc:
+        raise HTTPException(503, str(exc)) from None
+    except HardDeleteStateChanged as claim_error:
         # A durable LogStore fence makes an abandoned post-fence deletion
         # safely retryable after the claim recovery grace period. The
         # operational store may take over that claim only then; an active
@@ -1189,31 +1275,59 @@ async def hard_delete_user(
             try:
                 claim = await op_store.begin_hard_delete_user(
                     user_id,
-                    recover_stale_claim=True,
+                    recovery_mode=HardDeleteRecoveryMode.PRE_FENCE_OPERATOR,
                 )
             except HardDeleteStateChanged:
                 raise HTTPException(
                     409,
-                    "Account state changed before hard-delete could begin. "
-                    "The claim is still active or has not reached the recovery grace period.",
+                    detail={
+                        "code": "hard_delete_recovery_not_ready",
+                        "recovery_available": False,
+                        "message": (
+                            "The claim is active or has not reached the one-hour recovery "
+                            "grace period."
+                        ),
+                    },
                 ) from None
         elif not fence_exists:
+            recovery_available = isinstance(claim_error, HardDeleteRecoveryAvailable)
+            if recovery_available:
+                message = (
+                    "The previous pre-fence claim passed its recovery grace period. "
+                    "Confirm recovery to take over and continue the permanent deletion."
+                )
+            else:
+                message = (
+                    "A pre-fence hard-delete claim is still active or has not reached its "
+                    "one-hour recovery grace period."
+                )
             raise HTTPException(
                 409,
-                "Account state changed before hard-delete could begin. "
-                "Retry if the account is still soft-deleted.",
+                detail={
+                    "code": "hard_delete_pre_fence_recovery_available"
+                    if recovery_available
+                    else "hard_delete_recovery_not_ready",
+                    "recovery_available": recovery_available,
+                    "message": message,
+                },
             ) from None
         else:
             try:
                 claim = await op_store.begin_hard_delete_user(
                     user_id,
-                    allow_existing_fence=True,
+                    recovery_mode=HardDeleteRecoveryMode.POST_FENCE,
                 )
             except HardDeleteStateChanged:
                 raise HTTPException(
                     409,
-                    "Account state changed before hard-delete could begin. "
-                    "An active claim or recovery grace period must expire before retrying.",
+                    detail={
+                        "code": "hard_delete_recovery_not_ready",
+                        "recovery_available": False,
+                        "message": (
+                            "An active claim or recovery grace period must expire before "
+                            "the fenced deletion can continue."
+                        ),
+                    },
                 ) from None
 
     assert claim is not None
@@ -1272,7 +1386,7 @@ async def hard_delete_user(
     except BaseException as exc:
         if (
             claim is not None
-            and claim.provenance is HardDeleteClaimProvenance.NEW
+            and claim.newly_acquired
             and not fence_established
         ):
             # A LogStore transaction normally rolls back its fence before
