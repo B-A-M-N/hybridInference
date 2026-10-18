@@ -529,7 +529,7 @@ function ProviderObservabilitySection({ data }: { data: ProviderObservabilityRes
   const cacheHitRate = pctValue(totals.cache_hit_count, totals.cache_eligible_count);
   const cacheTokenShare = pctValue(
     totals.cache_read_tokens,
-    totals.cache_eligible_input_tokens ?? totals.input_tokens,
+    totals.cache_eligible_input_tokens,
   );
   const trendData = data.buckets.map((bucket) => ({
     t: fmtHour(bucket.start_time),
