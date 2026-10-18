@@ -310,8 +310,6 @@ def extract_cache_tokens(
     return cache_read, cache_write
 
 
-
-
 def normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
     """Normalize usage dict by extracting and flattening token fields.
 
