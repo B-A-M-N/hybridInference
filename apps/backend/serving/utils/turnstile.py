@@ -32,7 +32,10 @@ async def verify_turnstile_token(token: str | None, remote_ip: str | None = None
         return False
 
     data = {"secret": secret_key, "response": token}
-    if remote_ip:
+    # ``get_client_ip`` keeps the historical string API and represents an
+    # unresolved address as "unknown". That sentinel is not a valid visitor
+    # address and must not be forwarded to Turnstile as ``remoteip``.
+    if remote_ip and remote_ip != "unknown":
         data["remoteip"] = remote_ip
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
