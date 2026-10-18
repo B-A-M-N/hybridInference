@@ -35,6 +35,7 @@ from typing import Any, TypeGuard
 
 from serving.analytics.automation_score import (
     INTERACTIVE_CLIENTS,
+    SCRIPT_CLIENTS,
     classify_client,
     ua_automation_value,
 )
@@ -382,6 +383,16 @@ def classify_traffic(evidence: TrafficEvidence) -> TrafficClassification:
 
     # Derive class from score and confidence
     class_hint = _derive_class(score, confidence)
+    # A positively identified raw HTTP client is strong automation evidence.
+    # It can deny a human scheduling preference, but the public class must not
+    # contradict that evidence when slower behavioral signals pull the score
+    # into the human band. Unknown or ambiguous user-agent labels stay governed
+    # by the behavioral score.
+    if (
+        class_hint is TrafficClass.LIKELY_HUMAN
+        and classify_client(evidence.user_agent) in SCRIPT_CLIENTS
+    ):
+        class_hint = TrafficClass.UNKNOWN
 
     # Generate stable reason codes
     reasons = _generate_reasons(evidence, signals, class_hint)

@@ -252,6 +252,43 @@ def test_script_or_unknown_agent_cannot_receive_human_hint(user_agent, request_c
     )
 
 
+@pytest.mark.parametrize("user_agent", ["httpx/0.27", "python-requests/2.31"])
+def test_identified_script_client_is_not_classified_as_likely_human(user_agent):
+    """Slow sequential traffic cannot override a positively identified script UA."""
+    classification = classify_traffic(
+        TrafficEvidence(
+            # This is response-idle time. A prior request may have taken a long
+            # time upstream before this client immediately started its next one.
+            inter_arrival_ms=60_000,
+            concurrent_requests=1,
+            shape_repeat_count=1,
+            session_continuity=None,
+            is_authenticated=True,
+            user_agent=user_agent,
+            request_count=8,
+        )
+    )
+
+    assert classification.class_hint is TrafficClass.UNKNOWN
+
+
+def test_uncertain_user_agent_keeps_behavior_based_classification():
+    """An unrecognized client token is not treated as identified automation."""
+    classification = classify_traffic(
+        TrafficEvidence(
+            inter_arrival_ms=60_000,
+            concurrent_requests=1,
+            shape_repeat_count=1,
+            session_continuity=None,
+            is_authenticated=True,
+            user_agent="client-that-is-uncertain/1.0",
+            request_count=8,
+        )
+    )
+
+    assert classification.class_hint is TrafficClass.LIKELY_HUMAN
+
+
 def test_hint_gate_requires_reason_codes_to_grant_hint():
     """The public hint API cannot grant a preference from confidence alone."""
     classification = classify_traffic(
@@ -298,7 +335,8 @@ def test_hint_gate_denies_strong_automation_evidence_even_with_confidence():
         )
     )
 
-    assert classification.class_hint == TrafficClass.LIKELY_HUMAN
+    assert classification.class_hint == TrafficClass.UNKNOWN
+    assert classification.confidence >= 0.70
     assert not is_high_confidence_human_hint(
         classification.class_hint.value,
         classification.confidence,
