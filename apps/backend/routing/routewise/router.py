@@ -2962,8 +2962,8 @@ class RouteWiseRouter:
 
         Two distinct concerns are handled separately:
 
-        1. **Prefix warming** (``obs.success``): only successful dispatches
-           may have populated the endpoint's cache. A non-terminal failed
+        1. **Prefix warming** (``obs.outcome``): only outcomes that admit real
+           work may have populated the endpoint's cache. A non-terminal failed
            attempt must not consume the stash because the winning
            fallback/hedge observation still needs it.
 
@@ -2976,11 +2976,6 @@ class RouteWiseRouter:
         request_id = str(getattr(obs, "request_id", None) or "")
         if not request_id:
             return
-
-        # Emit the expected-versus-observed record up front so it is published on
-        # every path, including terminal failures where no scope is resolved and
-        # nothing is committed. Diagnosing this incident required knowing what
-        # the router expected even for requests that changed no state.
 
         # Record authoritative cache evidence BEFORE the success/warming gate
         # so that a streamed empty-completion path (success=False) still

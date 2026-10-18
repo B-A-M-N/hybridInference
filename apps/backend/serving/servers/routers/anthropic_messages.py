@@ -152,6 +152,7 @@ def _load_stream_limits() -> None:
     _MAX_FIRST_FRAME_IDLE = max(max_first_frame_idle, max_stream_idle)
 
 
+# Both limits are re-read whenever the configuration changes (_load_stream_limits).
 _load_stream_limits()
 on_change(_load_stream_limits)
 _STREAM_SENTINEL: Any = object()
