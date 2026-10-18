@@ -225,9 +225,10 @@ async def record_auth_failure(provenance: str | ClientIpInfo) -> bool:
                 blocked_now = True
         if blocked_now:
             logger.warning(
-                "unresolved_auth_traffic_blocked",
+                "auth_ip_blocked",
                 extra={
-                    "event": "unresolved_auth_traffic_blocked",
+                    "event": "auth_ip_blocked",
+                    "ip_bucket": "unresolved-global",
                     "threshold": settings.unresolved_auth_failure_block_threshold,
                     "window_sec": settings.unresolved_auth_failure_block_window_sec,
                     "block_seconds": settings.unresolved_auth_failure_block_duration_sec,
