@@ -10,7 +10,9 @@ response body and no outcome argument at all, because that is how
 
 from __future__ import annotations
 
-from routing.completion_outcome import CompletionOutcome
+import pytest
+
+from routing.completion_outcome import CompletionOutcome, classify_completion_outcome
 from routing.routers import RoutingObservation
 from serving.servers.routers.completions_logging import CompletionsLogger
 
@@ -117,3 +119,25 @@ class TestUnclassifiedObservationIsInert:
         )
         assert obs.success is True
         assert obs.admits_real_work is False
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # The incident signature: warmup notice with provider-reported tokens.
+        ("The model is starting up - this takes about 120 seconds. Please wait...", True),
+        ("Model is loading, please wait", True),
+        ("the model is warming up now", True),
+        ("please wait while the model loads", True),
+        ("the model is not ready yet, hold on", True),
+        ("model is initializing", True),
+        # A genuine answer that merely mentions a marker stays PROGRESS.
+        ("Here is how to fix it: the model is starting up because the GPU is cold.", False),
+        ("The log says the model is starting up, so I will retry.", False),
+        ("The answer is 42, and 'model is not ready' is a common message", False),
+    ],
+)
+def test_warmup_notice_is_transient_only_when_it_leads_the_message(text, expected):
+    outcome = classify_completion_outcome(content=text, usage=None, http_status=200, terminal=True)
+    is_transient = outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
+    assert is_transient is expected

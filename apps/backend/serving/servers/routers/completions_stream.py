@@ -970,6 +970,13 @@ class StreamSession:
                 # model for a response the user got nothing out of.
                 success=not is_empty_completion,
                 cached_tokens=cached_tokens,
+                # Pass the accumulated stream text so a warmup notice is
+                # classified TRANSIENT_NO_PROGRESS instead of PROGRESS.
+                response_body=(
+                    {"choices": [{"message": {"content": self._final_text}}]}
+                    if self._final_text
+                    else None
+                ),
             )
 
     async def _finalize_failure(self, exc: BaseException) -> None:

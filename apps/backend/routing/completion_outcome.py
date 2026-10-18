@@ -91,6 +91,7 @@ class CompletionOutcome(str, Enum):
 _DEFAULT_TRANSIENT_MARKERS: tuple[str, ...] = (
     r"the model is starting up",
     r"model is starting up",
+    r"the model is warming up",
     r"model is warming up",
     r"warming up the model",
     r"model is loading,? please wait",
@@ -100,8 +101,28 @@ _DEFAULT_TRANSIENT_MARKERS: tuple[str, ...] = (
     r"model is initializing",
 )
 
+# Each marker is anchored so the pattern only matches when the transient notice
+# is the whole message (possibly repeated with whitespace/ellipses), not when the
+# phrase appears incidentally inside a genuine answer (e.g. a model quoting or
+# discussing "the model is starting up"). A response is transient only if every
+# non-empty line matches a marker.
+# A response is transient only when a marker dominates the whole message. Each
+# marker is paired with a whole-message-anchored variant that permits a bounded
+# trailing tail (the provider's own "please wait"/duration wording); a genuine
+# answer that merely mentions a marker mid-text does not match the anchored
+# form, so it stays PROGRESS. The bare pattern keeps an exact marker match
+# transient even when a trailing word falls outside the bounded tail.
+# A response is transient only when a marker leads the message. ``re.match``
+# anchors each marker at the start and the bounded tail absorbs the provider's
+# own "please wait"/duration wording; a marker appearing mid-answer never leads,
+# so a genuine response that merely mentions a marker stays PROGRESS. The tail
+# is capped so an arbitrarily long answer cannot ride on a leading marker.
+_TAIL = r"(?:[\s.!\u2026-]+(?:\w+\b(?:[\s.!\u2026-]+\w+\b){0,2}(?:.{0,80})?)?)?$"
 _TRANSIENT_MARKERS: list[re.Pattern[str]] = [
-    re.compile(pattern, re.IGNORECASE) for pattern in _DEFAULT_TRANSIENT_MARKERS
+    # ``\b`` after the marker keeps "the model is warming up" from also matching
+    # inside "the model is warming uphe ..." while still allowing a trailing word.
+    re.compile(pattern + r"\b" + _TAIL, re.IGNORECASE)
+    for pattern in _DEFAULT_TRANSIENT_MARKERS
 ]
 
 #: Statuses that indicate a retryable provider condition rather than a bad
@@ -111,11 +132,11 @@ _TRANSIENT_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
 
 def register_transient_marker(pattern: str) -> None:
     """Register an additional provider-specific no-progress marker."""
-    _TRANSIENT_MARKERS.append(re.compile(pattern, re.IGNORECASE))
+    _TRANSIENT_MARKERS.append(re.compile(pattern + r"\b" + _TAIL, re.IGNORECASE))
 
 
 def _looks_transient_text(text: str) -> bool:
-    return any(marker.search(text) for marker in _TRANSIENT_MARKERS)
+    return any(marker.match(text) for marker in _TRANSIENT_MARKERS)
 
 
 def _output_token_count(usage: dict[str, Any] | None) -> int | None:
