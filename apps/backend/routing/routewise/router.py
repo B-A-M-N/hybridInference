@@ -524,17 +524,14 @@ class RouteWiseRouter:
     def _ensure_health(self, endpoint_id: str) -> None:
         self._health_registry.ensure(endpoint_id)
 
-    def _on_success(self, endpoint_id: str, response: Any = None) -> None:
+    def _on_success(self, endpoint_id: str, response: Any) -> None:
         """Record a semantic serving success, which requires a real response.
 
         A transport-level 200 is not sufficient. The response is classified here
-        so endpoint health and prefix locality judge it by the same rule; with no
-        response to classify there is no evidence of useful work, so this records
-        liveness only and leaves serving state alone.
+        so endpoint health and prefix locality judge it by the same rule. A
+        caller that cannot classify a response must call ``_on_liveness``
+        instead; a missing response is never positive evidence.
         """
-        if response is None:
-            self._health_registry.record_liveness(endpoint_id)
-            return
         self._health_registry.record_success(
             endpoint_id,
             outcome=classify_completion_outcome(

@@ -277,19 +277,6 @@ def test_both_routers_recover_on_genuine_progress(monkeypatch):
         assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED, name
 
 
-def test_router_on_success_without_a_response_records_liveness_not_success(monkeypatch):
-    """A router call without an outcome keeps the historical contract."""
-    monkeypatch.setenv(_THRESHOLD_ENV, "3")
-    for router in _routers():
-        name = type(router).__name__
-        registry = router._health_registry
-        _trip(monkeypatch, registry)
-
-        router._on_success(_ENDPOINT)
-
-        assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.OPEN, name
-
-
 # ---------------------------------------------------------------------------
 # Streaming success must close breakers
 # ---------------------------------------------------------------------------

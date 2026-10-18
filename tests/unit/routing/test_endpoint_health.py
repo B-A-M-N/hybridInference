@@ -77,7 +77,7 @@ def test_router_registry_defaults_are_isolated_and_explicit_injection_is_honored
     fixed = FixedRouter()
     routewise = RouteWiseRouter(config=RouteWiseConfig())
 
-    fixed._on_success("openai:api.example.com:443")
+    fixed._ensure_health("openai:api.example.com:443")
 
     assert fixed._health_registry is not routewise._health_registry
     assert routewise.get_provider_status() == {}
@@ -93,7 +93,7 @@ def test_router_registry_defaults_are_isolated_and_explicit_injection_is_honored
 def test_fixed_router_record_observation_is_an_explicit_noop():
     endpoint_id = "openai:api.example.com:443"
     fixed = FixedRouter()
-    fixed._on_success(endpoint_id)
+    fixed._ensure_health(endpoint_id)
     baseline = fixed.get_provider_status()
 
     result = fixed.record_observation(
