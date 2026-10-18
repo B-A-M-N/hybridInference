@@ -440,16 +440,21 @@ class CachedOperationalStore(OperationalStore):
         """Delegate to wrapped store."""
         return await self._store.get_user_by_email(email)
 
+    async def get_user_by_login_name(self, login_name: str) -> Row | None:
+        """Delegate to wrapped store."""
+        return await self._store.get_user_by_login_name(login_name)
+
     async def create_user(
         self,
         *,
         user_id: str,
-        email: str,
+        email: str | None,
         password_hash: str,
         user_name: str | None = None,
         email_verified: bool = False,
         status: str = "active",
         signup_reason: str | None = None,
+        login_name: str | None = None,
     ) -> None:
         """Delegate to wrapped store."""
         return await self._store.create_user(
@@ -460,6 +465,47 @@ class CachedOperationalStore(OperationalStore):
             email_verified=email_verified,
             status=status,
             signup_reason=signup_reason,
+            login_name=login_name,
+        )
+
+    async def get_or_create_setup_code(
+        self,
+        *,
+        marker_key: str,
+        code_key: str,
+        completed_at: str,
+        candidate_code: str,
+    ) -> str | None:
+        """Delegate to wrapped store."""
+        return await self._store.get_or_create_setup_code(
+            marker_key=marker_key,
+            code_key=code_key,
+            completed_at=completed_at,
+            candidate_code=candidate_code,
+        )
+
+    async def create_first_admin(
+        self,
+        *,
+        user_id: str,
+        login_name: str,
+        password_hash: str,
+        user_name: str,
+        marker_key: str,
+        marker_value: str,
+        code_key: str,
+        admin_ip: str,
+    ) -> bool:
+        """Delegate to wrapped store (a new user id has nothing cached)."""
+        return await self._store.create_first_admin(
+            user_id=user_id,
+            login_name=login_name,
+            password_hash=password_hash,
+            user_name=user_name,
+            marker_key=marker_key,
+            marker_value=marker_value,
+            code_key=code_key,
+            admin_ip=admin_ip,
         )
 
     async def get_user_counts_by_status(self) -> dict[str, int]:
@@ -613,6 +659,106 @@ class CachedOperationalStore(OperationalStore):
     async def delete_user_sessions(self, user_id: str) -> None:
         """Delegate to wrapped store."""
         return await self._store.delete_user_sessions(user_id)
+
+    # -- browser sessions (pass-through) -------------------------------------
+
+    async def create_browser_session(
+        self, *, browser_session_id: str, secret_hash: str, expires_at: datetime
+    ) -> None:
+        """Delegate to wrapped store."""
+        return await self._store.create_browser_session(
+            browser_session_id=browser_session_id, secret_hash=secret_hash, expires_at=expires_at
+        )
+
+    async def get_browser_session(self, secret_hash: str) -> Row | None:
+        """Delegate to wrapped store."""
+        return await self._store.get_browser_session(secret_hash)
+
+    async def rotate_browser_session(
+        self,
+        browser_session_id: str,
+        *,
+        current_secret_hash: str,
+        new_secret_hash: str,
+        expires_at: datetime | None = None,
+    ) -> bool:
+        """Delegate to wrapped store."""
+        return await self._store.rotate_browser_session(
+            browser_session_id,
+            current_secret_hash=current_secret_hash,
+            new_secret_hash=new_secret_hash,
+            expires_at=expires_at,
+        )
+
+    async def list_browser_session_accounts(self, browser_session_id: str) -> list[Row]:
+        """Delegate to wrapped store."""
+        return await self._store.list_browser_session_accounts(browser_session_id)
+
+    async def attach_browser_session_account(
+        self, browser_session_id: str, *, user_id: str, auth_session_id: str
+    ) -> None:
+        """Delegate to wrapped store."""
+        return await self._store.attach_browser_session_account(
+            browser_session_id, user_id=user_id, auth_session_id=auth_session_id
+        )
+
+    async def set_browser_session_active(
+        self, browser_session_id: str, user_id: str | None
+    ) -> None:
+        """Delegate to wrapped store."""
+        return await self._store.set_browser_session_active(browser_session_id, user_id)
+
+    async def detach_browser_session_account(self, browser_session_id: str, user_id: str) -> int:
+        """Delegate to wrapped store."""
+        return await self._store.detach_browser_session_account(browser_session_id, user_id)
+
+    async def revoke_browser_session(self, browser_session_id: str) -> None:
+        """Delegate to wrapped store."""
+        return await self._store.revoke_browser_session(browser_session_id)
+
+    async def get_user_by_phone(self, phone: str) -> Row | None:
+        """Fetch an account by its canonical phone number."""
+        return await self._store.get_user_by_phone(phone)
+
+    async def create_phone_user(self, **fields: Any) -> bool:
+        """Create a verified phone-only identity, refusing duplicate identifiers."""
+        return await self._store.create_phone_user(**fields)
+
+    async def bind_user_phone(self, user_id: str, phone: str) -> bool:
+        """Bind a verified phone atomically without replacing or merging identities."""
+        bound = await self._store.bind_user_phone(user_id, phone)
+        if bound:
+            await self._cache.delete(self._user_key(user_id))
+            await self._cache.delete_pattern("auth:*")
+            await self._cache.delete_pattern("auth_light:*")
+        return bound
+
+    async def reserve_phone_code(self, **fields: Any) -> int:
+        """Reserve a send within shared quotas and install an inactive challenge."""
+        return await self._store.reserve_phone_code(**fields)
+
+    async def activate_phone_code(self, challenge_id: str) -> bool:
+        """Activate only the challenge acknowledged by the SMS provider."""
+        return await self._store.activate_phone_code(challenge_id)
+
+    async def invalidate_phone_code(self, challenge_id: str) -> None:
+        """Remove a failed delivery without removing another concurrent challenge."""
+        return await self._store.invalidate_phone_code(challenge_id)
+
+    async def consume_phone_code(self, **fields: Any) -> str:
+        """Record bounded attempts and atomically consume a matching challenge once."""
+        return await self._store.consume_phone_code(**fields)
+
+    async def create_phone_session(self, **fields: Any) -> bool:
+        """Issue a session, timestamp, and success event under an active-owner lock."""
+        created = await self._store.create_phone_session(**fields)
+        if created:
+            await self._cache.delete(self._user_key(fields["user_id"]))
+        return created
+
+    async def record_phone_login_event(self, **fields: Any) -> None:
+        """Record phone login outcomes without fabricating an email."""
+        await self._store.record_phone_login_event(**fields)
 
     # -- login events (pass-through) -----------------------------------------
 

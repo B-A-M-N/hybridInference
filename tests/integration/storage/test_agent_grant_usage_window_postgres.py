@@ -137,10 +137,14 @@ async def _write(
     usage: dict[str, Any] | None,
     status_code: int = 200,
     estimated: bool = False,
+    response_id: str | None = None,
     pricing: dict[str, str] | None = PRICING,
+    auto: str | None = None,
 ) -> None:
     """One row as a surface would write it: the job column plus attribution."""
     metadata: dict[str, Any] = {"agent_job_id": JOB}
+    if auto is not None:
+        metadata["auto"] = {"requested": auto, "chosen": "glm-5.1"}
     if grant is not None:
         metadata.update(
             ledger_attribution(
@@ -155,7 +159,7 @@ async def _write(
         model_id="glm-5.1",
         provider="zai",
         prompt="hi",
-        response=None,
+        response={"id": response_id, "content": "private"} if response_id else None,
         usage=usage,
         latency_ms=50,
         status_code=status_code,
@@ -316,8 +320,62 @@ async def test_requests_page_in_start_order_and_resume_after_a_row(log_store) ->
 
 
 @pytest.mark.asyncio
+async def test_a_request_for_an_auto_model_reports_the_auto_model(log_store) -> None:
+    """The owner is not told which model served it; its cost is still that model's."""
+    await _write(
+        log_store,
+        "auto-request",
+        grant=GRANT,
+        started_at=SINCE,
+        usage={"prompt_tokens": 100, "completion_tokens": 10},
+        auto="auto-balance",
+    )
+    query = {"agent_job_id": JOB, "grant_id": GRANT, "since": SINCE, "until": UNTIL}
+
+    (row,) = await log_store.list_agent_grant_requests(**query, limit=5)
+
+    assert (row["model_id"], row["served_model_id"]) == ("auto-balance", "auto-balance")
+    assert row["cost_usd"] > 0
+
+
+@pytest.mark.asyncio
 async def test_the_legacy_job_total_still_counts_every_grant_on_the_job(log_store) -> None:
     """The lifetime report is keyed on the job column and is left as it was."""
     await _seed(log_store)
     usage = await log_store.get_agent_job_usage(JOB)
     assert usage["calls"] == 7
+
+
+@pytest.mark.asyncio
+async def test_message_identity_query_keeps_grant_and_window_fences(log_store):
+    for request_id, grant, instant in [
+        ("match", GRANT, SINCE),
+        ("other-grant", OTHER_GRANT, SINCE),
+        ("outside-window", GRANT, UNTIL),
+    ]:
+        await _write(
+            log_store,
+            request_id,
+            grant=grant,
+            started_at=instant,
+            usage={"prompt_tokens": 1, "completion_tokens": 2},
+            response_id="msg_1",
+        )
+    rows = await log_store.list_agent_grant_requests(
+        agent_job_id=JOB, grant_id=GRANT, since=SINCE, until=UNTIL, limit=2, response_id="msg_1"
+    )
+    assert [row["request_id"] for row in rows] == ["match"]
+    assert rows[0]["response_id"] == "msg_1"
+    async with log_store.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT response FROM api_logs WHERE request_id='match'") is None
+    assert (
+        await log_store.list_agent_grant_requests(
+            agent_job_id=JOB,
+            grant_id=GRANT,
+            since=SINCE,
+            until=UNTIL,
+            limit=2,
+            response_id="msg_missing",
+        )
+        == []
+    )

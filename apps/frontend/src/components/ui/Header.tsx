@@ -1,19 +1,13 @@
 'use client';
 
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
 import { useAuth } from '@/components/providers';
 import { useSiteConfig } from '@/components/providers/SiteConfigProvider';
+import { AccountMenu } from './AccountMenu';
 
 export function Header() {
-  const router = useRouter();
-  const { state, logout } = useAuth();
+  const { state } = useAuth();
   const { branding, features } = useSiteConfig();
-
-  const handleLogout = async () => {
-    await logout();
-    router.replace('/');
-  };
 
   return (
     <header className="mx-auto flex w-full max-w-5xl flex-wrap items-center justify-between gap-3 px-6 py-6">
@@ -57,6 +51,15 @@ export function Header() {
             Status
           </a>
         )}
+        {features.publicStats && (
+          <Link
+            href="/stats"
+            prefetch={false}
+            className="rounded-md px-2 py-1.5 text-sm font-medium text-gray-600 transition-colors hover:bg-gray-100 hover:text-gray-900 sm:px-3"
+          >
+            Stats
+          </Link>
+        )}
         {branding.navLinks.map((link) => (
           <a
             key={link.url}
@@ -85,13 +88,7 @@ export function Header() {
             >
               Dashboard
             </Link>
-            <button
-              type="button"
-              onClick={handleLogout}
-              className="rounded-md px-2 py-1.5 text-sm font-medium text-gray-600 transition-colors hover:bg-gray-100 hover:text-gray-900 sm:px-3"
-            >
-              Log out
-            </button>
+            <AccountMenu />
           </>
         )}
       </div>
