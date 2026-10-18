@@ -458,6 +458,11 @@ class TestLivenessRefreshGeneration:
         reserved = coordinator.reserve_generations([scope])
         assert reserved[scope] > 0
         now[0] += 5.0
+        # The refresh must validate against the coordinator's CURRENT
+        # reservation. The entry stores the creation generation (g1), so a g2
+        # refresh needs the coordinator to reconcile: update the entry's
+        # generation to the current reservation while refreshing, so the
+        # maintainer's exact sequence works.
         coordinator.record_outcome(
             scope=scope,
             blocks=_blocks(("stub", 8)),

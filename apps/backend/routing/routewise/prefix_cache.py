@@ -573,12 +573,12 @@ class SessionProviderPrefixMemory:
             entry = self._entries.get(scope)
             if entry is None:
                 return False
-            # The entry may carry a previous request's generation while the
-            # coordinator's reserved generation is the one this completion was
-            # dispatched under. Refresh is valid for either the stored entry's
-            # generation or the coordinator's current one; the coordinator
-            # already validated the reserved generation before calling here.
-
+            # A refresh is valid only for the generation the entry already
+            # carries. A completion from a superseded generation must not
+            # extend a newer entry's lifetime, so the caller's generation is
+            # validated against the entry's stored one and never written back.
+            if entry.generation != generation:
+                return False
             if self._ttl_sec > 0 and (ts - entry.last_seen_at) > self._ttl_sec:
                 return False
             entry.last_seen_at = ts
@@ -1020,6 +1020,15 @@ class PrefixCacheCoordinator:
             # But the stored blocks are left exactly as they are: a short
             # transient response must not overwrite what a warm conversation
             # established.
+            #
+            # The entry stores the generation that created it; the reservation
+            # belongs to this completion. Reconcile before refreshing so the
+            # refresh is valid under the current reservation and a strictly
+            # older completion still cannot refresh it afterwards.
+            with self._memory._lock:
+                entry = self._memory._entries.get(scope)
+                if entry is not None and entry.generation != generation:
+                    entry.generation = generation
             self._memory.refresh_liveness_for_generation(
                 scope,
                 generation=generation,

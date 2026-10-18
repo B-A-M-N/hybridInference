@@ -18,6 +18,16 @@ from serving.servers.routers.completions_logging import CompletionsLogger
 
 WARMUP_NOTICE = "The model is starting up - this takes about 120 seconds. Please wait..."
 REAL_ANSWER = "Applied the erasure-fence fix and verified it against postgres."
+# The maintainer's scenario: a short answer whose own first words are the warmup
+# phrase must still classify TRANSIENT, so short-prefix matching stays intact.
+SHORT_WARMUP_ANSWER = "The model is starting up; give it another second."
+# A genuine answer that merely mentions warmup in a longer reply must be PROGRESS.
+LONG_ANSWER_MENTIONING_WARMUP = (
+    "Applied the fix and verified it. The vLLM server can take a minute after a "
+    "restart; while the model is warming up, the probe returns the startup notice, "
+    "which is why the first request failed. The retry then succeeded with the "
+    "expected answer, so the route itself is healthy again."
+)
 
 
 def _body(content: str) -> dict:
@@ -123,6 +133,23 @@ class TestUnclassifiedObservationIsInert:
 
 class TestWarmupMarkerAnchoring:
     """The warmup regex must not flag genuine answers that mention warmup."""
+
+    def test_short_answer_starting_with_warmup_is_still_transient(self):
+        from routing.completion_outcome import CompletionOutcome, classify_completion_outcome
+
+        outcome = classify_completion_outcome(
+            content=SHORT_WARMUP_ANSWER, http_status=200, terminal=True
+        )
+        assert outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
+
+    def test_long_answer_mentioning_warmup_is_progress(self):
+        from routing.completion_outcome import CompletionOutcome, classify_completion_outcome
+
+        assert len(LONG_ANSWER_MENTIONING_WARMUP) > 200
+        outcome = classify_completion_outcome(
+            content=LONG_ANSWER_MENTIONING_WARMUP, http_status=200, terminal=True
+        )
+        assert outcome is CompletionOutcome.PROGRESS
 
     @pytest.mark.parametrize(
         "text",

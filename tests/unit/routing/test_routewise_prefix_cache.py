@@ -786,3 +786,57 @@ class TestRouteWiseRouterPrefixCacheCostAdjustment:
         scopes = prefix_context[1]["scopes"]
         assert "prov-a:h:1" in scopes  # eligible -> collected for warm
         assert "prov-b:h:1" not in scopes  # rotating key pool -> skipped
+
+
+@pytest.mark.unit
+class TestLivenessRefreshGenerationGuard:
+    """A stale generation must not refresh a newer entry."""
+
+    def test_stale_generation_cannot_refresh_newer_entry(self):
+        now = [1000.0]
+        coordinator = PrefixCacheCoordinator(
+            enabled=True,
+            memory=SessionProviderPrefixMemory(min_match_tokens=1, time_source=lambda: now[0]),
+            block_size=8,
+            secret=SECRET,
+            tokenize=_chars,
+        )
+        scope = coordinator.scope_for(
+            session="sess-1",
+            provider_id="prov",
+            endpoint_id="prov:h:1",
+            model_profile="m",
+        )
+        coordinator.remember(scope, tuple(Block(digest="a", token_count=4096) for _ in range(1)))
+
+        reserved = coordinator.reserve_generations([scope])
+        assert reserved[scope] > 0
+        # Under the current reservation, a non-progress completion refreshes the
+        # entry and adopts the reservation's generation.
+        now[0] += 5.0
+        assert (
+            coordinator.record_outcome(
+                scope=scope,
+                blocks=tuple(Block(digest="stub", token_count=8) for _ in range(1)),
+                outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS,
+                generation=reserved[scope],
+            )
+            is False
+        )
+        entry = coordinator.memory._entries[scope]
+        # The coordinator reconciles the entry's generation to the current
+        # reservation on the non-progress path, then refreshes. A completion
+        # from a superseded generation cannot refresh afterwards because the
+        # entry's generation now matches only the current reservation.
+        assert entry.generation == reserved[scope]
+        assert entry.last_seen_at == 1005.0
+
+        # A completion from a superseded generation cannot refresh afterwards.
+        now[0] += 5.0
+        assert (
+            coordinator.memory.refresh_liveness_for_generation(
+                scope, generation=reserved[scope] - 1
+            )
+            is False
+        )
+        assert coordinator.memory._entries[scope].last_seen_at == 1005.0
