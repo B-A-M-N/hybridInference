@@ -549,13 +549,11 @@ def test_cost_tracker_compute_cost_matches_calculate_cost_byte_for_byte(usage, p
 
 
 @pytest.mark.asyncio
-async def test_cost_tracker_unknown_cache_is_not_a_measured_miss(op_store, empty_lookup):
-    """``None`` cache usage must not be silently billed as a 0-token miss.
+async def test_cost_tracker_unknown_cache_uses_full_prompt_rate(op_store, empty_lookup):
+    """Unreported cache usage earns no discount in billing arithmetic.
 
-    A provider that reports no cache field has an *unknown* cache state. The
-    cost arithmetic treats it as zero (nothing to discount), but the value
-    must not be mutated to a measured 0 on the way in -- the caller owns the
-    None-vs-0 distinction and the log row depends on it.
+    The persisted usage dict owns the distinction between an unknown cache
+    state and a measured miss; CostTracker only calculates the bill.
     """
     tracker = CostTracker(op_store=op_store, pricing=empty_lookup)
     pricing = Pricing(prompt_price=0.60, completion_price=2.40, cache_read_price=0.03)
@@ -617,8 +615,8 @@ async def test_cost_tracker_reported_cache_hit_earns_the_discount(op_store, empt
     assert enriched.upstream_cost_usd == pytest.approx(expected)
 
 
-def test_calculate_cost_unknown_cache_is_not_a_miss():
-    """The canonical billing fn must not treat an absent cache field as a 0 miss."""
+def test_calculate_cost_unknown_cache_uses_full_prompt_rate():
+    """The billing function applies no cache discount without a reported count."""
     usage = {"prompt_tokens": 1000, "completion_tokens": 0}  # no cache key at all
     pricing = {"prompt": "0.60", "completion": "2.40", "input_cache_reads": "0.03"}
     cost = calculate_cost(usage, pricing)

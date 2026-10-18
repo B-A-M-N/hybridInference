@@ -1087,8 +1087,8 @@ async def chat_completions(
                     if _ns_usage.get("total_tokens") is not None
                     else None
                 ),
-                cache_read_tokens=optional_token_count(_ns_usage.get("cache_read_tokens")),
-                cache_write_tokens=optional_token_count(_ns_usage.get("cache_write_tokens")),
+                cache_read_tokens=_ns_usage.get("cache_read_tokens"),
+                cache_write_tokens=_ns_usage.get("cache_write_tokens"),
                 reasoning_tokens=int(_ns_usage.get("reasoning_tokens", 0) or 0),
             )
 

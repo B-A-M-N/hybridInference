@@ -931,8 +931,8 @@ class StreamSession:
                 total_tokens=(
                     int(_usage["total_tokens"]) if _usage.get("total_tokens") is not None else None
                 ),
-                cache_read_tokens=optional_token_count(_usage.get("cache_read_tokens")),
-                cache_write_tokens=optional_token_count(_usage.get("cache_write_tokens")),
+                cache_read_tokens=_usage.get("cache_read_tokens"),
+                cache_write_tokens=_usage.get("cache_write_tokens"),
                 reasoning_tokens=int(_usage.get("reasoning_tokens", 0) or 0),
             )
 

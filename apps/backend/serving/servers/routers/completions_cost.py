@@ -257,12 +257,10 @@ class CostTracker:
         failures and 4xx error paths never reach this method, but freebie
         models with zero pricing legitimately produce zero cost).
 
-        ``cache_read_tokens`` / ``cache_write_tokens`` accept ``None`` to mean
-        "the provider did not report cache usage", which is distinct from a
-        reported ``0`` (a measured miss). A ``None`` is treated as 0 for the
-        arithmetic (there is nothing to discount) but the distinction is
-        preserved by callers before this point; see
-        ``serving.utils.token_utils.optional_token_count``.
+        ``cache_read_tokens`` / ``cache_write_tokens`` are used only for price
+        arithmetic here. Both ``None`` (unreported) and ``0`` (measured miss)
+        apply no cache discount; the distinct measurement state is preserved
+        on the normalized usage dict that the logging path persists.
         """
         pricing = routing.pricing or self._pricing.for_routing(routing)
         if pricing is None:
@@ -318,9 +316,10 @@ class CostTracker:
         same behavior as the dict-based path).
 
         ``cache_read_tokens`` / ``cache_write_tokens`` may be ``None`` when the
-        provider did not report cache usage. ``None`` is arithmetic zero here
-        (nothing to discount) and never a measured miss; the distinction is
-        preserved upstream so the log row stays NULL.
+        provider did not report cache usage. This function uses those values
+        only for billing arithmetic, where both ``None`` and measured ``0``
+        mean that no cache discount applies. The separate logging path carries
+        the measurement state into ``api_logs``.
         """
         try:
             prompt = float(prompt_tokens or 0)
