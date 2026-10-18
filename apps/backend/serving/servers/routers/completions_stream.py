@@ -955,17 +955,11 @@ class StreamSession:
 
         if not self._is_synthetic_probe:
             stream_usage = normalize_usage(self._usage_data) if self._usage_data else {}
-            # Authoritative observed cache usage from the provider.
-            # None means "provider did not report" (NOT equivalent to 0).
-            cached_tokens_raw = stream_usage.get("cache_read_tokens")
-            cached_tokens: int | None = None
-            if cached_tokens_raw is not None:
-                try:
-                    cached_tokens = int(cached_tokens_raw)
-                    if cached_tokens < 0:
-                        cached_tokens = None
-                except (TypeError, ValueError):
-                    cached_tokens = None
+            # Authoritative observed cache usage from the provider, through the
+            # canonical helper so this path shares one validation rule with
+            # cost and persistence. None means "provider did not report" (NOT
+            # equivalent to 0).
+            cached_tokens = optional_token_count(stream_usage.get("cache_read_tokens"))
             self._completions_logger.record_routing_observation(
                 self._active_router,
                 self._model,
