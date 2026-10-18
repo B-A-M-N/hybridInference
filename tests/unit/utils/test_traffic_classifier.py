@@ -330,7 +330,9 @@ def test_sessionless_changing_shape_history_reaches_preference_gate():
                 )
             )
         )
-        state.record_response_completed("authenticated-user", observed_at=now[0] + 1.0)
+        state.record_response_completed(
+            "authenticated-user", observation["request_id"], observed_at=now[0] + 1.0
+        )
         now[0] += 5.0
 
     assert all(
@@ -596,8 +598,8 @@ def test_traffic_state_inter_arrival_uses_response_idle_time():
     state = TrafficObservationState(clock=lambda: now[0])
     result1 = state.record_request(user_id="user_1")
     assert result1["inter_arrival_ms"] is None  # First request
-    assert state.record_response_completed("user_1", observed_at=100.5)
-    now[0] = 106.0  # 5.5s serving latency, then 0.5s client idle
+    assert state.record_response_completed("user_1", result1["request_id"], observed_at=100.5)
+    now[0] = 106.0  # 0.5s client idle after the response completed
     result2 = state.record_request(user_id="user_1")
     assert result2["inter_arrival_ms"] == pytest.approx(5500.0)
 
@@ -612,6 +614,41 @@ def test_start_to_start_timing_is_not_used_without_response_completion():
     result = state.record_request(user_id="user_1")
 
     assert result["inter_arrival_ms"] is None
+
+
+def test_overlapping_response_completions_wait_for_the_whole_request_group():
+    """An older response cannot set idle timing while a newer call is active."""
+    now = [100.0]
+    state = TrafficObservationState(clock=lambda: now[0])
+    first = state.record_request("user_1", observed_at=100.0)
+    second = state.record_request("user_1", observed_at=101.0)
+
+    assert state.record_response_completed("user_1", first["request_id"], observed_at=104.0)
+    assert not state.record_response_completed("user_1", first["request_id"], observed_at=104.5)
+    assert state.preview_request("user_1", observed_at=105.0)["inter_arrival_ms"] is None
+
+    third = state.record_request("user_1", observed_at=105.0)
+    assert third["inter_arrival_ms"] is None
+    assert state.record_response_completed("user_1", second["request_id"], observed_at=106.0)
+    assert state.preview_request("user_1", observed_at=107.0)["inter_arrival_ms"] is None
+    assert state.record_response_completed("user_1", third["request_id"], observed_at=108.0)
+
+    fourth = state.record_request("user_1", observed_at=110.0)
+    assert fourth["inter_arrival_ms"] == pytest.approx(2_000.0)
+
+
+def test_overlapping_response_timing_has_a_fixed_memory_bound():
+    """Excessive overlap disables timing rather than growing state unbounded."""
+    state = TrafficObservationState(clock=lambda: 100.0)
+    for _ in range(128):
+        state.record_request("user_1")
+
+    overflow = state.record_request("user_1")
+    entry = next(iter(state._identities.values()))
+
+    assert overflow["request_id"] is None
+    assert entry.response_timing_disabled is True
+    assert entry.in_flight_requests == {}
 
 
 def test_hourly_shape_reuse_does_not_accumulate_as_high_frequency():
@@ -635,7 +672,7 @@ def test_zero_client_idle_is_preserved_in_preview_and_commit():
     state = TrafficObservationState(clock=lambda: now[0])
 
     first = state.record_request(user_id="user_1", observed_at=100.0)
-    assert state.record_response_completed("user_1", observed_at=100.0)
+    assert state.record_response_completed("user_1", first["request_id"], observed_at=100.0)
     preview = state.preview_request(user_id="user_1", observed_at=100.0)
     committed = state.record_request(user_id="user_1", observed_at=100.0)
 
@@ -648,8 +685,8 @@ def test_backdated_request_does_not_consume_future_response_completion():
     """A stale arrival cannot claim a response completion from the future."""
     now = [101.0]
     state = TrafficObservationState(clock=lambda: now[0])
-    state.record_request(user_id="user_1", observed_at=101.0)
-    assert state.record_response_completed("user_1", observed_at=101.5)
+    first = state.record_request(user_id="user_1", observed_at=101.0)
+    assert state.record_response_completed("user_1", first["request_id"], observed_at=101.5)
 
     now[0] = 102.0
     preview = state.preview_request(user_id="user_1", observed_at=100.0)
@@ -658,7 +695,7 @@ def test_backdated_request_does_not_consume_future_response_completion():
 
     assert preview["inter_arrival_ms"] is None
     assert committed["inter_arrival_ms"] is None
-    assert latest["inter_arrival_ms"] == pytest.approx(500.0)
+    assert latest["inter_arrival_ms"] is None
 
 
 def test_traffic_state_shape_repetition():
@@ -696,15 +733,17 @@ def test_traffic_state_preview_does_not_commit_history():
         shape_hash="abc123",
         session_id="session",
     )
-    assert committed == preview
+    assert {key: value for key, value in committed.items() if key != "request_id"} == {
+        key: value for key, value in preview.items() if key != "request_id"
+    }
 
 
 def test_traffic_state_commit_preserves_preview_timestamp():
     """Pre-dispatch commit retains arrival time for response-idle evidence."""
     now = [100.0]
     state = TrafficObservationState(clock=lambda: now[0])
-    state.record_request(user_id="user_1")
-    assert state.record_response_completed("user_1", observed_at=105.0)
+    first = state.record_request(user_id="user_1")
+    assert state.record_response_completed("user_1", first["request_id"], observed_at=105.0)
 
     # The tracker clock has advanced during gateway preflight, but the router
     # captured this request's arrival at 110.0 before those awaits.
@@ -818,11 +857,11 @@ def test_traffic_state_lru_refreshes_on_access():
     """A recently used identity is retained when capacity forces eviction."""
     now = [100.0]
     state = TrafficObservationState(max_identities=2, clock=lambda: now[0])
-    state.record_request(user_id="user_a")
-    state.record_response_completed("user_a")
+    first = state.record_request(user_id="user_a")
+    state.record_response_completed("user_a", first["request_id"])
     state.record_request(user_id="user_b")
-    state.record_request(user_id="user_a")
-    state.record_response_completed("user_a")
+    second = state.record_request(user_id="user_a")
+    state.record_response_completed("user_a", second["request_id"])
     state.record_request(user_id="user_c")
 
     result = state.record_request(user_id="user_a")

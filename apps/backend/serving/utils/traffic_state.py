@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 _SHAPE_REPEAT_WINDOW_SECONDS = 600.0
 _MAX_SHAPE_OBSERVATIONS = 100
+_MAX_IN_FLIGHT_REQUESTS_PER_IDENTITY = 128
 
 
 @dataclass
@@ -35,6 +36,9 @@ class _IdentityEntry:
 
     last_request_ts: float | None = None
     last_response_completed_ts: float | None = None
+    in_flight_requests: dict[int, float] = field(default_factory=dict)
+    in_flight_latest_completion_ts: float | None = None
+    response_timing_disabled: bool = False
     request_count: int = 0
     shape_counts: OrderedDict[str, list[float]] = field(default_factory=OrderedDict)
     session_id: str | None = None
@@ -76,6 +80,7 @@ class TrafficObservationState:
         self._max_shapes_per_identity = max_shapes_per_identity
         self._ttl_seconds = ttl_seconds
         self._clock = clock or time.monotonic
+        self._next_request_id = 0
         # OrderedDict for LRU eviction
         self._identities: OrderedDict[str, _IdentityEntry] = OrderedDict()
 
@@ -125,6 +130,7 @@ class TrafficObservationState:
         - tracked: whether an authenticated identity was available for this
           observation
         - observed_at: monotonic timestamp associated with this observation
+        - request_id: opaque in-process correlation key for tracked responses
         """
         current_time = self._clock()
         request_time = current_time if observed_at is None else observed_at
@@ -138,6 +144,7 @@ class TrafficObservationState:
                 "request_count": 0,
                 "tracked": False,
                 "observed_at": request_time,
+                "request_id": None,
             }
 
         entry = self._identities.get(key)
@@ -167,10 +174,30 @@ class TrafficObservationState:
         # useful estimate of human think time. Only a known response completion
         # can support this signal.
         inter_arrival_ms: float | None = None
-        if entry.last_response_completed_ts is not None:
+        if (
+            not entry.response_timing_disabled
+            and not entry.in_flight_requests
+            and entry.last_response_completed_ts is not None
+        ):
             elapsed = request_time - entry.last_response_completed_ts
             if elapsed >= 0:
                 inter_arrival_ms = elapsed * 1000
+
+        # Correlate completion with one request. If one identity has more
+        # overlapping requests than the bounded tracker can retain, stop
+        # producing timing evidence for that entry instead of guessing.
+        request_id: int | None = None
+        if not entry.response_timing_disabled:
+            if len(entry.in_flight_requests) >= _MAX_IN_FLIGHT_REQUESTS_PER_IDENTITY:
+                entry.response_timing_disabled = True
+                entry.in_flight_requests.clear()
+                entry.in_flight_latest_completion_ts = None
+                entry.last_response_completed_ts = None
+            else:
+                request_id = self._next_request_id
+                self._next_request_id += 1
+                entry.in_flight_requests[request_id] = request_time
+                entry.last_response_completed_ts = None
 
         # Update last request timestamp
         is_latest_observation = (
@@ -228,34 +255,43 @@ class TrafficObservationState:
             "request_count": entry.request_count,
             "tracked": True,
             "observed_at": request_time,
+            "request_id": request_id,
         }
 
     def record_response_completed(
         self,
         user_id: str | None,
+        request_id: int | None,
         observed_at: float | None = None,
     ) -> bool:
-        """Record the completion time needed to measure the next idle interval.
+        """Record a response completion for its matching request only.
 
-        Returns False when the identity has no current observation or the
-        completion predates its latest request. A caller should pass the
-        gateway's monotonic response-completion timestamp.
+        Timing remains unavailable while any overlapping request is in flight.
+        Once the overlap group completes, its latest completion anchors the
+        next idle interval. A caller should pass the gateway's monotonic
+        response-completion timestamp.
         """
+        if not isinstance(request_id, int) or isinstance(request_id, bool):
+            return False
         key = self._resolve_identity_key(user_id)
         if key is None:
             return False
         entry = self._identities.get(key)
-        if entry is None:
+        if entry is None or entry.response_timing_disabled:
             return False
         completed_at = self._clock() if observed_at is None else observed_at
-        if entry.last_request_ts is None or completed_at < entry.last_request_ts:
+        request_time = entry.in_flight_requests.get(request_id)
+        if request_time is None or completed_at < request_time:
             return False
+        del entry.in_flight_requests[request_id]
         if (
-            entry.last_response_completed_ts is not None
-            and completed_at < entry.last_response_completed_ts
+            entry.in_flight_latest_completion_ts is None
+            or completed_at > entry.in_flight_latest_completion_ts
         ):
-            return False
-        entry.last_response_completed_ts = completed_at
+            entry.in_flight_latest_completion_ts = completed_at
+        if not entry.in_flight_requests:
+            entry.last_response_completed_ts = entry.in_flight_latest_completion_ts
+            entry.in_flight_latest_completion_ts = None
         return True
 
     def preview_request(
@@ -283,6 +319,7 @@ class TrafficObservationState:
                 "request_count": 0,
                 "tracked": False,
                 "observed_at": request_time,
+                "request_id": None,
             }
 
         entry = self._identities.get(key)
@@ -301,10 +338,15 @@ class TrafficObservationState:
                 "request_count": 1,
                 "tracked": True,
                 "observed_at": request_time,
+                "request_id": None,
             }
 
         inter_arrival_ms: float | None = None
-        if entry.last_response_completed_ts is not None:
+        if (
+            not entry.response_timing_disabled
+            and not entry.in_flight_requests
+            and entry.last_response_completed_ts is not None
+        ):
             elapsed = request_time - entry.last_response_completed_ts
             if elapsed >= 0:
                 inter_arrival_ms = elapsed * 1000
@@ -331,6 +373,7 @@ class TrafficObservationState:
             "request_count": entry.request_count + 1,
             "tracked": True,
             "observed_at": request_time,
+            "request_id": None,
         }
 
     def _evict_one(self) -> None:
