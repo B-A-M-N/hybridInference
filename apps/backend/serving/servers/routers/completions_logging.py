@@ -20,6 +20,7 @@ import asyncio
 from typing import Any
 
 from routing.completion_outcome import CompletionOutcome, classify_completion_outcome
+from routing.response_text import response_text
 from routing.routers import RoutingObservation
 from serving.observability.tracked_tasks import tracked_task
 from serving.servers.routers.routing_info import RoutingInfo, merge_strategy_metadata
@@ -121,20 +122,13 @@ class CompletionsLogger:
         if not success:
             return CompletionOutcome.PROVIDER_ERROR
 
-        content = ""
-        if isinstance(response_body, dict):
-            choices = response_body.get("choices") or [{}]
-            message = (choices[0] or {}).get("message") or {}
-            content = message.get("content") or message.get("reasoning_content") or ""
-            if not content and message.get("tool_calls"):
-                # A tool call is real work even with no prose and no reported
-                # usage: the model produced a structured call for the caller to
-                # run. Without this a legitimate tool-only completion from a
-                # provider that omits usage would read as empty.
-                content = "[tool_call]"
+        # The shared helper returns a non-empty sentinel for tool-call-only
+        # completions, so the classifier treats a structured call as real work
+        # even with no prose and no reported usage.
+        content = response_text(response_body)
 
         return classify_completion_outcome(
-            content=content if isinstance(content, str) else None,
+            content=content,
             usage=usage,
             http_status=200,
             terminal=True,

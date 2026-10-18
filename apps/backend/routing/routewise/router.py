@@ -58,6 +58,7 @@ from routing.dispatch import DispatchMismatchError, binding_for_adapter, executi
 from routing.endpoint_health import EndpointHealthRegistry
 from routing.endpoints import endpoint_id_for_adapter
 from routing.prefill_load import PrefillLoadTracker, estimate_prefill_tokens
+from routing.response_text import chunk_text, response_text, response_usage
 from routing.route_scope import adapter_in_endpoint_scope
 from routing.routers import (
     AllCircuitsOpenError,
@@ -401,44 +402,6 @@ def _configured_worker_count() -> int | None:
     return None
 
 
-def _response_text(response: Any) -> str | None:
-    if not isinstance(response, dict):
-        return None
-    choices = response.get("choices") or [{}]
-    message = (choices[0] or {}).get("message") or {}
-    content = message.get("content") or message.get("reasoning_content")
-    return content if isinstance(content, str) else None
-
-
-def _chunk_text(chunk: Any) -> str | None:
-    """Extract generated text from a stream chunk for outcome classification."""
-    if not isinstance(chunk, str | bytes):
-        return None
-    text = chunk.decode("utf-8", errors="surrogatepass") if isinstance(chunk, bytes) else chunk
-    prefix = "data: "
-    if not text.startswith(prefix):
-        return None
-    import json
-
-    try:
-        obj = json.loads(text[len(prefix) :].strip())
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(obj, dict):
-        return None
-    choices = obj.get("choices") or []
-    delta = (choices[0] or {}).get("delta") or {} if choices else {}
-    content = delta.get("content") or delta.get("reasoning_content")
-    return content if isinstance(content, str) and content else None
-
-
-def _response_usage(response: Any) -> dict[str, Any] | None:
-    if not isinstance(response, dict):
-        return None
-    usage = response.get("usage")
-    return usage if isinstance(usage, dict) else None
-
-
 class RouteWiseRouter:
     """RouteWise router.
 
@@ -575,8 +538,8 @@ class RouteWiseRouter:
         self._health_registry.record_success(
             endpoint_id,
             outcome=classify_completion_outcome(
-                content=_response_text(response),
-                usage=_response_usage(response),
+                content=response_text(response),
+                usage=response_usage(response),
                 http_status=200,
                 terminal=True,
             ),
@@ -587,7 +550,7 @@ class RouteWiseRouter:
         self._health_registry.record_success(
             endpoint_id,
             outcome=classify_completion_outcome(
-                content=_chunk_text(chunk),
+                content=chunk_text(chunk),
                 http_status=200,
                 terminal=True,
             ),
