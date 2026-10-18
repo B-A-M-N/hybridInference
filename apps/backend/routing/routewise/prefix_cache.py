@@ -335,6 +335,14 @@ class _CacheLocalityEstimator:
             self._evidence.move_to_end(scope)
             return estimated_tokens, ev.state, decayed
 
+    def state_for(self, scope: CacheScope) -> tuple[CacheLocalityEvidenceState, float]:
+        """Return the recorded evidence state and confidence for one scope."""
+        with self._lock:
+            evidence = self._evidence.get(scope)
+            if evidence is None:
+                return CacheLocalityEvidenceState.UNKNOWN, 0.0
+            return evidence.state, evidence.confidence
+
     def invalidate(self, scope: CacheScope) -> None:
         """Remove evidence for a scope when its remembered prefix is evicted."""
         with self._lock:
@@ -1083,14 +1091,9 @@ class PrefixCacheCoordinator:
         the blocks and whether they are backed by verified reuse evidence --
         rather than inferring it from a cost estimate.
         """
-        blocks = self._memory.current_blocks(scope)
-        state = CacheLocalityEvidenceState.UNKNOWN
-        confidence = 0.0
-        with self._evidence._lock:
-            found = self._evidence._evidence.get(scope)
-        if found is not None:
-            state = found.state
-            confidence = found.confidence
+        with self._generation_lock:
+            blocks = self._memory.current_blocks(scope)
+            state, confidence = self._evidence.state_for(scope)
         return SimpleNamespace(
             blocks=blocks,
             # ``present`` is the honest question for "is anything remembered

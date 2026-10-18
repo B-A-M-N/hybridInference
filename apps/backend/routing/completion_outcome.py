@@ -41,15 +41,11 @@ class CompletionOutcome(str, Enum):
 
     #: Real assistant output was produced.
     PROGRESS = "progress"
-    #: The objective was demonstrably finished.
-    COMPLETE = "complete"
     #: Provider is not ready (warming up, cold replica, queued). Transport
     #: succeeded but no inference work happened.
     TRANSIENT_NO_PROGRESS = "transient_no_progress"
     #: Success, but no assistant-visible output.
     EMPTY = "empty"
-    #: Same non-progressing response as a recent prior attempt.
-    REPEATED_NOOP = "repeated_noop"
     #: Structured provider/transport failure.
     PROVIDER_ERROR = "provider_error"
     #: The request was abandoned or cancelled by the client.
@@ -61,33 +57,11 @@ class CompletionOutcome(str, Enum):
     def admits_real_work(self) -> bool:
         """Whether this outcome may be used as evidence that real work happened.
 
-        Only ``PROGRESS`` and ``COMPLETE`` qualify. Everything else -- including
-        ``UNKNOWN`` -- must leave positive evidence untouched, because an
-        indeterminate observation is not grounds for discarding what we already
-        know.
+        Only ``PROGRESS`` qualifies. Everything else -- including ``UNKNOWN`` --
+        must leave positive evidence untouched, because an indeterminate
+        observation is not grounds for discarding what we already know.
         """
-        return self in (CompletionOutcome.PROGRESS, CompletionOutcome.COMPLETE)
-
-    @classmethod
-    def from_response(
-        cls,
-        *,
-        content: str | None,
-        usage: dict[str, Any] | None,
-        http_status: int | None,
-        terminal: bool,
-    ) -> CompletionOutcome:
-        """Classify a single response.
-
-        ``usage`` is the provider's own reported usage mapping, when available.
-        ``http_status`` of None means no HTTP response was obtained.
-        """
-        return classify_completion_outcome(
-            content=content,
-            usage=usage,
-            http_status=http_status,
-            terminal=terminal,
-        )
+        return self is CompletionOutcome.PROGRESS
 
 
 #: Literal starts of provider warmup notices. Keep these canonical strings

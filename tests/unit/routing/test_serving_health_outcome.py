@@ -50,7 +50,6 @@ def _body(content: str) -> dict:
 NO_PROGRESS_OUTCOMES = [
     CompletionOutcome.TRANSIENT_NO_PROGRESS,
     CompletionOutcome.EMPTY,
-    CompletionOutcome.REPEATED_NOOP,
     CompletionOutcome.PROVIDER_ERROR,
     CompletionOutcome.ABORTED,
     CompletionOutcome.UNKNOWN,
@@ -124,7 +123,7 @@ def test_non_progress_does_not_force_close_half_open(monkeypatch):
         registry.record_success(_ENDPOINT, outcome=outcome)
         assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.HALF_OPEN, outcome
 
-    registry.record_success(_ENDPOINT, outcome=CompletionOutcome.COMPLETE)
+    registry.record_success(_ENDPOINT, outcome=CompletionOutcome.PROGRESS)
     assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED
 
 
@@ -142,7 +141,7 @@ def test_liveness_never_recovers_a_half_open_breaker(monkeypatch):
         registry.record_liveness(_ENDPOINT)
         assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.HALF_OPEN
 
-    registry.record_success(_ENDPOINT, outcome=CompletionOutcome.COMPLETE)
+    registry.record_success(_ENDPOINT, outcome=CompletionOutcome.PROGRESS)
     assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED
 
 
@@ -158,7 +157,7 @@ def test_liveness_does_not_clear_credential_rejections(monkeypatch):
         registry.record_liveness(_ENDPOINT)
         assert registry.snapshot()[_ENDPOINT]["consecutive_auth_rejections"] == 1
 
-        registry.record_success(_ENDPOINT, outcome=CompletionOutcome.COMPLETE)
+        registry.record_success(_ENDPOINT, outcome=CompletionOutcome.PROGRESS)
         assert registry.snapshot()[_ENDPOINT]["consecutive_auth_rejections"] == 0
 
 
@@ -185,7 +184,7 @@ def test_process_liveness_is_not_serving_progress(monkeypatch):
     registry.ensure(_ENDPOINT)
 
     for _ in range(4):
-        registry.record_success(_ENDPOINT, outcome=CompletionOutcome.REPEATED_NOOP)
+        registry.record_success(_ENDPOINT, outcome=CompletionOutcome.EMPTY)
 
     full = registry.snapshot()
     # Liveness: the endpoint is tracked and reachable.

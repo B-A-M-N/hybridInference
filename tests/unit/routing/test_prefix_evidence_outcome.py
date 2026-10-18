@@ -39,7 +39,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from routing.completion_outcome import CompletionOutcome
+from routing.completion_outcome import CompletionOutcome, classify_completion_outcome
 from routing.routers import RoutingObservation
 from routing.routewise.prefix_cache import (
     Block,
@@ -145,13 +145,13 @@ def _router_with_cache(**kw) -> SimpleNamespace:
 
 class TestCompletionOutcome:
     def test_textual_warmup_stub_is_not_progress(self):
-        outcome = CompletionOutcome.from_response(
+        outcome = classify_completion_outcome(
             content=WARMUP_STUB, usage=None, http_status=200, terminal=True
         )
         assert outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
 
     def test_real_answer_is_progress(self):
-        outcome = CompletionOutcome.from_response(
+        outcome = classify_completion_outcome(
             content="I inspected the handler and applied the fix.",
             usage=None,
             http_status=200,
@@ -160,25 +160,25 @@ class TestCompletionOutcome:
         assert outcome is CompletionOutcome.PROGRESS
 
     def test_http_error_is_provider_error(self):
-        outcome = CompletionOutcome.from_response(
+        outcome = classify_completion_outcome(
             content=None, usage=None, http_status=503, terminal=True
         )
         assert outcome is CompletionOutcome.PROVIDER_ERROR
 
     def test_empty_body_is_empty(self):
-        outcome = CompletionOutcome.from_response(
+        outcome = classify_completion_outcome(
             content=None, usage=None, http_status=200, terminal=True
         )
         assert outcome is CompletionOutcome.EMPTY
 
     def test_non_terminal_is_aborted(self):
-        outcome = CompletionOutcome.from_response(
+        outcome = classify_completion_outcome(
             content=None, usage=None, http_status=200, terminal=False
         )
         assert outcome is CompletionOutcome.ABORTED
 
     def test_known_wait_notice_is_transient(self):
-        outcome = CompletionOutcome.from_response(
+        outcome = classify_completion_outcome(
             content="Model is loading, please wait",
             usage={"output_tokens": 12},
             http_status=200,
@@ -188,11 +188,9 @@ class TestCompletionOutcome:
 
     def test_outcome_admits_real_work(self):
         assert CompletionOutcome.PROGRESS.admits_real_work is True
-        assert CompletionOutcome.COMPLETE.admits_real_work is True
         for bad in (
             CompletionOutcome.TRANSIENT_NO_PROGRESS,
             CompletionOutcome.EMPTY,
-            CompletionOutcome.REPEATED_NOOP,
             CompletionOutcome.PROVIDER_ERROR,
             CompletionOutcome.ABORTED,
             CompletionOutcome.UNKNOWN,
@@ -226,7 +224,7 @@ class TestTransientStubDoesNotPoisonLocality:
         conversation = _blocks(("a", 4096), ("b", 4096), ("c", 4096))
         _remember_with_observed_hit(coordinator, scope, conversation)
 
-        outcome = CompletionOutcome.from_response(
+        outcome = classify_completion_outcome(
             content=WARMUP_STUB, usage=None, http_status=200, terminal=True
         )
         assert outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
