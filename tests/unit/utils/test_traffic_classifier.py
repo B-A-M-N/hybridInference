@@ -229,7 +229,7 @@ def test_sessionless_sequential_history_can_reach_human_scheduling_hint(user_age
 
 @pytest.mark.parametrize(
     ("user_agent", "request_count"),
-    [("curl/8.0", 6), ("python-requests/2.31", 6), (None, 6)],
+    [("curl/8.0", 6), ("httpx/0.27", 6), ("python-requests/2.31", 6), (None, 6)],
 )
 def test_script_or_unknown_agent_cannot_receive_human_hint(user_agent, request_count):
     """The maintainer's sequential script loop is denied by its automation evidence."""
@@ -330,6 +330,7 @@ def test_sessionless_changing_shape_history_reaches_preference_gate():
                 )
             )
         )
+        state.record_response_completed("authenticated-user", observed_at=now[0] + 1.0)
         now[0] += 5.0
 
     assert all(
@@ -589,24 +590,52 @@ def test_traffic_state_ttl_eviction():
     assert state.get_identity_count() == 0
 
 
-def test_traffic_state_inter_arrival():
-    """Inter-arrival time is calculated correctly."""
+def test_traffic_state_inter_arrival_uses_response_idle_time():
+    """Cadence excludes serving latency and uses only known client idle time."""
     now = [100.0]
     state = TrafficObservationState(clock=lambda: now[0])
     result1 = state.record_request(user_id="user_1")
     assert result1["inter_arrival_ms"] is None  # First request
-    now[0] += 0.05
+    assert state.record_response_completed("user_1", observed_at=100.5)
+    now[0] = 106.0  # 5.5s serving latency, then 0.5s client idle
     result2 = state.record_request(user_id="user_1")
-    assert result2["inter_arrival_ms"] is not None
-    assert result2["inter_arrival_ms"] == pytest.approx(50.0)
+    assert result2["inter_arrival_ms"] == pytest.approx(5500.0)
 
 
-def test_simultaneous_arrivals_keep_zero_inter_arrival_in_preview_and_commit():
-    """Equal original arrival timestamps produce a real zero interval."""
+def test_start_to_start_timing_is_not_used_without_response_completion():
+    """Slow model serving must not be interpreted as client think time."""
+    now = [100.0]
+    state = TrafficObservationState(clock=lambda: now[0])
+    state.record_request(user_id="user_1")
+    now[0] = 110.0
+
+    result = state.record_request(user_id="user_1")
+
+    assert result["inter_arrival_ms"] is None
+
+
+def test_hourly_shape_reuse_does_not_accumulate_as_high_frequency():
+    """A shape used once per hour never looks like a burst of repetition."""
+    now = [100.0]
+    state = TrafficObservationState(ttl_seconds=7200.0, clock=lambda: now[0])
+    repeats = []
+
+    for _ in range(8):
+        repeats.append(
+            state.record_request("user_1", shape_hash="stable-shape")["shape_repeat_count"]
+        )
+        now[0] += 3600.0
+
+    assert repeats == [1] * 8
+
+
+def test_zero_client_idle_is_preserved_in_preview_and_commit():
+    """A response and the next arrival at the same time produce zero idle."""
     now = [100.0]
     state = TrafficObservationState(clock=lambda: now[0])
 
     first = state.record_request(user_id="user_1", observed_at=100.0)
+    assert state.record_response_completed("user_1", observed_at=100.0)
     preview = state.preview_request(user_id="user_1", observed_at=100.0)
     committed = state.record_request(user_id="user_1", observed_at=100.0)
 
@@ -615,20 +644,21 @@ def test_simultaneous_arrivals_keep_zero_inter_arrival_in_preview_and_commit():
     assert committed["inter_arrival_ms"] == 0.0
 
 
-def test_out_of_order_commit_does_not_manufacture_zero_inter_arrival():
-    """A late commit with an older arrival time is not simultaneous traffic."""
+def test_backdated_request_does_not_consume_future_response_completion():
+    """A stale arrival cannot claim a response completion from the future."""
     now = [101.0]
     state = TrafficObservationState(clock=lambda: now[0])
     state.record_request(user_id="user_1", observed_at=101.0)
+    assert state.record_response_completed("user_1", observed_at=101.5)
 
     now[0] = 102.0
     preview = state.preview_request(user_id="user_1", observed_at=100.0)
     committed = state.record_request(user_id="user_1", observed_at=100.0)
-    latest = state.preview_request(user_id="user_1", observed_at=101.0)
+    latest = state.preview_request(user_id="user_1", observed_at=102.0)
 
     assert preview["inter_arrival_ms"] is None
     assert committed["inter_arrival_ms"] is None
-    assert latest["inter_arrival_ms"] == 0.0
+    assert latest["inter_arrival_ms"] == pytest.approx(500.0)
 
 
 def test_traffic_state_shape_repetition():
@@ -670,10 +700,11 @@ def test_traffic_state_preview_does_not_commit_history():
 
 
 def test_traffic_state_commit_preserves_preview_timestamp():
-    """Post-dispatch commits retain arrival time instead of completion time."""
+    """Pre-dispatch commit retains arrival time for response-idle evidence."""
     now = [100.0]
     state = TrafficObservationState(clock=lambda: now[0])
     state.record_request(user_id="user_1")
+    assert state.record_response_completed("user_1", observed_at=105.0)
 
     # The tracker clock has advanced during gateway preflight, but the router
     # captured this request's arrival at 110.0 before those awaits.
@@ -687,7 +718,7 @@ def test_traffic_state_commit_preserves_preview_timestamp():
     )
 
     assert committed["observed_at"] == 110.0
-    assert committed["inter_arrival_ms"] == pytest.approx(10_000.0)
+    assert committed["inter_arrival_ms"] == pytest.approx(5_000.0)
 
 
 def test_traffic_state_backdated_observation_preserves_latest_session():
@@ -788,8 +819,10 @@ def test_traffic_state_lru_refreshes_on_access():
     now = [100.0]
     state = TrafficObservationState(max_identities=2, clock=lambda: now[0])
     state.record_request(user_id="user_a")
+    state.record_response_completed("user_a")
     state.record_request(user_id="user_b")
     state.record_request(user_id="user_a")
+    state.record_response_completed("user_a")
     state.record_request(user_id="user_c")
 
     result = state.record_request(user_id="user_a")

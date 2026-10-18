@@ -1,8 +1,8 @@
 """Bounded traffic observation state for traffic classification.
 
 Tracks minimal temporal evidence needed by the traffic classifier:
-- last request timestamp (for inter-arrival calculation)
-- request shape fingerprints (for repetition detection)
+- response completion and next request timestamps (for idle-time cadence)
+- bounded request-shape timestamps in a short sliding window
 
 Design:
 - Bounded cardinality (max entries per identity, max total entries)
@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import math
 import time
+from bisect import bisect_left, insort
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -24,21 +25,28 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+_SHAPE_REPEAT_WINDOW_SECONDS = 600.0
+_MAX_SHAPE_OBSERVATIONS = 100
+
 
 @dataclass
 class _IdentityEntry:
     """Observation state for one identity."""
 
     last_request_ts: float | None = None
+    last_response_completed_ts: float | None = None
     request_count: int = 0
-    shape_counts: OrderedDict[str, int] = field(default_factory=OrderedDict)
+    shape_counts: OrderedDict[str, list[float]] = field(default_factory=OrderedDict)
     session_id: str | None = None
 
 
 class TrafficObservationState:
     """Bounded tracker for traffic observation evidence.
 
-    Tracks per-identity temporal evidence needed by the classifier.
+    Tracks per-identity temporal evidence needed by the classifier. Cadence is
+    measured from a completed response to the next request; start-to-start time
+    is not used because it includes model serving latency. Shape repetition is
+    limited to a short sliding window.
     Uses LRU eviction when capacity is reached.
 
     Thread-safety: asyncio single-threaded; no internal lock needed.
@@ -108,7 +116,8 @@ class TrafficObservationState:
         """Record a request and return observation evidence.
 
         Returns a dict with:
-        - inter_arrival_ms: time since last request (or None if first request)
+        - inter_arrival_ms: idle time since the last response completed, or None
+          when completion timing is unavailable
         - shape_repeat_count: how many times this shape has been seen
         - session_continuity: whether session matches previous request (or None
           when no comparable prior session exists)
@@ -154,10 +163,12 @@ class TrafficObservationState:
         else:
             self._identities.move_to_end(key)
 
-        # Calculate inter-arrival
+        # Start-to-start time includes model serving latency, so it is not a
+        # useful estimate of human think time. Only a known response completion
+        # can support this signal.
         inter_arrival_ms: float | None = None
-        if entry.last_request_ts is not None:
-            elapsed = request_time - entry.last_request_ts
+        if entry.last_response_completed_ts is not None:
+            elapsed = request_time - entry.last_response_completed_ts
             if elapsed >= 0:
                 inter_arrival_ms = elapsed * 1000
 
@@ -167,20 +178,31 @@ class TrafficObservationState:
         )
         if is_latest_observation:
             entry.last_request_ts = request_time
+            # A completion marker is consumed by the first later arrival.
+            entry.last_response_completed_ts = None
         entry.request_count += 1
 
-        # Track shape repetition
+        # Keep only recent observations. The helper already returns an opaque
+        # structural digest, so hashing it again adds cost without improving
+        # the privacy boundary.
         shape_repeat_count: int | None = None
         if shape_hash:
-            shape_key = self._identity_key("shape", shape_hash)
+            shape_key = shape_hash
             if shape_key not in entry.shape_counts:
                 # Remove the least recently seen shape if at capacity.
                 if len(entry.shape_counts) >= self._max_shapes_per_identity:
                     entry.shape_counts.popitem(last=False)
-                entry.shape_counts[shape_key] = 0
-            entry.shape_counts[shape_key] += 1
+                entry.shape_counts[shape_key] = []
+            observations = entry.shape_counts[shape_key]
+            cutoff = request_time - _SHAPE_REPEAT_WINDOW_SECONDS
+            first_recent = bisect_left(observations, cutoff)
+            if first_recent:
+                del observations[:first_recent]
+            insort(observations, request_time)
+            if len(observations) > _MAX_SHAPE_OBSERVATIONS:
+                del observations[:-_MAX_SHAPE_OBSERVATIONS]
             entry.shape_counts.move_to_end(shape_key)
-            shape_repeat_count = entry.shape_counts[shape_key]
+            shape_repeat_count = len(observations) - bisect_left(observations, cutoff)
 
         # Check session continuity without retaining the caller-provided
         # session identifier in process memory.
@@ -207,6 +229,34 @@ class TrafficObservationState:
             "tracked": True,
             "observed_at": request_time,
         }
+
+    def record_response_completed(
+        self,
+        user_id: str | None,
+        observed_at: float | None = None,
+    ) -> bool:
+        """Record the completion time needed to measure the next idle interval.
+
+        Returns False when the identity has no current observation or the
+        completion predates its latest request. A caller should pass the
+        gateway's monotonic response-completion timestamp.
+        """
+        key = self._resolve_identity_key(user_id)
+        if key is None:
+            return False
+        entry = self._identities.get(key)
+        if entry is None:
+            return False
+        completed_at = self._clock() if observed_at is None else observed_at
+        if entry.last_request_ts is None or completed_at < entry.last_request_ts:
+            return False
+        if (
+            entry.last_response_completed_ts is not None
+            and completed_at < entry.last_response_completed_ts
+        ):
+            return False
+        entry.last_response_completed_ts = completed_at
+        return True
 
     def preview_request(
         self,
@@ -254,15 +304,17 @@ class TrafficObservationState:
             }
 
         inter_arrival_ms: float | None = None
-        if entry.last_request_ts is not None:
-            elapsed = request_time - entry.last_request_ts
+        if entry.last_response_completed_ts is not None:
+            elapsed = request_time - entry.last_response_completed_ts
             if elapsed >= 0:
                 inter_arrival_ms = elapsed * 1000
 
         shape_repeat_count: int | None = None
         if shape_hash:
-            shape_key = self._identity_key("shape", shape_hash)
-            shape_repeat_count = entry.shape_counts.get(shape_key, 0) + 1
+            shape_key = shape_hash
+            observations = entry.shape_counts.get(shape_key, [])
+            cutoff = request_time - _SHAPE_REPEAT_WINDOW_SECONDS
+            shape_repeat_count = len(observations) - bisect_left(observations, cutoff) + 1
 
         session_continuity: bool | None = None
         if session_id:

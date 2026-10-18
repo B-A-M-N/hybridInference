@@ -80,7 +80,8 @@ class TrafficEvidence:
     meaningful.
     """
 
-    # Inter-arrival time in milliseconds (time since last request from same identity)
+    # Client idle time in milliseconds: this request arrival minus the previous
+    # response completion. None means completion timing was unavailable.
     inter_arrival_ms: float | None = None
 
     # Current concurrent in-flight requests for this identity
@@ -226,10 +227,8 @@ def _score_concurrency(concurrent_requests: int) -> float:
     Automated systems often have 5+ concurrent requests. The score is capped
     because in-flight concurrency also reflects downstream service time.
     """
-    if concurrent_requests >= 20:
-        score = 0.90
-    elif concurrent_requests >= 10:
-        score = 0.70
+    if concurrent_requests >= 10:
+        score = MAX_CONCURRENCY_SIGNAL_SCORE
     elif concurrent_requests >= 5:
         score = 0.50
     elif concurrent_requests >= 3:
