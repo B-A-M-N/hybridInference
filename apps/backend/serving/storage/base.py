@@ -121,6 +121,14 @@ class OperationalStore(ABC):
 
     # -- phone authentication (optional for legacy store implementations) ----
 
+    async def require_phone_accounts(self) -> None:  # noqa: B027
+        """Raise ``AccountSchemaPending`` while the database cannot hold phone accounts yet.
+
+        An upgrade adds the phone columns from the background when it cannot
+        get the users table's lock at startup; until then phone routes answer
+        503. The base implementation has nothing pending.
+        """
+
     async def get_user_by_phone(self, phone: str) -> Row | None:
         """Fetch an account by its canonical phone number."""
         raise RuntimeError("Phone authentication is unavailable in this store")
@@ -1029,13 +1037,34 @@ class OperationalStore(ABC):
     async def get_user_preferences(self, user_id: str) -> dict[str, Any]:
         """Return the preferences JSONB column for *user_id*, parsed as dict."""
 
+    # Preferences are written one key at a time, in the database. A whole-column
+    # write from a value read earlier loses whatever another request wrote to a
+    # different key in between, so there is deliberately no such method.
+
     @abstractmethod
-    async def update_user_preferences(
+    async def set_user_preference(self, user_id: str, key: str, value: Any) -> bool:
+        """Set one preference key atomically; return False when there is no such user."""
+
+    @abstractmethod
+    async def delete_user_preference(self, user_id: str, key: str) -> bool:
+        """Remove one preference key atomically; return False when there is no such user."""
+
+    @abstractmethod
+    async def set_user_preference_if_newer(
         self,
         user_id: str,
-        preferences: dict[str, Any],
-    ) -> None:
-        """Atomically replace the full preferences JSONB column."""
+        key: str,
+        value: dict[str, Any],
+        chosen_at: datetime,
+    ) -> dict[str, Any] | None:
+        """Set a timestamped preference unless the stored one is at least as recent.
+
+        ``value`` carries its own ``chosen_at`` (ISO 8601). The comparison and
+        the write are one statement, so of two overlapping requests the more
+        recent choice is the one kept whichever lands last. Returns the value
+        now stored — this one, or the newer one already there — or ``None``
+        when there is no such user.
+        """
 
     @abstractmethod
     async def get_user_avatar(self, user_id: str) -> str | None:
@@ -1120,6 +1149,17 @@ class OperationalStore(ABC):
         self, key: str, value: str, value_type: str, updated_by: str | None
     ) -> None:
         """Upsert a site_settings row."""
+
+    async def compare_and_set_setting(
+        self,
+        key: str,
+        expected: str | None,
+        value: str,
+        value_type: str,
+        updated_by: str | None,
+    ) -> bool:
+        """Publish only if the row still has *expected* (None means absent)."""
+        raise NotImplementedError("This operational store does not support atomic settings")
 
     @abstractmethod
     async def delete_setting(self, key: str) -> bool:
