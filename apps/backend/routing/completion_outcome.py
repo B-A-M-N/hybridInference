@@ -28,7 +28,12 @@ import re
 from enum import Enum
 from typing import Any
 
-__all__ = ["CompletionOutcome", "classify_completion_outcome"]
+__all__ = [
+    "CompletionOutcome",
+    "classify_completion_outcome",
+    "classify_stream_prefix",
+    "could_still_be_transient_prefix",
+]
 
 
 class CompletionOutcome(str, Enum):
@@ -85,21 +90,50 @@ class CompletionOutcome(str, Enum):
         )
 
 
+#: Literal starts of provider warmup notices. Keep these canonical strings
+#: shared by final classification and the incremental stream-prefix check.
+#: Commas and regex alternatives are expanded here so partial matching never
+#: treats regex syntax as literal provider output.
+_DEFAULT_TRANSIENT_MARKERS: tuple[str, ...] = (
+    "the model is starting up",
+    "model is starting up",
+    "the model is warming up",
+    "model is warming up",
+    "warming up the model",
+    "model is loading please wait",
+    "model is loading, please wait",
+    "loading the model please wait",
+    "loading the model, please wait",
+    "please wait while the model loads",
+    "please wait while the model starts",
+    "the model is not ready",
+    "model is initializing",
+)
+
 #: Provider warmup notices are short and appear at the start of the response.
 #: Keep both their total length and permitted trailing wording bounded so a
 #: genuine answer that quotes one is not mistaken for a transient response.
 _TRANSIENT_TEXT_MAX_CHARS = 200
-_DEFAULT_TRANSIENT_MARKERS: tuple[str, ...] = (
-    r"^the model is starting up",
-    r"^model is starting up",
-    r"^the model is warming up",
-    r"^model is warming up",
-    r"^warming up the model",
-    r"^model is loading,? please wait",
-    r"^loading the model,? please wait",
-    r"^please wait while the model (loads|starts)",
-    r"^the model is not ready",
-    r"^model is initializing",
+_TRANSIENT_SUFFIX_PREFIXES: tuple[str, ...] = (
+    "this takes about",
+    "this will take about",
+    "please wait",
+    "please wait while the model loads",
+    "please wait while the model starts",
+    "please wait while the model initializes",
+    "hold on",
+    "try again",
+    "try again soon",
+    "try again later",
+    "try again shortly",
+    "please try again",
+    "please try again soon",
+    "please try again later",
+    "please try again shortly",
+    "give it another",
+    "shortly",
+    "yet",
+    "now",
 )
 
 _NOTICE_SUFFIX = (
@@ -119,7 +153,8 @@ _NOTICE_SUFFIX = (
     r")*$"
 )
 _TRANSIENT_MARKERS: tuple[re.Pattern[str], ...] = tuple(
-    re.compile(pattern + _NOTICE_SUFFIX, re.IGNORECASE) for pattern in _DEFAULT_TRANSIENT_MARKERS
+    re.compile(r"^" + re.escape(marker) + _NOTICE_SUFFIX, re.IGNORECASE)
+    for marker in _DEFAULT_TRANSIENT_MARKERS
 )
 
 
@@ -129,6 +164,51 @@ def _looks_transient_text(text: str) -> bool:
     if len(stripped) > _TRANSIENT_TEXT_MAX_CHARS:
         return False
     return any(marker.match(stripped) for marker in _TRANSIENT_MARKERS)
+
+
+def _possible_notice_suffix(text: str) -> bool:
+    """Return whether the text after a marker can still be a notice suffix."""
+    suffix = text.strip(" \t.!…,:;-").lower()
+    if not suffix:
+        return True
+
+    for phrase in _TRANSIENT_SUFFIX_PREFIXES:
+        if phrase.startswith(suffix):
+            return True
+        if suffix.startswith(phrase):
+            remainder = suffix[len(phrase) :].strip(" \t.!…,:;-")
+            if not remainder:
+                return True
+            if any(
+                next_phrase.startswith(remainder) or remainder.startswith(next_phrase)
+                for next_phrase in _TRANSIENT_SUFFIX_PREFIXES
+            ):
+                return True
+
+    # Duration suffixes have a bounded numeric component. Once their literal
+    # introducer appears, wait for the terminal chunk to decide whether the
+    # remaining text forms a valid duration or a substantive continuation.
+    return suffix.startswith("this takes about") or suffix.startswith("this will take about")
+
+
+def could_still_be_transient_prefix(content: str | None) -> bool:
+    """Return whether *content* can still become a bounded warmup notice.
+
+    Streaming callers must defer a success decision while this is true. The
+    final response classifier remains authoritative once the stream terminates.
+    """
+    normalized = (content or "").strip().lower()
+    if not normalized:
+        return True
+    if len(normalized) > _TRANSIENT_TEXT_MAX_CHARS:
+        return False
+
+    for marker in _DEFAULT_TRANSIENT_MARKERS:
+        if marker.startswith(normalized):
+            return True
+        if normalized.startswith(marker) and _possible_notice_suffix(normalized[len(marker) :]):
+            return True
+    return False
 
 
 def _output_token_count(usage: dict[str, Any] | None) -> int | None:
@@ -180,3 +260,23 @@ def classify_completion_outcome(
         return CompletionOutcome.PROGRESS
 
     return CompletionOutcome.EMPTY
+
+
+def classify_stream_prefix(
+    content: str | None,
+    *,
+    terminal: bool = False,
+) -> CompletionOutcome | None:
+    """Classify available stream text, returning ``None`` while ambiguous.
+
+    A final answer may begin with the first few characters of a warmup marker.
+    Until the prefix diverges from every known marker/suffix or the stream ends,
+    that fragment is not enough evidence to close a provider breaker.
+    """
+    if not terminal and could_still_be_transient_prefix(content):
+        return None
+    return classify_completion_outcome(
+        content=content,
+        http_status=200,
+        terminal=True,
+    )

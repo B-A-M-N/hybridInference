@@ -23,7 +23,11 @@ if TYPE_CHECKING:
     from serving.adapters.base import BaseAdapter
 
 from routing.backends import LeafBackend
-from routing.completion_outcome import CompletionOutcome, classify_completion_outcome
+from routing.completion_outcome import (
+    CompletionOutcome,
+    classify_completion_outcome,
+    classify_stream_prefix,
+)
 from routing.dispatch import EndpointBinding, binding_for_adapter, execution_adapter
 from routing.endpoint_health import DispatchClaim, EndpointHealthRegistry, _http_status_of
 from routing.endpoints import endpoint_id_for_adapter, route_id_for_adapter
@@ -811,21 +815,26 @@ class FixedRouter:
             ),
         )
 
-    def _on_stream_first_content(self, endpoint_id: str, chunks: list[Any]) -> None:
-        """Record serving health from the first content-bearing stream chunks.
+    def _on_stream_first_content(
+        self,
+        endpoint_id: str,
+        chunks: list[Any],
+        *,
+        terminal: bool = False,
+    ) -> CompletionOutcome | None:
+        """Record health only after the available prefix proves real progress.
 
-        A warmup notice can be split across multiple SSE chunks; classifying
-        only the first one would read a fragment as PROGRESS. The accumulated
-        prefix is bounded so the classifier can decide without unbounded work.
+        A prefix that can still become a warmup notice remains undecided until
+        later chunks arrive or the stream terminates. The accumulated text is
+        bounded by ``accumulate_stream_prefix``.
         """
-        self._health_registry.record_success(
-            endpoint_id,
-            outcome=classify_completion_outcome(
-                content=accumulate_stream_prefix(chunks),
-                http_status=200,
-                terminal=True,
-            ),
+        outcome = classify_stream_prefix(
+            accumulate_stream_prefix(chunks),
+            terminal=terminal,
         )
+        if outcome is not None:
+            self._health_registry.record_success(endpoint_id, outcome=outcome)
+        return outcome
 
     def _on_liveness(self, endpoint_id: str) -> None:
         self._health_registry.record_liveness(endpoint_id)
@@ -2685,30 +2694,36 @@ class FixedRouter:
                 stream = aiter(leaf.stream_chat_completion(messages, **params))
                 if primary_watch is not None:
                     held = await self._await_first_token(stream, primary_watch)
-                    if held and has_non_empty_content(held[-1]):
-                        # The loop below's first-token bookkeeping, for a
-                        # first token that arrived while it was being awaited.
-                        first = False
-                        stream_prefix.extend(held)
-                        self._on_stream_first_content(primary_endpoint_id, stream_prefix)
-                        self._prefill_load.release(lease, prefill_confirmed=True)
                     for chunk in held:
+                        if first and has_non_empty_content(chunk):
+                            stream_prefix.append(chunk)
+                            outcome = self._on_stream_first_content(
+                                primary_endpoint_id, stream_prefix
+                            )
+                            if outcome is not None and outcome.admits_real_work:
+                                first = False
+                                self._prefill_load.release(lease, prefill_confirmed=True)
                         yield chunk
                         chunks_yielded = True
                 async for chunk in stream:
                     if first and has_non_empty_content(chunk):
-                        # Providers may emit keep-alives or empty terminal chunks.
-                        first = False
+                        # Keep accumulating while the prefix could still be a
+                        # warmup notice; only substantive output ends prefill.
                         stream_prefix.append(chunk)
-                        self._on_stream_first_content(primary_endpoint_id, stream_prefix)
-                        # First token means the prompt is resident and this
-                        # endpoint is decoding, not prefilling. Holding the
-                        # lease for the whole stream would let a long cheap
-                        # decode read as prefill pressure and push traffic away
-                        # from an endpoint that is no longer busy prefilling.
-                        self._prefill_load.release(lease, prefill_confirmed=True)
+                        outcome = self._on_stream_first_content(primary_endpoint_id, stream_prefix)
+                        if outcome is not None and outcome.admits_real_work:
+                            first = False
+                            self._prefill_load.release(lease, prefill_confirmed=True)
                     yield chunk
                     chunks_yielded = True
+                if first:
+                    outcome = self._on_stream_first_content(
+                        primary_endpoint_id,
+                        stream_prefix,
+                        terminal=True,
+                    )
+                    if outcome is not None and outcome.admits_real_work:
+                        self._prefill_load.release(lease, prefill_confirmed=True)
             return
         except Exception as primary_error:
             # Primary is done either way; release before the fallback attempts
@@ -2854,6 +2869,7 @@ class FixedRouter:
                             offload=offload_reason or earlier_offload,
                             offload_endpoint_id=earlier_offload_endpoint,
                         )
+                        stream_prefix = []
                         first = True
                         lease = self._prefill_load.acquire(
                             adapter_endpoint_id,
@@ -2865,22 +2881,42 @@ class FixedRouter:
                         stream = aiter(leaf.stream_chat_completion(messages, **params))
                         if fallback_watch is not None:
                             held = await self._await_first_token(stream, fallback_watch)
-                            if held and has_non_empty_content(held[-1]):
-                                first = False
-                                stream_prefix.extend(held)
-                                self._on_stream_first_content(adapter_endpoint_id, stream_prefix)
-                                self._prefill_load.release(lease, prefill_confirmed=True)
                             for chunk in held:
+                                if first and has_non_empty_content(chunk):
+                                    stream_prefix.append(chunk)
+                                    outcome = self._on_stream_first_content(
+                                        adapter_endpoint_id, stream_prefix
+                                    )
+                                    if outcome is not None and outcome.admits_real_work:
+                                        first = False
+                                        self._prefill_load.release(
+                                            lease,
+                                            prefill_confirmed=True,
+                                        )
                                 yield chunk
                                 chunks_yielded = True
                         async for chunk in stream:
                             if first and has_non_empty_content(chunk):
-                                first = False
                                 stream_prefix.append(chunk)
-                                self._on_stream_first_content(adapter_endpoint_id, stream_prefix)
-                                self._prefill_load.release(lease, prefill_confirmed=True)
+                                outcome = self._on_stream_first_content(
+                                    adapter_endpoint_id, stream_prefix
+                                )
+                                if outcome is not None and outcome.admits_real_work:
+                                    first = False
+                                    self._prefill_load.release(
+                                        lease,
+                                        prefill_confirmed=True,
+                                    )
                             yield chunk
                             chunks_yielded = True
+                        if first:
+                            outcome = self._on_stream_first_content(
+                                adapter_endpoint_id,
+                                stream_prefix,
+                                terminal=True,
+                            )
+                            if outcome is not None and outcome.admits_real_work:
+                                self._prefill_load.release(lease, prefill_confirmed=True)
                     return
                 except Exception as fallback_error:
                     self._on_failure(

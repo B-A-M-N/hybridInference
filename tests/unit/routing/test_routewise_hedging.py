@@ -2566,6 +2566,34 @@ class TestToolCallsWinnerDetection:
         assert "test:reasoning-primary" in sink.successes
 
     @pytest.mark.asyncio
+    async def test_thinking_delta_closes_the_endpoint_breaker(self, monkeypatch):
+        """A thinking-first stream records semantic progress in endpoint health."""
+        monkeypatch.setenv("CIRCUIT_FAILURE_THRESHOLD", "3")
+        sink = EndpointHealthRegistry()
+        thinking_chunk = 'data: {"choices":[{"delta":{"thinking":"reasoning first"}}]}\n\n'
+        primary = _make_fake_adapter(
+            provider="thinking-primary",
+            stream_chunks=[thinking_chunk, "data: [DONE]\n\n"],
+            stream_delay=0.0,
+        )
+        endpoint = primary.config.endpoint_id or primary.config.provider
+        for _ in range(3):
+            sink.record_failure(endpoint, reason="test")
+        backup = _make_fake_adapter(provider="backup", stream_delay=10.0)
+        hedged = HedgedAdapter(
+            primary=primary,
+            backup=backup,
+            hedge_threshold_sec=10.0,
+            event_sink=sink,
+        )
+
+        async for _chunk in hedged.stream_chat_completion([{"role": "user", "content": "think"}]):
+            pass
+
+        assert sink.snapshot()[endpoint]["circuit_state"] == "closed"
+        assert sink._circuits[endpoint].consecutive_failures == 0
+
+    @pytest.mark.asyncio
     async def test_reasoning_content_resolves_race_before_visible_content(self):
         """The race should return on reasoning_content without waiting for visible content."""
         sink = _FakeEventSink()
@@ -2910,6 +2938,37 @@ class TestHedgedWinnerOutcomeClassification:
         assert result["choices"][0]["message"]["content"] == "The model is starting up..."
 
     @pytest.mark.asyncio
+    async def test_nonstreaming_tool_call_winner_records_progress(self):
+        sink = _FakeEventSink()
+        primary = _make_fake_adapter(
+            provider="tool-primary",
+            chat_result={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {"id": "call-1", "type": "function", "function": {"name": "lookup"}}
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+        backup = _make_fake_adapter(provider="tool-backup", chat_result={"choices": []})
+        hedged = HedgedAdapter(
+            primary=primary,
+            backup=backup,
+            hedge_threshold_sec=10.0,
+            event_sink=sink,
+        )
+
+        await hedged.chat_completion([{"role": "user", "content": "look this up"}])
+
+        from routing.completion_outcome import CompletionOutcome
+
+        assert sink.success_outcomes == [CompletionOutcome.PROGRESS]
+
+    @pytest.mark.asyncio
     async def test_streaming_buffer_cap_win_records_liveness_not_progress(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -2951,6 +3010,17 @@ class TestHedgedWinnerOutcomeClassification:
 @pytest.mark.unit
 class TestFragmentedWarmupStreaming:
     """A warmup notice split across SSE chunks must not close the breaker."""
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "Please wait while the model sta",
+            "Model is loading, please",
+            "The model is starting up - this takes about 12",
+        ],
+    )
+    def test_pattern_fragments_remain_possible_warmup_prefixes(self, prefix):
+        assert hedging_module._could_still_become_warmup(prefix)
 
     @pytest.mark.asyncio
     async def test_streaming_fragmented_warmup_records_transient_not_progress(self):

@@ -508,6 +508,34 @@ class TestNonProgressEvidenceRecording:
         assert state.blocks == conversation
         assert state.verified is False, "provider contradicted the warm entry"
 
+    def test_progress_with_cached_zero_records_one_materialization_observation(self, monkeypatch):
+        """A successful cache miss is one observation, not a miss plus a candidate."""
+        coordinator = _coordinator(min_match_tokens=1)
+        scope = _scope()
+        conversation = _blocks(("a", 4096))
+        coordinator.remember(scope, conversation)
+        calls = 0
+        record_evidence = coordinator.record_evidence
+
+        def _record_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return record_evidence(*args, **kwargs)
+
+        monkeypatch.setattr(coordinator, "record_evidence", _record_once)
+        coordinator.record_outcome(
+            scope=scope,
+            blocks=conversation,
+            outcome=CompletionOutcome.PROGRESS,
+            observed_cached_tokens=0,
+        )
+
+        assert calls == 1
+        assert (
+            coordinator._evidence._evidence[scope].state
+            is CacheLocalityEvidenceState.MATERIALIZATION_CANDIDATE
+        )
+
 
 class TestDifferingPrefixEvidenceContract:
     """Non-progress completions with differing stored/dispatched prefixes."""

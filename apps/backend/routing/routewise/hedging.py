@@ -14,8 +14,13 @@ if TYPE_CHECKING:
 
 from llm_routewise.core import CheckpointBackupDispatch, CheckpointBackupSelector
 
-from routing.completion_outcome import CompletionOutcome, classify_completion_outcome
+from routing.completion_outcome import (
+    CompletionOutcome,
+    classify_completion_outcome,
+    could_still_be_transient_prefix,
+)
 from routing.endpoints import endpoint_id_for_adapter
+from routing.response_text import response_text, response_usage
 from routing.streaming import has_non_empty_content
 from routing.telemetry import failed_attempt, routing_chunk
 from serving.adapters.base import BaseAdapter
@@ -44,43 +49,19 @@ def _could_still_become_warmup(text: str) -> bool:
     classified together. A marker followed by an incomplete duration suffix
     must not win the race as ordinary progress.
     """
-    from routing.completion_outcome import _DEFAULT_TRANSIENT_MARKERS
-
-    normalized = text.strip().lower()
-    if not normalized:
-        return True
-    suffix_prefixes = (
-        "this takes about",
-        "this will take about",
-        "please wait",
-        "hold on",
-        "try again",
-        "please try again",
-        "give it another",
-        "shortly",
-        "yet",
-        "now",
-    )
-    for marker in _DEFAULT_TRANSIENT_MARKERS:
-        phrase = marker.removeprefix("^")
-        if phrase.startswith(normalized):
-            return True
-        if not normalized.startswith(phrase):
-            continue
-        tail = normalized[len(phrase) :].strip(" \t.!…,:;-")
-        if not tail or any(prefix.startswith(tail) for prefix in suffix_prefixes):
-            return True
-    return False
+    return could_still_be_transient_prefix(text)
 
 
 def _accumulated_text_exceeds_warmup_window(buffer: list[str]) -> bool:
-    """Return whether accumulated stream text is safe to classify as real work.
+    """Return whether the buffered outcome is stable enough to resolve a race.
 
     A warmup notice split across chunks must not win the race while the
     accumulated text is still a prefix of a warmup phrase, because a longer
     continuation would classify TRANSIENT. Once the text diverges from every
-    warmup marker -- or the accumulated prefix is empty/no text at all -- the
-    classification is stable.
+    warmup marker -- or the bounded buffer contains no model text and therefore
+    has a stable EMPTY outcome -- the race may resolve. EMPTY is not semantic
+    progress: health classification and prefill confirmation remain gated on
+    their own outcome and actual-content checks.
     """
     from routing.response_text import accumulate_stream_prefix
 
@@ -107,18 +88,9 @@ def _classify_stream_buffer_outcome(buffer: list[str]) -> CompletionOutcome:
 
 def _classify_result_outcome(result: Any) -> CompletionOutcome:
     """Classify a non-streaming hedge winner's completion result."""
-    content: str | None = None
-    usage: dict[str, Any] | None = None
-    if isinstance(result, dict):
-        choices = result.get("choices") or [{}]
-        message = (choices[0] or {}).get("message") or {}
-        raw_content = message.get("content") or message.get("reasoning_content")
-        content = raw_content if isinstance(raw_content, str) else None
-        raw_usage = result.get("usage")
-        usage = raw_usage if isinstance(raw_usage, dict) else None
     return classify_completion_outcome(
-        content=content,
-        usage=usage,
+        content=response_text(result),
+        usage=response_usage(result),
         http_status=200,
         terminal=True,
     )

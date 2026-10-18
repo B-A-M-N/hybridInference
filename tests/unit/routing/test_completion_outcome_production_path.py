@@ -14,7 +14,12 @@ from typing import Any
 
 import pytest
 
-from routing.completion_outcome import CompletionOutcome
+from routing.completion_outcome import (
+    CompletionOutcome,
+    classify_stream_prefix,
+    could_still_be_transient_prefix,
+)
+from routing.response_text import chunk_text
 from routing.routers import RoutingObservation
 from serving.servers.routers.completions_logging import CompletionsLogger
 
@@ -229,3 +234,40 @@ class TestWarmupMarkerAnchoring:
 
         outcome = classify_completion_outcome(content=text, http_status=200, terminal=True)
         assert outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS, text
+
+
+class TestStreamingOutcomePrefixes:
+    def test_short_warmup_prefix_is_undecided_until_stream_end(self):
+        assert classify_stream_prefix("The") is None
+        assert classify_stream_prefix("The model is starting up...") is None
+        assert (
+            classify_stream_prefix("The model is starting up...", terminal=True)
+            is CompletionOutcome.TRANSIENT_NO_PROGRESS
+        )
+
+    def test_substantive_continuation_resolves_a_warmup_prefix(self):
+        assert (
+            classify_stream_prefix("The model is starting up to answer the request")
+            is CompletionOutcome.PROGRESS
+        )
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Please wait while the model sta",
+            "Model is loading, please",
+            "The model is starting up - this takes about 12",
+        ],
+    )
+    def test_regex_alternatives_and_suffixes_remain_possible_prefixes(self, text):
+        assert could_still_be_transient_prefix(text)
+
+    def test_tool_call_and_thinking_deltas_are_semantic_output(self):
+        tool_call = (
+            'data: {"choices":[{"delta":{"tool_calls":'
+            '[{"id":"call-1","function":{"name":"lookup"}}]}}]}\n\n'
+        )
+        thinking = 'data: {"choices":[{"delta":{"thinking":"reasoning here"}}]}\n\n'
+
+        assert chunk_text(tool_call) == "[tool_call]"
+        assert chunk_text(thinking) == "reasoning here"

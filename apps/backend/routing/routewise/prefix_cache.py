@@ -1013,18 +1013,20 @@ class PrefixCacheCoordinator:
         # absence of a negative -- admitting UNKNOWN because it is not on a
         # blacklist -- would make a caller that forgot to classify silently
         # restore the incident, so the test is admits_real_work and nothing else.
-        if observed_cached_tokens is not None:
-            # Provider-reported cache usage is authoritative evidence even for a
-            # non-progress completion: a warmup 200 with cached_tokens=0
-            # contradicts a warm entry and must degrade its evidence.
-            self.record_evidence(
-                scope,
-                observed_cached_tokens,
-                generation=generation,
-                blocks=tuple(blocks),
-                materialization_candidate=False,
-            )
         if not bool(getattr(outcome, "admits_real_work", False)):
+            if observed_cached_tokens is not None:
+                # Provider-reported cache usage is authoritative evidence even
+                # for a non-progress completion: a warmup 200 with
+                # cached_tokens=0 contradicts a warm entry and must degrade its
+                # evidence. Record it once without treating the request as a
+                # materialization candidate.
+                self.record_evidence(
+                    scope,
+                    observed_cached_tokens,
+                    generation=generation,
+                    blocks=tuple(blocks),
+                    materialization_candidate=False,
+                )
             # The provider answered, so the scope is provably live and a
             # transient hiccup must not age strong evidence out through the TTL.
             # But the stored blocks are left exactly as they are: a short
@@ -1052,6 +1054,9 @@ class PrefixCacheCoordinator:
         if not self.remember(scope, tuple(blocks), generation=generation):
             return False
         if observed_cached_tokens is not None:
+            # A successful request gets one authoritative observation after the
+            # remembered prefix is current. Recording before ``remember`` too
+            # would count the same cache reading twice when blocks are unchanged.
             self.record_evidence(
                 scope,
                 observed_cached_tokens,

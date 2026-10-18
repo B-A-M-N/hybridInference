@@ -53,7 +53,11 @@ if TYPE_CHECKING:
     from .config import RouteWiseConfig
 
 from routing.backends import LeafBackend
-from routing.completion_outcome import classify_completion_outcome
+from routing.completion_outcome import (
+    CompletionOutcome,
+    classify_completion_outcome,
+    classify_stream_prefix,
+)
 from routing.dispatch import DispatchMismatchError, binding_for_adapter, execution_adapter
 from routing.endpoint_health import EndpointHealthRegistry
 from routing.endpoints import endpoint_id_for_adapter
@@ -523,29 +527,26 @@ class RouteWiseRouter:
             ),
         )
 
-    def _on_stream_first_content(self, endpoint_id: str, chunks: list[Any]) -> None:
-        """Record serving health from the first content-bearing stream chunks."""
-        self._health_registry.record_success(
-            endpoint_id,
-            outcome=classify_completion_outcome(
-                content=accumulate_stream_prefix(chunks),
-                http_status=200,
-                terminal=True,
-            ),
+    def _on_stream_first_content(
+        self,
+        endpoint_id: str,
+        chunks: list[Any],
+        *,
+        terminal: bool = False,
+    ) -> CompletionOutcome | None:
+        """Record health only when a bounded stream prefix proves real progress."""
+        outcome = classify_stream_prefix(
+            accumulate_stream_prefix(chunks),
+            terminal=terminal,
         )
+        if outcome is not None:
+            self._health_registry.record_success(endpoint_id, outcome=outcome)
+        return outcome
 
     @staticmethod
     def _stream_prefix_is_transient(chunks: list[Any]) -> bool:
-        """Return whether the accumulated stream prefix still reads as a warmup notice."""
-        return classify_completion_outcome(
-            content=accumulate_stream_prefix(chunks),
-            http_status=200,
-            terminal=True,
-        ) == classify_completion_outcome(
-            content="the model is starting up",
-            http_status=200,
-            terminal=True,
-        )
+        """Return whether the current prefix could still become a warmup notice."""
+        return classify_stream_prefix(accumulate_stream_prefix(chunks)) is None
 
     def _on_liveness(self, endpoint_id: str) -> None:
         self._health_registry.record_liveness(endpoint_id)
@@ -3387,13 +3388,13 @@ class RouteWiseRouter:
             with req_ctx.push(model=model_id, provider=adapter.config.provider):
                 self._ensure_health(endpoint_id)
                 first = True
+                stream_prefix: list[Any] = []
                 if isinstance(adapter, HedgedAdapter):
                     primary_prefill_release = (
                         None
                         if lease is None
                         else lambda lease=lease: self._prefill_load.release(lease)
                     )
-                    stream_prefix: list[Any] = []
                     async for chunk in adapter.stream_chat_completion(
                         messages,
                         primary_prefill_release=primary_prefill_release,
@@ -3428,7 +3429,6 @@ class RouteWiseRouter:
                                 )
                         yield chunk
                 else:
-                    stream_prefix: list[Any] = []
                     async for chunk in adapter.stream_chat_completion(messages, **params):
                         if first:
                             if not has_non_empty_content(chunk):
@@ -3458,6 +3458,23 @@ class RouteWiseRouter:
                                     endpoint_id_for_adapter(adapter), stream_prefix
                                 )
                         yield chunk
+                if first:
+                    if getattr(adapter, "reports_leg_outcomes", False):
+                        outcome = classify_stream_prefix(
+                            accumulate_stream_prefix(stream_prefix),
+                            terminal=True,
+                        )
+                    else:
+                        outcome = self._on_stream_first_content(
+                            endpoint_id_for_adapter(adapter),
+                            stream_prefix,
+                            terminal=True,
+                        )
+                    if outcome is not None and outcome.admits_real_work:
+                        self._prefill_load.release(
+                            lease,
+                            prefill_confirmed=endpoint_id_for_adapter(adapter) == endpoint_id,
+                        )
         finally:
             # Release prefill lease if it was acquired. Idempotent: no-op if
             # already released with prefill_confirmed=True.

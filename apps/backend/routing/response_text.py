@@ -16,7 +16,12 @@ def response_text(response: Any) -> str | None:
         return None
     choices = response.get("choices") or [{}]
     message = (choices[0] or {}).get("message") or {}
-    content = message.get("content") or message.get("reasoning_content")
+    content = (
+        message.get("content")
+        or message.get("reasoning_content")
+        or message.get("reasoning")
+        or message.get("thinking")
+    )
     if isinstance(content, str) and content:
         return content
     if message.get("tool_calls"):
@@ -48,8 +53,17 @@ def chunk_text(chunk: Any) -> str | None:
         return None
     choices = obj.get("choices") or []
     delta = (choices[0] or {}).get("delta") or {} if choices else {}
-    content = delta.get("content") or delta.get("reasoning_content")
-    return content if isinstance(content, str) and content else None
+    content = (
+        delta.get("content")
+        or delta.get("reasoning_content")
+        or delta.get("reasoning")
+        or delta.get("thinking")
+    )
+    if isinstance(content, str) and content:
+        return content
+    if delta.get("tool_calls"):
+        return "[tool_call]"
+    return None
 
 
 def accumulate_stream_prefix(chunks: list[Any], max_chars: int = 512) -> str | None:

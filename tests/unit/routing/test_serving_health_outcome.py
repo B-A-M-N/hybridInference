@@ -25,6 +25,8 @@ useful *serving*.
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -356,3 +358,129 @@ async def test_fragmented_genuine_stream_closes_breaker():
 
     assert registry._circuits[_ENDPOINT].consecutive_failures == 0
     assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED
+
+
+@pytest.mark.parametrize(
+    "delta",
+    [
+        {"tool_calls": [{"id": "call-1", "function": {"name": "lookup"}}]},
+        {"thinking": "reasoning before visible text"},
+        {"reasoning_content": "reasoning before visible text"},
+    ],
+)
+def test_fixed_and_routewise_health_recorders_accept_structured_stream_output(monkeypatch, delta):
+    """Structured first deltas are real work for both router health owners."""
+    monkeypatch.setenv(_THRESHOLD_ENV, "3")
+    chunk = f'data: {{"choices":[{{"delta":{json.dumps(delta)}}}]}}\n\n'
+
+    for router in _routers():
+        registry = router._health_registry
+        _trip(monkeypatch, registry)
+
+        router._on_stream_first_content(_ENDPOINT, [chunk])
+
+        assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED
+        assert registry._circuits[_ENDPOINT].consecutive_failures == 0
+
+
+def test_fixed_and_routewise_health_recorders_defer_partial_warmup_prefix(monkeypatch):
+    """A stream fragment that could become a warmup notice is not success."""
+    monkeypatch.setenv(_THRESHOLD_ENV, "3")
+    first_chunk = 'data: {"choices":[{"delta":{"content":"The"}}]}\n\n'
+
+    for router in _routers():
+        registry = router._health_registry
+        _trip(monkeypatch, registry)
+
+        assert router._on_stream_first_content(_ENDPOINT, [first_chunk]) is None
+        assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.OPEN
+        assert registry._circuits[_ENDPOINT].consecutive_failures == 3
+
+
+class _StreamingAdapter:
+    """Minimal endpoint adapter used to exercise both public stream paths."""
+
+    def __init__(self, chunks: list[str]) -> None:
+        self.config = SimpleNamespace(
+            id="stream-model",
+            name="stream-model",
+            provider="stream-provider",
+            base_url="https://stream.example/v1",
+            endpoint_id=_ENDPOINT,
+            context_length=8192,
+            input_modalities=["text"],
+            output_modalities=["text"],
+            supports_tools=False,
+        )
+        self.chunks = chunks
+
+    async def stream_chat_completion(self, messages, **params):
+        for chunk in self.chunks:
+            yield chunk
+
+
+def _stream_chunks(contents: list[str]) -> list[str]:
+    return [
+        f'data: {{"choices":[{{"delta":{{"content":{json.dumps(content)}}}}}]}}\n\n'
+        for content in contents
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("router_kind", ["fixed", "routewise"])
+@pytest.mark.parametrize(
+    ("contents", "expected_failure_counts"),
+    [
+        (["The", " model is starting up - this takes about 120 seconds. Please wait..."], [2, 2]),
+        (["The", " answer is 42"], [2, 0]),
+    ],
+    ids=["warmup-prefix", "substantive-continuation"],
+)
+async def test_router_stream_entrypoints_defer_health_until_prefix_resolves(
+    monkeypatch,
+    router_kind,
+    contents,
+    expected_failure_counts,
+):
+    """Only the resolved semantic prefix may reset serving failures."""
+    from routing.routers import FixedRouter
+    from routing.routewise.config import RouteWiseConfig
+    from routing.routewise.decisions import ProviderReservation, RoutingDecision, RoutingTrace
+    from routing.routewise.router import RouteWiseRouter
+
+    monkeypatch.setenv(_THRESHOLD_ENV, "3")
+    registry = EndpointHealthRegistry()
+    registry.record_failure(_ENDPOINT, reason="upstream_502")
+    registry.record_failure(_ENDPOINT, reason="upstream_502")
+    adapter = _StreamingAdapter(_stream_chunks(contents))
+
+    if router_kind == "fixed":
+        router = FixedRouter(health_registry=registry)
+        router.register_route("stream-model", [(adapter, 1.0)])
+    else:
+        router = RouteWiseRouter(
+            config=RouteWiseConfig(db_bootstrap_enabled=False),
+            health_registry=registry,
+        )
+        decision = RoutingDecision(
+            adapter=adapter,
+            reservation=ProviderReservation(),
+            metadata={},
+            trace=RoutingTrace(request_id="stream-health-test"),
+        )
+        router._select_decision = lambda *args, **kwargs: decision
+
+    observed_failure_counts = []
+    async for chunk in router.stream_chat_completion(
+        "stream-model",
+        [{"role": "user", "content": "question"}],
+        request_id="stream-health-test",
+    ):
+        if '"content"' in chunk and '"_routing"' not in chunk:
+            observed_failure_counts.append(registry._circuits[_ENDPOINT].consecutive_failures)
+
+    assert observed_failure_counts == expected_failure_counts
+    if expected_failure_counts[-1] == 2:
+        assert registry.snapshot()[_ENDPOINT]["circuit_state"] == _CircuitState.CLOSED
+    else:
+        assert registry._circuits[_ENDPOINT].consecutive_failures == 0
