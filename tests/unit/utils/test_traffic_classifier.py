@@ -43,12 +43,12 @@ def test_minimal_evidence_unknown():
 
 
 def test_missing_evidence_is_not_treated_as_observed_zero():
-    """Omitted optional signals do not alter the score or confidence."""
+    """Omitted behavioral signals do not alter confidence or classification."""
     classification = classify_traffic(TrafficEvidence())
 
-    assert classification.automation_score == 0.0
     assert classification.confidence == 0.0
     assert classification.class_hint == TrafficClass.UNKNOWN
+    assert classification.reasons == ("insufficient_evidence", "automation_client")
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +153,9 @@ def test_two_observations_cannot_receive_human_scheduling_hint():
     )
     assert classification.confidence < 0.70
     assert not is_high_confidence_human_hint(
-        classification.class_hint.value, classification.confidence
+        classification.class_hint.value,
+        classification.confidence,
+        reasons=classification.reasons,
     )
 
 
@@ -172,7 +174,11 @@ def test_five_observations_can_receive_human_scheduling_hint():
 
     assert classification.class_hint == TrafficClass.LIKELY_HUMAN
     assert classification.confidence >= 0.70
-    assert is_high_confidence_human_hint(classification.class_hint.value, classification.confidence)
+    assert is_high_confidence_human_hint(
+        classification.class_hint.value,
+        classification.confidence,
+        reasons=classification.reasons,
+    )
 
 
 def test_sequential_interactive_history_can_reach_human_scheduling_hint():
@@ -191,10 +197,14 @@ def test_sequential_interactive_history_can_reach_human_scheduling_hint():
 
     assert classification.class_hint == TrafficClass.LIKELY_HUMAN
     assert classification.confidence >= 0.70
-    assert is_high_confidence_human_hint(classification.class_hint.value, classification.confidence)
+    assert is_high_confidence_human_hint(
+        classification.class_hint.value,
+        classification.confidence,
+        reasons=classification.reasons,
+    )
 
 
-@pytest.mark.parametrize("user_agent", ["OpenAI Python/1.0", "claude-code/1.0"])
+@pytest.mark.parametrize("user_agent", ["claude-code/1.0", "browser/1.0"])
 def test_sessionless_sequential_history_can_reach_human_scheduling_hint(user_agent):
     """Normal authenticated multi-turn clients need no custom session ID."""
     classification = classify_traffic(
@@ -210,7 +220,90 @@ def test_sessionless_sequential_history_can_reach_human_scheduling_hint(user_age
     )
 
     assert classification.class_hint == TrafficClass.LIKELY_HUMAN
-    assert is_high_confidence_human_hint(classification.class_hint.value, classification.confidence)
+    assert is_high_confidence_human_hint(
+        classification.class_hint.value,
+        classification.confidence,
+        reasons=classification.reasons,
+    )
+
+
+@pytest.mark.parametrize(
+    ("user_agent", "request_count"),
+    [("curl/8.0", 6), ("python-requests/2.31", 6), (None, 6)],
+)
+def test_script_or_unknown_agent_cannot_receive_human_hint(user_agent, request_count):
+    """The maintainer's sequential script loop is denied by its automation evidence."""
+    classification = classify_traffic(
+        TrafficEvidence(
+            inter_arrival_ms=3000,
+            concurrent_requests=1,
+            shape_repeat_count=1,
+            session_continuity=None,
+            is_authenticated=True,
+            user_agent=user_agent,
+            request_count=request_count,
+        )
+    )
+
+    assert not is_high_confidence_human_hint(
+        classification.class_hint.value,
+        classification.confidence,
+        reasons=classification.reasons,
+    )
+
+
+def test_hint_gate_requires_reason_codes_to_grant_hint():
+    """The public hint API cannot grant a preference from confidence alone."""
+    classification = classify_traffic(
+        TrafficEvidence(
+            inter_arrival_ms=3000,
+            concurrent_requests=1,
+            shape_repeat_count=1,
+            session_continuity=None,
+            is_authenticated=True,
+            user_agent="claude-code/1.0",
+            request_count=6,
+        )
+    )
+
+    assert classification.class_hint == TrafficClass.LIKELY_HUMAN
+    assert is_high_confidence_human_hint(
+        classification.class_hint.value,
+        classification.confidence,
+        reasons=classification.reasons,
+    )
+    assert not is_high_confidence_human_hint(
+        classification.class_hint.value,
+        classification.confidence,
+        reasons=(),
+    )
+    assert not is_high_confidence_human_hint(
+        classification.class_hint.value,
+        classification.confidence,
+        reasons=None,
+    )
+
+
+def test_hint_gate_denies_strong_automation_evidence_even_with_confidence():
+    """Strong automation evidence denies the human preference."""
+    classification = classify_traffic(
+        TrafficEvidence(
+            inter_arrival_ms=3000,
+            concurrent_requests=1,
+            shape_repeat_count=1,
+            session_continuity=None,
+            is_authenticated=True,
+            user_agent="curl/8.0",
+            request_count=6,
+        )
+    )
+
+    assert classification.class_hint == TrafficClass.LIKELY_HUMAN
+    assert not is_high_confidence_human_hint(
+        classification.class_hint.value,
+        classification.confidence,
+        reasons=classification.reasons,
+    )
 
 
 def test_sessionless_changing_shape_history_reaches_preference_gate():
@@ -232,7 +325,7 @@ def test_sessionless_changing_shape_history_reaches_preference_gate():
                     shape_repeat_count=observation["shape_repeat_count"],
                     session_continuity=observation["session_continuity"],
                     is_authenticated=True,
-                    user_agent="OpenAI Python/1.0",
+                    user_agent="claude-code/1.0",
                     request_count=observation["request_count"],
                 )
             )
@@ -240,12 +333,17 @@ def test_sessionless_changing_shape_history_reaches_preference_gate():
         now[0] += 5.0
 
     assert all(
-        not is_high_confidence_human_hint(c.class_hint.value, c.confidence)
+        not is_high_confidence_human_hint(
+            c.class_hint.value,
+            c.confidence,
+            reasons=c.reasons,
+        )
         for c in classifications[:4]
     )
     assert is_high_confidence_human_hint(
         classifications[-1].class_hint.value,
         classifications[-1].confidence,
+        reasons=classifications[-1].reasons,
     )
 
 
@@ -264,7 +362,9 @@ def test_sessionless_sequential_history_stays_cold_until_mature():
 
     assert classification.class_hint in (TrafficClass.UNKNOWN, TrafficClass.LIKELY_HUMAN)
     assert not is_high_confidence_human_hint(
-        classification.class_hint.value, classification.confidence
+        classification.class_hint.value,
+        classification.confidence,
+        reasons=classification.reasons,
     )
 
 
@@ -284,7 +384,9 @@ def test_sessionless_history_does_not_override_machine_like_cadence():
 
     assert classification.class_hint != TrafficClass.LIKELY_HUMAN
     assert not is_high_confidence_human_hint(
-        classification.class_hint.value, classification.confidence
+        classification.class_hint.value,
+        classification.confidence,
+        reasons=classification.reasons,
     )
 
 
@@ -313,11 +415,18 @@ def test_service_time_cannot_flip_human_hint_via_concurrency():
     ]
 
     assert all(
-        classification.class_hint == TrafficClass.LIKELY_HUMAN for classification in classifications
-    )
-    assert all(
-        is_high_confidence_human_hint(classification.class_hint.value, classification.confidence)
+        classification.class_hint != TrafficClass.LIKELY_AUTOMATED
         for classification in classifications
+    )
+    assert is_high_confidence_human_hint(
+        classifications[0].class_hint.value,
+        classifications[0].confidence,
+        reasons=classifications[0].reasons,
+    )
+    assert not is_high_confidence_human_hint(
+        classifications[1].class_hint.value,
+        classifications[1].confidence,
+        reasons=classifications[1].reasons,
     )
 
 

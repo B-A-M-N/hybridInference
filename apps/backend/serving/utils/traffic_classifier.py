@@ -17,6 +17,7 @@ Architecture:
 
 The classifier is designed so that:
 - No single signal can independently produce LIKELY_AUTOMATED
+- Strong automation evidence denies the LIKELY_HUMAN scheduling hint
 - Missing evidence cannot inflate remaining signals
 - UNKNOWN is preserved when independent evidence is insufficient
 - Score and confidence are separate concepts
@@ -32,7 +33,11 @@ import math
 from dataclasses import dataclass
 from typing import Any, TypeGuard
 
-from serving.analytics.automation_score import ua_automation_value
+from serving.analytics.automation_score import (
+    INTERACTIVE_CLIENTS,
+    classify_client,
+    ua_automation_value,
+)
 from serving.utils import context as req_ctx
 
 
@@ -102,8 +107,8 @@ class TrafficEvidence:
 
 # Thresholds for score → class mapping
 # These are intentionally conservative to avoid false automation classification
-HUMAN_THRESHOLD = 0.30
-AUTOMATED_THRESHOLD = 0.70
+HUMAN_THRESHOLD = 0.35
+AUTOMATED_THRESHOLD = 0.60
 
 # Minimum confidence required to classify as anything other than UNKNOWN
 MIN_CONFIDENCE_FOR_CLASSIFICATION = 0.40
@@ -117,6 +122,17 @@ HUMAN_SCHEDULING_CONFIDENCE = 0.70
 # observations, matching the online tracker's intentionally quick adaptation
 # while preserving the offline scorer's insufficient-data caution.
 HISTORY_OBSERVATION_TARGET = 5.0
+
+# Reason codes that independently deny a human scheduling hint. These represent
+# strong automation evidence; slow measured cadence cannot override them.
+_AUTOMATION_HINT_REASONS = frozenset(
+    {
+        "rapid_cadence",
+        "high_concurrency",
+        "repeated_request_shape",
+        "automation_client",
+    }
+)
 
 # Maximum contribution from any single signal (prevents single-signal domination)
 MAX_SINGLE_SIGNAL_SCORE = 0.35
@@ -162,8 +178,20 @@ def _positive_count(value: object) -> TypeGuard[int]:
 def is_high_confidence_human_hint(
     classification: str | None,
     confidence: float | None,
+    *,
+    reasons: tuple[str, ...] | None = None,
 ) -> bool:
-    """Return whether routing may apply the bounded human-like preference."""
+    """Return whether routing may apply the bounded human-like preference.
+
+    ``reasons`` is required to check a persisted metadata payload accurately.
+    A omitted reason list is an unknown, not a clean signal, so it denies the
+    scheduling preference rather than allowing confidence alone to grant it.
+    Confidence alone is not sufficient: strong automation evidence -- such as a
+    raw script User-Agent -- denies the hint even when a sequential client's
+    slow measured cadence also looks human-like.
+    """
+    if not reasons or _AUTOMATION_HINT_REASONS.intersection(reasons):
+        return False
     return (
         classification == TrafficClass.LIKELY_HUMAN.value
         and isinstance(confidence, (int, float))
@@ -280,14 +308,16 @@ def classify_traffic(evidence: TrafficEvidence) -> TrafficClassification:
             )
         )
 
-    if evidence.user_agent:
-        signals.append(
-            (
-                "client_tool",
-                ua_automation_value(evidence.user_agent),
-                WEIGHT_CLIENT_TOOL,
-            )
+    # The analytics scorer treats an absent User-Agent as weak automation
+    # evidence rather than dropping the signal, so the request-time classifier
+    # uses the same taxonomy and thresholds for the same field name.
+    signals.append(
+        (
+            "client_tool",
+            ua_automation_value(evidence.user_agent),
+            WEIGHT_CLIENT_TOOL,
         )
+    )
 
     if not signals:
         return TrafficClassification(
@@ -378,6 +408,12 @@ def _score_session_evidence(session_continuity: bool) -> float:
     return 0.10 if session_continuity else 0.30
 
 
+def _is_interactive_client(user_agent: str | None) -> bool:
+    """Return whether the shared analytics taxonomy recognizes an interactive client."""
+    label = classify_client(user_agent)
+    return label is not None and label in INTERACTIVE_CLIENTS
+
+
 def _derive_class(score: float, confidence: float) -> TrafficClass:
     """Derive classification from score and confidence.
 
@@ -442,7 +478,14 @@ def _signal_reason(
             return "rapid_cadence"
     elif name == "concurrency" and score >= 0.50:
         return "high_concurrency"
-    elif name == "shape_repetition" and score >= 0.40:
+    elif (
+        name == "shape_repetition"
+        and score >= 0.40
+        and not (
+            # Interactive coding agents legitimately reuse the same request shape.
+            _is_interactive_client(evidence.user_agent)
+        )
+    ):
         return "repeated_request_shape"
     elif name == "session_continuity" and evidence.session_continuity:
         return "session_continuity"
