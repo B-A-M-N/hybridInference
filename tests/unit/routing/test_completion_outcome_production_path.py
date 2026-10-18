@@ -193,16 +193,8 @@ def test_notice_suffix_is_bounded_to_known_provider_wording(text, expected):
     assert is_transient is expected
 
 
-def test_non_streaming_handler_passes_response_body_to_the_classifier():
-    """The non-streaming production handler must hand the real body over.
-
-    Regression for the review's C1 top finding: the handler used to call
-    record_routing_observation with no response_body, so classify_outcome
-    never saw the content and a warmup notice with provider-reported tokens
-    classified PROGRESS. This drives the handler's real observation path --
-    the same code block in completions.py that production traffic takes --
-    and asserts the body reaches the classifier.
-    """
+def test_logger_classifies_response_body_when_supplied():
+    """The logger classifies structured provider content when its caller supplies it."""
     captured: dict[str, Any] = {}
 
     def _record(active_router, model_id, routing, **kwargs):
@@ -213,9 +205,6 @@ def test_non_streaming_handler_passes_response_body_to_the_classifier():
     real_logger = CompletionsLogger(log_store=None)
     real_logger.record_routing_observation = _record  # type: ignore[method-assign]
 
-    # The handler's success-path call site, driven with the same arguments
-    # production passes: the response dict, the normalized usage, and no
-    # cached tokens (the provider did not report cache usage).
     response = _body(WARMUP_NOTICE)
     real_logger.record_routing_observation(
         object(),  # active_router

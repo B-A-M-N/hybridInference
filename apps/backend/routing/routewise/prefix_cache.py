@@ -248,6 +248,14 @@ class _CacheLocalityEstimator:
                 self._evidence.move_to_end(scope)
             self._enforce_capacity()
 
+    def state_for(self, scope: CacheScope) -> tuple[CacheLocalityEvidenceState, float]:
+        """Return the evidence state and confidence for a scope."""
+        with self._lock:
+            evidence = self._evidence.get(scope)
+            if evidence is None:
+                return CacheLocalityEvidenceState.UNKNOWN, 0.0
+            return evidence.state, evidence.confidence
+
     def record_dispatch(self, scope: CacheScope) -> None:
         """Record a successful dispatch (potential warming).
 
@@ -556,7 +564,6 @@ class SessionProviderPrefixMemory:
         scope: CacheScope,
         *,
         now: float | None = None,
-        generation: int | None = None,
     ) -> bool:
         """Refresh an existing entry's recency WITHOUT replacing its blocks.
 
@@ -572,10 +579,9 @@ class SessionProviderPrefixMemory:
         and only ``last_seen_at`` moves forward.
 
         Returns ``True`` when a current entry was refreshed, ``False`` when
-        there is nothing to refresh (no entry, or the generation is stale).
+        there is nothing to refresh (no current entry).
         """
         ts = self._time() if now is None else now
-        del generation  # accepted for call-site symmetry; not used by the memory
         with self._lock:
             entry = self._entries.get(scope)
             if entry is None:
@@ -1012,19 +1018,15 @@ class PrefixCacheCoordinator:
             # transient hiccup must not age strong evidence out through the
             # TTL. The stored blocks are left exactly as they are: a short
             # transient response must not overwrite what a warm conversation
-            # established. Positive evidence is still recorded when the
-            # provider reported cached tokens for the *currently remembered*
-            # prefix: record_evidence itself ignores a mismatched prefix, so
-            # the measurement can only attach to blocks this scope actually
-            # remembers, never to the stub's own few blocks.
+            # established. Cache usage remains independent: a reported hit
+            # verifies reuse, while a reported miss degrades prior evidence.
             self._memory.refresh_liveness(scope)
-            if observed_cached_tokens is not None and observed_cached_tokens > 0:
+            if observed_cached_tokens is not None:
                 self.record_evidence(
                     scope,
                     observed_cached_tokens,
                     generation=generation,
                     blocks=tuple(blocks),
-                    materialization_candidate=True,
                 )
             return False
 
@@ -1050,13 +1052,7 @@ class PrefixCacheCoordinator:
         rather than inferring it from a cost estimate.
         """
         blocks = self._memory.current_blocks(scope)
-        state = CacheLocalityEvidenceState.UNKNOWN
-        confidence = 0.0
-        with self._evidence._lock:
-            found = self._evidence._evidence.get(scope)
-        if found is not None:
-            state = found.state
-            confidence = found.confidence
+        state, confidence = self._evidence.state_for(scope)
         return SimpleNamespace(
             blocks=blocks,
             # ``present`` is the honest question for "is anything remembered

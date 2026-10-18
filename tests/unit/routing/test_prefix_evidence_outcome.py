@@ -22,10 +22,11 @@ from itself, the estimate stayed at zero for the whole ~87-request loop.
 The defect is the conflation of *transport success* with *semantic progress*.
 This file pins the required behavior:
 
-* a non-progressing completion must not mutate positive locality evidence
-* strong existing evidence must survive a weak or indeterminate observation
+* a non-progressing completion must not replace remembered prefix blocks
+* missing cache usage preserves evidence; measured hits and misses remain
+  authoritative regardless of response content
 * the provider's own ``cached_input_tokens`` must reach the routing layer so
-  "router expected warm / provider reported cold" is directly observable
+  cache hits and misses remain distinct from missing usage
 
 The first test in ``TestTransientStubDoesNotPoisonLocality`` is a deliberate
 control: it reproduces the pre-fix behavior and asserts the match collapses to
@@ -220,7 +221,7 @@ class TestTransientStubDoesNotPoisonLocality:
         signal = coordinator.evaluate(scope, conversation, cold_cost=1.0, price_delta=0.5)
         assert signal.matched_prefix_tokens == 0, "fixture no longer reproduces the incident"
 
-    def test_stub_text_must_not_replace_strong_evidence(self):
+    def test_stub_without_cache_usage_preserves_existing_evidence(self):
         coordinator = _coordinator(min_match_tokens=1)
         scope = _scope()
         conversation = _blocks(("a", 4096), ("b", 4096), ("c", 4096))
@@ -233,9 +234,9 @@ class TestTransientStubDoesNotPoisonLocality:
 
         coordinator.record_outcome(
             scope=scope,
-            blocks=_blocks(("stub", 8)),
+            blocks=conversation,
             outcome=outcome,
-            observed_cached_tokens=0,
+            observed_cached_tokens=None,
         )
 
         after = coordinator.lookup_state(scope)
@@ -244,24 +245,24 @@ class TestTransientStubDoesNotPoisonLocality:
         signal = coordinator.evaluate(scope, conversation, cold_cost=1.0, price_delta=0.5)
         assert signal.matched_prefix_tokens == 3 * 4096
 
-    def test_next_real_request_still_gets_full_discount(self):
+    def test_reported_miss_preserves_prefix_but_removes_verified_discount(self):
         coordinator = _coordinator(min_match_tokens=1)
         scope = _scope()
         conversation = _blocks(("a", 4096), ("b", 4096))
         _remember_with_observed_hit(coordinator, scope, conversation)
         coordinator.record_outcome(
             scope=scope,
-            blocks=_blocks(("stub", 8)),
+            blocks=conversation,
             outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS,
             observed_cached_tokens=0,
         )
+        state = coordinator.lookup_state(scope)
+        assert state.blocks == conversation
+        assert state.evidence == CacheLocalityEvidenceState.NEGATIVE
         signal = coordinator.evaluate(scope, conversation, cold_cost=1.0, price_delta=0.5)
         assert signal.matched_prefix_tokens == 2 * 4096
-        # The whole conversation must still be eligible. Expected tokens are
-        # observed tokens scaled by decaying confidence, so the real invariant is
-        # "essentially the full observed amount", not strict equality.
-        assert signal.expected_cached_tokens == pytest.approx(2 * 4096, rel=1e-3)
-        assert signal.cache_discount > 0.0
+        assert signal.expected_cached_tokens == 0
+        assert signal.cache_discount == 0.0
 
     def test_growing_conversation_after_stub_still_matches(self):
         """The /goal loop appends turns; locality must survive the stub."""
@@ -271,9 +272,9 @@ class TestTransientStubDoesNotPoisonLocality:
         coordinator.remember(scope, conversation)
         coordinator.record_outcome(
             scope=scope,
-            blocks=_blocks(("stub", 8)),
+            blocks=conversation,
             outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS,
-            observed_cached_tokens=0,
+            observed_cached_tokens=None,
         )
         grown = _blocks(("a", 4096), ("b", 4096), ("c", 512))
         signal = coordinator.evaluate(scope, grown, cold_cost=1.0, price_delta=0.5)
@@ -305,9 +306,9 @@ class TestEvidenceIsNotWholesaleReplaced:
 
         coordinator.record_outcome(
             scope=scope,
-            blocks=_blocks(("stub", 8)),
+            blocks=conversation,
             outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS,
-            observed_cached_tokens=0,
+            observed_cached_tokens=None,
         )
 
         state = coordinator.lookup_state(scope)
@@ -322,9 +323,9 @@ class TestEvidenceIsNotWholesaleReplaced:
         coordinator.remember(scope, conversation)
         coordinator.record_outcome(
             scope=scope,
-            blocks=_blocks(("stub", 8)),
+            blocks=conversation,
             outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS,
-            observed_cached_tokens=0,
+            observed_cached_tokens=None,
         )
         assert coordinator.lookup_state(scope).blocks == conversation
 
@@ -462,7 +463,7 @@ def test_verified_evidence_decays_from_observation_time_even_across_warmups():
     before = coordinator.evaluate(scope, conversation, cold_cost=1.0, price_delta=0.5)
     assert before.expected_cached_tokens == pytest.approx(2 * 4096, rel=1e-3)
 
-    # Feed repeated transient warmup notices, each refreshing liveness.
+    # Missing cache usage only refreshes liveness; it does not change evidence.
     warmup = CompletionOutcome.from_response(
         content=WARMUP_STUB, usage=None, http_status=200, terminal=True
     )
@@ -470,9 +471,9 @@ def test_verified_evidence_decays_from_observation_time_even_across_warmups():
     for _ in range(5):
         coordinator.record_outcome(
             scope=scope,
-            blocks=_blocks(("stub", 8)),
+            blocks=conversation,
             outcome=warmup,
-            observed_cached_tokens=0,
+            observed_cached_tokens=None,
         )
 
     # The evidence's observed_at is unchanged: the same decay applies, so the
@@ -482,8 +483,8 @@ def test_verified_evidence_decays_from_observation_time_even_across_warmups():
     observed_at = ev.observed_at
     coordinator.record_outcome(
         scope=scope,
-        blocks=_blocks(("stub", 8)),
+        blocks=conversation,
         outcome=warmup,
-        observed_cached_tokens=0,
+        observed_cached_tokens=None,
     )
     assert coordinator._evidence._evidence.get(scope).observed_at == observed_at
