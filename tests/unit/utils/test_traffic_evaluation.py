@@ -161,11 +161,11 @@ def test_synthetic_evaluation_uses_classifier_contract() -> None:
     assert cold_start["class"] == "unknown"
     expected_classes = {
         "interactive": "likely_human",
-        "agentic_ide": "unknown",
+        "agentic_ide": "likely_human",
         "batch": "likely_automated",
         "burst": "likely_automated",
         "shared_network_human": "likely_human",
-        "distributed_automation": "unknown",
+        "distributed_automation": "likely_automated",
         "cold_start": "unknown",
     }
     assert {result["scenario"]: result["class"] for result in results} == expected_classes
@@ -178,8 +178,9 @@ def test_synthetic_evaluation_uses_classifier_contract() -> None:
 
     agentic = next(result for result in results if result["scenario"] == "agentic_ide")
     assert 0.25 <= agentic["automation_score"] <= 0.45
-    # Agentic traffic deliberately gets strong classification confidence, but
-    # its mixed cadence/concurrency/repetition evidence keeps the class UNKNOWN.
+    # Agentic traffic deliberately gets strong classification confidence. Its
+    # interactive client identity and human-triggered cadence outweigh the
+    # multi-call volume signals in the request-time hint contract.
     assert 0.7 <= agentic["confidence"] <= 1.0
 
 
