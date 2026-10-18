@@ -2991,21 +2991,7 @@ class RouteWiseRouter:
                         scope = stashed.scopes.get(endpoint_id)
                         if scope is not None:
                             generation = stashed.generations.get(endpoint_id)
-                            if cached_tokens > 0 and self.prefix_cache.remember(
-                                scope,
-                                stashed.blocks,
-                                generation=generation,
-                            ):
-                                # Bind positive evidence to the exact stashed
-                                # prefix so a later request matching these
-                                # blocks can use the observed cache hit.
-                                self.prefix_cache.record_evidence(
-                                    scope,
-                                    cached_tokens,
-                                    generation=generation,
-                                    blocks=stashed.blocks,
-                                )
-                            elif cached_tokens == 0:
+                            if cached_tokens is not None:
                                 # A miss is measured before this request can
                                 # warm the cache. Do not replace remembered
                                 # prefix memory on a failed/empty response;
