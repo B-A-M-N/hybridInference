@@ -273,6 +273,12 @@ async def _buffer_streaming_response_for_non_stream_client(
 
 _FORCE_STREAMING_KEEPALIVE_S = 15
 
+# Hand-off depth between the upstream reader and the keepalive generator in
+# ``_streaming_response_with_keepalive``: enough slack for a fast consumer to
+# never stall, small enough that a stalled client cannot buffer the whole
+# generation a second time in the queue (issue: forced-stream buffer growth).
+_KEEPALIVE_QUEUE_MAXSIZE = 256
+
 
 def _timeout_fired_probe(request: Request) -> Callable[[], bool]:
     """Build a probe telling whether TimeoutMiddleware's deadline has fired.
@@ -353,6 +359,15 @@ async def _streaming_response_with_keepalive(
     accumulating SSE chunks, then yields the final ``application/json`` body.
     The leading whitespace before the JSON object is harmless — all standard
     JSON parsers ignore it.
+
+    The hand-off queue is bounded (``_KEEPALIVE_QUEUE_MAXSIZE``): a stalled
+    or slow client suspends this generator while ``_reader`` keeps draining
+    the upstream, so an unbounded queue would buffer a second full copy of
+    the generation (plus whatever the provider sends next) in memory for as
+    long as the client stalls. With the bound, the reader blocks on
+    ``put`` instead and the backpressure propagates to the provider
+    connection. Cancellation-safe: a reader blocked on ``put`` when the
+    consumer disappears is cancelled without blocking on the sentinel.
     """
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
@@ -364,16 +379,21 @@ async def _streaming_response_with_keepalive(
 
     last_client_byte = time.monotonic()
     yielded_any = False
-    chunk_queue: Any = asyncio.Queue()
+    chunk_queue: Any = asyncio.Queue(maxsize=_KEEPALIVE_QUEUE_MAXSIZE)
 
     async def _reader() -> None:
         try:
-            async for item in stream_chunks:
-                await chunk_queue.put(item)
-        except Exception as exc:
-            await chunk_queue.put(exc)
-        finally:
+            try:
+                async for item in stream_chunks:
+                    await chunk_queue.put(item)
+            except Exception as exc:
+                await chunk_queue.put(exc)
             await chunk_queue.put(None)
+        except asyncio.CancelledError:
+            # The consumer is gone (generator closed/-cancelled). Skip the
+            # remaining puts: blocking on a full queue here would leak the
+            # reader task and the upstream connection forever.
+            pass
 
     reader_task = asyncio.create_task(_reader())
     try:
