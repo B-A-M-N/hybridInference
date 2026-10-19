@@ -18,6 +18,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from routing.routers import FixedRouter
 from serving.config.runtime_settings import get_runtime_settings
 from serving.observability.alert_rules import _is_failed_request
 from serving.servers.auth import verify_api_key
@@ -26,7 +27,9 @@ from serving.servers.deps import (
     get_completions_logger,
     get_embedding_adapters,
     get_log_store,
+    get_model_visibility_resolver,
     get_operational_store,
+    get_router,
 )
 from serving.servers.embedding_fallback import FallbackEmbeddingAdapter
 from serving.servers.middleware.request_id import RequestIdMiddleware
@@ -129,6 +132,8 @@ def _build_app(
         "authenticated": True,
     }
     app.dependency_overrides[enforce_user_concurrency] = lambda: None
+    app.dependency_overrides[get_router] = lambda: FixedRouter()
+    app.dependency_overrides[get_model_visibility_resolver] = lambda: None
     app.dependency_overrides[get_embedding_adapters] = lambda: {"emb-model": adapter}
     app.dependency_overrides[get_log_store] = lambda: object()  # truthy → logging enabled
     app.dependency_overrides[get_completions_logger] = lambda: logger
