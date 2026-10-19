@@ -416,6 +416,30 @@ def _dynamic_key_provider_name(kind: str, adapter_cfg: dict[str, Any]) -> str:
     return dynamic_keys.normalize_key_provider(str(canonical))
 
 
+def _parse_role_gate(model: dict[str, Any], model_id: str) -> tuple[bool, str]:
+    """Parse a model entry's access gate: ``(admin_only, required_role)``.
+
+    Shared by the chat and embedding registration branches so both spellings
+    of the model-level tier declaration validate identically: an invalid
+    ``required_role`` fails closed to ``admin`` (a typo must gate the model,
+    not open it), and ``admin_only: true`` stays the older spelling of
+    ``required_role: admin``.
+    """
+    admin_only = bool(model.get("admin_only", False))
+    required_role = str(model.get("required_role", "free"))
+    # Validate required_role to prevent fail-open on typos
+    from serving.config.settings import VALID_ROLES
+
+    if required_role not in VALID_ROLES:
+        logging.getLogger(__name__).warning(
+            "Model %s has invalid required_role '%s', defaulting to 'admin'",
+            model_id,
+            required_role,
+        )
+        required_role = "admin"
+    return admin_only, required_role
+
+
 def register_from_models_yaml(
     router: RouteExecutor,
     path: Path,
@@ -925,30 +949,24 @@ def register_from_models_yaml(
                     embedding_adapters[model_id] = emb_adapter
                     for alias in aliases:
                         embedding_adapters[alias] = emb_adapter
+                # The gate chat reads off the route table would be dead config
+                # here: embedding models never enter it, so without recording
+                # it separately, /v1/embeddings served any authenticated
+                # caller regardless of the declared tier. Same fail-closed
+                # parse as chat; the surface enforces it through the shared
+                # model-access check.
+                admin_only, required_role = _parse_role_gate(m, model_id)
+                router.register_embedding_route(
+                    model_id,
+                    adapters_with_weights,
+                    aliases=aliases,
+                    admin_only=admin_only,
+                    required_role=required_role,
+                )
                 count += 1 + len(aliases)
             else:
                 # Chat models go through the full RouteExecutor
-                # Preserve explicit required_role as the source of truth;
-                # admin_only supplies the default only when it is omitted.
-                admin_only = bool(m.get("admin_only", False)) and "required_role" not in m
-                # Issue #1576: an omitted required_role used to publish every
-                # such model free-tier, including the paid-upstream Claude
-                # compatibility routes. A model that costs anything defaults
-                # to pro; an explicit value (even invalid, failed closed
-                # below) still wins.
-                required_role = default_required_role_for_model(m)
-                # Validate required_role to prevent fail-open on typos
-                from serving.config.settings import VALID_ROLES
-
-                if required_role not in VALID_ROLES:
-                    import logging as _logging
-
-                    _logging.getLogger(__name__).warning(
-                        "Model %s has invalid required_role '%s', defaulting to 'admin'",
-                        model_id,
-                        required_role,
-                    )
-                    required_role = "admin"
+                admin_only, required_role = _parse_role_gate(m, model_id)
                 router.register_route(
                     model_id,
                     adapters_with_weights,
