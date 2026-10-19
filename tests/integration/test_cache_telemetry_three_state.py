@@ -14,8 +14,8 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
-import asyncpg
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
@@ -27,6 +27,9 @@ from serving.servers.routers.anthropic_messages import _schedule_log_store_task
 from serving.storage.log_schema import ensure_api_logs_schema
 from serving.storage.postgres_log import PostgresLogStore
 from tests.fixtures import postgres
+
+if TYPE_CHECKING:
+    import asyncpg
 
 pytestmark = [pytest.mark.integration, pytest.mark.dbtest]
 
