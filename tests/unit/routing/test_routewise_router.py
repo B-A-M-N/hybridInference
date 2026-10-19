@@ -5294,6 +5294,7 @@ class TestPrefillLoadRoutingDecision:
         router._prefill_load.release(prior, prefill_confirmed=True)
 
         messages = [{"role": "user", "content": "unrelated" * 1000}]
+        expected_tokens = router._tracked_prefill_tokens(messages, {})
         with req_ctx.push(affinity_key=affinity_key):
             decision = router._select_decision(
                 "test-model",
@@ -5309,7 +5310,11 @@ class TestPrefillLoadRoutingDecision:
         assert decision.prefill_lease is not None
         assert decision.prefill_lease.fingerprint == conversation_fingerprint(messages)
         assert decision.prefill_lease.anchor == prompt_anchor(messages)
+        # The anchor-less caller hint cannot discount this RouteWise lease.
+        assert decision.prefill_lease.tokens == expected_tokens
+        assert router._prefill_load.backlog("test-model:primary") == expected_tokens
         decision.release()
+        assert router._prefill_load.backlog("test-model:primary") == 0
 
     def test_lower_load_preferred_when_otherwise_equivalent(self):
         """Endpoint with lower prefill load is preferred when cost/latency are equal."""
