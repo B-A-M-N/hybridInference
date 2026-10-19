@@ -347,6 +347,42 @@ class TestNormalizeUsageCacheTokens:
         result = normalize_usage(usage)
         assert "cache_read_tokens" not in result
 
+    def test_invalid_alias_cache_counts_are_removed_before_sanitizing(self):
+        """An invalid alias count stays unknown: sanitize must not measure it as 0.
+
+        sanitize_usage coerces an unreadable count to a readable 0 for billing;
+        run before that coercion, the removal keeps a negative alias (Anthropic
+        style here) flowing to api_logs as NULL -- unknown -- instead of a
+        fabricated measured miss.
+        """
+        usage = {
+            "prompt_tokens": 1000,
+            "completion_tokens": 64,
+            "cache_read_input_tokens": -100,
+            "cache_creation_input_tokens": "lots",
+        }
+
+        result = normalize_usage(usage)
+
+        assert "cache_read_tokens" not in result
+        assert "cache_write_tokens" not in result
+        assert result["prompt_tokens"] == 1000
+        assert usage["cache_read_input_tokens"] == -100  # the raw response is untouched
+
+    def test_valid_alias_cache_counts_survive_sanitizing(self):
+        """A valid alias count is still extracted after the pre-sanitize filter."""
+        usage = {
+            "prompt_tokens": 1000,
+            "completion_tokens": 64,
+            "cached_tokens": 256,
+            "cache_creation_input_tokens": 0,
+        }
+
+        result = normalize_usage(usage)
+
+        assert result["cache_read_tokens"] == 256
+        assert result["cache_write_tokens"] == 0
+
 
 # ---------------------------------------------------------------------------
 # usage_count / sanitize_usage: an unreadable count is billed as 0, not raised
