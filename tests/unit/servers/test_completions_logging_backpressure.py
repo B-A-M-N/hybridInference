@@ -136,6 +136,25 @@ async def test_failed_write_still_emits_alert_event(caplog):
 
 
 @pytest.mark.asyncio
+async def test_worker_survives_a_failed_write():
+    """One bad row must not end logging for subsequent requests."""
+    store = MagicMock()
+    store.log_request = AsyncMock(side_effect=[RuntimeError("db down"), None, None])
+    cl = CompletionsLogger(log_store=store)
+
+    cl.schedule_log("req-1", {"request_id": "req-1"})
+    cl.schedule_log("req-2", {"request_id": "req-2"})
+    cl.schedule_log("req-3", {"request_id": "req-3"})
+    await cl.stop()
+
+    assert [call.kwargs["request_id"] for call in store.log_request.await_args_list] == [
+        "req-1",
+        "req-2",
+        "req-3",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_successful_write_still_emits_alert_event():
     """A successful row write keeps the tracked_task success event contract."""
     store = _store()

@@ -193,8 +193,9 @@ class CompletionsLogger:
             raise
         finally:
             # The worker blocks on ``queue.get()`` once idle; end it on every
-            # path. A write the worker was awaiting keeps running detached in
-            # ``_TRACKED_TASKS`` and is logged when it completes.
+            # path. On the timeout path a write the worker was awaiting is
+            # cancelled with the worker and aborts (its row is part of the
+            # discarded count logged above).
             worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await worker
