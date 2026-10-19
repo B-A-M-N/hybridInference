@@ -55,7 +55,7 @@ def _make_gen(upstream: Any) -> Any:
     )
 
 
-async def _spy_queues(monkeypatch: pytest.MonkeyPatch) -> list[asyncio.Queue]:
+def _spy_queues(monkeypatch: pytest.MonkeyPatch) -> list[asyncio.Queue]:
     """Capture every asyncio.Queue the function creates during the test."""
     captured: list[asyncio.Queue] = []
     real_queue = asyncio.Queue
@@ -69,30 +69,32 @@ async def _spy_queues(monkeypatch: pytest.MonkeyPatch) -> list[asyncio.Queue]:
     return captured
 
 
+def _fast_keepalive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the keepalive window so the queue-vs-consumer race is observable."""
+    monkeypatch.setattr(comp, "_FORCE_STREAMING_KEEPALIVE_S", 0.01)
+
+
 @pytest.mark.asyncio
 async def test_slow_consumer_bounds_queued_chunks(monkeypatch):
     """A stalled consumer must not leave the reader buffering without limit."""
-    queues = await _spy_queues(monkeypatch)
+    queues = _spy_queues(monkeypatch)
+    _fast_keepalive(monkeypatch)
     gen = _make_gen(_fast_upstream(2000))
 
-    comp._FORCE_STREAMING_KEEPALIVE_S = 0.01  # type: ignore[attr-defined]
-    try:
-        first = await gen.__anext__()  # first keepalive byte
-        assert first == b" "
-        # Consumer stalls here (client stopped reading); upstream keeps
-        # producing into the queue.
-        await asyncio.sleep(0.3)
+    first = await gen.__anext__()  # first keepalive byte
+    assert first == b" "
+    # Consumer stalls here (client stopped reading); upstream keeps
+    # producing into the queue.
+    await asyncio.sleep(0.3)
 
-        q = queues[0]
-        assert q.qsize() <= comp._KEEPALIVE_QUEUE_MAXSIZE
+    q = queues[0]
+    assert q.qsize() <= comp._KEEPALIVE_QUEUE_MAXSIZE
 
-        # The bound is backpressure, not data loss: draining the generator
-        # to completion still yields the whole generation in the final body.
-        items: list[bytes] = [first]
-        async for item in gen:
-            items.append(item)
-    finally:
-        comp._FORCE_STREAMING_KEEPALIVE_S = 15  # type: ignore[attr-defined]
+    # The bound is backpressure, not data loss: draining the generator
+    # to completion still yields the whole generation in the final body.
+    items: list[bytes] = [first]
+    async for item in gen:
+        items.append(item)
 
     body = json.loads(items[-1].decode())
     assert body["choices"][0]["message"]["content"] == "x" * 2000
@@ -106,16 +108,13 @@ async def test_closing_while_reader_blocked_on_full_queue_does_not_hang(monkeypa
     a full bounded queue once the consumer was gone, leaking the task and the
     upstream connection.
     """
-    await _spy_queues(monkeypatch)
+    _spy_queues(monkeypatch)
+    _fast_keepalive(monkeypatch)
     close_flag: list[bool] = []
     gen = _make_gen(_fast_upstream(5000, close_flag))
 
-    comp._FORCE_STREAMING_KEEPALIVE_S = 0.01  # type: ignore[attr-defined]
-    try:
-        await gen.__anext__()
-        await asyncio.sleep(0.1)  # fill the queue; reader blocks on put
-    finally:
-        comp._FORCE_STREAMING_KEEPALIVE_S = 15  # type: ignore[attr-defined]
+    await gen.__anext__()
+    await asyncio.sleep(0.1)  # fill the queue; reader blocks on put
 
     await asyncio.wait_for(gen.aclose(), timeout=2.0)
     assert close_flag == [True]  # the upstream generator was closed, not leaked
@@ -124,15 +123,14 @@ async def test_closing_while_reader_blocked_on_full_queue_does_not_hang(monkeypa
 @pytest.mark.asyncio
 async def test_upstream_exception_still_reaches_the_consumer_with_bound(monkeypatch):
     """The error path through the bounded queue is unchanged."""
-    await _spy_queues(monkeypatch)
+    _spy_queues(monkeypatch)
 
     async def _fail_after_first():
         yield _chunk("hello")
         raise RuntimeError("upstream blew up")
 
-    comp._FORCE_STREAMING_KEEPALIVE_S = 15  # type: ignore[attr-defined]
-    # Run with the default keepalive window: the exception arrives well within
-    # the first wait_for timeout, so the clean re-raise path is exercised.
+    # Default keepalive window: the consumer receives the exception long
+    # before the keepalive timer fires, exercising the clean re-raise path.
     slow = _fail_after_first()
 
     async def run() -> None:
