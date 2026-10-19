@@ -629,3 +629,23 @@ def test_calculate_cost_explicit_none_cache_does_not_crash():
     pricing = {"prompt": "0.60", "completion": "2.40", "input_cache_reads": "0.03"}
     cost = calculate_cost(usage, pricing)
     assert cost == pytest.approx(1000 * 0.60 / 1_000_000)
+
+
+def test_calculate_cost_explicit_none_for_all_token_fields_is_unreported():
+    """Explicit nulls for ordinary and cache usage fields are handled uniformly."""
+    usage = {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "reasoning_tokens": None,
+        "total_tokens": None,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+    }
+    pricing = {
+        "prompt": "0.60",
+        "completion": "2.40",
+        "input_cache_reads": "0.03",
+        "input_cache_writes": "0.03",
+    }
+
+    assert calculate_cost(usage, pricing) == pytest.approx(0.0)
