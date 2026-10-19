@@ -80,7 +80,7 @@ from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
 from serving.utils.request_ip import derive_affinity_key, get_client_ip_info
 from serving.utils.session_identity import consume_session_fields, session_identity
-from serving.utils.token_utils import optional_token_count
+from serving.utils.token_utils import optional_token_count, usage_count
 from serving.utils.tokens import estimate_prompt_tokens, estimate_text_tokens
 
 if TYPE_CHECKING:
@@ -997,8 +997,8 @@ def _schedule_log_store_task(
     if operator_error:
         # Operator-only: stored in metadata, never returned to the user.
         metadata = {**(metadata or {}), "operator_error": operator_error}
-    input_tokens = int(usage.get("input_tokens", 0) or 0)
-    output_tokens = int(usage.get("output_tokens", 0) or 0)
+    input_tokens = usage_count(usage.get("input_tokens"), field="input_tokens")
+    output_tokens = usage_count(usage.get("output_tokens"), field="output_tokens")
     # ``None`` means the upstream reported no cache usage, which is distinct
     # from a reported 0 (a measured miss). Preserve that distinction here so
     # the api_logs ``cache_read_tokens`` / ``cache_write_tokens`` columns stay
@@ -2436,8 +2436,11 @@ async def anthropic_messages(
 
     usage = (resp.get("usage") or {}) if isinstance(resp, dict) else {}
     usage_for_log = {
-        "input_tokens": int(usage.get("input_tokens", 0)),
-        "output_tokens": int(usage.get("output_tokens", 0)),
+        field: usage_count(usage.get(field), field=field)
+        for field in (
+            "input_tokens",
+            "output_tokens",
+        )
     }
     for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
         cache_count = optional_token_count(usage.get(key))

@@ -29,6 +29,8 @@ import {
   getProviderStats,
   getTtftScatter,
 } from '@/lib/api/admin';
+import { ComputedAt } from '@/components/features/admin/ComputedAt';
+import { useRefreshedAdminView } from '@/components/features/admin/useRefreshedAdminView';
 import { getErrorMessage } from '@/lib/utils/errors';
 
 type RangeKey = '24h' | '7d' | '30d';
@@ -664,27 +666,20 @@ export function ProviderPerformanceTab({ refreshKey = 0 }: { refreshKey?: number
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [initializing, setInitializing] = useState(true);
-  const [ttftScatter, setTtftScatter] = useState<AdminTtftScatterModel[]>([]);
-  const [ttftScatterLoading, setTtftScatterLoading] = useState(false);
-  const [ttftScatterError, setTtftScatterError] = useState<string | null>(null);
+  const {
+    data: ttftScatterView,
+    busy: ttftScatterLoading,
+    error: ttftScatterError,
+    load: loadTtftScatter,
+  } = useRefreshedAdminView(getTtftScatter);
   const [modelRows, setModelRows] = useState<Record<string, ProviderStatsRow[]>>({});
   const [observability, setObservability] = useState<ProviderObservabilityResponse | null>(null);
 
-  const loadTtftScatter = useCallback(async () => {
-    setTtftScatterLoading(true);
-    setTtftScatterError(null);
-    try {
-      const resp = await getTtftScatter();
-      setTtftScatter(resp.models);
-    } catch (exc) {
-      setTtftScatterError(getErrorMessage(exc));
-    } finally {
-      setTtftScatterLoading(false);
-    }
-  }, []);
-
+  // The server keeps the scatter for a few minutes; an explicit refresh of the
+  // page (refreshKey > 0) asks it to recompute, and the new one replaces it
+  // once computed.
   useEffect(() => {
-    void loadTtftScatter();
+    void loadTtftScatter(refreshKey > 0);
   }, [loadTtftScatter, refreshKey]);
 
   const providerModels = useMemo(
@@ -800,8 +795,8 @@ export function ProviderPerformanceTab({ refreshKey = 0 }: { refreshKey?: number
   }, [provider, range, model, loadObservability, initializing, refreshKey]);
 
   const scatterForProvider = useMemo(
-    () => ttftScatter.filter((m) => m.provider === provider),
-    [ttftScatter, provider],
+    () => (ttftScatterView?.models ?? []).filter((m) => m.provider === provider),
+    [ttftScatterView, provider],
   );
   const visibleScatter = useMemo(
     () =>
@@ -898,30 +893,37 @@ export function ProviderPerformanceTab({ refreshKey = 0 }: { refreshKey?: number
         <div className="mb-3 flex items-center justify-between">
           <div>
             <h2 className="text-[15px] font-semibold text-gray-900">
-              TTFT vs input length (last 1000 per model)
+              TTFT vs input length (last 1000 per model and cache class)
             </h2>
             <p className="text-[12px] text-gray-400">
               Per-model scatter of time-to-first-token against prompt length, split by prompt-cache
               hit.
             </p>
           </div>
-          {ttftScatterLoading && (
-            <span className="h-4 w-4 animate-spin rounded-full border-2 border-gray-200 border-t-gray-900" />
-          )}
+          <div className="flex items-center gap-2">
+            <ComputedAt
+              at={ttftScatterView?.generated_at}
+              refreshing={ttftScatterView?.refreshing}
+            />
+            {ttftScatterLoading && (
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-gray-200 border-t-gray-900" />
+            )}
+          </div>
         </div>
-        {ttftScatterError ? (
-          <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3">
+        {ttftScatterError && (
+          <div className="mb-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3">
             <p className="text-[13px] text-red-700">
               Failed to load scatter data: {ttftScatterError}
             </p>
           </div>
-        ) : visibleScatter.length > 0 ? (
+        )}
+        {visibleScatter.length > 0 ? (
           <div className="grid gap-3 lg:grid-cols-2">
             {visibleScatter.map((m) => (
               <TtftScatterCard key={`${m.model_id}::${m.provider}`} model={m} />
             ))}
           </div>
-        ) : !ttftScatterLoading ? (
+        ) : !ttftScatterLoading && !ttftScatterError ? (
           <div className="rounded-xl border border-dashed border-gray-200 py-8 text-center">
             <p className="text-[13px] text-gray-400">No scatter data available.</p>
           </div>
