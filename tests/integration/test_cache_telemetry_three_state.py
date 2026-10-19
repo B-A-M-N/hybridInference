@@ -26,7 +26,7 @@ from serving.servers.routers import admin as admin_router
 from serving.servers.routers.anthropic_messages import _schedule_log_store_task
 from serving.storage.log_schema import ensure_api_logs_schema
 from serving.storage.postgres_log import PostgresLogStore
-from tests.fixtures.auth_helpers import assert_test_db_name
+from tests.fixtures import postgres
 
 pytestmark = [pytest.mark.integration, pytest.mark.dbtest]
 
@@ -42,100 +42,43 @@ class _Pool:
         self.pool = pool
 
 
-def _dsn() -> str:
-    """Resolve the test DSN with the sibling suites' precedence: TEST_PG_DSN first.
-
-    The suite once preferred DB_* over TEST_PG_DSN with two bespoke
-    CACHE_TELEMETRY_* env vars; that sent a runner exporting both to the
-    gateway's database and is the reverse of what every sibling Postgres test
-    does. TEST_PG_DSN wins, then DB_*, then defaults -- one convention.
-    """
-    dsn = os.getenv("TEST_PG_DSN")
-    if dsn:
-        return dsn
-    host = os.getenv("DB_HOST", "localhost")
-    port = os.getenv("DB_PORT", "5432")
-    name = os.getenv("DB_NAME", "hybridinference_test_db")
-    user = os.getenv("DB_USER", "postgres")
-    password = os.getenv("DB_PASSWORD", "postgres")
-    return f"postgresql://{user}:{password}@{host}:{port}/{name}"
-
-
-@pytest.fixture(scope="session")
-def pg_dsn() -> str:
-    """A reachable dedicated test database, or skip when Postgres is absent."""
-    import asyncio
-
-    dsn = _dsn()
-
-    async def _probe() -> str | None:
-        try:
-            conn = await asyncpg.connect(dsn, timeout=2)
-        except Exception as exc:
-            return str(exc)
-        try:
-            assert_test_db_name(
-                await conn.fetchval("SELECT current_database()"), "cache three-state"
-            )
-        finally:
-            await conn.close()
-        return None
-
-    loop = asyncio.new_event_loop()
-    try:
-        failure = loop.run_until_complete(_probe())
-    finally:
-        loop.close()
-    if failure is not None:
-        message = f"PostgreSQL test database not available: {failure}"
-        if os.getenv("CI"):
-            pytest.fail(message, pytrace=False)
-        pytest.skip(message)
-    return dsn
-
-
 @pytest_asyncio.fixture
-async def pool(pg_dsn: str):
+async def pool():
     """A pool scoped to a private schema holding a fresh ``api_logs``.
 
-    Schema-per-worker rather than DELETE on the shared ``public.api_logs``: a
-    run that dies before teardown (timeout, SIGKILL, Ctrl-C) used to leave its
-    ``cache3s-*`` rows behind and poison the next run's exact-count assertions.
-    A crashed run leaves a schema that the next run of the same worker drops
-    and recreates, so counts stay deterministic. ``assert_test_db_name`` still
+    Schema-per-worker rather than DELETE on the shared ``api_logs``: a run
+    that dies before teardown (timeout, SIGKILL, Ctrl-C) leaves its rows
+    behind and would poison the next run's exact-count assertions. A crashed
+    run leaves a schema that the next run of the same worker drops and
+    recreates, so counts stay deterministic. The connection itself comes from
+    the tests' Postgres entrypoint, which prepares the worker database and
     refuses a non-test database before any DDL.
     """
-    import hashlib
-
     worker = os.getenv("PYTEST_XDIST_WORKER", "master")
-    schema = f"cache3s_{worker}_{hashlib.sha1(pg_dsn.encode()).hexdigest()[:8]}"
+    schema = f"cache3s_{worker}"
 
-    admin_conn = await asyncpg.connect(pg_dsn)
+    admin_conn = await postgres.connect()
     try:
-        assert_test_db_name(
-            await admin_conn.fetchval("SELECT current_database()"), "cache three-state"
-        )
         await admin_conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         await admin_conn.execute(f'CREATE SCHEMA "{schema}"')
     finally:
         await admin_conn.close()
 
-    pool = await asyncpg.create_pool(
-        pg_dsn, min_size=1, max_size=3, server_settings={"search_path": schema}
+    new_pool = await postgres.create_pool(
+        min_size=1, max_size=3, server_settings={"search_path": schema}
     )
-    assert pool is not None
-    async with pool.acquire() as conn:
+    async with new_pool.acquire() as conn:
         await ensure_api_logs_schema(conn)
 
     # Unique per fixture instance so assertions about exact counts hold per
     # test even if a future test in this module runs concurrently.
     prefix = f"cache3s-{uuid.uuid4().hex[:12]}"
     try:
-        yield pool, prefix
+        yield new_pool, prefix
     finally:
-        await pool.execute("DELETE FROM api_logs WHERE request_id LIKE $1", f"{prefix}%")
-        await pool.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-        await pool.close()
+        await new_pool.execute("DELETE FROM api_logs WHERE request_id LIKE $1", f"{prefix}%")
+        await new_pool.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        await new_pool.close()
 
 
 async def _seed(pool: asyncpg.Pool, prefix: str, cache_read_tokens: list[int | None]) -> None:
