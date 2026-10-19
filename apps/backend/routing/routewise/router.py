@@ -3045,12 +3045,12 @@ class RouteWiseRouter:
         if self.prefix_cache.enabled:
             self._commit_prefix_cache_observation(obs)
         model_id = self.canonical_model_id(obs.model_id)
-        if obs.completion_tokens > 0:
+        real_work = bool(obs.success and obs.terminal and obs.outcome.admits_real_work)
+        if real_work and obs.completion_tokens > 0:
             self.predictor.update(model_id, obs.prompt_tokens, obs.completion_tokens)
 
         if obs.endpoint_id and obs.endpoint_id in self._latency_profiles:
             now = time.time()
-            error_type: str | None = None if obs.success else "error"
             latency_ms = (
                 obs.ttft_ms
                 if obs.ttft_ms is not None
@@ -3058,12 +3058,15 @@ class RouteWiseRouter:
                 if obs.success
                 else -1.0
             )
-            if error_type is None and latency_ms > 0:
+            if not obs.success:
+                # Keep transport failures visible to availability/liveness logic.
+                self._latency_profiles[obs.endpoint_id].record(now, latency_ms, "error")
+            elif real_work and latency_ms > 0:
                 self._record_latency_success(obs.endpoint_id, now, latency_ms)
-            else:
-                self._latency_profiles[obs.endpoint_id].record(now, latency_ms, error_type)
+            elif real_work:
+                self._latency_profiles[obs.endpoint_id].record(now, latency_ms, None)
 
-        if obs.prompt_tokens > 0 and obs.completion_tokens > 0:
+        if real_work and obs.prompt_tokens > 0 and obs.completion_tokens > 0:
             sample_cost = self._reference_api_cost(
                 model_id,
                 prompt_tokens=obs.prompt_tokens,

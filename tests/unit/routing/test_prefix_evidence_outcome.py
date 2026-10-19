@@ -47,6 +47,7 @@ from routing.routewise.prefix_cache import (
     CacheScope,
     PrefixCacheCoordinator,
     SessionProviderPrefixMemory,
+    _CacheLocalityEstimator,
 )
 from routing.routewise.prefix_cache_pending import PendingPrefixCacheStore
 from routing.routewise.router import RouteWiseRouter
@@ -482,6 +483,46 @@ class TestLivenessRefreshGeneration:
         entry = coordinator.memory._entries[scope]
         assert entry.blocks == conversation, "a transient stub replaced warm evidence"
         assert entry.last_seen_at > first_seen, "the warm entry was not refreshed"
+
+    def test_missing_cache_usage_refreshes_ttl_without_refreshing_evidence_age(self):
+        now = [1000.0]
+
+        def time_source():
+            return now[0]
+
+        coordinator = PrefixCacheCoordinator(
+            enabled=True,
+            memory=SessionProviderPrefixMemory(
+                min_match_tokens=1, ttl_sec=300.0, time_source=time_source
+            ),
+            evidence=_CacheLocalityEstimator(ttl_sec=300.0, time_source=time_source),
+            block_size=8,
+            secret=SECRET,
+            tokenize=_chars,
+        )
+        scope = _scope()
+        conversation = _blocks(("a", 4096), ("b", 4096))
+        _remember_with_observed_hit(coordinator, scope, conversation)
+        observed_at = coordinator._evidence._evidence[scope].observed_at
+        initial = coordinator.evaluate(scope, conversation, cold_cost=1.0, price_delta=0.5)
+
+        warmup = CompletionOutcome.TRANSIENT_NO_PROGRESS
+        for _ in range(5):
+            now[0] += 10.0
+            coordinator.record_outcome(
+                scope=scope,
+                blocks=conversation,
+                outcome=warmup,
+                observed_cached_tokens=None,
+            )
+
+        now[0] = observed_at + 150.0
+        decayed = coordinator.evaluate(scope, conversation, cold_cost=1.0, price_delta=0.5)
+
+        assert coordinator._evidence._evidence[scope].observed_at == observed_at
+        assert decayed.expected_cached_tokens == pytest.approx(
+            initial.expected_cached_tokens / 2, rel=1e-3
+        )
 
 
 class TestNonProgressEvidenceRecording:
