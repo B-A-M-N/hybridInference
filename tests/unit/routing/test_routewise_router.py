@@ -67,6 +67,33 @@ class _StatusError(RuntimeError):
         self.status_code = status_code
 
 
+class _TransactionRecordingPrefillLoad(PrefillLoadTracker):
+    """Record the routing-transaction depth at each lease reservation.
+
+    Same instrument the FixedRouter fallback test uses: an acquire recorded at
+    depth 0 reserved from an unserialized load snapshot; depth 1 proves it
+    happened inside ``routing_transaction()``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.transaction_depth = 0
+        self.acquire_depths: list[int] = []
+
+    @contextlib.contextmanager
+    def routing_transaction(self):
+        with super().routing_transaction():
+            self.transaction_depth += 1
+            try:
+                yield
+            finally:
+                self.transaction_depth -= 1
+
+    def acquire(self, *args: Any, **kwargs: Any):
+        self.acquire_depths.append(self.transaction_depth)
+        return super().acquire(*args, **kwargs)
+
+
 def _unreserved_decision(
     adapter: Any,
     *,
@@ -4791,6 +4818,89 @@ class TestPrefillLoadPenalty:
 
         assert router._prefill_load.backlog("test-model:disabled") == 0
         assert router._prefill_load._prefix_hints == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ("chat", "stream"))
+    async def test_fallback_lease_is_acquired_inside_routing_transaction(self, operation):
+        """A dispatch that arrives without a pre-reserved lease serializes its
+        fallback acquisition with selection, and holds no tracker lock over the
+        upstream call.
+
+        This is the defensive ``lease is None`` branch in the execution helpers,
+        reached through the actual dispatch entrypoint rather than by invoking
+        an acquisition helper in isolation: whatever path produced a
+        lease-less decision, the reservation it triggers must not race a
+        concurrent selection that reads the same load snapshot.
+        """
+        tracker = _TransactionRecordingPrefillLoad()
+        adapter = _make_adapter(endpoint_id="test-model:fallback-lease")
+        seen_depths: list[int] = []
+
+        async def _chat(messages, **params):
+            # The upstream call itself must run outside the routing transaction:
+            # the lease was acquired (depth 1), the transaction exited before I/O.
+            seen_depths.append(tracker.transaction_depth)
+            assert tracker.backlog("test-model:fallback-lease") > 0
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        async def _stream(messages, **params):
+            seen_depths.append(tracker.transaction_depth)
+            assert tracker.backlog("test-model:fallback-lease") > 0
+            yield 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+
+        adapter.chat_completion = _chat
+        adapter.stream_chat_completion = _stream
+        router = RouteWiseRouter(
+            config=RouteWiseConfig(db_bootstrap_enabled=False, prefill_load_routing_enabled=True),
+            prefill_load=tracker,
+        )
+        messages = [{"role": "user", "content": "x" * 4000}]
+
+        if operation == "chat":
+            await router._execute_adapter(_unreserved_decision(adapter), "test-model", messages)
+        else:
+            async for _chunk in router._execute_stream_adapter(
+                _unreserved_decision(adapter), "test-model", messages
+            ):
+                pass
+
+        # The fallback reservation was serialized with selection, the upstream
+        # I/O ran outside the transaction, and the lease did not outlive the call.
+        assert tracker.acquire_depths == [1]
+        assert seen_depths == [0]
+        assert tracker.backlog("test-model:fallback-lease") == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ("chat", "stream"))
+    async def test_fallback_lease_skipped_when_tracking_disabled(self, operation):
+        """A lease-less dispatch under disabled tracking neither reserves nor serializes."""
+        tracker = _TransactionRecordingPrefillLoad()
+        adapter = _make_adapter(endpoint_id="test-model:fallback-off")
+
+        async def _chat(messages, **params):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        async def _stream(messages, **params):
+            yield 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+
+        adapter.chat_completion = _chat
+        adapter.stream_chat_completion = _stream
+        router = RouteWiseRouter(
+            config=RouteWiseConfig(db_bootstrap_enabled=False, prefill_load_routing_enabled=False),
+            prefill_load=tracker,
+        )
+        messages = [{"role": "user", "content": "x" * 4000}]
+
+        if operation == "chat":
+            await router._execute_adapter(_unreserved_decision(adapter), "test-model", messages)
+        else:
+            async for _chunk in router._execute_stream_adapter(
+                _unreserved_decision(adapter), "test-model", messages
+            ):
+                pass
+
+        assert tracker.acquire_depths == []
+        assert tracker.backlog("test-model:fallback-off") == 0
 
     def test_linear_penalty(self):
         router = RouteWiseRouter(
