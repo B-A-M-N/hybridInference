@@ -84,8 +84,48 @@ def test_embedding_model_records_required_role_gate(tmp_path):
 
 
 @pytest.mark.unit
-def test_embedding_model_without_role_defaults_free_like_chat(tmp_path):
+def test_embedding_model_without_role_shares_the_chat_cost_default(tmp_path):
+    """An omitted required_role reads as the same default on both surfaces.
+
+    The cross-PR consistency requirement: the chat branch derives the tier
+    from cost (a paid or unknown-cost model publishes as pro), and the
+    embedding branch must not silently keep those models free-tier. The
+    fixture's route is a remote openai_compat endpoint with no pricing
+    metadata — the exact shape that must not fall through to free.
+    """
     p = _write_models_yaml(tmp_path, _embedding_yaml(role=None))
+
+    exe = FixedRouter()
+    register_from_models_yaml(exe, p, {})
+
+    assert exe.embedding_routes["emb-x"].required_role == "pro"
+
+
+@pytest.mark.unit
+def test_embedding_model_on_a_local_engine_keeps_the_free_default(tmp_path):
+    # The cost-derived default reaches embeddings too: a locally-served
+    # engine route (the one free-by-construction shape) with no role and no
+    # pricing stays free, same as chat would classify it.
+    body = _embedding_yaml(role=None).replace(
+        "      - kind: openai_compat\n        base_url: https://gateway.example/api/v2/",
+        "      - kind: sglang\n        base_url: http://localhost:12003/v1",
+    )
+    p = _write_models_yaml(tmp_path, body)
+
+    exe = FixedRouter()
+    register_from_models_yaml(exe, p, {})
+
+    assert exe.embedding_routes["emb-x"].required_role == "free"
+
+
+@pytest.mark.unit
+def test_embedding_model_with_zero_pricing_keeps_the_free_default(tmp_path):
+    # Explicit pricing at zero is the other provably-free declaration.
+    body = _embedding_yaml(role=None).replace(
+        "    route:",
+        '    pricing:\n      prompt: "0"\n      completion: "0"\n    route:',
+    )
+    p = _write_models_yaml(tmp_path, body)
 
     exe = FixedRouter()
     register_from_models_yaml(exe, p, {})
