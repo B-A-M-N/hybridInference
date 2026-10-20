@@ -1275,6 +1275,13 @@ def _unknown_cost_yaml() -> str:
         "      - kind: openai_compat\n"
         "        weight: 1.0\n"
         "        base_url: http://localhost:11434/v1\n"
+        "  - id: provably-local-engine\n"
+        "    name: Provably Local Engine\n"
+        "    provider: sglang\n"
+        "    route:\n"
+        "      - kind: sglang\n"
+        "        weight: 1.0\n"
+        "        base_url: http://localhost:12003/v1\n"
     )
 
 
@@ -1283,11 +1290,12 @@ def test_unknown_cost_external_routes_default_to_pro_not_free(tmp_path, monkeypa
     """The #1605 conditional gap: an externally billed upstream configured
     with no pricing metadata and no role must not default to free.
 
-    Only routes that stay on this host can keep the historical ``free``
-    default without a pricing block: a local GPU box cannot incur an
-    upstream charge by construction, while a remote route with no pricing
-    metadata can cost real money — the config's silence is not proof of
-    free, so it defaults closed.
+    The free default without a pricing block needs more than a local host:
+    a localhost compatibility proxy can relay to a paid remote provider,
+    so local network placement is not proof of free (audit, 2026-10-20).
+    Only a local host serving a self-hosted engine API kind (sglang, vllm)
+    keeps the historical ``free`` default; every other unpriced route —
+    remote or localhost-forwarding — defaults closed.
     """
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
     p = tmp_path / "models.yaml"
@@ -1299,7 +1307,12 @@ def test_unknown_cost_external_routes_default_to_pro_not_free(tmp_path, monkeypa
     assert exe.routes["explicit-free"].required_role == "free"
     assert exe.routes["explicit-paid"].required_role == "pro"
     assert exe.routes["unknown-cost-external"].required_role == "pro"
-    assert exe.routes["unknown-cost-local"].required_role == "free"
+    # A localhost openai_compat is a forwarding dialect: it defaults closed
+    # even though the host is local.
+    assert exe.routes["unknown-cost-local"].required_role == "pro"
+    # A self-hosted engine API on a local host is the one free-by-construction
+    # shape that remains.
+    assert exe.routes["provably-local-engine"].required_role == "free"
 
 
 @pytest.mark.unit
