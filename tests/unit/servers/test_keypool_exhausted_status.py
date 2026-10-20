@@ -82,6 +82,30 @@ class _FakeAdapter:
         return {"data": [{"embedding": [0.0], "index": 0}], "usage": {}}
 
 
+class _FakeRoute:
+    """Enough of a routing entry for ``model_access_denial`` (see #1602).
+
+    The embeddings tier gate resolves the model's access-gate record off the
+    router's ``embedding_routes`` table before serving; a published free-tier
+    record lets the request through to the adapter, where the exhaustion is
+    raised. Inert on branches without the gate: the handler never reads it.
+    """
+
+    def __init__(self) -> None:
+        from types import SimpleNamespace
+
+        adapter = SimpleNamespace(config=SimpleNamespace(id="emb-model"))
+        self.adapters = [(adapter, 1.0)]
+        self.published = True
+        self.required_role = "free"
+        self.admin_only = False
+
+
+class _FakeRouterExec:
+    def __init__(self) -> None:
+        self.embedding_routes = {"emb-model": _FakeRoute()}
+
+
 class _CapturingLogger:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -106,7 +130,9 @@ def _build_app(adapter: _FakeAdapter, logger: _CapturingLogger) -> FastAPI:
         get_completions_logger,
         get_embedding_adapters,
         get_log_store,
+        get_model_visibility_resolver,
         get_operational_store,
+        get_router,
     )
     from serving.servers.routers import embeddings
 
@@ -123,6 +149,11 @@ def _build_app(adapter: _FakeAdapter, logger: _CapturingLogger) -> FastAPI:
     app.dependency_overrides[get_completions_logger] = lambda: logger
     app.dependency_overrides[get_operational_store] = lambda: None
     app.dependency_overrides[get_runtime_settings] = lambda: _FakeRuntimeSettings()
+    # The tier gate (#1602) sources these from app.state.services; overriding
+    # them keeps the app dependency-free without building that state. Both
+    # overrides are simply unused where the gate does not exist yet.
+    app.dependency_overrides[get_router] = lambda: _FakeRouterExec()
+    app.dependency_overrides[get_model_visibility_resolver] = lambda: None
     return app
 
 
