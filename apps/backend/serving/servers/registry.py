@@ -976,6 +976,18 @@ def register_from_models_yaml(
                     admin_only=admin_only,
                     required_role=required_role,
                 )
+                # Registration invariant: every embedding adapter key —
+                # including aliases — must have a matching access-gate record
+                # before the registry hands either table to a request surface.
+                # /v1/embeddings now refuses an adapter whose gate record is
+                # missing (fail-closed), so an inconsistency here is a bug,
+                # not a silent hole; assert it at the source.
+                _gate = router.embedding_routes
+                for _key in [model_id, *aliases]:
+                    assert _key in _gate and _key in embedding_adapters, (
+                        f"embedding registration invariant violated for {_key!r}: "
+                        "adapter table and access-gate record must both exist"
+                    )
                 count += 1 + len(aliases)
             else:
                 # Chat models go through the full FixedRouter.

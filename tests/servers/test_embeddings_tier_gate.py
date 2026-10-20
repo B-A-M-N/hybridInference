@@ -273,8 +273,14 @@ async def test_visibility_override_wins_over_baseline():
 
 
 @pytest.mark.asyncio
-async def test_router_without_gate_keeps_serving():
-    """A router predating the gate gates nothing — the old behavior."""
+async def test_router_without_gate_fails_closed():
+    """A router with no embedding_routes table at all refuses the request.
+
+    The gate is mandatory, not best-effort: an adapter that dispatches
+    without a gate record would skip tier/visibility/grant enforcement
+    entirely, so the surface refuses — exactly like an unknown model —
+    rather than serving through the gap.
+    """
 
     class _LegacyRouter:
         def __init__(self) -> None:
@@ -285,4 +291,140 @@ async def test_router_without_gate_keeps_serving():
 
     resp = await _post(app, "emb-pro")
 
+    assert resp.status_code == 404
+    # The refusal is loud internally, silent to the caller.
+    assert len(logger.calls) == 1
+    assert logger.calls[0][1]["status_code"] == 404
+
+
+@pytest.mark.asyncio
+async def test_adapter_without_gate_record_fails_closed_and_skips_dispatch():
+    """Adapter registered, access policy missing → 404, no adapter call.
+
+    This is the fail-closed invariant: normal YAML registration populates
+    both tables, so the mismatch can only come from dynamic registration,
+    a partial rebuild, or a future refactor — the one state the surface
+    must never serve through.
+    """
+
+    class _CountingAdapter(_FakeAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def embeddings(self, input_data, **params):
+            self.calls += 1
+            return await super().embeddings(input_data, **params)
+
+    adapter = _CountingAdapter()
+    exe = FixedRouter()  # no embedding_routes entry for emb-pro
+    app = _build_app(exe, _CapturingLogger(), user_role="pro")
+    app.dependency_overrides[get_embedding_adapters] = lambda: {"emb-pro": adapter}
+
+    resp = await _post(app, "emb-pro")
+
+    assert resp.status_code == 404
+    assert adapter.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_alias_without_gate_record_fails_closed():
+    """An alias present in the adapter table but not the gate table refuses."""
+
+    class _CountingAdapter(_FakeAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def embeddings(self, input_data, **params):
+            self.calls += 1
+            return await super().embeddings(input_data, **params)
+
+    adapter = _CountingAdapter()
+    exe = FixedRouter()
+    # Gate record exists for the canonical model only — the alias was added
+    # to the adapter table without one (e.g. dynamic registration).
+    exe.register_embedding_route("emb-pro", [(_FakeAdapter(), 1.0)], required_role="pro")
+    app = _build_app(exe, _CapturingLogger(), user_role="pro")
+    app.dependency_overrides[get_embedding_adapters] = lambda: {
+        "emb-pro": _FakeAdapter(),
+        "emb-pro-alias": adapter,
+    }
+
+    resp = await _post(app, "emb-pro-alias")
+
+    assert resp.status_code == 404
+    assert adapter.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_visibility_override_can_raise_required_role():
+    """A runtime override may only tighten the gate: pro caller, model
+    raised to admin → refused."""
+
+    class _RaisingResolver:
+        async def get_effective_required_role(self, canonical: str, required: str) -> str:
+            return "admin"
+
+    app = _build_app(
+        _gated_router("pro"),
+        _CapturingLogger(),
+        user_role="pro",
+        visibility_resolver=_RaisingResolver(),
+    )
+
+    resp = await _post(app, "emb-pro")
+
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_grant_excluding_embedding_model_denied():
+    """An inference grant whose model list omits the model → 404."""
+    app = _build_app(_gated_router("pro"), _CapturingLogger(), user_role="pro")
+    # Auth dependency returns a grant ctx whose allowed list names another model.
+    app.dependency_overrides[verify_api_key] = lambda: {
+        "user_id": "grant-user",
+        "role": "pro",
+        "authenticated": True,
+        "agent_allowed_models": ["some-other-model"],
+    }
+
+    resp = await _post(app, "emb-pro")
+
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_grant_including_embedding_model_admitted():
+    app = _build_app(_gated_router("pro"), _CapturingLogger(), user_role="pro")
+    app.dependency_overrides[verify_api_key] = lambda: {
+        "user_id": "grant-user",
+        "role": "pro",
+        "authenticated": True,
+        "agent_allowed_models": ["emb-pro"],
+    }
+
+    resp = await _post(app, "emb-pro")
+
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_missing_gate_error_names_model_internally(caplog):
+    """The internal error names the gap and the model id; the caller's 404
+    body never mentions authorization details."""
+    import logging
+
+    caplog.set_level(logging.ERROR, logger="serving.servers.routers.embeddings")
+    app = _build_app(FixedRouter(), _CapturingLogger(), user_role="free")
+
+    resp = await _post(app, "emb-pro")
+
+    assert resp.status_code == 404
+    assert any("embedding_access_policy_missing" in r.message for r in caplog.records)
+    assert "embedding" not in resp.text.lower() or "not found" in resp.text.lower()
+    # The external detail is the standard unavailable-model message, same as
+    # the chat surface's denial — no authorization wording leaks.
+    assert "authorization" not in resp.text.lower()
+    assert "policy" not in resp.text.lower()

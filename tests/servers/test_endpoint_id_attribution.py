@@ -284,6 +284,7 @@ class _FakeEmbeddingAdapter:
         raises: Exception | None = None,
     ) -> None:
         self.config = SimpleNamespace(
+            id="emb-model",
             provider=provider,
             endpoint_id=endpoint_id,
             pricing=_EMB_PRICING,
@@ -317,7 +318,10 @@ def _build_embeddings_app(adapter, logger: _CapturingLogger) -> FastAPI:
         "authenticated": True,
     }
     app.dependency_overrides[enforce_user_concurrency] = lambda: None
-    app.dependency_overrides[get_router] = lambda: FixedRouter()
+    # Register the access gate the surface now requires (fail-closed).
+    router_exec = FixedRouter()
+    router_exec.register_embedding_route("emb-model", [(adapter, 1.0)], required_role="free")
+    app.dependency_overrides[get_router] = lambda: router_exec
     app.dependency_overrides[get_model_visibility_resolver] = lambda: None
     app.dependency_overrides[get_embedding_adapters] = lambda: {"emb-model": adapter}
     app.dependency_overrides[get_log_store] = lambda: object()  # truthy → logging enabled
