@@ -18,6 +18,7 @@ from serving.model_access import (
     baseline_required_role,
     default_required_role_for_model,
     model_access_denial,
+    model_cost_is_unknown_remote,
     route_canonical_model_id,
 )
 
@@ -69,6 +70,54 @@ class TestDefaultRequiredRoleForModel:
     def test_an_omitted_role_on_a_model_without_pricing_stays_free(self):
         # No pricing block at all (local GPU default): the historical default.
         assert default_required_role_for_model({"id": "local-only"}) == "free"
+
+    def test_an_unknown_cost_remote_route_defaults_to_pro(self):
+        # The #1605 gap: an externally billed upstream configured with no
+        # pricing metadata and no role. The config cannot prove it is free,
+        # and the route reaches a non-local host, so it defaults closed.
+        model = {
+            "id": "ext-silent",
+            "route": [
+                {
+                    "kind": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_keys": ["${OPENROUTER_API_KEY}"],
+                    "provider_model_id": "meta-llama/llama-3.3-70b-instruct",
+                }
+            ],
+        }
+        assert model_cost_is_unknown_remote(model) is True
+        assert default_required_role_for_model(model) == "pro"
+
+    def test_a_remote_kind_on_a_local_host_stays_free(self):
+        # Someone can point any kind at localhost; the host decides, not the
+        # kind. A local box cannot incur an upstream charge by construction.
+        model = {
+            "id": "local-openrouter",
+            "route": [{"kind": "openrouter", "base_url": "http://localhost:12003/v1"}],
+        }
+        assert model_cost_is_unknown_remote(model) is False
+        assert default_required_role_for_model(model) == "free"
+
+    def test_an_unparseable_top_level_base_url_defaults_closed(self):
+        # A single-route model without a route list falls back to the
+        # top-level base_url; if it cannot be parsed as local, default closed.
+        model = {"id": "top-level-only", "base_url": "https://api.example.io/v1"}
+        assert model_cost_is_unknown_remote(model) is True
+        assert default_required_role_for_model(model) == "pro"
+
+    def test_a_mixed_local_and_unknown_cost_remote_model_defaults_to_pro(self):
+        # One remote route with no pricing metadata is enough: the model as a
+        # whole can cost money.
+        model = {
+            "id": "hybrid-silent",
+            "route": [
+                {"kind": "openai_compat", "base_url": "http://localhost:11434/v1"},
+                {"kind": "openrouter", "base_url": "https://openrouter.ai/api/v1"},
+            ],
+        }
+        assert model_cost_is_unknown_remote(model) is True
+        assert default_required_role_for_model(model) == "pro"
 
     def test_a_route_level_price_counts_as_paid(self):
         model = {

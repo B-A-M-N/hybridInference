@@ -1234,6 +1234,74 @@ def test_explicit_required_role_still_wins_over_the_pricing_default(tmp_path):
     assert exe.routes["sponsored-pro"].required_role == "free"
 
 
+def _unknown_cost_yaml() -> str:
+    """The three cost states side by side, none naming ``required_role``."""
+    return (
+        "models:\n"
+        "  - id: explicit-free\n"
+        "    name: Explicit Free\n"
+        "    provider: openai_compat\n"
+        "    pricing:\n"
+        '      prompt: "0"\n'
+        '      completion: "0"\n'
+        "    route:\n"
+        "      - kind: openai_compat\n"
+        "        weight: 1.0\n"
+        "        base_url: https://sponsored.example.test/v1\n"
+        "  - id: explicit-paid\n"
+        "    name: Explicit Paid\n"
+        "    provider: openai_compat\n"
+        "    pricing:\n"
+        '      prompt: "1.20"\n'
+        '      completion: "4.80"\n'
+        "    route:\n"
+        "      - kind: openai_compat\n"
+        "        weight: 1.0\n"
+        "        base_url: https://compat.example.test/v1\n"
+        "  - id: unknown-cost-external\n"
+        "    name: Unknown Cost External\n"
+        "    provider: openrouter\n"
+        "    route:\n"
+        "      - kind: openrouter\n"
+        "        weight: 1.0\n"
+        "        base_url: https://openrouter.ai/api/v1\n"
+        "        api_keys:\n"
+        '          - "${OPENROUTER_API_KEY}"\n'
+        "        provider_model_id: meta-llama/llama-3.3-70b-instruct\n"
+        "  - id: unknown-cost-local\n"
+        "    name: Unknown Cost Local\n"
+        "    provider: openai_compat\n"
+        "    route:\n"
+        "      - kind: openai_compat\n"
+        "        weight: 1.0\n"
+        "        base_url: http://localhost:11434/v1\n"
+    )
+
+
+@pytest.mark.unit
+def test_unknown_cost_external_routes_default_to_pro_not_free(tmp_path, monkeypatch):
+    """The #1605 conditional gap: an externally billed upstream configured
+    with no pricing metadata and no role must not default to free.
+
+    Only routes that stay on this host can keep the historical ``free``
+    default without a pricing block: a local GPU box cannot incur an
+    upstream charge by construction, while a remote route with no pricing
+    metadata can cost real money — the config's silence is not proof of
+    free, so it defaults closed.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    p = tmp_path / "models.yaml"
+    p.write_text(_unknown_cost_yaml())
+
+    exe = RouteExecutor()
+    registry.register_from_models_yaml(exe, Path(p))
+
+    assert exe.routes["explicit-free"].required_role == "free"
+    assert exe.routes["explicit-paid"].required_role == "pro"
+    assert exe.routes["unknown-cost-external"].required_role == "pro"
+    assert exe.routes["unknown-cost-local"].required_role == "free"
+
+
 @pytest.mark.unit
 def test_route_level_pricing_makes_the_model_paid_even_when_model_pricing_is_zero(
     tmp_path, monkeypatch
