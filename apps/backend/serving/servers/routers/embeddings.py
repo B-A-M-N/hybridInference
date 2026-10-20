@@ -283,40 +283,65 @@ async def create_embeddings(
     # surface reads it, so the registry records their gate on the router
     # (``embedding_routes``) for this surface to enforce; without it the
     # declaration was dead config and any authenticated caller could use the
-    # model. A router predating the gate gates nothing, matching the old
-    # behavior. Denials answer exactly like an unknown model.
-    embedding_routes = getattr(router_exec, "embedding_routes", None) or {}
-    route = embedding_routes.get(model)
-    if route is not None:
-        denial = await model_access_denial(
-            route, model, user_ctx, visibility_resolver=model_visibility_resolver
+    # model. Denials answer exactly like an unknown model.
+    #
+    # Fail-closed: the gate is mandatory, not optional. An adapter that is
+    # registered while its access-gate record is missing is a registry
+    # inconsistency (dynamic registration, a partial rebuild, a future
+    # refactor) — the one state this surface must never serve through, since
+    # dispatching it would skip tier/visibility/grant enforcement entirely.
+    # It is refused exactly like an unknown model, with an internal
+    # ``embedding_access_policy_missing`` error naming the gap. The error
+    # carries only the model id: the caller sees the standard 404 either way.
+    embedding_routes = getattr(router_exec, "embedding_routes", None)
+    route = embedding_routes.get(model) if embedding_routes else None
+    if route is None:
+        logger.error(
+            "embedding_access_policy_missing: embedding adapter registered without "
+            "an access-gate record; refusing the request",
+            extra={"model": model},
         )
-        if denial is not None:
-            if denial is ModelAccessDenial.ROLE:
-                logger.info(
-                    "Insufficient role for embedding model",
-                    extra={
-                        "model": model,
-                        "user_id": user_ctx.get("user_id"),
-                        "role": user_ctx.get("role", "free"),
-                    },
-                )
-            # An unpublished route is refused without a request log row, as
-            # on the chat surface.
-            if denial is not ModelAccessDenial.UNPUBLISHED:
-                _schedule_log(
-                    provider="router",
-                    status_code=404,
-                    response=None,
-                    usage=None,
-                    pricing=None,
-                    error=f"Embedding model '{model}' not found",
-                )
-            req_ctx.mark_model_not_found()
-            raise HTTPException(
-                404,
-                model_not_found_detail(model, user_ctx=user_ctx, noun="Embedding model"),
+        _schedule_log(
+            provider="router",
+            status_code=404,
+            response=None,
+            usage=None,
+            pricing=None,
+            error=f"Embedding model '{model}' not found",
+        )
+        req_ctx.mark_model_not_found()
+        raise HTTPException(
+            404, model_not_found_detail(model, user_ctx=user_ctx, noun="Embedding model")
+        )
+    denial = await model_access_denial(
+        route, model, user_ctx, visibility_resolver=model_visibility_resolver
+    )
+    if denial is not None:
+        if denial is ModelAccessDenial.ROLE:
+            logger.info(
+                "Insufficient role for embedding model",
+                extra={
+                    "model": model,
+                    "user_id": user_ctx.get("user_id"),
+                    "role": user_ctx.get("role", "free"),
+                },
             )
+        # An unpublished route is refused without a request log row, as
+        # on the chat surface.
+        if denial is not ModelAccessDenial.UNPUBLISHED:
+            _schedule_log(
+                provider="router",
+                status_code=404,
+                response=None,
+                usage=None,
+                pricing=None,
+                error=f"Embedding model '{model}' not found",
+            )
+        req_ctx.mark_model_not_found()
+        raise HTTPException(
+            404,
+            model_not_found_detail(model, user_ctx=user_ctx, noun="Embedding model"),
+        )
 
     adapter = embedding_adapters[model]
     require_embedding_pricing(adapter)
