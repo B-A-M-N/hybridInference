@@ -38,6 +38,7 @@ from routing.model_selection import (
 from serving.analytics import agent_catalog as catalog
 from serving.analytics.language_id import detect_message, user_languages
 from serving.config.settings import has_role
+from serving.model_access import default_required_role_for_model
 from serving.utils.geo_resolver import ALPHA2_TO_ALPHA3
 from serving.utils.logging import get_logger
 
@@ -322,7 +323,10 @@ def public_model_names(
         if not isinstance(model, dict) or model.get("id") is None:
             continue
         model_id = str(model["id"])
-        role = overrides.get(model_id) or str(model.get("required_role", "free"))
+        # Same default the registry's gate derives (issue #1576): a paid model
+        # without an explicit required_role publishes as pro, so the public
+        # page's visibility agrees with what the gate enforces.
+        role = overrides.get(model_id) or default_required_role_for_model(model)
         if model.get("admin_only") or not has_role(PUBLIC_MODEL_ROLE, role):
             continue
         names[model_id] = model_id

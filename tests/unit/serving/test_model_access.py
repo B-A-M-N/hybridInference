@@ -16,6 +16,7 @@ import pytest
 from serving.model_access import (
     ModelAccessDenial,
     baseline_required_role,
+    default_required_role_for_model,
     model_access_denial,
     route_canonical_model_id,
 )
@@ -52,6 +53,55 @@ def _ctx(**extra) -> dict:
 @pytest.mark.asyncio
 async def test_an_open_model_is_allowed():
     assert await model_access_denial(_route(), CANONICAL, _ctx()) is None
+
+
+class TestDefaultRequiredRoleForModel:
+    """The loader's default tier for a models.yaml entry (issue #1576)."""
+
+    def test_an_omitted_role_on_a_paid_model_defaults_to_pro(self):
+        model = {"id": "claude-opus-4.8", "pricing": {"prompt": "1.2", "completion": "4.8"}}
+        assert default_required_role_for_model(model) == "pro"
+
+    def test_an_omitted_role_on_a_zero_priced_model_stays_free(self):
+        model = {"id": "free-chat", "pricing": {"prompt": "0", "completion": "0"}}
+        assert default_required_role_for_model(model) == "free"
+
+    def test_an_omitted_role_on_a_model_without_pricing_stays_free(self):
+        # No pricing block at all (local GPU default): the historical default.
+        assert default_required_role_for_model({"id": "local-only"}) == "free"
+
+    def test_a_route_level_price_counts_as_paid(self):
+        model = {
+            "id": "hybrid",
+            "pricing": {"prompt": "0", "completion": "0"},
+            "route": [
+                {"kind": "openai_compat", "base_url": "http://local", "pricing": {"prompt": "0.3"}},
+                {"kind": "openai_compat", "base_url": "http://cloud"},
+            ],
+        }
+        assert default_required_role_for_model(model) == "pro"
+
+    def test_a_pricing_schedule_counts_as_paid(self):
+        model = {"id": "sched", "pricing_schedule": {"effective_at": "2026-01-01T00:00:00Z"}}
+        assert default_required_role_for_model(model) == "pro"
+
+    def test_a_pricing_source_counts_as_paid(self):
+        model = {"id": "sourced", "pricing_source": {"provider": "deepseek", "model": "x"}}
+        assert default_required_role_for_model(model) == "pro"
+
+    def test_an_unparseable_price_counts_as_paid(self):
+        model = {"id": "odd", "pricing": {"prompt": "market"}}
+        assert default_required_role_for_model(model) == "pro"
+
+    def test_an_explicit_role_always_wins(self):
+        model = {"id": "sponsored", "required_role": "free", "pricing": {"prompt": "2.0"}}
+        assert default_required_role_for_model(model) == "free"
+
+    def test_an_invalid_explicit_role_is_returned_untouched(self):
+        # The registry validates and fails closed to admin; the default
+        # helper must not swallow the typo.
+        model = {"id": "typo", "required_role": "freee"}
+        assert default_required_role_for_model(model) == "freee"
 
 
 @pytest.mark.asyncio
