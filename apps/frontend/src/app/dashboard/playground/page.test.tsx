@@ -110,18 +110,25 @@ function controlledStream() {
   const queue: string[] = [];
   let ended = false;
   let wake: (() => void) | null = null;
+  let parkedReject: ((reason: unknown) => void) | null = null;
   const read = () =>
-    new Promise<{ done: boolean; value?: Uint8Array }>((resolve) => {
+    new Promise<{ done: boolean; value?: Uint8Array }>((resolve, reject) => {
       const next = () => {
         if (queue.length) resolve({ done: false, value: encoder.encode(queue.shift()) });
         else if (ended) resolve({ done: true, value: undefined });
-        else wake = next;
+        else {
+          // Park exactly the way a real reader does; `failRead` rejects the
+          // parked read the way a real one rejects when its signal aborts.
+          parkedReject = reject;
+          wake = next;
+        }
       };
       next();
     });
   const poke = () => {
     const w = wake;
     wake = null;
+    parkedReject = null;
     w?.();
   };
   return {
@@ -133,6 +140,11 @@ function controlledStream() {
     end: () => {
       ended = true;
       poke();
+    },
+    failRead: () => {
+      const reject = parkedReject;
+      poke();
+      reject?.(new DOMException('The operation was aborted.', 'AbortError'));
     },
   };
 }
@@ -257,6 +269,86 @@ describe('PlaygroundPage', () => {
     expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
     await act(async () => finishStream(sseResponse(['data: [DONE]\n\n'])));
     await waitFor(() => expect(picker).not.toBeDisabled());
+  });
+
+  it('keeps streaming into its own session while another session is active', async () => {
+    const first = controlledStream();
+    mockChats(first.response);
+    render(<PlaygroundPage />);
+    await screen.findByRole('button', { name: 'Model: GLM 4.6' });
+    await sendPrompt('first question');
+
+    // Leaving the streaming session is allowed again, and the fresh session's
+    // controls are live while the background turn runs.
+    fireEvent.click(screen.getByRole('button', { name: '+ New' }));
+    expect(screen.getByPlaceholderText(/Type a message/)).toHaveValue('');
+    expect(screen.getByLabelText('Temperature')).not.toBeDisabled();
+
+    await act(async () => first.push(contentFrame('background ')));
+    await act(async () => first.push(contentFrame('reply')));
+    fireEvent.click(screen.getByRole('button', { name: /first question/ }));
+    await waitFor(() => expect(screen.getByText(/background reply/)).toBeInTheDocument());
+  });
+
+  it('can start a stream in another session while one is running', async () => {
+    const first = controlledStream();
+    const second = controlledStream();
+    mockChats(first.response, second.response);
+    render(<PlaygroundPage />);
+    await screen.findByRole('button', { name: 'Model: GLM 4.6' });
+    await sendPrompt('one');
+    fireEvent.click(screen.getByRole('button', { name: '+ New' }));
+    await sendPrompt('two');
+
+    // Both turns are in flight; each writes into its own session.
+    await act(async () => first.push(contentFrame('reply-one')));
+    await act(async () => second.push(contentFrame('reply-two')));
+    await act(async () => {
+      first.end();
+      second.end();
+    });
+    await waitFor(() => expect(screen.getByText(/reply-two/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /^one \d/ }));
+    expect(screen.getByText(/reply-one/)).toBeInTheDocument();
+    // Back to idle: the label reads Send again (disabled only because the
+    // editor is empty, not because something is streaming).
+    expect(screen.getByRole('button', { name: 'Send' })).toHaveTextContent('Send');
+  });
+
+  it('protects the streaming session from deletion but not the others', async () => {
+    const first = controlledStream();
+    mockChats(first.response);
+    render(<PlaygroundPage />);
+    await screen.findByRole('button', { name: 'Model: GLM 4.6' });
+    await sendPrompt('busy');
+    fireEvent.click(screen.getByRole('button', { name: '+ New' }));
+
+    expect(screen.queryByRole('button', { name: /Delete session busy/ })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /Delete session New session/ }));
+    expect(screen.queryByRole('button', { name: /Delete session New session/ })).toBeNull();
+
+    // The background stream survives the deletion of the other session.
+    await act(async () => first.push(contentFrame('still streaming')));
+    fireEvent.click(screen.getByRole('button', { name: /busy/ }));
+    await waitFor(() => expect(screen.getByText(/still streaming/)).toBeInTheDocument());
+  });
+
+  it('stops only the active session stream', async () => {
+    const first = controlledStream();
+    mockChats(first.response);
+    render(<PlaygroundPage />);
+    await screen.findByRole('button', { name: 'Model: GLM 4.6' });
+    await sendPrompt('stoppable');
+    fireEvent.click(screen.getByRole('button', { name: '+ New' }));
+
+    // Another session's stream shows no Stop control here.
+    expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /stoppable/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop' }));
+    // Aborting makes the parked read reject, exactly as a real reader does.
+    await act(async () => first.failRead());
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull());
   });
 
   it('renders assistant markdown as styled elements, not literal text', async () => {
