@@ -336,6 +336,10 @@ async def test_multi_backend_streaming_withholds_unresolved_served_fields(chat_a
         ("private.internal:local-12003", "zai", "private.internal", "private.internal:local-12003"),
         # No trusted served model to anchor the prefix: degrade, fail closed.
         ("glm-4.6:local-12003", "sglang", None, "sglang"),
+        # A colon-less id is not a registry construction at all: the old code
+        # fullmatched the whole string as the candidate and published a bare
+        # "local"; the anchor check requires the {model}:{location} shape.
+        ("local", "vllm", "glm-4.6", "vllm"),
         (None, "zai", "glm-4.6", "zai"),
         (None, None, None, None),
         ("", "zai", "glm-4.6", "zai"),
