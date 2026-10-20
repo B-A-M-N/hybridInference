@@ -91,16 +91,43 @@ class TestDefaultRequiredRoleForModel:
 
     def test_a_local_inference_kind_on_a_local_host_stays_free(self):
         # The one free-by-construction exemption the gate still grants: a
-        # route whose kind names a self-hosted engine API (sglang, vllm) on
-        # a local host. The kind is the deployment asserting "this box runs
-        # the engine itself", which is what makes the absence of a pricing
-        # block meaningful — an engine API is not a forwarding dialect.
+        # route whose kind names a self-hosted engine API (sglang, vllm,
+        # ollama) on a local host. The kind is the deployment asserting
+        # "this box runs the engine itself", which is what makes the
+        # absence of a pricing block meaningful — an engine API is not a
+        # forwarding dialect.
+        for kind in ("sglang", "vllm", "ollama"):
+            model = {
+                "id": "local-gpu",
+                "route": [{"kind": kind, "base_url": "http://localhost:12003/v1"}],
+            }
+            assert model_cost_is_unknown_remote(model) is False, kind
+            assert default_required_role_for_model(model) == "free", kind
+
+    def test_a_route_inherits_the_model_level_base_url_like_the_registry(self):
+        # The registry fills an omitted route base_url from the top-level
+        # config; the classifier mirrors that, so a locally-served engine
+        # declared with a model-level base_url stays free.
         model = {
             "id": "local-gpu",
-            "route": [{"kind": "sglang", "base_url": "http://localhost:12003/v1"}],
+            "provider": "sglang",
+            "base_url": "http://localhost:12003/v1",
+            "route": [{"kind": "sglang", "weight": 1.0}],
         }
         assert model_cost_is_unknown_remote(model) is False
         assert default_required_role_for_model(model) == "free"
+
+    def test_an_env_template_base_url_fails_closed(self):
+        # A ${VAR} base_url cannot be classified from the raw config: the
+        # registry expands it, this gate must not guess. An engine kind on
+        # an unclassifiable host still defaults pro; an explicit role or a
+        # zero pricing block is the remedy.
+        model = {
+            "id": "local-gpu",
+            "route": [{"kind": "sglang", "base_url": "${LOCAL_ENGINE_URL}"}],
+        }
+        assert model_cost_is_unknown_remote(model) is True
+        assert default_required_role_for_model(model) == "pro"
 
     def test_a_local_compat_proxy_defaults_to_pro(self):
         # The gap the local-host rule used to leave open (audit, 2026-10-20):

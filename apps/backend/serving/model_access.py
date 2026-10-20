@@ -66,32 +66,38 @@ _LOCAL_ROUTE_HOSTS = frozenset(("localhost", "127.0.0.1", "0.0.0.0", "host.docke
 # externally billed upstream, and "localhost" carries no cost information.
 # A deployment that wants free-tier for such a route says so explicitly
 # (``required_role: free`` or a zero ``pricing`` block).
-_PROVABLY_LOCAL_INFERENCE_KINDS = frozenset(("sglang", "vllm"))
+_PROVABLY_LOCAL_INFERENCE_KINDS = frozenset(("sglang", "vllm", "ollama"))
 
 
-def _route_is_locally_served(route: Mapping[str, Any], provider_kind: Any) -> bool:
+def _route_is_locally_served(
+    route: Mapping[str, Any], provider_kind: Any, model_base_url: Any = None
+) -> bool:
     """Whether a route is provably local inference: engine-API kind, local host.
 
     Both halves must hold. The host being local used to be the whole test,
     which made ``openai_compat`` pointed at a localhost reverse proxy look
     free-by-construction; the kind is the half that says this route is an
     engine endpoint rather than a forwarding one. A route that names no kind
-    inherits the model's ``provider`` field, mirroring the registry's own
-    route synthesis.
+    or no base_url inherits the model's ``provider`` / ``base_url`` fields,
+    mirroring the registry's own route synthesis. A ``${VAR}`` template
+    base_url cannot be classified from the raw config and fails closed.
     """
     kind = route.get("kind") or provider_kind
     if not isinstance(kind, str) or kind not in _PROVABLY_LOCAL_INFERENCE_KINDS:
         return False
+    base_url = route.get("base_url") or model_base_url
     try:
         from urllib.parse import urlparse
 
-        host = urlparse(str(route.get("base_url", ""))).hostname or ""
+        host = urlparse(str(base_url or "")).hostname or ""
     except (ValueError, TypeError):
         return False
     return host in _LOCAL_ROUTE_HOSTS
 
 
-def _route_cost_is_unknown(route: Mapping[str, Any], provider_kind: Any = None) -> bool:
+def _route_cost_is_unknown(
+    route: Mapping[str, Any], provider_kind: Any = None, model_base_url: Any = None
+) -> bool:
     """Whether a route has no pricing metadata and is not provably local.
 
     The conservative half of the #1605 gap: a model with no pricing block
@@ -101,7 +107,7 @@ def _route_cost_is_unknown(route: Mapping[str, Any], provider_kind: Any = None) 
     """
     if route.get("pricing") is not None:
         return False
-    return not _route_is_locally_served(route, provider_kind)
+    return not _route_is_locally_served(route, provider_kind, model_base_url)
 
 
 def model_cost_is_unknown_remote(model: Mapping[str, Any]) -> bool:
@@ -125,6 +131,7 @@ def model_cost_is_unknown_remote(model: Mapping[str, Any]) -> bool:
         # model_pricing_indicates_paid itself.
         return False
     provider_kind = model.get("provider")
+    model_base_url = model.get("base_url")
     routes = model.get("route")
     if not isinstance(routes, list):
         # A single-route model without a route list: the registry synthesizes
@@ -133,7 +140,7 @@ def model_cost_is_unknown_remote(model: Mapping[str, Any]) -> bool:
         # no endpoint to spend through (free by construction).
         return "base_url" in model and _route_cost_is_unknown(model, provider_kind)
     return any(
-        isinstance(route, Mapping) and _route_cost_is_unknown(route, provider_kind)
+        isinstance(route, Mapping) and _route_cost_is_unknown(route, provider_kind, model_base_url)
         for route in routes
     )
 
