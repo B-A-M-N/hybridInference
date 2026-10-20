@@ -234,6 +234,16 @@ class CachedOperationalStore(OperationalStore):
             await self._cache.set(ck, result, _AUTH_CONTEXT_TTL)
         return result
 
+    async def get_auth_context_with_spend(self, key_hash: str) -> Row | None:
+        """Delegate to wrapped store — deliberately not cached.
+
+        The merged row (issue #185) carries the ``user_daily_cost`` spend the
+        quota gate reads on every request; caching it would stale the gate by
+        the auth TTL. One round-trip is also what the identity cache saves on
+        the miss path, so there is nothing left for a cache to buy here.
+        """
+        return await self._store.get_auth_context_with_spend(key_hash)
+
     async def get_auth_context_lightweight(self, key_hash: str) -> Row | None:
         """Return cached lightweight auth context (30 s TTL)."""
         ck = self._auth_light_key(key_hash)
