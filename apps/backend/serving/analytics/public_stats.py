@@ -271,9 +271,11 @@ def public_model_names(
     """Map each model id and alias the page may name to the id it is shown under.
 
     A model is public when ``PUBLIC_MODEL_ROLE`` meets its required role, after
-    the runtime override. A missing or unknown role reads as the gateway reads
-    it (``free`` when unset, never satisfied when unknown), and ``admin_only``
-    always hides. An auto model is public when its tier has a public candidate.
+    the runtime override. A role the entry names explicitly is read as written
+    (unknown names never satisfy the public role); an omitted role reads as the
+    same pricing-derived default the registry's gate enforces, and
+    ``admin_only`` always hides. An auto model is public when its tier has a
+    public candidate.
 
     Args:
         models_config: The parsed ``models.yaml``.
