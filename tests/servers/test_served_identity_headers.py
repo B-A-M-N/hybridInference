@@ -314,28 +314,37 @@ async def test_multi_backend_streaming_withholds_unresolved_served_fields(chat_a
 
 
 @pytest.mark.parametrize(
-    ("endpoint_id", "provider", "expected"),
+    ("endpoint_id", "provider", "served_model", "expected"),
     [
-        ("glm-4.6:local-12003", "sglang", "glm-4.6:local-12003"),
-        ("glm-4.6:zai-api", "zai", "glm-4.6:zai-api"),
-        ("glm-4.6:local", "vllm", "glm-4.6:local"),
+        ("glm-4.6:local-12003", "sglang", "glm-4.6", "glm-4.6:local-12003"),
+        ("glm-4.6:zai-api", "zai", "glm-4.6", "glm-4.6:zai-api"),
+        ("glm-4.6:local", "vllm", "glm-4.6", "glm-4.6:local"),
         # LAN octet stamps, hostnames and admin route_ids never reach the
         # header: they degrade to the provider label.
-        ("glm-4.6:10-api", "zai", "zai"),
-        ("glm-4.6:gpu-7-api", "sglang", "sglang"),
-        ("glm-4.6:my-internal-box", "zai", "zai"),
-        ("glm-4.6:.local-api", "zai", "zai"),
+        ("glm-4.6:10-api", "zai", "glm-4.6", "zai"),
+        ("glm-4.6:gpu-7-api", "sglang", "glm-4.6", "sglang"),
+        ("glm-4.6:my-internal-box", "zai", "glm-4.6", "zai"),
+        ("glm-4.6:.local-api", "zai", "glm-4.6", "zai"),
         # A trailing newline must not smuggle an unsanitized shape through.
-        ("glm-4.6:zai-api\n", "zai", "zai"),
-        (None, "zai", "zai"),
-        (None, None, None),
-        ("", "zai", "zai"),
+        ("glm-4.6:zai-api\n", "zai", "glm-4.6", "zai"),
+        # A safe-looking location is not authority for the whole identifier:
+        # only a prefix that IS the trusted served model may be republished.
+        # "private.internal:local-12003" ends in a registry-minted location,
+        # but the prefix must come from the registry-resolved served model,
+        # not ride along with the location's shape.
+        ("private.internal:local-12003", "zai", "glm-4.6", "zai"),
+        ("private.internal:local-12003", "zai", "private.internal", "private.internal:local-12003"),
+        # No trusted served model to anchor the prefix: degrade, fail closed.
+        ("glm-4.6:local-12003", "sglang", None, "sglang"),
+        (None, "zai", "glm-4.6", "zai"),
+        (None, None, None, None),
+        ("", "zai", "glm-4.6", "zai"),
     ],
 )
-def test_header_endpoint_id_sanitization(endpoint_id, provider, expected):
+def test_header_endpoint_id_sanitization(endpoint_id, provider, served_model, expected):
     from serving.servers.routers.served_identity import header_endpoint_id
 
-    assert header_endpoint_id(endpoint_id, provider) == expected
+    assert header_endpoint_id(endpoint_id, provider, served_model) == expected
 
 
 def test_served_identity_headers_omit_missing_fields():

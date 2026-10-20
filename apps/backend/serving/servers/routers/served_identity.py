@@ -11,11 +11,14 @@ that dispatch already knows:
 ``X-FI-Served-Endpoint``  the sanitized logical endpoint id
 ``X-FI-Served-Provider``  the provider label of the serving adapter
 
-The endpoint id degrades to the provider label when it is not one of the
-registry's sanitized shapes: a gateway-owned LAN server is stamped
-``<first-octet>-api`` and an admin-supplied route_id is kept verbatim, so a
-lexical pattern — not trust in the input — is what keeps private topology out
-of a caller-visible header. The api_logs columns keep the full id either way.
+The endpoint id degrades to the provider label unless it is exactly
+``{served_model}:{location}`` with ``served_model`` the trusted name the
+response already publishes and the location one of the registry's
+sanitized shapes: a gateway-owned LAN server is stamped
+``<first-octet>-api`` and an admin-supplied route_id is kept verbatim, so
+neither a hostname nor an untrusted prefix dressed up with a
+registry-shaped location reaches a caller-visible header. The api_logs
+columns keep the full id either way.
 
 Every served-* field is optional: auto-selection deliberately conceals which
 model serves an auto request (the response names the auto model, and so do
@@ -40,20 +43,35 @@ SERVED_PROVIDER_HEADER = "X-FI-Served-Provider"
 _SAFE_LOCATION_RE = re.compile(r"^(?:local(?:-\d+)?|[a-z][a-z0-9]*-api)$")
 
 
-def header_endpoint_id(endpoint_id: str | None, provider: str | None) -> str | None:
+def header_endpoint_id(
+    endpoint_id: str | None, provider: str | None, served_model: str | None
+) -> str | None:
     """Sanitized endpoint identity for a public response header.
 
     The api_logs column may carry a LAN or cluster-DNS stamp the registry
     derived from base_url, or an admin-supplied route_id kept verbatim; a
-    response header must not. The registry's sanitized shapes pass through;
-    anything else degrades to the provider label, and both absent degrade to
-    ``None`` so the header is omitted entirely.
+    response header must not. Trust here is anchored in ``served_model`` —
+    the canonical model name the response's own ``X-FI-Served-Model`` header
+    carries, resolved through the registry — not in any lexical property of
+    ``endpoint_id``: the identifier is republished only when it is exactly
+    ``{served_model}:{location}`` and the location is one of the registry's
+    sanitized shapes. Anything else degrades to the provider label, and both
+    absent degrade to ``None`` so the header is omitted entirely.
+
+    A location that merely looks registry-minted grants nothing: an endpoint
+    id like ``private.internal:local-12003`` ends in a legitimate location,
+    but the prefix is untrusted input, so the whole identifier degrades.
+    A request that names an alias whose canonical id differs from the
+    endpoint's prefix degrades the same way — the header set stays
+    internally consistent with the model the caller was told about.
     """
     if not endpoint_id:
         return provider
-    _model, sep, location = endpoint_id.rpartition(":")
-    candidate = location if sep else endpoint_id
-    if _SAFE_LOCATION_RE.fullmatch(candidate):
+    if not served_model:
+        # No trusted name to anchor the prefix: nothing is publishable.
+        return provider
+    prefix, sep, location = endpoint_id.rpartition(":")
+    if sep and prefix == served_model and _SAFE_LOCATION_RE.fullmatch(location):
         return endpoint_id
     return provider
 
@@ -78,7 +96,7 @@ def served_identity_headers(
         headers[SERVED_MODEL_HEADER] = served_model
     if provider:
         headers[SERVED_PROVIDER_HEADER] = provider
-    endpoint = header_endpoint_id(endpoint_id, provider)
+    endpoint = header_endpoint_id(endpoint_id, provider, served_model)
     if endpoint:
         headers[SERVED_ENDPOINT_HEADER] = endpoint
     return headers
