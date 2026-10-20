@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 from typing import Any
 
 from routing.routers import RoutingObservation
@@ -35,6 +36,23 @@ _LOG_DRAIN_TIMEOUT_S = 10.0
 _LOG_DROP_WARN_EVERY = 100
 
 
+class _Lifecycle(enum.Enum):
+    """Admission states of the request-log queue.
+
+    ``stop()`` is the only transition out of ``RUNNING``, and
+    ``schedule_log`` admits payloads in exactly one of them. Without this
+    the admission gate was "is there a worker task object" — undefined
+    during shutdown (the queue was still accepting while ``stop`` waited
+    on ``queue.join``, so late rows could arrive behind the drain that was
+    supposed to flush them) and wrong after a worker crash (a dead
+    consumer kept accepting).
+    """
+
+    RUNNING = "running"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+
+
 class CompletionsLogger:
     """Encapsulate fire-and-forget side effects from the chat-completions handler.
 
@@ -49,6 +67,17 @@ class CompletionsLogger:
     payload is dropped and the loss is logged loudly — it is never silent.
     ``stop`` drains the queue on graceful shutdown before the log store's
     pool is torn down, so billing-critical rows queued in memory survive.
+
+    Accounting boundary (issue #133 discussion): ``api_logs`` rows written
+    here are billing *reports and analytics*, not the quota-authoritative
+    ledger. Quota enforcement reads ``user_daily_cost``, incremented inline
+    by ``CostTracker.schedule_increment`` (chat), the embeddings surface's
+    ``_schedule_cost_increment``, and the Anthropic messages path — each as
+    its own ``tracked_task``, on the request path, never through this
+    queue. A payload dropped under saturation therefore loses an
+    analytics/report row while the caller's quota spend stays recorded.
+    The queue is a throughput optimization over that ledger, never the
+    only surviving copy of an accounting fact.
     """
 
     def __init__(self, *, log_store: Any, model_router_registry: Any | None = None) -> None:
@@ -74,6 +103,7 @@ class CompletionsLogger:
         self._queue_loop: asyncio.AbstractEventLoop | None = None
         self._worker: asyncio.Task[None] | None = None
         self._dropped_count = 0
+        self._lifecycle: _Lifecycle = _Lifecycle.RUNNING
 
     # -- DB log scheduling ---------------------------------------------------
 
@@ -95,8 +125,24 @@ class CompletionsLogger:
         The write itself still runs as its own ``tracked_task`` so the
         ``tracked_task_completed`` failure event consumed by the alert
         engine keeps flowing exactly as before.
+
+        Admission is lifecycle-gated: after ``stop`` (or during it) the
+        method refuses new payloads instead of queueing them behind a drain
+        that can no longer represent them, and if the worker task has died
+        unexpectedly the pending payloads are preserved and consumption is
+        restarted exactly once rather than left unconsumed.
         """
         if self._log_store is None:
+            return
+        if self._lifecycle is not _Lifecycle.RUNNING:
+            logger.error(
+                f"Request-log admission refused after shutdown: dropping payload "
+                f"for {request_id} (lifecycle={self._lifecycle.value})",
+                extra={
+                    "event": "request_log_admission_refused",
+                    "lifecycle": self._lifecycle.value,
+                },
+            )
             return
 
         try:
@@ -106,7 +152,33 @@ class CompletionsLogger:
             logger.debug(f"No event loop; dropping log payload for {request_id}")
             return
 
-        if self._queue is None or self._queue_loop is not loop or self._worker is None:
+        if self._worker is not None and self._worker.done():
+            # The consumer died (cancelled by a dead loop, an unexpected
+            # exception outside the per-row guard, a loop teardown). The
+            # queue's pending payloads are still the only copy of those
+            # rows — preserve them and restart consumption over the SAME
+            # queue, exactly once, so two consumers can never drain one
+            # queue concurrently. If the worker died on a different loop
+            # than this one, restarting on this loop would hand a second
+            # loop a queue it cannot share; keep the pending rows and
+            # refuse instead.
+            if self._queue_loop is not loop:
+                logger.error(
+                    f"Request-log worker died on its original loop; refusing "
+                    f"payload for {request_id} with {self._queue.qsize()} "
+                    "pending rows preserved",
+                    extra={"event": "request_log_worker_faulted"},
+                )
+                return
+            logger.error(
+                "Request-log worker terminated unexpectedly; restarting "
+                f"consumption over {self._queue.qsize()} pending rows",
+                extra={"event": "request_log_worker_faulted"},
+            )
+            self._worker = asyncio.create_task(self._drain_loop(), name="request_log_worker")
+            self._background_tasks.add(self._worker)
+            self._worker.add_done_callback(self._background_tasks.discard)
+        elif self._queue is None or self._queue_loop is not loop or self._worker is None:
             # Lazy, per-loop worker. One worker serializes the writes; a plain
             # task (not ``tracked_task``) because its completion is observable
             # through ``stop``, and it must not end a tracked-task window.
@@ -172,10 +244,23 @@ class CompletionsLogger:
         Called from ``bootstrap.shutdown`` BEFORE the log store is torn down:
         billing-critical rows queued in memory are written out (bounded by
         ``timeout``) instead of being lost when the process exits.
+
+        Moves the lifecycle RUNNING → STOPPING before draining (admission
+        is refused from the first await of this method, so late writes can
+        no longer join the drain being flushed) and to STOPPED once the
+        worker has actually ended — the worker reference is cleared only
+        after its task has been awaited to completion, never while a
+        producer could still observe it.
         """
+        if self._lifecycle is not _Lifecycle.RUNNING:
+            # Idempotent re-entry (or shutdown racing shutdown): nothing
+            # left to do that the first call did not do.
+            self._lifecycle = _Lifecycle.STOPPED
+            return
+        self._lifecycle = _Lifecycle.STOPPING
         worker, queue = self._worker, self._queue
-        self._worker = None
         if worker is None or queue is None:
+            self._lifecycle = _Lifecycle.STOPPED
             return
         try:
             if self._queue_loop is asyncio.get_running_loop():
@@ -190,15 +275,20 @@ class CompletionsLogger:
                 f"{queue.qsize()} queued payloads discarded"
             )
         except asyncio.CancelledError:
+            self._lifecycle = _Lifecycle.STOPPED
             raise
         finally:
             # The worker blocks on ``queue.get()`` once idle; end it on every
             # path. On the timeout path a write the worker was awaiting is
             # cancelled with the worker and aborts (its row is part of the
-            # discarded count logged above).
+            # discarded count logged above). The reference is cleared only
+            # after the task has been awaited, so a concurrent ``stop`` or a
+            # late ``schedule_log`` never sees a half-retired worker.
             worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await worker
+            self._worker = None
+            self._lifecycle = _Lifecycle.STOPPED
 
     # -- Routing observation forwarding -------------------------------------
 

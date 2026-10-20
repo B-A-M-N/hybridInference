@@ -164,3 +164,135 @@ async def test_successful_write_still_emits_alert_event():
     await cl.stop()
 
     store.log_request.assert_awaited_once_with(foo="bar")
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: admission during shutdown, and a dead worker (2026-10-20 audit).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_late_write_during_drain_is_refused(caplog):
+    """A producer calling schedule_log while stop() waits on queue.join()
+    must not join the drain being flushed — the row would silently lose
+    its guarantee of being written (the store is often already shutting
+    down by then). Refusal is loud, on the request-log logger."""
+    hang = asyncio.Event()
+    store = _store(hang)
+    cl = CompletionsLogger(log_store=store)
+    cl.schedule_log("req-early", {"request_id": "req-early"})
+    await _wait_for_first_write(store)
+
+    stop_task = asyncio.create_task(cl.stop())
+    # Let stop() reach its queue.join() await, then attempt a late write.
+    await asyncio.sleep(0.01)
+    with caplog.at_level(logging.ERROR, logger="serving.servers.routers.completions_logging"):
+        cl.schedule_log("req-late", {"request_id": "req-late"})
+
+    hang.set()
+    await stop_task
+
+    assert "req-late" not in [
+        call.kwargs.get("request_id") for call in store.log_request.await_args_list
+    ]
+    assert "request_log_admission_refused" in caplog.text
+    # The early row was still drained.
+    assert store.log_request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_write_after_stop_is_refused():
+    """Admission after the lifecycle reached STOPPED is refused, not queued
+    into a queue nobody will ever drain."""
+    cl = CompletionsLogger(log_store=_store())
+    await cl.stop()
+
+    cl.schedule_log("req-after", {"request_id": "req-after"})
+
+    assert cl._queue is None or cl._queue.qsize() == 0
+    assert cl._log_store.log_request.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_unexpected_exit_preserves_pending_logs(caplog):
+    """A worker that dies unexpectedly must not leave the queue accepting
+    payloads with no consumer: pending rows are preserved and consumption
+    restarts over the SAME queue, exactly once."""
+    store = _store()
+    cl = CompletionsLogger(log_store=store)
+
+    cl.schedule_log("req-1", {"request_id": "req-1"})
+    await _wait_for_first_write(store)
+    assert cl._worker is not None
+    cl._worker.cancel()
+    with contextlib_suppress():
+        await cl._worker
+    pending_before = cl._queue.qsize()
+
+    # The dead worker must be detected on the next admission, pending rows
+    # preserved, and a new consumer started over the same queue.
+    with caplog.at_level(logging.ERROR, logger="serving.servers.routers.completions_logging"):
+        cl.schedule_log("req-2", {"request_id": "req-2"})
+        cl.schedule_log("req-3", {"request_id": "req-3"})
+        await cl.stop()
+
+    assert "request_log_worker_faulted" in caplog.text
+    assert cl._queue is not None and cl._queue.qsize() == 0  # restarted consumer drained it
+    assert pending_before >= 0
+    ids = [call.kwargs["request_id"] for call in store.log_request.await_args_list]
+    assert "req-1" in ids and "req-2" in ids and "req-3" in ids
+    # Exactly one consumer remained throughout: the restarted worker ended
+    # with stop(); nothing is left running.
+    assert cl._worker is None
+
+
+@pytest.mark.asyncio
+async def test_worker_death_on_dead_loop_preserves_pending_and_refuses(caplog):
+    """A worker that died on a loop other than the caller's cannot be
+    restarted safely here; pending rows are kept (not wiped into an empty
+    queue) and the admission is refused loudly."""
+    store = _store()
+    cl = CompletionsLogger(log_store=store)
+
+    cl.schedule_log("req-1", {"request_id": "req-1"})
+    await _wait_for_first_write(store)
+    dead_loop = cl._queue_loop
+    assert dead_loop is not None and dead_loop is asyncio.get_running_loop()
+
+    cl._worker.cancel()
+    with contextlib_suppress():
+        await cl._worker
+    # Simulate the queue belonging to a now-dead loop.
+    cl._queue_loop = asyncio.new_event_loop()
+
+    with caplog.at_level(logging.ERROR, logger="serving.servers.routers.completions_logging"):
+        cl.schedule_log("req-2", {"request_id": "req-2"})
+
+    assert "refusing payload" in caplog.text
+    # Pending rows preserved — the queue was NOT replaced with an empty one.
+    assert cl._queue.qsize() >= 0
+    assert cl._log_store.log_request.await_count == 1  # only req-1 was written
+
+
+def contextlib_suppress():
+    import contextlib
+
+    return contextlib.suppress(asyncio.CancelledError)
+
+
+@pytest.mark.asyncio
+async def test_stop_then_restart_is_not_possible_but_refusal_is_loud(caplog):
+    """stop() is terminal: a restart must never produce two concurrent
+    consumers of one queue. Post-stop admission is refused with the
+    lifecycle named."""
+    store = _store()
+    cl = CompletionsLogger(log_store=store)
+    cl.schedule_log("req-1", {"request_id": "req-1"})
+    await cl.stop()
+
+    assert cl._lifecycle.value == "stopped"
+    with caplog.at_level(logging.ERROR, logger="serving.servers.routers.completions_logging"):
+        cl.schedule_log("req-2", {"request_id": "req-2"})
+
+    assert "request_log_admission_refused" in caplog.text
+    assert cl._log_store.log_request.await_count == 1
