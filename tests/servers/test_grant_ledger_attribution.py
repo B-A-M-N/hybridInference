@@ -122,7 +122,13 @@ async def test_an_embedding_call_is_attributed_too():
     """Embeddings build their metadata separately from the chat surfaces."""
     logger = _CapturingLogger()
     app = _build_embeddings_app(_FakeAdapter(response=_ok_response()), logger)
-    app.dependency_overrides[verify_api_key] = lambda: {**GRANT_CTX, "role": "internal"}
+    # The grant's model list must cover the embedding model too, or the
+    # surface's access gate refuses the call as outside the grant scope.
+    app.dependency_overrides[verify_api_key] = lambda: {
+        **GRANT_CTX,
+        "role": "internal",
+        "agent_allowed_models": ["emb-model"],
+    }
     before = time.time()
     resp = await _post_embeddings(app, {"model": "emb-model", "input": "hello"})
     assert resp.status_code == status.HTTP_200_OK
