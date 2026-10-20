@@ -104,14 +104,30 @@ class CompletionsLogger:
         response_body: Any,
         usage: dict[str, Any] | None,
     ) -> CompletionOutcome:
-        """Classify a completed response once, for every routing consumer.
+        """Classify a completed response once, for every logging consumer.
 
-        This is the single authoritative classification point. Both the streaming
-        and non-streaming completion paths funnel through
+        This is the single authoritative classification point *for the logging
+        layer* (completion outcomes recorded with the request log). Both the
+        streaming and non-streaming completion paths funnel through
         ``record_routing_observation``, so classifying here -- rather than at
-        each downstream consumer -- gives locality admission and endpoint health
-        one shared authority instead of letting each reconstruct a verdict from
-        partial local information.
+        each logging consumer -- gives the recorded outcome one shared authority
+        instead of letting each reconstruct a verdict from partial local
+        information.
+
+        Deliberately NOT the router's classification: routing already judged
+        this completion in its own success path
+        (``FixedRouter``/``RouteWiseRouter._on_success`` via
+        ``classify_completion_outcome``), at a different lifecycle boundary --
+        the router's verdict drives admission, breaker and locality state
+        inside the routing transaction, while this one stamps the durable log
+        row after the response is fully buffered. Sharing those two calls
+        would require threading an outcome carrier across the serving/routing
+        boundary; re-classifying here is the accepted cost (see the
+        classification benchmark in the PR notes: bounded regex work on text
+        already in memory, dwarfed by the DB write that follows). The two
+        share the same primitives -- ``response_text`` and
+        ``classify_completion_outcome`` -- so for a given body and usage they
+        agree; known divergence in tool-call extraction is tracked in review.
 
         Transport success is not semantic success: a provider can answer HTTP 200
         with a well-formed body whose only content is a warmup notice. On the
