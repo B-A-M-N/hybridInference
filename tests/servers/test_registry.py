@@ -1160,3 +1160,146 @@ def test_an_existing_alias_still_reaches_the_same_adapter(tmp_path, monkeypatch)
     assert exe.routes["legacy-name"] is exe.routes["real-model"]
     assert exe.canonical_id("legacy-name") == "real-model"
     assert exe.routes["legacy-name"].adapters[0][0] is exe.routes["real-model"].adapters[0][0]
+
+
+def _paid_and_free_yaml() -> str:
+    return (
+        "models:\n"
+        "  - id: claude-compat\n"
+        "    name: Claude Compat\n"
+        "    provider: openai_compat\n"
+        "    pricing:\n"
+        '      prompt: "1.20"\n'
+        '      completion: "4.80"\n'
+        "    route:\n"
+        "      - kind: openai_compat\n"
+        "        weight: 1.0\n"
+        "        base_url: https://compat.example.test/v1\n"
+        "  - id: free-chat\n"
+        "    name: Free Chat\n"
+        "    provider: openai_compat\n"
+        "    pricing:\n"
+        '      prompt: "0"\n'
+        '      completion: "0"\n'
+        "    route:\n"
+        "      - kind: openai_compat\n"
+        "        weight: 1.0\n"
+        "        base_url: https://free.example.test/v1\n"
+    )
+
+
+@pytest.mark.unit
+def test_a_paid_model_without_required_role_defaults_to_pro(tmp_path, monkeypatch):
+    """Issue #1576: a paid model whose YAML omits ``required_role`` must not
+    publish as free-tier.
+
+    The Claude compatibility routes carried real upstream costs but no
+    ``required_role``, so the loader's unconditional ``"free"`` default let
+    free-tier keys reach paid upstreams. A model that costs anything defaults
+    to ``pro``; an all-zero-priced model keeps the ``free`` default.
+    """
+    p = tmp_path / "models.yaml"
+    p.write_text(_paid_and_free_yaml())
+
+    exe = RouteExecutor()
+    registry.register_from_models_yaml(exe, Path(p))
+
+    assert exe.routes["claude-compat"].required_role == "pro"
+    assert exe.routes["free-chat"].required_role == "free"
+
+
+@pytest.mark.unit
+def test_explicit_required_role_still_wins_over_the_pricing_default(tmp_path):
+    """An explicit ``required_role`` is never overridden by pricing."""
+    yaml_text = (
+        "models:\n"
+        "  - id: sponsored-pro\n"
+        "    name: Sponsored Pro\n"
+        "    provider: openai_compat\n"
+        "    required_role: free\n"
+        "    pricing:\n"
+        '      prompt: "2.00"\n'
+        '      completion: "8.00"\n'
+        "    route:\n"
+        "      - kind: openai_compat\n"
+        "        weight: 1.0\n"
+        "        base_url: https://sponsored.example.test/v1\n"
+    )
+    p = tmp_path / "models.yaml"
+    p.write_text(yaml_text)
+
+    exe = RouteExecutor()
+    registry.register_from_models_yaml(exe, Path(p))
+
+    assert exe.routes["sponsored-pro"].required_role == "free"
+
+
+@pytest.mark.unit
+def test_route_level_pricing_makes_the_model_paid_even_when_model_pricing_is_zero(
+    tmp_path, monkeypatch
+):
+    """Paid-upstream routes are the actual cost carriers; a route-level price
+    alone must trip the paid default."""
+    yaml_text = (
+        "models:\n"
+        "  - id: hybrid-cost\n"
+        "    name: Hybrid Cost\n"
+        "    provider: openai_compat\n"
+        "    pricing:\n"
+        '      prompt: "0"\n'
+        '      completion: "0"\n'
+        "    route:\n"
+        "      - kind: openai_compat\n"
+        "        weight: 1.0\n"
+        "        base_url: https://local.example.test/v1\n"
+        "        pricing:\n"
+        '          prompt: "0.30"\n'
+        '          completion: "1.10"\n'
+        "      - kind: openai_compat\n"
+        "        weight: 1.0\n"
+        "        base_url: https://cloud.example.test/v1\n"
+    )
+    p = tmp_path / "models.yaml"
+    p.write_text(yaml_text)
+
+    exe = RouteExecutor()
+    registry.register_from_models_yaml(exe, Path(p))
+
+    assert exe.routes["hybrid-cost"].required_role == "pro"
+
+
+@pytest.mark.unit
+def test_a_scheduled_price_makes_the_model_paid(tmp_path):
+    """``pricing_schedule`` windows resolve to non-zero prices at runtime; the
+    loader sees only the base ``pricing`` dict, so the schedule itself must
+    count as a paid signal."""
+    yaml_text = (
+        "models:\n"
+        "  - id: scheduled\n"
+        "    name: Scheduled\n"
+        "    provider: openai_compat\n"
+        "    pricing:\n"
+        '      prompt: "0"\n'
+        '      completion: "0"\n'
+        "    pricing_schedule:\n"
+        '      effective_at: "2026-01-01T00:00:00Z"\n'
+        "      default:\n"
+        '        prompt: "0"\n'
+        '        completion: "0"\n'
+        "      windows:\n"
+        "        - start: '09:00'\n"
+        "          end: '17:00'\n"
+        "          pricing:\n"
+        '            prompt: "0.10"\n'
+        "    route:\n"
+        "      - kind: openai_compat\n"
+        "        weight: 1.0\n"
+        "        base_url: https://sched.example.test/v1\n"
+    )
+    p = tmp_path / "models.yaml"
+    p.write_text(yaml_text)
+
+    exe = RouteExecutor()
+    registry.register_from_models_yaml(exe, Path(p))
+
+    assert exe.routes["scheduled"].required_role == "pro"

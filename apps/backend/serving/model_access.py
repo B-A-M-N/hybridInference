@@ -3,11 +3,68 @@
 from __future__ import annotations
 
 import enum
+from collections.abc import Mapping
 from typing import Any
 
 from serving.config.settings import has_role
 
 DISABLED_MODELS_PREFERENCE_KEY = "disabled_models"
+
+
+def _pricing_mapping_indicates_paid(pricing: Any) -> bool:
+    """Whether a raw ``pricing`` mapping carries any non-zero price.
+
+    A price that cannot be parsed as a number counts as paid: an unprovable-
+    free cost defaults closed, like every other gate in this codebase.
+    """
+    if not isinstance(pricing, Mapping):
+        return False
+    for value in pricing.values():
+        try:
+            if float(value) != 0.0:
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+def model_pricing_indicates_paid(model: Mapping[str, Any]) -> bool:
+    """Whether a raw models.yaml model entry can cost money to serve.
+
+    Reads the same shapes the registry copies into adapters: model-level
+    ``pricing`` / ``pricing_schedule`` / ``pricing_source`` and their
+    route-level overrides. A schedule or source means runtime-resolved prices
+    the loader cannot prove are zero, so it counts as paid.
+    """
+    if _pricing_mapping_indicates_paid(model.get("pricing")):
+        return True
+    if model.get("pricing_schedule") is not None or model.get("pricing_source") is not None:
+        return True
+    routes = model.get("route")
+    if not isinstance(routes, list):
+        return False
+    for route in routes:
+        if not isinstance(route, Mapping):
+            continue
+        if _pricing_mapping_indicates_paid(route.get("pricing")):
+            return True
+        if route.get("pricing_schedule") is not None or route.get("pricing_source") is not None:
+            return True
+    return False
+
+
+def default_required_role_for_model(model: Mapping[str, Any]) -> str:
+    """The tier a models.yaml model publishes as when it does not name one.
+
+    Issue #1576: an omitted ``required_role`` used to publish every such model
+    free-tier — including the paid-upstream Claude compatibility routes. A
+    model that costs anything defaults to ``pro``; an all-zero-priced model
+    keeps the historical ``free`` default. An explicit value always wins, even
+    an invalid one (callers fail that closed themselves).
+    """
+    if "required_role" in model:
+        return str(model["required_role"])
+    return "pro" if model_pricing_indicates_paid(model) else "free"
 
 
 def normalize_disabled_models(value: Any) -> list[str]:
