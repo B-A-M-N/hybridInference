@@ -3258,11 +3258,13 @@ class RouteWiseRouter:
             # No req_ctx.UPSTREAM_PRIORITY here, deliberately: see the note on
             # _execute_stream_adapter.
             if lease is None and self.config.prefill_load_routing_enabled:
-                # Serialize fallback lease acquisition with candidate selection so
-                # the two cannot both reserve from the same stale load snapshot.
+                # Estimate outside the shared lock: it is pure token counting
+                # over request data no tracker mutation can change, and it
+                # does not need to lengthen the critical section. The acquire
+                # stays inside so the lease cannot reserve from a stale load
+                # snapshot (see the lock-split thread on this PR).
+                tracked_tokens = self._tracked_prefill_tokens(messages, params)
                 with self._prefill_load.routing_transaction():
-                    # Use the whole-request estimator, not just message content.
-                    tracked_tokens = self._tracked_prefill_tokens(messages, params)
                     lease = self._prefill_load.acquire(endpoint_id, tracked_tokens)
             with req_ctx.push(model=model_id, provider=adapter.config.provider):
                 self._ensure_health(endpoint_id)
@@ -3341,11 +3343,10 @@ class RouteWiseRouter:
             # whole-request estimation cost. Only the fallback path estimates and
             # acquires here (for direct/internal callers without that lease).
             if lease is None and self.config.prefill_load_routing_enabled:
-                # Serialize fallback lease acquisition with candidate selection so
-                # the two cannot both reserve from the same stale load snapshot.
+                # Estimate outside the shared lock; acquire inside. Same
+                # reasoning as _execute_adapter above.
+                tracked_tokens = self._tracked_prefill_tokens(messages, params)
                 with self._prefill_load.routing_transaction():
-                    # Use the whole-request estimator, not just message content.
-                    tracked_tokens = self._tracked_prefill_tokens(messages, params)
                     lease = self._prefill_load.acquire(endpoint_id, tracked_tokens)
             with req_ctx.push(model=model_id, provider=adapter.config.provider):
                 self._ensure_health(endpoint_id)
