@@ -55,6 +55,8 @@ interface PlaygroundSession {
 interface UndoAction {
   label: string;
   restore: () => void;
+  /** The session whose action this is: the timer pauses only while *it* streams. */
+  sessionId: string;
 }
 
 let messageCounter = 0;
@@ -200,6 +202,29 @@ export default function PlaygroundPage() {
   const counterRef = useRef(2);
   const followRef = useRef(true);
   const lastScrollTopRef = useRef(0);
+  // Which session is on screen right now, as a ref so an animation-frame
+  // callback reads the current answer rather than the one captured when the
+  // stream began: the user can switch sessions mid-stream.
+  const visibleSessionRef = useRef<string>(activeSessionId);
+
+  useEffect(() => {
+    visibleSessionRef.current = activeSessionId;
+  }, [activeSessionId]);
+
+  // Navigating away must not leave generations running until the network or
+  // idle timeout ends them: every live abort controller fires on unmount. The
+  // per-turn `finally` stays authoritative for its own scratch state (raf
+  // cancel, streaming-set removal, aborted stamp) — this only pulls the
+  // network plug.
+  useEffect(() => {
+    const controllers = abortControllersRef.current;
+    return () => {
+      for (const controller of controllers.values()) {
+        controller.abort();
+      }
+      controllers.clear();
+    };
+  }, []);
 
   const session = sessions.find((s) => s.id === activeSessionId) ?? sessions[0];
   const modelId = session?.selectedModelId || '';
@@ -253,12 +278,15 @@ export default function PlaygroundPage() {
     loadModels();
   }, [state.user?.role, loadModels]);
 
-  // The countdown waits for a stream to finish: Undo is disabled until then.
+  // The countdown waits for *its* session's stream to finish: Undo is
+  // disabled until then. Scoped to the Undo's own session, so a stream in
+  // another session neither blocks nor restarts this timer.
+  const undoPaused = undo !== null && streamingIds.has(undo.sessionId);
   useEffect(() => {
-    if (!undo || streaming) return;
+    if (!undo || undoPaused) return;
     const timer = setTimeout(() => setUndo(null), UNDO_MS);
     return () => clearTimeout(timer);
-  }, [undo, streaming]);
+  }, [undo, undoPaused]);
 
   /** Scroll to the newest message, unless the reader has scrolled away (`force` overrides). */
   const scrollDown = useCallback((behavior: ScrollBehavior = 'auto', force = false) => {
@@ -321,7 +349,14 @@ export default function PlaygroundPage() {
       turn.raf = requestAnimationFrame(() => {
         turn.raf = null;
         flushDelta(sessionId, turn);
-        scrollDown('auto');
+        // Only the session the reader is looking at follows the stream: a
+        // background turn still lands its deltas in its own session, but it
+        // must not yank the visible one's scroll position. The ref, not the
+        // value captured when the stream began, because the user can switch
+        // sessions mid-generation.
+        if (visibleSessionRef.current === sessionId) {
+          scrollDown('auto');
+        }
       });
     },
     [flushDelta, scrollDown],
@@ -386,6 +421,7 @@ export default function PlaygroundPage() {
     if (snapshot.length > 0 || draft) {
       setUndo({
         label: 'Conversation cleared',
+        sessionId,
         restore: () => restoreMessages(sessionId, snapshot, draft, cleared),
       });
     }
@@ -420,6 +456,7 @@ export default function PlaygroundPage() {
       }
       setUndo({
         label: `Deleted "${getSessionTitle(removed)}"`,
+        sessionId: id,
         restore: () => {
           setSessions((prev) =>
             prev.some((s) => s.id === id)
@@ -687,6 +724,7 @@ export default function PlaygroundPage() {
       isUsableReply(last)
         ? {
             label: 'Replaced the last reply',
+            sessionId,
             restore: () => restoreMessages(sessionId, snapshot, ''),
           }
         : null,
@@ -709,6 +747,7 @@ export default function PlaygroundPage() {
     );
     setUndo({
       label: 'Moved your last message back to the editor',
+      sessionId,
       restore: () =>
         setSessions((prev) =>
           prev.map((s) =>
@@ -1292,7 +1331,7 @@ export default function PlaygroundPage() {
                     <div className="flex shrink-0 items-center gap-3">
                       <button
                         type="button"
-                        disabled={streaming}
+                        disabled={undoPaused}
                         onClick={() => {
                           undo.restore();
                           setUndo(null);
