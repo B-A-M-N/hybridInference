@@ -57,6 +57,9 @@ from serving.servers.routers.routing_info import (
     build_initial_routing_info,
     merge_adapter_routing,
 )
+from serving.servers.routers.served_identity import (
+    served_identity_headers,
+)
 from serving.servers.streaming_state import (
     REQUEST_TIMEOUT_SCOPE_STATE_KEY,
     STREAMING_RESPONSE_SCOPE_STATE_KEY,
@@ -513,6 +516,9 @@ async def chat_completions(
     suppress_synthetic_logging = is_synthetic_probe and not log_synthetic_probes
 
     model = payload.model
+    # The client's own spelling, taken before auto selection rewrites the
+    # payload: the X-FI-Requested-Model header's value (issue #1504).
+    requested_model = model
     messages = [m.model_dump() for m in payload.messages]
 
     # Debug-only: log inbound message roles to verify client behavior.
@@ -631,6 +637,30 @@ async def chat_completions(
         metadata["auto"] = auto_selection.log_metadata()
     # The model name the client is shown, when it is not the one serving it.
     response_model = auto_selection.requested if auto_selection is not None else None
+
+    # X-FI-* response headers, static part: what was requested and, when auto
+    # selection is not concealing it, what will serve. The serving endpoint and
+    # provider are only known here when the route has exactly one backend —
+    # multi-backend routes pick an adapter lazily inside the router, and by the
+    # time the choice is known the response headers are already on the wire;
+    # the exact identity reaches the logs through ``_routing`` (issue #1504).
+    def get_single_route_identity() -> tuple[str | None, str | None]:
+        """Return (provider, endpoint_id) when the route has exactly one backend."""
+        route_config = router_exec.routes.get(model)
+        if route_config is None or len(route_config.adapters) != 1:
+            return None, None
+        only_adapter = route_config.adapters[0][0]
+        return getattr(only_adapter.config, "provider", None), endpoint_id_for_adapter(only_adapter)
+
+    single_provider, single_endpoint = get_single_route_identity()
+    identity_headers = served_identity_headers(
+        requested_model=requested_model,
+        # Auto conceals which model serves: the endpoint and provider name the
+        # same model, so they are withheld with it.
+        served_model=None if auto_selection is not None else model,
+        endpoint_id=None if auto_selection is not None else single_endpoint,
+        provider=None if auto_selection is not None else single_provider,
+    )
 
     # Check if model has routing configured
     if model not in router_exec.routes:
@@ -952,6 +982,7 @@ async def chat_completions(
                 provider_header = get_single_route_provider()
                 if provider_header:
                     http_response.headers["X-Provider"] = provider_header
+            http_response.headers.update(identity_headers)
 
             # This path emits keepalive whitespace to keep intermediaries alive;
             # without no-transform / no-buffering a CDN (e.g. Cloudflare) can
@@ -1007,6 +1038,7 @@ async def chat_completions(
         response_headers = {
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
+            **identity_headers,
         }
         if is_synthetic_probe:
             provider_header = get_single_route_provider()
@@ -1183,6 +1215,16 @@ async def chat_completions(
 
         if is_synthetic_probe and provider != "router":
             http_response.headers["X-Provider"] = provider
+        # Non-streaming: the adapter has run, so the enriched routing carries
+        # the exact served endpoint, not just a single-route guess.
+        http_response.headers.update(
+            served_identity_headers(
+                requested_model=requested_model,
+                served_model=None if auto_selection is not None else model,
+                endpoint_id=None if auto_selection is not None else routing.endpoint_id,
+                provider=provider if provider != "router" and auto_selection is None else None,
+            )
+        )
         if isinstance(response, dict) and isinstance(response.get("usage"), dict):
             # The client's copy only: the response model requires all three totals.
             return {**response, "usage": sanitize_usage(response["usage"], complete=True)}

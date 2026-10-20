@@ -165,6 +165,10 @@ async def test_small_budget_reasoning_call_is_rerouted(reroute_client, monkeypat
     assert "example-qwen.test" in captured["url"]
     sent_max = captured["json"].get("max_tokens") or captured["json"].get("max_completion_tokens")
     assert sent_max >= 512
+    # The X-FI-* headers are the one place the client sees that the served
+    # model is not the one it named (issue #1504).
+    assert r.headers["x-fi-requested-model"] == REASONING_MODEL
+    assert r.headers["x-fi-served-model"] == FAST_MODEL
 
 
 @pytest.mark.asyncio

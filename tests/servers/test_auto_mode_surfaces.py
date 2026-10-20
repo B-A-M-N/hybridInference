@@ -366,6 +366,23 @@ async def test_bare_auto_is_the_default_tier(gateway):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "body"), _SURFACES[:2])
+async def test_auto_served_headers_carry_the_request_but_not_the_serving_identity(
+    gateway, path, body
+):
+    """Auto's concealment extends to the X-FI-* served-identity headers.
+
+    The requested model is the caller's own string, but which model, endpoint
+    or provider served it is exactly what auto declines to say (issue #1504).
+    """
+    response = await gateway.post(path, body("auto-balance"), SESSION)
+
+    assert response.status_code == 200
+    assert response.headers["x-fi-requested-model"] == "auto-balance"
+    assert not any(name.lower().startswith("x-fi-served") for name in response.headers)
+
+
+@pytest.mark.asyncio
 async def test_every_chunk_of_a_streamed_chat_names_the_auto_model(gateway):
     response = await gateway.post("/v1/chat/completions", _chat("auto-balance", stream=True))
 
