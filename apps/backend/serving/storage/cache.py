@@ -307,6 +307,13 @@ class CachedOperationalStore(OperationalStore):
             await self._cache.delete_pattern("auth:*")
             await self._cache.delete_pattern("auth_light:*")
 
+    async def suspend_user(self, user_id: str, **fields: Any) -> None:
+        """Delegate then invalidate the user and every auth entry (status and keys changed)."""
+        await self._store.suspend_user(user_id, **fields)
+        await self._cache.delete(self._user_key(user_id))
+        await self._cache.delete_pattern("auth:*")
+        await self._cache.delete_pattern("auth_light:*")
+
     async def update_user_last_login(self, user_id: str) -> None:
         """Delegate then invalidate user cache."""
         await self._store.update_user_last_login(user_id)
@@ -421,19 +428,14 @@ class CachedOperationalStore(OperationalStore):
         recover_stale_claim: bool = False,
     ) -> None:
         """Delegate then invalidate user + auth caches."""
-        if recover_stale_claim:
-            await self._store.resume_user(
-                user_id,
-                admin_ip=admin_ip,
-                admin_id=admin_id,
-                reason=reason,
-                email=email,
-                recover_stale_claim=True,
-            )
-        else:
-            await self._store.resume_user(
-                user_id, admin_ip=admin_ip, admin_id=admin_id, reason=reason, email=email
-            )
+        await self._store.resume_user(
+            user_id,
+            admin_ip=admin_ip,
+            admin_id=admin_id,
+            reason=reason,
+            email=email,
+            recover_stale_claim=recover_stale_claim,
+        )
         await self._cache.delete(self._user_key(user_id))
         await self._cache.delete_pattern("auth:*")
         await self._cache.delete_pattern("auth_light:*")
@@ -618,6 +620,10 @@ class CachedOperationalStore(OperationalStore):
         """Delegate to wrapped store."""
         return await self._store.list_user_activity_providers(days=days)
 
+    async def get_bulk_user_usage_totals(self, user_ids: list[str]) -> dict[str, Row]:
+        """Delegate to wrapped store."""
+        return await self._store.get_bulk_user_usage_totals(user_ids)
+
     async def list_users(
         self,
         *,
@@ -640,6 +646,7 @@ class CachedOperationalStore(OperationalStore):
         provider: str | None = None,
         active_within_hours: int | None = None,
         anomaly: bool | None = None,
+        include_usage_totals: bool = True,
     ) -> tuple[int, list[Row], Row]:
         """Delegate to wrapped store."""
         return await self._store.list_users(
@@ -654,6 +661,7 @@ class CachedOperationalStore(OperationalStore):
             provider=provider,
             active_within_hours=active_within_hours,
             anomaly=anomaly,
+            include_usage_totals=include_usage_totals,
         )
 
     async def update_key_last_used(self, key_id: int) -> None:
@@ -843,8 +851,9 @@ class CachedOperationalStore(OperationalStore):
         """Bind or update a verified email atomically without merging identities."""
         bound = await self._store.bind_user_email(user_id, email)
         if bound:
+            # Nothing is cached by e-mail address; the user and auth entries
+            # carry it.
             await self._cache.delete(self._user_key(user_id))
-            await self._cache.delete(self._email_key(email))
             await self._cache.delete_pattern("auth:*")
             await self._cache.delete_pattern("auth_light:*")
         return bound

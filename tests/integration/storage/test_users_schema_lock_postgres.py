@@ -9,24 +9,26 @@ the columns that exist, refuses the writes that need the new ones with
 free. Refusing to start instead crash-looped the backend until the backup ended.
 
 Each test builds the ``users`` and ``login_events`` tables of the release before
-#1515 (``git show e6eb9a17~1:apps/backend/serving/storage/postgres_operational.py``)
+#1515 as of the claim-state lease columns (#1463 adds
+``hard_delete_claimed_at``/``hard_delete_claim_recovered`` to the required-at-
+startup floor, so the pre-upgrade fixture carries them)
+(``git show e6eb9a17~1:apps/backend/serving/storage/postgres_operational.py``)
 in a schema of its own, so the shared test database's tables are not touched.
 """
 
 from __future__ import annotations
 
-import os
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
-import asyncpg
 import pytest
 import pytest_asyncio
 
 from serving.exceptions import AccountSchemaPending
 from serving.servers import bootstrap
-from serving.storage import account_schema
+from serving.storage import account_schema, log_schema
 from serving.storage.log_schema import (
     SchemaLockUnavailable,
     ensure_api_logs_schema,
@@ -36,11 +38,27 @@ from serving.storage.postgres_operational import (
     PostgresOperationalStore,
     RequiredOperationalSchemaUnavailable,
 )
+from tests.fixtures import postgres
+
+if TYPE_CHECKING:
+    import asyncpg
 
 pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
 
-_ALLOWED_TEST_DB_PATTERN = "_test_"
 _ACCOUNT_COLUMNS = {"login_name", "phone", "phone_verified"}
+
+
+@pytest.fixture(autouse=True)
+def _short_lock_wait(monkeypatch):
+    """Time out on the held lock in a fraction of the production bound.
+
+    Every test here holds the lock for as long as it wants the migration to
+    defer, so the timeout always fires and its length decides nothing but how
+    long the file runs: at the production 3s it was ~25s, the longest file in
+    the database suite and so the floor of a parallel run.
+    """
+    monkeypatch.setattr(log_schema, "_DDL_LOCK_TIMEOUT", "300ms")
+
 
 _PRE_UPGRADE_USERS = """
     CREATE TABLE users (
@@ -57,6 +75,8 @@ _PRE_UPGRADE_USERS = """
                               'pending_approval', 'rejected')),
         hard_delete_pending BOOLEAN NOT NULL DEFAULT FALSE,
         hard_delete_claim_token TEXT,
+        hard_delete_claimed_at TIMESTAMPTZ,
+        hard_delete_claim_recovered BOOLEAN NOT NULL DEFAULT FALSE,
         approval_note TEXT,
         reviewed_at TIMESTAMPTZ,
         reviewed_by TEXT,
@@ -117,40 +137,17 @@ _ADMIN = {
 }
 
 
-def _connection_settings() -> dict[str, object]:
-    base_db_name = os.getenv("TEST_DB_NAME", "hybridinference_test_db")
-    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "master")
-    test_db_name = base_db_name if worker_id == "master" else f"{base_db_name}_{worker_id}"
-    if _ALLOWED_TEST_DB_PATTERN not in (test_db_name or ""):
-        pytest.fail(
-            f"SAFETY: TEST_DB_NAME='{test_db_name}' does not contain "
-            f"'{_ALLOWED_TEST_DB_PATTERN}'. Refusing to run."
-        )
-    return {
-        "host": os.getenv("TEST_DB_HOST", "localhost"),
-        "port": int(os.getenv("TEST_DB_PORT", "5432")),
-        "database": test_db_name,
-        "user": os.getenv("TEST_DB_USER", "postgres"),
-        "password": os.getenv("TEST_DB_PASSWORD", "postgres"),
-    }
-
-
 @pytest_asyncio.fixture
 async def pool(monkeypatch):
     """A pool whose search path is a fresh schema holding the pre-#1515 tables."""
     # The store publishes what it reads for SQL outside it; leave the process
     # with the complete schema whatever happens below.
     monkeypatch.setattr(account_schema, "_current", account_schema.COMPLETE)
-    settings = _connection_settings()
-    try:
-        admin = await asyncpg.connect(**settings)
-    except Exception as exc:
-        pytest.skip(f"PostgreSQL not available: {exc}")
-        return  # unreachable
+    admin = await postgres.connect()
     schema = f"users_upgrade_{secrets.token_hex(4)}"
     await admin.execute(f"CREATE SCHEMA {schema}")
-    pool = await asyncpg.create_pool(
-        **settings, min_size=1, max_size=4, server_settings={"search_path": schema}
+    pool = await postgres.create_pool(
+        min_size=1, max_size=4, server_settings={"search_path": schema}
     )
     try:
         async with pool.acquire() as conn:
