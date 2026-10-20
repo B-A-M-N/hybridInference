@@ -272,8 +272,9 @@ def public_model_names(
 
     A model is public when ``PUBLIC_MODEL_ROLE`` meets its required role, after
     the runtime override. A role the entry names explicitly is read as written
-    (unknown names never satisfy the public role); an omitted role reads as the
-    same pricing-derived default the registry's gate enforces, and
+    (unknown names never satisfy the public role); an omitted role reads as
+    the same cost-derived default the registry's gate enforces (a paid or
+    unknown-cost model publishes as pro; a provably free one stays free), and
     ``admin_only`` always hides. An auto model is public when its tier has a
     public candidate.
 
@@ -286,9 +287,10 @@ def public_model_names(
         if not isinstance(model, dict) or model.get("id") is None:
             continue
         model_id = str(model["id"])
-        # Same default the registry's gate derives (issue #1576): a paid model
-        # without an explicit required_role publishes as pro, so the public
-        # page's visibility agrees with what the gate enforces.
+        # Same default the registry's gate derives (issue #1576): a paid or
+        # unknown-cost model without an explicit required_role publishes as
+        # pro, so the public page's visibility agrees with what the gate
+        # enforces.
         role = overrides.get(model_id) or default_required_role_for_model(model)
         if model.get("admin_only") or not has_role(PUBLIC_MODEL_ROLE, role):
             continue
