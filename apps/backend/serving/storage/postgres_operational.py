@@ -20,7 +20,7 @@ from serving.exceptions import (
     HardDeleteStateChanged,
     SelfDeleteRefused,
 )
-from serving.storage import account_schema
+from serving.storage import account_schema, user_usage_rollup
 from serving.storage.account_schema import (
     COMPLETE as COMPLETE_ACCOUNT_SCHEMA,
     AccountSchema,
@@ -52,6 +52,29 @@ if TYPE_CHECKING:
     import asyncpg
 
 logger = get_logger(__name__)
+
+# Distinct ``api_logs.provider`` values with a row in the last $1 days; see
+# ``PostgresOperationalStore.list_user_activity_providers``.
+ACTIVITY_PROVIDERS_SQL = """
+WITH RECURSIVE seen(provider) AS (
+    (SELECT provider FROM api_logs WHERE provider > ''
+     ORDER BY provider LIMIT 1)
+    UNION ALL
+    SELECT (SELECT l.provider FROM api_logs l WHERE l.provider > seen.provider
+            ORDER BY l.provider LIMIT 1)
+    FROM seen
+    WHERE seen.provider IS NOT NULL
+)
+SELECT provider FROM seen
+WHERE provider IS NOT NULL
+  AND EXISTS (
+      SELECT 1 FROM api_logs l
+      WHERE l.provider = seen.provider
+        AND l.timestamp >= NOW() - make_interval(days => $1)
+  )
+ORDER BY provider
+"""
+
 
 # Columns of a single-user lookup (get_user_by_id / _by_email / _by_login_name),
 # in select order. The account columns among them that the users table does not
@@ -1370,6 +1393,28 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         async with self._pool.acquire() as conn:
             await conn.execute(sql, *params)
 
+    async def suspend_user(self, user_id: str, **fields: Any) -> None:
+        """Suspend *user_id* and revoke its keys and sessions atomically."""
+        from .base import USERS_MUTABLE_COLUMNS
+
+        fields = {**fields, "status": "suspended"}
+        invalid = set(fields) - USERS_MUTABLE_COLUMNS.keys()
+        if invalid:
+            raise ValueError(f"Invalid column(s) for users: {invalid}")
+        set_parts = []
+        params: list[Any] = [user_id]
+        for idx, (key, val) in enumerate(fields.items(), start=2):
+            set_parts.append(f"{USERS_MUTABLE_COLUMNS[key]} = ${idx}")
+            params.append(val)
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.execute(f"UPDATE users SET {', '.join(set_parts)} WHERE id = $1", *params)
+            await conn.execute("UPDATE api_keys SET status = 'revoked' WHERE user_id = $1", user_id)
+            await conn.execute(
+                "UPDATE auth_sessions SET revoked = TRUE "
+                "WHERE user_id = $1 AND revoked IS NOT TRUE",
+                user_id,
+            )
+
     async def update_user_last_login(self, user_id: str) -> None:
         """Set ``last_login_at`` to the current timestamp."""
         async with self._pool.acquire() as conn:
@@ -1650,44 +1695,23 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         """Distinct ``api_logs.provider`` values seen in the last *days* days.
 
         Same table and window as the ``provider`` filter in ``list_users``.
+
+        A skip scan of ``idx_api_logs_provider`` ``(provider, timestamp DESC)``:
+        the recursive part walks the index from one distinct provider to the
+        next, and each is kept if its newest row falls in the window -- one
+        index probe each. A ``SELECT DISTINCT`` over the window read every row
+        of the last *days* days instead, ~15 s on staging for a dozen providers.
         """
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT DISTINCT provider FROM api_logs "
-                "WHERE provider IS NOT NULL AND provider <> '' "
-                "AND timestamp >= NOW() - make_interval(days => $1) "
-                "ORDER BY provider",
-                days,
-            )
+            rows = await conn.fetch(ACTIVITY_PROVIDERS_SQL, days)
         return [str(row["provider"]) for row in rows]
-
-    @staticmethod
-    async def _fetch_user_usage_totals(
-        conn: asyncpg.Connection, user_ids: list[str]
-    ) -> dict[str, Row]:
-        # Scan lifetime logs once for both metrics. The cost rollup excludes
-        # free requests and cannot supply these counts.
-        rows = await conn.fetch(
-            "SELECT user_id, COUNT(*) AS requests, "
-            "COALESCE(SUM(total_tokens), 0) AS tokens FROM api_logs "
-            "WHERE user_id = ANY($1::text[]) GROUP BY user_id",
-            user_ids,
-        )
-        totals = {uid: {"requests": 0, "tokens": 0} for uid in user_ids}
-        totals.update(
-            {
-                r["user_id"]: {"requests": int(r["requests"]), "tokens": int(r["tokens"])}
-                for r in rows
-            }
-        )
-        return totals
 
     async def get_bulk_user_usage_totals(self, user_ids: list[str]) -> dict[str, Row]:
         """Return lifetime totals separately so user management can load first."""
         if not user_ids:
             return {}
         async with self._pool.acquire() as conn:
-            return await self._fetch_user_usage_totals(conn, user_ids)
+            return await user_usage_rollup.fetch_totals(conn, user_ids)
 
     async def list_users(
         self,
@@ -1722,10 +1746,11 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         for this implementation).
 
         ``sort_by`` also supports ``requests`` (all-time request count) and
-        ``tokens`` (all-time ``total_tokens`` total). Both are derived from
-        ``api_logs`` — the request count is ``COUNT(*)`` of logged rows rather
-        than ``user_daily_cost.requests``, which only tracks billable
-        (cost > 0) requests and would miss free/zero-cost calls. Both metrics
+        ``tokens`` (all-time ``total_tokens`` total). Both count every logged
+        ``api_logs`` row, read through the daily rollup in
+        :mod:`serving.storage.user_usage_rollup` -- not
+        ``user_daily_cost.requests``, which only tracks billable (cost > 0)
+        requests and would miss free/zero-cost calls. Both metrics
         are returned by default. With ``include_usage_totals=False``, metrics
         not needed for sorting are ``None`` and can be fetched separately.
 
@@ -1830,15 +1855,14 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         needs_today = needs_today_filter or needs_alltime_sort
         needs_month = needs_month_filter or needs_alltime_sort
         needs_alltime = needs_alltime_sort
-        # All-time request count and all-time token total — both derived from
-        # api_logs (one row per logged request). The request count must come
-        # from api_logs rather than the user_daily_cost rollup: the rollup is
-        # only incremented for billable (cost > 0) requests, so zero-priced /
-        # free / local-model calls would be missed. Each is joined into the row
-        # query as a CTE only when that column is the active sort key; otherwise
-        # both are enriched per-page after the main query (like cost_alltime).
-        needs_requests_sort = sort_by == "requests"
-        needs_tokens_sort = sort_by == "tokens"
+        # All-time request count and all-time token total — both count every
+        # logged api_logs row, through the daily rollup in user_usage_rollup.
+        # The request count must not come from user_daily_cost: it is only
+        # incremented for billable (cost > 0) requests, so zero-priced / free /
+        # local-model calls would be missed. Both are joined into the row query
+        # as one CTE when either is the active sort key; otherwise both are
+        # enriched per-page after the main query (like cost_alltime).
+        needs_usage_sort = sort_by in ("requests", "tokens")
 
         # Cost-based scalar correlated subqueries — placed in WHERE so
         # filters apply before LIMIT/OFFSET.
@@ -1846,7 +1870,7 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             where_clauses.append(
                 f"COALESCE((SELECT SUM(cost_usd) FROM api_logs l "
                 f"  WHERE l.user_id = u.id "
-                f"    AND l.timestamp >= date_trunc('day', NOW() AT TIME ZONE 'UTC')), 0) "
+                f"    AND l.timestamp >= (date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')), 0) "
                 f">= ${len(filter_params) + 1}"
             )
             filter_params.append(min_cost_today)
@@ -1854,7 +1878,7 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             where_clauses.append(
                 f"COALESCE((SELECT SUM(cost_usd) FROM api_logs l "
                 f"  WHERE l.user_id = u.id "
-                f"    AND l.timestamp >= date_trunc('month', NOW() AT TIME ZONE 'UTC')), 0) "
+                f"    AND l.timestamp >= (date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')), 0) "
                 f">= ${len(filter_params) + 1}"
             )
             filter_params.append(min_cost_month)
@@ -1870,8 +1894,8 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                 f"    AND kq.quota_daily_cost_usd > 0 "
                 f"    AND COALESCE((SELECT SUM(cost_usd) FROM api_logs l "
                 f"                  WHERE l.user_id = u.id "
-                f"                    AND l.timestamp >= date_trunc('day', "
-                f"                                                  NOW() AT TIME ZONE 'UTC')"
+                f"                    AND l.timestamp >= (date_trunc('day', "
+                f"                        NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')"
                 f"                 ), 0) >= {threshold} * kq.quota_daily_cost_usd"
                 f")"
             )
@@ -1926,8 +1950,8 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             "cost_month": "COALESCE(um.cost, 0) DESC, fu.created_at DESC, fu.id",
             "cost_alltime": "COALESCE(ua.cost, 0) DESC, fu.created_at DESC, fu.id",
             "last_login": "fu.last_login_at DESC NULLS LAST, fu.created_at DESC, fu.id",
-            "requests": "COALESCE(ureq.n, 0) DESC, fu.created_at DESC, fu.id",
-            "tokens": "COALESCE(utok.n, 0) DESC, fu.created_at DESC, fu.id",
+            "requests": "COALESCE(ux.request_count, 0) DESC, fu.created_at DESC, fu.id",
+            "tokens": "COALESCE(ux.total_tokens, 0) DESC, fu.created_at DESC, fu.id",
         }
         order_clause = _sort_clauses[sort_by]
 
@@ -1984,7 +2008,7 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                     "  SELECT user_id, COALESCE(SUM(cost_usd), 0) AS cost"
                     "  FROM api_logs"
                     "  WHERE user_id IN (SELECT id FROM filtered_users)"
-                    "    AND timestamp >= date_trunc('day', NOW() AT TIME ZONE 'UTC')"
+                    "    AND timestamp >= (date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')"
                     "  GROUP BY user_id"
                     ")"
                 )
@@ -1997,7 +2021,7 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                     "  SELECT user_id, COALESCE(SUM(cost_usd), 0) AS cost"
                     "  FROM api_logs"
                     "  WHERE user_id IN (SELECT id FROM filtered_users)"
-                    "    AND timestamp >= date_trunc('month', NOW() AT TIME ZONE 'UTC')"
+                    "    AND timestamp >= (date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')"
                     "  GROUP BY user_id"
                     ")"
                 )
@@ -2016,42 +2040,30 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                 join_parts.append("LEFT JOIN usage_alltime ua ON ua.user_id = fu.id")
                 select_extras.append("COALESCE(ua.cost, 0) AS usage_alltime")
 
-            if needs_requests_sort:
-                cte_parts.append(
-                    "usage_requests AS ("
-                    "  SELECT user_id, COUNT(*) AS n"
-                    "  FROM api_logs"
-                    "  WHERE user_id IN (SELECT id FROM filtered_users)"
-                    "  GROUP BY user_id"
-                    ")"
+            stored_usage = needs_usage_sort and await user_usage_rollup.stored_ready(conn)
+            if needs_usage_sort:
+                usage_totals = user_usage_rollup.metrics_sql(
+                    "IN (SELECT id FROM filtered_users)", stored=stored_usage
                 )
-                join_parts.append("LEFT JOIN usage_requests ureq ON ureq.user_id = fu.id")
-                select_extras.append("COALESCE(ureq.n, 0) AS usage_alltime_requests")
-
-            if needs_tokens_sort:
-                cte_parts.append(
-                    "usage_tokens AS ("
-                    "  SELECT user_id, COALESCE(SUM(total_tokens), 0) AS n, COUNT(*) AS requests"
-                    "  FROM api_logs"
-                    "  WHERE user_id IN (SELECT id FROM filtered_users)"
-                    "  GROUP BY user_id"
-                    ")"
-                )
-                join_parts.append("LEFT JOIN usage_tokens utok ON utok.user_id = fu.id")
-                select_extras.append("COALESCE(utok.n, 0) AS usage_alltime_tokens")
-                select_extras.append("COALESCE(utok.requests, 0) AS usage_alltime_requests")
+                cte_parts.append(f"usage_totals AS ({usage_totals})")
+                join_parts.append("LEFT JOIN usage_totals ux ON ux.user_id = fu.id")
+                select_extras.append("COALESCE(ux.request_count, 0) AS usage_alltime_requests")
+                select_extras.append("COALESCE(ux.total_tokens, 0) AS usage_alltime_tokens")
 
             extra_cols = ", " + ", ".join(select_extras) if select_extras else ""
             joins = " ".join(join_parts)
             ctes = ", ".join(cte_parts)
 
-            rows = await conn.fetch(
-                f"WITH {ctes} "
-                f"SELECT fu.*{extra_cols} FROM filtered_users fu {joins} "
-                f"ORDER BY {order_clause} "
-                f"LIMIT ${limit_idx} OFFSET ${offset_idx}",
-                *query_params,
-            )
+            async with conn.transaction():
+                if stored_usage:
+                    await conn.execute(user_usage_rollup.NO_JIT_SQL)
+                rows = await conn.fetch(
+                    f"WITH {ctes} "
+                    f"SELECT fu.*{extra_cols} FROM filtered_users fu {joins} "
+                    f"ORDER BY {order_clause} "
+                    f"LIMIT ${limit_idx} OFFSET ${offset_idx}",
+                    *query_params,
+                )
 
             if not rows:
                 return total, [], status_counts
@@ -2065,7 +2077,7 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                     "SELECT user_id, COALESCE(SUM(cost_usd), 0) AS cost "
                     "FROM api_logs "
                     "WHERE user_id = ANY($1::text[]) "
-                    "  AND timestamp >= date_trunc('day', NOW() AT TIME ZONE 'UTC') "
+                    "  AND timestamp >= (date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') "
                     "GROUP BY user_id",
                     user_ids,
                 )
@@ -2078,7 +2090,7 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                     "SELECT user_id, COALESCE(SUM(cost_usd), 0) AS cost "
                     "FROM api_logs "
                     "WHERE user_id = ANY($1::text[]) "
-                    "  AND timestamp >= date_trunc('month', NOW() AT TIME ZONE 'UTC') "
+                    "  AND timestamp >= (date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') "
                     "GROUP BY user_id",
                     user_ids,
                 )
@@ -2098,11 +2110,11 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             else:
                 alltime_map = {}
 
-            # Expensive lifetime statistics must not block the lightweight
-            # list. Sorting by either metric still uses the full filtered set.
+            # Callers that load lifetime statistics separately skip them here.
+            # Sorting by either metric already returned both above.
             totals = (
-                await self._fetch_user_usage_totals(conn, user_ids)
-                if include_usage_totals and not needs_tokens_sort
+                await user_usage_rollup.fetch_totals(conn, user_ids)
+                if include_usage_totals and not needs_usage_sort
                 else {}
             )
 

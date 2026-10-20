@@ -512,8 +512,13 @@ export interface AdminPerformanceMetricsWindow {
 }
 
 export interface AdminPerformanceMetricsResponse {
-  generated_at: string;
+  /** When the server computed these; null while its first computation runs. */
+  generated_at: string | null;
   windows: AdminPerformanceMetricsWindow[];
+  /** The server is computing new ones; ask again to get them. */
+  refreshing: boolean;
+  /** Why the last computation failed, if none has succeeded since. */
+  refresh_error?: string | null;
 }
 
 export async function getPerformanceMetrics({
@@ -544,11 +549,31 @@ export interface AdminTtftScatterModel {
 }
 
 export interface AdminTtftScatterResponse {
+  /** When the server computed this scatter; null while its first computation runs. */
+  generated_at: string | null;
   models: AdminTtftScatterModel[];
+  /** The server is computing a new one; ask again to get it. */
+  refreshing: boolean;
+  /** Why the last computation failed, if none has succeeded since. */
+  refresh_error?: string | null;
 }
 
-export async function getTtftScatter(): Promise<AdminTtftScatterResponse> {
-  const resp = await fetchWithAuth(API_BASE, '/admin/ttft-scatter');
+/**
+ * The TTFT scatter; with `provider`, only that provider's series (every
+ * provider's together run to megabytes).
+ */
+export async function getTtftScatter({
+  refresh = false,
+  provider,
+}: { refresh?: boolean; provider?: string } = {}): Promise<AdminTtftScatterResponse> {
+  const params = new URLSearchParams();
+  if (refresh) params.set('refresh', 'true');
+  if (provider !== undefined) params.set('provider', provider);
+  const query = params.toString();
+  const resp = await fetchWithAuth(
+    API_BASE,
+    query ? `/admin/ttft-scatter?${query}` : '/admin/ttft-scatter',
+  );
   return jsonOrThrow<AdminTtftScatterResponse>(resp);
 }
 
