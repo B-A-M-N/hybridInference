@@ -246,6 +246,68 @@ async def test_chat_completions_stream_carries_requested_identity(chat_client):
     assert r.headers["x-fi-served-provider"] == "zai"
 
 
+@pytest.mark.asyncio
+async def test_forced_streaming_branch_carries_the_headers(chat_app):
+    """The keepalive branch returns its StreamingResponse directly, so the
+    headers must ride on that object — injected-parameter headers are not
+    merged into a returned Response."""
+
+    class _Forced:
+        async def get_bool(self, key: str) -> bool:
+            return key == "force_chat_completions_streaming"
+
+    from serving.config.runtime_settings import get_runtime_settings
+
+    chat_app.dependency_overrides[get_runtime_settings] = lambda: _Forced()
+
+    transport = ASGITransport(app=chat_app)
+    from httpx import AsyncClient as _AC
+
+    async with _AC(transport=transport, base_url="http://test") as client:
+        r = await client.post(
+            "/v1/chat/completions",
+            json={"model": CHAT_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
+        )
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/json")
+    assert r.headers["x-fi-requested-model"] == CHAT_MODEL
+    assert r.headers["x-fi-served-model"] == CHAT_MODEL
+    assert r.headers["x-fi-served-endpoint"] == f"{CHAT_MODEL}:zai-api"
+    assert r.headers["x-fi-served-provider"] == "zai"
+
+
+@pytest.mark.asyncio
+async def test_multi_backend_streaming_withholds_unresolved_served_fields(chat_app):
+    """With two backends the serving adapter is chosen after the headers are
+    on the wire, so the served endpoint/provider are withheld, not guessed."""
+
+    class _SecondAdapter(DummyAdapter):
+        pass
+
+    second = _SecondAdapter(_chat_cfg(CHAT_MODEL + "-b"))
+    chat_app.state.services.router.register_route(
+        CHAT_MODEL,
+        [(chat_app.state.services.router.routes[CHAT_MODEL].adapters[0][0], 0.5), (second, 0.5)],
+    )
+    transport = ASGITransport(app=chat_app)
+    from httpx import AsyncClient as _AC
+
+    async with _AC(transport=transport, base_url="http://test") as client:
+        r = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": CHAT_MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+            },
+        )
+    assert r.status_code == 200
+    assert r.headers["x-fi-requested-model"] == CHAT_MODEL
+    assert r.headers["x-fi-served-model"] == CHAT_MODEL
+    assert "x-fi-served-endpoint" not in r.headers
+    assert "x-fi-served-provider" not in r.headers
+
+
 # ---------------------------------------------------------------------------
 # Header sanitizer
 # ---------------------------------------------------------------------------
@@ -263,6 +325,8 @@ async def test_chat_completions_stream_carries_requested_identity(chat_client):
         ("glm-4.6:gpu-7-api", "sglang", "sglang"),
         ("glm-4.6:my-internal-box", "zai", "zai"),
         ("glm-4.6:.local-api", "zai", "zai"),
+        # A trailing newline must not smuggle an unsanitized shape through.
+        ("glm-4.6:zai-api\n", "zai", "zai"),
         (None, "zai", "zai"),
         (None, None, None),
         ("", "zai", "zai"),

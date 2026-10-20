@@ -982,7 +982,6 @@ async def chat_completions(
                 provider_header = get_single_route_provider()
                 if provider_header:
                     http_response.headers["X-Provider"] = provider_header
-            http_response.headers.update(identity_headers)
 
             # This path emits keepalive whitespace to keep intermediaries alive;
             # without no-transform / no-buffering a CDN (e.g. Cloudflare) can
@@ -991,6 +990,10 @@ async def chat_completions(
             streaming_headers: dict[str, str] = {
                 "Cache-Control": "no-cache, no-transform",
                 "X-Accel-Buffering": "no",
+                # The response object is returned directly, so its headers must
+                # be complete here: FastAPI does not merge the injected
+                # parameter's headers into a returned Response.
+                **identity_headers,
             }
             if is_synthetic_probe:
                 provider_header = get_single_route_provider()

@@ -53,7 +53,7 @@ def header_endpoint_id(endpoint_id: str | None, provider: str | None) -> str | N
         return provider
     _model, sep, location = endpoint_id.rpartition(":")
     candidate = location if sep else endpoint_id
-    if _SAFE_LOCATION_RE.match(candidate):
+    if _SAFE_LOCATION_RE.fullmatch(candidate):
         return endpoint_id
     return provider
 
