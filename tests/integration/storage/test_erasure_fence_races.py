@@ -1289,6 +1289,106 @@ async def test_superseded_worker_cannot_continue_after_fence(fence_store):
     await op_store.renew_hard_delete_user_claim(_OWNER, recovered_claim.token)
 
 
+async def test_blocked_log_store_commit_is_recovered_and_late_release_is_inert(fence_store):
+    """A worker blocked in the log store loses its claim; its late release is inert.
+
+    Cross-store fault injection. A log write that started before the purge holds
+    the account's shared advisory lock, so the worker's fence-and-purge
+    transaction cannot commit. While it is blocked, its operational claim ages
+    past the recovery grace and a second worker takes it over. The late worker
+    can neither renew nor release its superseded claim: clearing it would make
+    resume possible while the first worker may still be unwinding.
+    """
+    store, pool = fence_store
+    op_store = _initialized_operational_store(pool)
+
+    first_claim = await op_store.begin_hard_delete_user(_OWNER)
+    assert first_claim.provenance is HardDeleteClaimProvenance.NEW
+
+    writer_ready = asyncio.Event()
+    release_writer = asyncio.Event()
+
+    async def _blocked_log_commit() -> None:
+        """Hold the shared lock a real in-flight log write would hold."""
+        conn = await pool.acquire()
+        try:
+            async with conn.transaction():
+                key = fence_account_digest(_OWNER, _SECRET)
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock_shared($1)",
+                    fence_account_advisory_key(key),
+                )
+                assert not await check_erasure_fence(conn, fence_keys=[key])
+                writer_ready.set()
+                await release_writer.wait()
+        finally:
+            await pool.release(conn)
+
+    async def _wait_for_blocked_worker(observer) -> None:
+        """Wait until some session is queued on an advisory lock."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        baseline = await observer.fetchval(
+            "SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted"
+        )
+        while True:
+            waiting = await observer.fetchval(
+                "SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted"
+            )
+            if waiting > baseline:
+                return
+            assert loop.time() < deadline, "the worker never blocked on the fence lock"
+            await asyncio.sleep(0.01)
+
+    writer = asyncio.create_task(_blocked_log_commit())
+    await writer_ready.wait()
+
+    blocked_worker = asyncio.create_task(store.hard_delete_user_data(_OWNER))
+    try:
+        async with pool.acquire() as observer:
+            await _wait_for_blocked_worker(observer)
+
+        # The claim ages past its recovery grace while the worker is blocked.
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET hard_delete_claimed_at = NOW() - INTERVAL '2 hours' "
+                "WHERE id = $1",
+                _OWNER,
+            )
+        recovered_claim = await op_store.begin_hard_delete_user(
+            _OWNER,
+            recovery_mode=HardDeleteRecoveryMode.PRE_FENCE_OPERATOR,
+        )
+        assert recovered_claim.provenance is HardDeleteClaimProvenance.RECOVERED
+        assert recovered_claim.token != first_claim.token
+
+        # The still-blocked worker cannot continue its own workflow.
+        with pytest.raises(HardDeleteStateChanged, match="no longer belongs"):
+            await op_store.renew_hard_delete_user_claim(_OWNER, first_claim.token)
+    finally:
+        release_writer.set()
+        await writer
+
+    # The blocked transaction commits once the writer releases, so the fence is
+    # durable even though the worker that started it lost its claim.
+    await blocked_worker
+    assert await store.account_has_erasure_fence(_OWNER) is True
+
+    # Its late release must not clear the recovered claim or re-open resume.
+    await op_store.release_hard_delete_user_claim(_OWNER, first_claim.token)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT hard_delete_pending, hard_delete_claim_token, "
+            "hard_delete_claim_recovered FROM users WHERE id = $1",
+            _OWNER,
+        )
+    assert row["hard_delete_pending"] is True
+    assert row["hard_delete_claim_token"] == recovered_claim.token
+    assert row["hard_delete_claim_recovered"] is True
+    assert await _count_identifying(pool, _OWNER) == 0
+
+
 async def test_hard_delete_route_stops_after_claim_recovery_between_stages(
     fence_store, monkeypatch
 ):
