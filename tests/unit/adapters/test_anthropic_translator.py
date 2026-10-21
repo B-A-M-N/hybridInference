@@ -829,6 +829,87 @@ def test_stream_text_then_tool_then_text_emits_correct_block_ordering():
     assert "Done!" in text_deltas
 
 
+def test_stream_text_mid_tool_call_does_not_reopen_an_orphan_tool_block():
+    """Issue #876 P1: text interleaved with one tool call's argument fragments.
+
+    Some providers emit a content fragment between two argument-continuation
+    deltas of the SAME tool call (index 0). The text must open a new text
+    block and close the open tool block for the wire's one-open-block rule,
+    but it must NOT forget the tool call: the next argument fragment for the
+    same OpenAI index belongs to the block that was already started, so it
+    continues that block's partial_json. The old code cleared _tool_blocks on
+    text, so the continuation reopened an orphan tool_use block with an empty
+    id and name — an unparseable call on the client.
+    """
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    parts = [
+        _openai_chunk({"role": "assistant"}),
+        _openai_chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city"'},
+                    }
+                ]
+            }
+        ),
+        # Interleaved text mid-tool-call.
+        _openai_chunk({"content": "Checking the weather..."}),
+        # Continuation of the SAME tool call (same index 0).
+        _openai_chunk({"tool_calls": [{"index": 0, "function": {"arguments": ':"SF"}'}}]}),
+        _openai_chunk({}, finish_reason="tool_calls"),
+    ]
+    out = b""
+    for c in parts:
+        out += b"".join(t.feed(c))
+    out += b"".join(t.finalize())
+    events = _events([out])
+
+    tool_starts = [
+        e
+        for e in events
+        if e[0] == "content_block_start" and e[1]["content_block"]["type"] == "tool_use"
+    ]
+    # Exactly ONE tool block for the one upstream call — not a reopened orphan.
+    assert len(tool_starts) == 1
+    assert tool_starts[0][1]["content_block"]["id"] == "call_1"
+    assert tool_starts[0][1]["content_block"]["name"] == "get_weather"
+
+    # The two argument fragments join into one valid JSON object on the
+    # single tool block.
+    json_pieces = [
+        e[1]["delta"]["partial_json"]
+        for e in events
+        if e[0] == "content_block_delta" and e[1]["delta"]["type"] == "input_json_delta"
+    ]
+    assert "".join(json_pieces) == '{"city":"SF"}'
+    assert all(
+        e[1]["index"] == tool_starts[0][1]["index"]
+        for e in events
+        if e[0] == "content_block_delta" and e[1]["delta"]["type"] == "input_json_delta"
+    )
+
+    # The interleaved text still made it out as its own text block.
+    text_deltas = [
+        e[1]["delta"]["text"]
+        for e in events
+        if e[0] == "content_block_delta" and e[1]["delta"]["type"] == "text_delta"
+    ]
+    assert text_deltas == ["Checking the weather..."]
+
+    # And the wire still respects one-open-block-at-a-time with ordered stops.
+    open_at = set()
+    for name, data in events:
+        if name == "content_block_start":
+            assert data["index"] not in open_at, f"block {data['index']} reopened"
+            open_at.add(data["index"])
+        elif name == "content_block_stop":
+            open_at.discard(data["index"])
+
+
 def test_extract_usage_from_anthropic_sse():
     chunk = (
         b"event: message_start\n"
