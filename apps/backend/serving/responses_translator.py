@@ -29,6 +29,7 @@ import uuid
 from typing import TYPE_CHECKING, Any
 
 from serving.utils.messages import merge_leading_system_messages
+from serving.utils.token_utils import normalize_usage
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -356,6 +357,64 @@ def _map_status(finish_reason: str | None) -> tuple[str, dict[str, Any] | None]:
     return "completed", None
 
 
+#: Cache-evidence states, kept deliberately separate from the wire value. The
+#: public Responses shape must carry a numeric ``cached_tokens`` for SDK
+#: compatibility, so an unreported measurement is serialised as 0; that
+#: compatibility zero is not evidence and must not be read as a measured miss.
+CACHE_EVIDENCE_UNREPORTED = "unreported"
+CACHE_EVIDENCE_MISS = "reported_miss"
+CACHE_EVIDENCE_HIT = "reported_hit"
+
+
+def _cache_token_count(
+    chat_usage: dict[str, Any] | None,
+) -> tuple[int | None, str]:
+    """``(cached_tokens, evidence_state)`` for one chat usage block.
+
+    ``cached_tokens`` is ``None`` when the upstream reported no cache measurement
+    at all, which is deliberately distinct from ``0`` (a measured miss).
+
+    Evidence is read from :func:`normalize_usage` -- the exact dict the logging
+    layer persists to ``api_logs.cache_read_tokens`` -- rather than by re-parsing
+    the raw block. Two independent field lists had already drifted: the logging
+    layer recognises the provider-native shapes (``prompt_cache_hit_tokens`` for
+    DeepSeek, ``cache_read_input_tokens`` for Anthropic, the MiniMax
+    ``*_tokens_details`` variants), and it sanitises counts *before* extracting,
+    so a numeric string or an unreadable value is resolved the same way here as
+    there. Deriving from the same output makes divergence impossible by
+    construction instead of by keeping two lists in step.
+    """
+    if not isinstance(chat_usage, dict):
+        return None, CACHE_EVIDENCE_UNREPORTED
+    normalized = normalize_usage(chat_usage) or {}
+    cache_read = normalized.get("cache_read_tokens")
+    if cache_read is None:
+        return None, CACHE_EVIDENCE_UNREPORTED
+    state = CACHE_EVIDENCE_HIT if cache_read > 0 else CACHE_EVIDENCE_MISS
+    return cache_read, state
+
+
+def cache_evidence_state(chat_usage: dict[str, Any] | None) -> str:
+    """Three-state cache evidence for a chat usage block.
+
+    ``unreported`` / ``reported_miss`` / ``reported_hit``. Use this for logging,
+    RouteWise learning, and diagnostics; the wire ``cached_tokens`` value is not
+    evidence, because an unreported measurement is serialised as 0.
+    """
+    return _cache_token_count(chat_usage)[1]
+
+
+def map_usage_with_evidence(
+    chat_usage: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Map chat usage to the Responses shape, plus the cache-evidence state.
+
+    The wire shape is unchanged and SDK-compatible; the state travels alongside
+    it so callers can record what the provider actually measured.
+    """
+    return _map_usage(chat_usage), cache_evidence_state(chat_usage)
+
+
 def _map_usage(chat_usage: dict[str, Any] | None) -> dict[str, Any] | None:
     """Translate chat ``usage`` to the Responses usage shape."""
     if not chat_usage:
@@ -367,15 +426,19 @@ def _map_usage(chat_usage: dict[str, Any] | None) -> dict[str, Any] | None:
     # shapes (prompt_tokens_details.cached_tokens /
     # completion_tokens_details.reasoning_tokens) so cache/reasoning tokens are
     # not under-reported for providers that emit the nested form.
-    prompt_details = chat_usage.get("prompt_tokens_details") or {}
     completion_details = chat_usage.get("completion_tokens_details") or {}
-    cached = int(chat_usage.get("cache_read_tokens") or prompt_details.get("cached_tokens") or 0)
+    cached, _evidence_state = _cache_token_count(chat_usage)
     reasoning = int(
         chat_usage.get("reasoning_tokens") or completion_details.get("reasoning_tokens") or 0
     )
     return {
         "input_tokens": input_tokens,
-        "input_tokens_details": {"cached_tokens": cached},
+        "input_tokens_details": {
+            # The public shape requires a numeric field, so an unreported
+            # measurement is serialised as 0. cache_evidence_state() is what
+            # tells that compatibility zero apart from a measured miss.
+            "cached_tokens": cached if cached is not None else 0,
+        },
         "output_tokens": output_tokens,
         "output_tokens_details": {"reasoning_tokens": reasoning},
         "total_tokens": total,
@@ -482,7 +545,7 @@ def chat_response_to_responses(
         "store": store,
     }
     _echo_request_fields(response, request_body)
-    usage = _map_usage(chat.get("usage"))
+    usage, _cache_state = map_usage_with_evidence(chat.get("usage"))
     if usage is not None:
         response["usage"] = usage
     return response
@@ -537,6 +600,10 @@ class ResponsesStreamTranslator:
 
         self._seq = 0
         self._created_emitted = False
+        #: Cache evidence for the final usage block: unreported / reported_miss /
+        #: reported_hit. Kept separate from the wire value, which serialises an
+        #: unreported measurement as 0 for SDK compatibility.
+        self._cache_evidence_state = CACHE_EVIDENCE_UNREPORTED
         # Position in the response ``output`` array, assigned-then-incremented
         # per output item so the first emitted item is always index 0 (whether
         # it is text or a tool call).
@@ -900,7 +967,7 @@ class ResponsesStreamTranslator:
         final = self._skeleton(status)
         final["incomplete_details"] = incomplete
         final["output"] = output
-        usage = _map_usage(self._usage)
+        usage, self._cache_evidence_state = map_usage_with_evidence(self._usage)
         if usage is not None:
             final["usage"] = usage
         self._final_response = final
