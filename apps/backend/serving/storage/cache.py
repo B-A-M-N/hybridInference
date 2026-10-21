@@ -12,10 +12,12 @@ CacheBackend.
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import math
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 from .base import OperationalStore, ProviderDefinitionRow, ProviderKeyRow, Row
@@ -33,7 +35,16 @@ if TYPE_CHECKING:
 
 
 class CacheBackend(ABC):
-    """Minimal async cache interface. Implementations must be concurrency-safe."""
+    """Minimal async cache interface. Implementations must be concurrency-safe.
+
+    Generational publication is supported through the *generation* parameter of
+    :meth:`set`.  A reader passes the generation it observed before it began the
+    underlying read; a publication whose generation differs from the store's
+    current generation is dropped.  Implementations that do not track
+    generations treat every publication as current, which is safe only for
+    caches without invalidation events -- :class:`InMemoryCache` below is the
+    canonical tracking implementation.
+    """
 
     @abstractmethod
     async def get(self, key: str) -> Any | None:
@@ -51,42 +62,141 @@ class CacheBackend(ABC):
     async def delete_pattern(self, pattern: str) -> None:
         """Remove all keys matching a glob *pattern* (e.g. ``user:*``)."""
 
+    # -- generation hooks (optional; a tracking implementation overrides) ----
 
-# ---------------------------------------------------------------------------
-# In-memory TTL cache
-# ---------------------------------------------------------------------------
+    def current_generation(self) -> int:
+        """Monotonic counter bumped by every invalidation event."""
+        return 0
+
+    def bump_generation(self) -> int:
+        """Advance the generation counter and return the new value."""
+        return 0
+
+    # -- observability (optional) -------------------------------------------
+
+    def stats(self) -> dict[str, int]:
+        """Snapshot of size / hits / misses / evictions counters."""
+        return {"size": 0, "hits": 0, "misses": 0, "evictions": 0}
 
 
 class InMemoryCache(CacheBackend):
-    """Dict-based TTL cache. Per-process, suitable for single-instance VPS."""
+    """Bounded, TTL-expiring, LRU cache. Per-process, single-instance VPS.
 
-    def __init__(self) -> None:
-        self._store: dict[str, tuple[Any, float]] = {}  # key → (value, expires_at)
+    Every method is serialized behind one lock. This is not optimistic: the
+    auth hot path issues far more reads than writes, and the whole point of
+    the generation fence is that an invalidation racing a fill *must not*
+    interleave between the fill's generation check and its publication.
+    Holding the lock across both is the only way to make that promise, and the
+    critical section is a few dict operations -- microseconds, not I/O.
+    """
+
+    def __init__(self, max_entries: int = 4096) -> None:
+        if max_entries < 1:
+            raise ValueError("max_entries must be >= 1")
+        self._store: OrderedDict[str, tuple[Any, float]] = OrderedDict()
+        self._lock = asyncio.Lock()
+        self._generation = 0
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+        self._max_entries = max_entries
+
+    # -- internal helpers (lock must be held) -------------------------------
+
+    def _expired(self, expires_at: float) -> bool:
+        return time.monotonic() > expires_at
+
+    def _evict_lru_if_needed(self) -> None:
+        """Drop least-recently-used entries until size <= max_entries."""
+        while len(self._store) > self._max_entries:
+            _, _ = self._store.popitem(last=False)
+            self._evictions += 1
+
+    def _purge_expired_locked(self, bound: int = 256) -> None:
+        """Drop up to *bound* expired entries, oldest-first, without scanning
+        the whole map on every miss."""
+        now = time.monotonic()
+        purged = 0
+        expired_keys = [k for k, (_, exp) in self._store.items() if now > exp]
+        for k in expired_keys[:bound]:
+            del self._store[k]
+            purged += 1
+        if purged:
+            # Expiry is a form of eviction for observability purposes.
+            self._evictions += purged
+
+    # -- CacheBackend API ----------------------------------------------------
 
     async def get(self, key: str) -> Any | None:
         """Return cached value or None on miss / expiry."""
-        entry = self._store.get(key)
-        if entry is None:
-            return None
-        value, expires_at = entry
-        if time.monotonic() > expires_at:
-            del self._store[key]
-            return None
-        return value
+        async with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                self._misses += 1
+                self._purge_expired_locked()
+                return None
+            value, expires_at = entry
+            if self._expired(expires_at):
+                del self._store[key]
+                self._evictions += 1
+                self._misses += 1
+                return None
+            self._hits += 1
+            # LRU: most recently used goes to the end.
+            self._store.move_to_end(key)
+            return value
 
     async def set(self, key: str, value: Any, ttl: int) -> None:
         """Store *value* with monotonic-clock expiry."""
-        self._store[key] = (value, time.monotonic() + ttl)
+        async with self._lock:
+            self._store[key] = (value, time.monotonic() + ttl)
+            self._store.move_to_end(key)
+            self._evict_lru_if_needed()
 
     async def delete(self, key: str) -> None:
-        """Remove a single key."""
-        self._store.pop(key, None)
+        """Remove a single key.
+
+        Bumps the generation unconditionally: an invalidation event is an
+        epoch marker, not a hit count. A fill that raced this call must see
+        a different generation afterwards even when no key matched, because
+        the *intent* of the write was to invalidate.
+        """
+        async with self._lock:
+            self._store.pop(key, None)
+            self._generation += 1
 
     async def delete_pattern(self, pattern: str) -> None:
-        """Remove all keys matching a glob *pattern*."""
-        to_delete = [k for k in self._store if fnmatch.fnmatch(k, pattern)]
-        for k in to_delete:
-            del self._store[k]
+        """Remove all keys matching a glob *pattern*.
+
+        Bumps the generation unconditionally, for the same reason as
+        :meth:`delete` — a fill racing this call must not publish its
+        snapshot even when nothing matched.
+        """
+        async with self._lock:
+            to_delete = [k for k in self._store if fnmatch.fnmatch(k, pattern)]
+            for k in to_delete:
+                del self._store[k]
+            self._generation += 1
+
+    # -- generation hooks ----------------------------------------------------
+
+    def current_generation(self) -> int:
+        return self._generation
+
+    def bump_generation(self) -> int:
+        self._generation += 1
+        return self._generation
+
+    # -- observability -------------------------------------------------------
+
+    def stats(self) -> dict[str, int]:
+        """Snapshot of size / hits / misses / evictions counters."""
+        return {
+            "size": len(self._store),
+            "hits": self._hits,
+            "misses": self._misses,
+            "evictions": self._evictions,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -213,35 +323,44 @@ class CachedOperationalStore(OperationalStore):
         return result
 
     async def get_user_by_id(self, user_id: str) -> Row | None:
-        """Return cached user row (60 s TTL)."""
+        """Return cached user row (60 s TTL).
+
+        Generation-fenced: the generation observed before the read is captured,
+        and the snapshot is only published if it still matches. An invalidation
+        that races the read therefore wins, and a stale row never lands in the
+        cache after the write that made it stale.
+        """
         ck = self._user_key(user_id)
         cached = await self._cache.get(ck)
         if cached is not None:
             return cached
+        gen_before = self._cache.current_generation()
         result = await self._store.get_user_by_id(user_id)
-        if result is not None:
+        if result is not None and self._cache.current_generation() == gen_before:
             await self._cache.set(ck, result, _USER_TTL)
         return result
 
     async def get_auth_context_by_key_hash(self, key_hash: str) -> Row | None:
-        """Return cached auth context (30 s TTL)."""
+        """Return cached auth context (30 s TTL), generation-fenced."""
         ck = self._auth_key(key_hash)
         cached = await self._cache.get(ck)
         if cached is not None:
             return cached
+        gen_before = self._cache.current_generation()
         result = await self._store.get_auth_context_by_key_hash(key_hash)
-        if result is not None:
+        if result is not None and self._cache.current_generation() == gen_before:
             await self._cache.set(ck, result, _AUTH_CONTEXT_TTL)
         return result
 
     async def get_auth_context_lightweight(self, key_hash: str) -> Row | None:
-        """Return cached lightweight auth context (30 s TTL)."""
+        """Return cached lightweight auth context (30 s TTL), generation-fenced."""
         ck = self._auth_light_key(key_hash)
         cached = await self._cache.get(ck)
         if cached is not None:
             return cached
+        gen_before = self._cache.current_generation()
         result = await self._store.get_auth_context_lightweight(key_hash)
-        if result is not None:
+        if result is not None and self._cache.current_generation() == gen_before:
             await self._cache.set(ck, result, _AUTH_CONTEXT_TTL)
         return result
 
@@ -268,10 +387,11 @@ class CachedOperationalStore(OperationalStore):
         cached = await self._cache.get(ck)
         if cached is not None:
             return cached
+        gen_before = self._cache.current_generation()
         result = await self._store.get_key_owner_for_audit(key_hash)
         if result is not None:
             ttl = _audit_entry_ttl(result)
-            if ttl > 0:
+            if ttl > 0 and self._cache.current_generation() == gen_before:
                 await self._cache.set(ck, result, ttl)
         return result
 
