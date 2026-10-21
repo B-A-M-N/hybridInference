@@ -223,6 +223,54 @@ def test_request_tool_choice_named_tool():
     }
 
 
+def test_request_tool_choice_none_is_translated_not_dropped():
+    # Issue #876 P3: {"type":"none"} is a real instruction — "the caller
+    # attached tool definitions but this turn must not use them" — and the
+    # OpenAI dialect spells it "none". Dropping it silently degraded the
+    # request to the model's default tool behavior.
+    body = {
+        "model": "glm-4.7",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "x"}],
+        "tools": [{"name": "get_weather", "description": "", "input_schema": {}}],
+        "tool_choice": {"type": "none"},
+    }
+    _, params = anthropic_request_to_openai(body)
+    assert params["tool_choice"] == "none"
+
+
+def test_request_disable_parallel_tool_use_maps_to_parallel_tool_calls():
+    # Issue #876 P3 (same bullet): Anthropic expresses "one tool call per
+    # turn" as tool_choice.disable_parallel_tool_use; the OpenAI dialect's
+    # spelling is the top-level parallel_tool_calls flag.
+    body = {
+        "model": "glm-4.7",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "x"}],
+        "tools": [{"name": "get_weather", "description": "", "input_schema": {}}],
+        "tool_choice": {"type": "auto", "disable_parallel_tool_use": True},
+    }
+    _, params = anthropic_request_to_openai(body)
+    assert params["tool_choice"] == "auto"
+    assert params["parallel_tool_calls"] is False
+
+
+def test_request_parallel_tool_use_flag_only_set_when_true():
+    # Anthropic only ever sends the flag to disable; when it is absent or
+    # false the OpenAI request must not carry a parallel_tool_calls key at
+    # all — a provider default of True must not be second-guessed, and an
+    # explicit False would be indistinguishable from the disabled spelling.
+    body = {
+        "model": "glm-4.7",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "x"}],
+        "tools": [{"name": "get_weather", "description": "", "input_schema": {}}],
+        "tool_choice": {"type": "auto"},
+    }
+    _, params = anthropic_request_to_openai(body)
+    assert "parallel_tool_calls" not in params
+
+
 def test_request_metadata_user_id_to_user_field():
     body = {
         "model": "glm-4.7",

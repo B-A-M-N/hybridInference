@@ -388,6 +388,17 @@ def _translate_params(body: dict[str, Any]) -> dict[str, Any]:
         tc = _translate_tool_choice(body["tool_choice"])
         if tc is not None:
             params["tool_choice"] = tc
+        # Anthropic spells "at most one tool call this turn" as a flag inside
+        # tool_choice; the OpenAI dialect's switch is the top-level
+        # parallel_tool_calls (issue #876 P3). Anthropic only ever sends the
+        # flag to disable, so the key is written only for True — a provider's
+        # OpenAI-dialect default of True must not be second-guessed, and an
+        # explicit False would be indistinguishable from the disabled spelling.
+        if (
+            isinstance(body["tool_choice"], dict)
+            and body["tool_choice"].get("disable_parallel_tool_use") is True
+        ):
+            params["parallel_tool_calls"] = False
     metadata = body.get("metadata") or {}
     user_id = metadata.get("user_id")
     if user_id:
@@ -411,6 +422,10 @@ def _translate_tool_choice(tc: Any) -> Any:
         return "auto"
     if t == "any":
         return "required"
+    if t == "none":
+        # A real instruction, not an absence of one: the caller attached the
+        # tool definitions but this turn must not use them (issue #876 P3).
+        return "none"
     if t == "tool" and tc.get("name"):
         return {"type": "function", "function": {"name": tc["name"]}}
     return None

@@ -641,6 +641,12 @@ class OpenAICompatAdapter(BaseAdapter):
             "reasoning_effort",
             "thinking",
             "tool_stream",
+            # The Anthropic translator spells tool_choice's
+            # disable_parallel_tool_use as this top-level switch (issue #876
+            # P3). Like reasoning_effort it only travels for models whose
+            # supported_params declare it: a provider that rejects the field
+            # must not start seeing it.
+            "parallel_tool_calls",
         )
         for name in passthrough_params:
             if name in params and name in self.config.supported_params:
