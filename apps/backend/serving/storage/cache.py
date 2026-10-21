@@ -240,15 +240,13 @@ class CachedOperationalStore(OperationalStore):
         await self._store.update_user_fields(user_id, **fields)
         await self._cache.delete(self._user_key(user_id))
         if fields.keys() & {"role", "status"}:
-            await self._cache.delete_pattern("auth:*")
-            await self._cache.delete_pattern("auth_light:*")
+            await self.invalidate_auth_caches()
 
     async def suspend_user(self, user_id: str, **fields: Any) -> None:
         """Delegate then invalidate the user and every auth entry (status and keys changed)."""
         await self._store.suspend_user(user_id, **fields)
         await self._cache.delete(self._user_key(user_id))
-        await self._cache.delete_pattern("auth:*")
-        await self._cache.delete_pattern("auth_light:*")
+        await self.invalidate_auth_caches()
 
     async def update_user_last_login(self, user_id: str) -> None:
         """Delegate then invalidate user cache."""
@@ -276,23 +274,20 @@ class CachedOperationalStore(OperationalStore):
         )
         await self._cache.delete(self._user_key(user_id))
         # Also purge any auth entries referencing this user's keys
-        await self._cache.delete_pattern("auth:*")
-        await self._cache.delete_pattern("auth_light:*")
+        await self.invalidate_auth_caches()
 
     async def begin_hard_delete_user(self, user_id: str) -> str:
         """Claim a hard-delete in the wrapped store and invalidate caches."""
         claim_token = await self._store.begin_hard_delete_user(user_id)
         await self._cache.delete(self._user_key(user_id))
-        await self._cache.delete_pattern("auth:*")
-        await self._cache.delete_pattern("auth_light:*")
+        await self.invalidate_auth_caches()
         return claim_token
 
     async def release_hard_delete_user_claim(self, user_id: str, claim_token: str) -> None:
         """Release a failed pre-fence claim and invalidate user caches."""
         await self._store.release_hard_delete_user_claim(user_id, claim_token)
         await self._cache.delete(self._user_key(user_id))
-        await self._cache.delete_pattern("auth:*")
-        await self._cache.delete_pattern("auth_light:*")
+        await self.invalidate_auth_caches()
 
     async def resume_user(
         self,
@@ -308,8 +303,7 @@ class CachedOperationalStore(OperationalStore):
             user_id, admin_ip=admin_ip, admin_id=admin_id, reason=reason, email=email
         )
         await self._cache.delete(self._user_key(user_id))
-        await self._cache.delete_pattern("auth:*")
-        await self._cache.delete_pattern("auth_light:*")
+        await self.invalidate_auth_caches()
 
     async def hard_delete_user(
         self,
@@ -331,8 +325,7 @@ class CachedOperationalStore(OperationalStore):
             email=email,
         )
         await self._cache.delete(self._user_key(user_id))
-        await self._cache.delete_pattern("auth:*")
-        await self._cache.delete_pattern("auth_light:*")
+        await self.invalidate_auth_caches()
         return counts
 
     async def approve_user(self, user_id: str, *, admin_id: str, note: str | None = None) -> None:
@@ -366,14 +359,12 @@ class CachedOperationalStore(OperationalStore):
         """Delegate then invalidate auth caches."""
         await self._store.update_key(user_id, **fields)
         # We don't know which key_hash maps to this user, so clear all auth entries.
-        await self._cache.delete_pattern("auth:*")
-        await self._cache.delete_pattern("auth_light:*")
+        await self.invalidate_auth_caches()
 
     async def revoke_key(self, user_id: str, *, hard_delete: bool = False) -> None:
         """Delegate then invalidate auth caches."""
         await self._store.revoke_key(user_id, hard_delete=hard_delete)
-        await self._cache.delete_pattern("auth:*")
-        await self._cache.delete_pattern("auth_light:*")
+        await self.invalidate_auth_caches()
 
     async def regenerate_key(
         self,
@@ -386,8 +377,7 @@ class CachedOperationalStore(OperationalStore):
         old_prefix = await self._store.regenerate_key(
             user_id, new_key_hash=new_key_hash, new_key_prefix=new_key_prefix
         )
-        await self._cache.delete_pattern("auth:*")
-        await self._cache.delete_pattern("auth_light:*")
+        await self.invalidate_auth_caches()
         return old_prefix
 
     # -- role quotas (invalidate auth caches on bulk write) ------------------
@@ -401,8 +391,7 @@ class CachedOperationalStore(OperationalStore):
         n = await self._store.apply_role_quota(role, quota)
         # Bulk write touches quota_daily_cost_usd on all keys for a role; clear
         # all per-key auth cache entries to prevent stale quota lookups.
-        await self._cache.delete_pattern("auth:*")
-        await self._cache.delete_pattern("auth_light:*")
+        await self.invalidate_auth_caches()
         return n
 
     # -- pure pass-through (no caching, no invalidation) ---------------------
@@ -714,8 +703,7 @@ class CachedOperationalStore(OperationalStore):
         bound = await self._store.bind_user_phone(user_id, phone)
         if bound:
             await self._cache.delete(self._user_key(user_id))
-            await self._cache.delete_pattern("auth:*")
-            await self._cache.delete_pattern("auth_light:*")
+            await self.invalidate_auth_caches()
         return bound
 
     async def bind_user_email(self, user_id: str, email: str) -> bool:
@@ -725,8 +713,7 @@ class CachedOperationalStore(OperationalStore):
             # Nothing is cached by e-mail address; the user and auth entries
             # carry it.
             await self._cache.delete(self._user_key(user_id))
-            await self._cache.delete_pattern("auth:*")
-            await self._cache.delete_pattern("auth_light:*")
+            await self.invalidate_auth_caches()
         return bound
 
     async def reserve_phone_code(self, **fields: Any) -> int:
@@ -822,8 +809,7 @@ class CachedOperationalStore(OperationalStore):
         await self._cache.delete(self._user_key(user_id))
         # email_verified is carried in the cached auth contexts too, but we don't
         # know which key_hash maps to this user, so clear all auth entries.
-        await self._cache.delete_pattern("auth:*")
-        await self._cache.delete_pattern("auth_light:*")
+        await self.invalidate_auth_caches()
 
     async def delete_user_verification_tokens(self, user_id: str) -> None:
         """Delegate to wrapped store."""
@@ -965,8 +951,7 @@ class CachedOperationalStore(OperationalStore):
         # The auth contexts carry preferences (disabled models), so every
         # preference write drops them along with the user row.
         await self._cache.delete(self._user_key(user_id))
-        await self._cache.delete_pattern("auth:*")
-        await self._cache.delete_pattern("auth_light:*")
+        await self.invalidate_auth_caches()
 
     async def set_user_preference(self, user_id: str, key: str, value: Any) -> bool:
         """Delegate then invalidate user and auth caches."""
