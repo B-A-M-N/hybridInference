@@ -18,6 +18,7 @@ import math
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 from .base import OperationalStore, ProviderDefinitionRow, ProviderKeyRow, Row
@@ -258,6 +259,23 @@ class InMemoryCache(CacheBackend):
         }
 
 
+def _snapshot(value: Any) -> Any:
+    """Return an independent deep copy of a cache value.
+
+    Rows returned from the cache must not alias the stored object that later
+    reads will hand out, and the stored object must not alias whatever was
+    written after a cache miss. A consumer that mutates one returned row must
+    never corrupt a later read of the same key. Deep-copying is the only way to
+    fully isolate the cache's stored value from every returned reference; the
+    cached rows here are shallow dicts whose ``preferences`` value is itself a
+    mutable dict, so a shallow copy would leak the nested object.
+    """
+    # Scalars and immutable values are copied by reference at no cost.
+    if value is None or isinstance(value, (str, int, float, bool, bytes, tuple, frozenset)):
+        return value
+    return deepcopy(value)
+
+
 # ---------------------------------------------------------------------------
 # Cached wrapper
 # ---------------------------------------------------------------------------
@@ -388,15 +406,21 @@ class CachedOperationalStore(OperationalStore):
         and the snapshot is only published if it still matches. An invalidation
         that races the read therefore wins, and a stale row never lands in the
         cache after the write that made it stale.
+
+        Snapshot-isolated: the stored value and the returned value are deep
+        copies of each other, so a consumer mutating one row cannot corrupt
+        either the cache or a later read of the same key.
         """
         ck = self._user_key(user_id)
         cached = await self._cache.get(ck)
         if cached is not None:
-            return cached
+            return _snapshot(cached)
         gen_before = self._cache.current_generation()
         result = await self._store.get_user_by_id(user_id)
         if result is not None:
-            await self._cache.set_if_generation(ck, result, _USER_TTL, generation=gen_before)
+            await self._cache.set_if_generation(
+                ck, _snapshot(result), _USER_TTL, generation=gen_before
+            )
         return result
 
     async def get_auth_context_by_key_hash(self, key_hash: str) -> Row | None:
@@ -404,12 +428,12 @@ class CachedOperationalStore(OperationalStore):
         ck = self._auth_key(key_hash)
         cached = await self._cache.get(ck)
         if cached is not None:
-            return cached
+            return _snapshot(cached)
         gen_before = self._cache.current_generation()
         result = await self._store.get_auth_context_by_key_hash(key_hash)
         if result is not None:
             await self._cache.set_if_generation(
-                ck, result, _AUTH_CONTEXT_TTL, generation=gen_before
+                ck, _snapshot(result), _AUTH_CONTEXT_TTL, generation=gen_before
             )
         return result
 
@@ -418,12 +442,12 @@ class CachedOperationalStore(OperationalStore):
         ck = self._auth_light_key(key_hash)
         cached = await self._cache.get(ck)
         if cached is not None:
-            return cached
+            return _snapshot(cached)
         gen_before = self._cache.current_generation()
         result = await self._store.get_auth_context_lightweight(key_hash)
         if result is not None:
             await self._cache.set_if_generation(
-                ck, result, _AUTH_CONTEXT_TTL, generation=gen_before
+                ck, _snapshot(result), _AUTH_CONTEXT_TTL, generation=gen_before
             )
         return result
 
@@ -449,13 +473,15 @@ class CachedOperationalStore(OperationalStore):
         ck = self._auth_audit_key(key_hash)
         cached = await self._cache.get(ck)
         if cached is not None:
-            return cached
+            return _snapshot(cached)
         gen_before = self._cache.current_generation()
         result = await self._store.get_key_owner_for_audit(key_hash)
         if result is not None:
             ttl = _audit_entry_ttl(result)
             if ttl > 0:
-                await self._cache.set_if_generation(ck, result, ttl, generation=gen_before)
+                await self._cache.set_if_generation(
+                    ck, _snapshot(result), ttl, generation=gen_before
+                )
         return result
 
     # -- user writes (invalidate user cache) ---------------------------------
