@@ -584,6 +584,7 @@ class OpenAIToAnthropicStreamTranslator:
         self._current_text_index: int | None = None
         self._pending_thinking: str = ""
         self._pending_text: str = ""
+        self._flushing_pending: bool = False
         self._tool_blocks: dict[
             int, dict[str, Any]
         ] = {}  # openai-tool-index -> {anthropic_index, name, id}
@@ -855,14 +856,23 @@ class OpenAIToAnthropicStreamTranslator:
         Both buffers exist only while a tool block was open; this runs at the
         close points (a new thinking block opening, or finalize). Thinking
         chronologically preceded the text it buffered behind, so it emits
-        first, as its own block.
+        first, as its own block. Reentrancy guard: emitting the buffered
+        thinking re-enters _emit_thinking, whose block-open path calls this
+        flush again — the guard keeps that inner call a no-op so the text
+        cannot jump ahead of the thinking block it follows.
         """
-        if self._pending_thinking:
-            thinking, self._pending_thinking = self._pending_thinking, ""
-            yield from self._emit_thinking(thinking)
-            # _close_thinking for the block _emit_thinking just opened is the
-            # caller's job (finalize) or stays open for more reasoning.
-        yield from self._flush_pending_text()
+        if self._flushing_pending:
+            return
+        self._flushing_pending = True
+        try:
+            if self._pending_thinking:
+                thinking, self._pending_thinking = self._pending_thinking, ""
+                yield from self._emit_thinking(thinking)
+            if self._pending_text:
+                text, self._pending_text = self._pending_text, ""
+                yield from self._emit_text(text)
+        finally:
+            self._flushing_pending = False
 
     def _emit_tool_call_delta(self, tc: dict[str, Any]) -> Iterator[bytes]:
         idx = tc.get("index", 0)

@@ -974,6 +974,15 @@ def test_stream_thinking_mid_tool_call_does_not_reopen_an_orphan_tool_block():
     ]
     assert text_deltas == ["Checking..."]
 
+    # Ordering between the flushed blocks: thinking chronologically preceded
+    # the text, so its block must start before the text block's.
+    block_order = [
+        (e[1]["index"], e[1]["content_block"]["type"])
+        for e in events
+        if e[0] == "content_block_start"
+    ]
+    assert block_order == [(0, "tool_use"), (1, "thinking"), (2, "text")], block_order
+
     # One start per index; every block that starts closes; nothing reopens.
     open_at = set()
     for name, data in events:
