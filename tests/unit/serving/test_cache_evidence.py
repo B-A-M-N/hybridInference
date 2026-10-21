@@ -10,15 +10,17 @@ unchanged in both response modes.
 
 from __future__ import annotations
 
+from typing import Any, ClassVar
+
 from serving.responses_translator import (
     CACHE_EVIDENCE_HIT,
     CACHE_EVIDENCE_MISS,
     CACHE_EVIDENCE_UNREPORTED,
+    ResponsesStreamTranslator,
     _cache_token_count,
     cache_evidence_state,
     chat_response_to_responses,
     map_usage_with_evidence,
-    ResponsesStreamTranslator,
 )
 from serving.utils.token_utils import normalize_usage
 
@@ -177,7 +179,7 @@ class TestEvidenceAgreesWithLoggingLayer:
 class TestWireShapeStaysSdkCompatible:
     """Both response modes must keep the exact public shape."""
 
-    EXPECTED = {
+    EXPECTED: ClassVar[dict[str, Any]] = {
         "input_tokens": 9,
         "input_tokens_details": {"cached_tokens": 0},
         "output_tokens": 3,
