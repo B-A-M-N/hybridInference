@@ -582,6 +582,7 @@ class OpenAIToAnthropicStreamTranslator:
         self._closed = False
         self._current_thinking_index: int | None = None
         self._current_text_index: int | None = None
+        self._pending_thinking: str = ""
         self._pending_text: str = ""
         self._tool_blocks: dict[
             int, dict[str, Any]
@@ -612,16 +613,23 @@ class OpenAIToAnthropicStreamTranslator:
             return
         if not self._started:
             yield from self._emit_message_start()
-        # Close any open content block. Tool blocks close before the buffered
-        # text flushes behind them (issue #876 P1), and the flushed text block
-        # closes before the terminal message_delta.
+        # Close any open content block. Tool blocks close first, then the
+        # fragments buffered behind them flush (thinking before text, issue
+        # #876 P1), and every flushed block closes before the terminal
+        # message_delta.
         yield from self._close_thinking()
         for tb in list(self._tool_blocks.values()):
             yield self._sse(
                 "content_block_stop", {"type": "content_block_stop", "index": tb["anthropic_index"]}
             )
         self._tool_blocks.clear()
-        yield from self._flush_pending_text()
+        yield from self._flush_pending_thinking_then_text()
+        if self._current_thinking_index is not None:
+            yield self._sse(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": self._current_thinking_index},
+            )
+            self._current_thinking_index = None
         if self._current_text_index is not None:
             yield self._sse(
                 "content_block_stop",
@@ -738,6 +746,16 @@ class OpenAIToAnthropicStreamTranslator:
         )
 
     def _emit_thinking(self, text: str) -> Iterator[bytes]:
+        if self._tool_blocks:
+            # Same defect class as the buffered-text path below (issue #876
+            # P1): a reasoning delta interleaved mid-tool-call must not close
+            # the tool block, or the next argument fragment for the same
+            # index reopens an orphan tool_use with an empty id and name.
+            # Buffer the reasoning fragment; it flushes when the tool block
+            # closes, ahead of any buffered text (thinking chronologically
+            # preceded the text).
+            self._pending_thinking += text
+            return
         if self._current_thinking_index is None:
             # Anthropic SSE allows one open block at a time. Reasoning usually
             # precedes visible output, but with interleaved thinking it can
@@ -754,6 +772,7 @@ class OpenAIToAnthropicStreamTranslator:
                     {"type": "content_block_stop", "index": tb["anthropic_index"]},
                 )
             self._tool_blocks.clear()
+            yield from self._flush_pending_thinking_then_text()
             self._current_thinking_index = self._next_index
             self._next_index += 1
             yield self._sse(
@@ -789,8 +808,11 @@ class OpenAIToAnthropicStreamTranslator:
             # Anthropic SSE has one open block at a time and a tool_use input
             # is one block: closing it here would force a later argument
             # fragment for the same index to either vanish or reopen an
-            # orphan tool_use with an empty id/name. Buffer the text instead
-            # and emit it as a text block once the tool block closes.
+            # orphan tool_use with an empty id/name. Buffer the text instead;
+            # it flushes at the tool block's close points (a new thinking
+            # block opening, or finalize) -- never in _emit_tool_call_delta,
+            # whose close path only ever closes one tool block to open
+            # another.
             self._pending_text += text
             return
         if self._current_text_index is None:
@@ -826,6 +848,21 @@ class OpenAIToAnthropicStreamTranslator:
         if self._pending_text:
             yield from self._emit_text(self._pending_text)
             self._pending_text = ""
+
+    def _flush_pending_thinking_then_text(self) -> Iterator[bytes]:
+        """Flush fragments buffered behind an open tool block, thinking first.
+
+        Both buffers exist only while a tool block was open; this runs at the
+        close points (a new thinking block opening, or finalize). Thinking
+        chronologically preceded the text it buffered behind, so it emits
+        first, as its own block.
+        """
+        if self._pending_thinking:
+            thinking, self._pending_thinking = self._pending_thinking, ""
+            yield from self._emit_thinking(thinking)
+            # _close_thinking for the block _emit_thinking just opened is the
+            # caller's job (finalize) or stays open for more reasoning.
+        yield from self._flush_pending_text()
 
     def _emit_tool_call_delta(self, tc: dict[str, Any]) -> Iterator[bytes]:
         idx = tc.get("index", 0)

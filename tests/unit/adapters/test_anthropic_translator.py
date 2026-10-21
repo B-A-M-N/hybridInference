@@ -908,6 +908,81 @@ def test_stream_text_mid_tool_call_does_not_reopen_an_orphan_tool_block():
             open_at.add(data["index"])
         elif name == "content_block_stop":
             open_at.discard(data["index"])
+    assert not open_at, "a block never closed"
+
+
+def test_stream_thinking_mid_tool_call_does_not_reopen_an_orphan_tool_block():
+    """Issue #876 P1, thinking variant: reasoning interleaved mid-arguments.
+
+    DeepSeek-R1-style providers emit reasoning_content fragments between
+    argument-continuation deltas of the same tool call. Closing the tool
+    block there used to orphan it exactly like the text variant: the next
+    fragment reopened a tool_use with an empty id and name. The reasoning
+    buffers behind the open tool block and flushes (ahead of any buffered
+    text, which it chronologically preceded) once the tool block closes.
+    """
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    parts = [
+        _openai_chunk({"role": "assistant"}),
+        _openai_chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city"'},
+                    }
+                ]
+            }
+        ),
+        _openai_chunk({"reasoning_content": "Need the city name."}),
+        _openai_chunk({"content": "Checking..."}),
+        _openai_chunk({"tool_calls": [{"index": 0, "function": {"arguments": ':"SF"}'}}]}),
+        _openai_chunk({}, finish_reason="tool_calls"),
+    ]
+    out = b""
+    for c in parts:
+        out += b"".join(t.feed(c))
+    out += b"".join(t.finalize())
+    events = _events([out])
+
+    tool_starts = [
+        e
+        for e in events
+        if e[0] == "content_block_start" and e[1]["content_block"]["type"] == "tool_use"
+    ]
+    assert len(tool_starts) == 1
+    assert tool_starts[0][1]["content_block"]["id"] == "call_1"
+    json_pieces = [
+        e[1]["delta"]["partial_json"]
+        for e in events
+        if e[0] == "content_block_delta" and e[1]["delta"]["type"] == "input_json_delta"
+    ]
+    assert "".join(json_pieces) == '{"city":"SF"}'
+
+    thinking_deltas = [
+        e[1]["delta"]["thinking"]
+        for e in events
+        if e[0] == "content_block_delta" and e[1]["delta"]["type"] == "thinking_delta"
+    ]
+    assert thinking_deltas == ["Need the city name."]
+    text_deltas = [
+        e[1]["delta"]["text"]
+        for e in events
+        if e[0] == "content_block_delta" and e[1]["delta"]["type"] == "text_delta"
+    ]
+    assert text_deltas == ["Checking..."]
+
+    # One start per index; every block that starts closes; nothing reopens.
+    open_at = set()
+    for name, data in events:
+        if name == "content_block_start":
+            assert data["index"] not in open_at, f"block {data['index']} reopened"
+            open_at.add(data["index"])
+        elif name == "content_block_stop":
+            open_at.discard(data["index"])
+    assert not open_at, "a block never closed"
 
 
 def test_extract_usage_from_anthropic_sse():
