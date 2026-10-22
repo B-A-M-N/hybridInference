@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import os
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock
 
@@ -254,6 +255,51 @@ async def test_models_openai_provider_is_preserved_for_gpt_style_entry(tmp_path,
 
     item = next(m for m in resp.json()["data"] if m["id"] == "gpt-5.5")
     assert item["owned_by"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_example_chat_is_public_but_unpriced_external_route_stays_restricted(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("EXAMPLE_UPSTREAM_BASE_URL", "http://example-provider:8351/v1")
+    monkeypatch.setenv("EXAMPLE_UPSTREAM_API_KEY", "example-key")
+    monkeypatch.setenv("EXAMPLE_UPSTREAM_MODEL", "example-upstream")
+
+    router = RouteExecutor()
+    example_models = (
+        Path(__file__).resolve().parents[2] / "distributions/example/config/models.yaml"
+    )
+    registry.register_from_models_yaml(router, example_models)
+
+    remote_models = tmp_path / "remote-models.yaml"
+    remote_models.write_text(
+        "models:\n"
+        "  - id: unconfigured-remote\n"
+        "    name: Unconfigured Remote\n"
+        "    provider: openai_compat\n"
+        "    route:\n"
+        "      - kind: openai_compat\n"
+        "        weight: 1.0\n"
+        "        base_url: https://provider.example.test/v1\n"
+        "        api_key: test-key\n"
+        "        provider_model_id: upstream-model\n"
+    )
+    registry.register_from_models_yaml(router, remote_models)
+
+    assert router.routes["example-chat"].required_role == "free"
+    assert router.routes["unconfigured-remote"].required_role == "pro"
+
+    app = FastAPI()
+    app.state.services = AppServices(router=router, db_logger=None)  # type: ignore[attr-defined]
+    app.include_router(models.router)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/models")
+
+    assert response.status_code == status.HTTP_200_OK
+    visible_ids = {item["id"] for item in response.json()["data"]}
+    assert "example-chat" in visible_ids
+    assert "unconfigured-remote" not in visible_ids
 
 
 @pytest.mark.asyncio
