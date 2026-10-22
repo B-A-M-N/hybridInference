@@ -10,9 +10,11 @@ import {
   ProviderRoute,
   ProviderRouteStrategy,
   ProviderRouteType,
+  RouteDeploymentType,
   ProviderRouteOption,
   Role,
   RouteWeight,
+  RuntimeModelCapabilities,
   clearRouteWeight,
   createProviderRouteModel,
   createProviderRouteCandidate,
@@ -33,6 +35,7 @@ import {
 } from '@/lib/api/admin';
 import { getErrorMessage } from '@/lib/utils/errors';
 import { OffloadRoutePanel } from './OffloadRoutePanel';
+import { RouteDeploymentField } from './RouteDeploymentField';
 import type { OffloadQueueInfo } from './OffloadRoutePanel';
 import { RoutewiseSettingsPanel } from './RoutewiseSettingsPanel';
 import { RoutewiseDecisionsPanel } from './RoutewiseDecisionsPanel';
@@ -43,11 +46,17 @@ type RouteForm = {
   customOpenRouterProvider: string;
   openRouterSort: string;
   baseUrl: string;
+  // Null until the admin picks one in this edit: the server then keeps the
+  // route's declaration, or resets it to auto when the endpoint moves.
+  deploymentType: RouteDeploymentType | null;
   apiKeyId: string;
   providerModelId: string;
   quotaLimit: string;
   concurrencyLimit: string;
 };
+
+// Starts unanswered: a choice the admin never made must not be sent as "no".
+type DeclaredChoice = '' | 'yes' | 'no';
 
 type CreateRouteForm = {
   routeType: ProviderRouteType;
@@ -56,6 +65,7 @@ type CreateRouteForm = {
   customOpenRouterProvider: string;
   openRouterSort: string;
   baseUrl: string;
+  deploymentType: RouteDeploymentType;
   apiKeyId: string;
   providerModelId: string;
   quotaLimit: string;
@@ -65,6 +75,10 @@ type CreateRouteForm = {
   pricingCompletion: string;
   pricingCacheReads: string;
   pricingCacheWrites: string;
+  contextLength: string;
+  maxOutputLength: string;
+  imageInput: DeclaredChoice;
+  toolCalling: DeclaredChoice;
 };
 
 const emptyCreateForm: CreateRouteForm = {
@@ -74,6 +88,7 @@ const emptyCreateForm: CreateRouteForm = {
   customOpenRouterProvider: '',
   openRouterSort: '',
   baseUrl: '',
+  deploymentType: 'auto',
   apiKeyId: '',
   providerModelId: '',
   quotaLimit: '5000',
@@ -83,6 +98,10 @@ const emptyCreateForm: CreateRouteForm = {
   pricingCompletion: '',
   pricingCacheReads: '',
   pricingCacheWrites: '',
+  contextLength: '',
+  maxOutputLength: '',
+  imageInput: '',
+  toolCalling: '',
 };
 
 const OPENROUTER_PROVIDER_AUTO = '';
@@ -151,6 +170,52 @@ function runtimePricingPayload(form: CreateRouteForm): Record<string, string> {
   return pricing;
 }
 
+// The backend's bound (RUNTIME_MODEL_MAX_TOKENS): the largest window a model ships with.
+const MAX_DECLARED_TOKENS = 10_000_000;
+const TOKEN_COUNT_ERROR = `Enter a whole number of tokens from 1 to ${MAX_DECLARED_TOKENS.toLocaleString('en-US')}.`;
+
+function tokenCountOrNull(value: string) {
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const parsed = Number.parseInt(trimmed, 10);
+  return parsed > 0 && parsed <= MAX_DECLARED_TOKENS ? parsed : null;
+}
+
+type RuntimeCapabilitiesDraft = {
+  payload: RuntimeModelCapabilities | null;
+  contextLengthError: string | null;
+  maxOutputLengthError: string | null;
+};
+
+// One reading of the four fields, used both for the inline messages and to
+// gate Create/Verify, so a field can never block the form without saying why.
+// An empty field has no message: it is visibly unanswered.
+function runtimeCapabilitiesDraft(form: CreateRouteForm): RuntimeCapabilitiesDraft {
+  const contextLength = tokenCountOrNull(form.contextLength);
+  const maxOutputLength = tokenCountOrNull(form.maxOutputLength);
+  const contextLengthError =
+    form.contextLength.trim() && contextLength === null ? TOKEN_COUNT_ERROR : null;
+  let maxOutputLengthError =
+    form.maxOutputLength.trim() && maxOutputLength === null ? TOKEN_COUNT_ERROR : null;
+  if (contextLength !== null && maxOutputLength !== null && maxOutputLength > contextLength) {
+    maxOutputLengthError = 'Max output cannot exceed the context length.';
+  }
+  const payload: RuntimeModelCapabilities | null =
+    contextLength !== null &&
+    maxOutputLength !== null &&
+    maxOutputLengthError === null &&
+    form.imageInput &&
+    form.toolCalling
+      ? {
+          context_length: contextLength,
+          max_output_length: maxOutputLength,
+          input_modalities: form.imageInput === 'yes' ? ['text', 'image'] : ['text'],
+          supports_tools: form.toolCalling === 'yes',
+        }
+      : null;
+  return { payload, contextLengthError, maxOutputLengthError };
+}
+
 function formatWeight(value: number) {
   return Number.isInteger(value) ? String(value) : value.toFixed(3);
 }
@@ -192,7 +257,12 @@ function noProviderHelpText(routeType: ProviderRouteType) {
   return 'There are no configured providers left for this route type.';
 }
 
+function overrideNotApplied(route: ProviderRoute) {
+  return route.source === 'override' && route.override_applied === false;
+}
+
 function sourceLabel(route: ProviderRoute) {
+  if (overrideNotApplied(route)) return 'Override not applied';
   if (route.source === 'override') return 'Override active';
   if (route.source === 'runtime') return 'Runtime added';
   return 'Config default';
@@ -369,6 +439,20 @@ function routePrimaryProvider(route: ProviderRoute) {
     return 'openrouter';
   }
   return route.provider;
+}
+
+// Mirrors the gateway's endpoint comparison closely enough to tell whether an
+// edit still points at the route's current endpoint.
+function canonicalEndpointUrl(value: string) {
+  const trimmed = value.trim();
+  try {
+    const url = new URL(
+      trimmed.includes('://') ? trimmed : `https://${trimmed.replace(/^\/+/, '')}`,
+    );
+    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    return trimmed.replace(/\/+$/, '');
+  }
 }
 
 function routePrimaryUpstreamProvider(route: ProviderRoute) {
@@ -585,6 +669,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     customOpenRouterProvider: '',
     openRouterSort: '',
     baseUrl: '',
+    deploymentType: 'auto',
     apiKeyId: '',
     providerModelId: '',
     quotaLimit: '',
@@ -756,6 +841,12 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
       pricingValueValid(createForm.pricingCompletion) &&
       optionalPricingValueValid(createForm.pricingCacheReads) &&
       optionalPricingValueValid(createForm.pricingCacheWrites));
+  const {
+    payload: runtimeCapabilities,
+    contextLengthError: createContextLengthError,
+    maxOutputLengthError: createMaxOutputLengthError,
+  } = runtimeCapabilitiesDraft(createForm);
+  const createCapabilitiesValid = !creatingModel || runtimeCapabilities !== null;
   const createQuotaValid =
     createForm.routeType !== 'quota' ||
     (parsedCreateQuotaLimit !== null &&
@@ -787,7 +878,8 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     createQuotaValid &&
     createConcurrencyValid &&
     createWeightValid &&
-    createPricingValid;
+    createPricingValid &&
+    createCapabilitiesValid;
   const editFormValid =
     Boolean(editingRoute) &&
     Boolean(form.upstreamProvider) &&
@@ -796,6 +888,16 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     formOpenRouterProviderValid &&
     quotaLimitValid &&
     concurrencyLimitValid;
+  const editDeploymentType: RouteDeploymentType =
+    form.deploymentType ??
+    (editingRoute &&
+    form.upstreamProvider === routePrimaryUpstreamProvider(editingRoute) &&
+    (form.upstreamProvider !== 'openrouter' ||
+      selectedOpenRouterProvider ===
+        resolvedOpenRouterProvider(routeOpenRouterProvider(editingRoute), '')) &&
+    canonicalEndpointUrl(form.baseUrl) === canonicalEndpointUrl(editingRoute.base_url)
+      ? (editingRoute.deployment_type ?? 'auto')
+      : 'auto');
   const editRoutePayload = useMemo(() => {
     if (!editingRoute) {
       return null;
@@ -810,6 +912,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
         form.openRouterSort,
       ),
       base_url: form.baseUrl.trim(),
+      ...(form.deploymentType ? { deployment_type: form.deploymentType } : {}),
       api_key_id: form.apiKeyId || null,
       provider_model_id: form.providerModelId.trim(),
       quota_limit: editsLocalQuota ? parsedQuotaLimit : null,
@@ -821,6 +924,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     editsLocalQuota,
     form.apiKeyId,
     form.baseUrl,
+    form.deploymentType,
     form.openRouterProvider,
     form.openRouterSort,
     form.providerModelId,
@@ -842,6 +946,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
         createForm.openRouterSort,
       ),
       base_url: createForm.baseUrl.trim(),
+      deployment_type: createForm.deploymentType,
       api_key_id: createForm.apiKeyId || null,
       provider_model_id: createForm.providerModelId.trim(),
       quota_limit: createForm.routeType === 'quota' ? parsedCreateQuotaLimit : null,
@@ -852,6 +957,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     [
       createForm.apiKeyId,
       createForm.baseUrl,
+      createForm.deploymentType,
       createForm.openRouterProvider,
       createForm.openRouterSort,
       createForm.providerModelId,
@@ -879,6 +985,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     strategy: creatingModel ? newModelStrategy : strategy,
     required_role: creatingModel ? newModelRequiredRole : undefined,
     pricing: creatingModel ? runtimePricing : undefined,
+    capabilities: creatingModel ? runtimeCapabilities : undefined,
     payload: createRoutePayload,
   });
   const editRouteVerified =
@@ -893,6 +1000,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
         customOpenRouterProvider: '',
         openRouterSort: '',
         baseUrl: '',
+        deploymentType: 'auto',
         apiKeyId: '',
         providerModelId: '',
         quotaLimit: '',
@@ -907,6 +1015,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
       customOpenRouterProvider: '',
       openRouterSort: editingRoute.openrouter_sort ?? '',
       baseUrl: editingRoute.base_url,
+      deploymentType: null,
       apiKeyId: editingRoute.api_key_id ?? '',
       providerModelId: editingRoute.provider_model_id ?? '',
       quotaLimit: editingRoute.quota_limit ? String(editingRoute.quota_limit) : '',
@@ -1097,6 +1206,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
         customOpenRouterProvider: '',
         openRouterSort: '',
         baseUrl: '',
+        deploymentType: 'auto',
         apiKeyId: '',
         providerModelId: '',
       }));
@@ -1169,6 +1279,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
           ? (editingRoute?.openrouter_sort ?? current.openRouterSort)
           : '',
       baseUrl: selected?.default_base_url || current.baseUrl,
+      deploymentType: upstreamProvider === current.upstreamProvider ? current.deploymentType : null,
       apiKeyId: '',
       providerModelId:
         editingRoute && upstreamProvider === routePrimaryUpstreamProvider(editingRoute)
@@ -1336,12 +1447,15 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     try {
       let created: ProviderRoute;
       if (creatingModel) {
+        // createFormValid already requires it; this check narrows the type.
+        if (!runtimeCapabilities) return;
         created = await createProviderRouteModel({
           ...createRoutePayload,
           model_id: newModelIdValue,
           strategy: newModelStrategy,
           required_role: newModelRequiredRole,
           pricing: runtimePricing,
+          capabilities: runtimeCapabilities,
         });
       } else {
         created = await createProviderRouteCandidate(selectedModel, createRoutePayload);
@@ -1366,12 +1480,15 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     setVerifyingCreateRoute(true);
     try {
       if (creatingModel) {
+        // createFormValid already requires it; this check narrows the type.
+        if (!runtimeCapabilities) return;
         await verifyProviderRouteModel({
           ...createRoutePayload,
           model_id: newModelIdValue,
           strategy: newModelStrategy,
           required_role: newModelRequiredRole,
           pricing: runtimePricing,
+          capabilities: runtimeCapabilities,
         });
       } else {
         await verifyProviderRouteCandidate(selectedModel, createRoutePayload);
@@ -1870,11 +1987,18 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                         className={
                           routeDisabled
                             ? 'inline-flex rounded bg-gray-100 px-1.5 py-0.5 text-[11px] font-medium text-gray-600'
-                            : route.source === 'override'
-                              ? 'inline-flex rounded bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-700'
-                              : route.source === 'runtime'
-                                ? 'inline-flex rounded bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium text-blue-700'
-                                : 'inline-flex rounded bg-gray-100 px-1.5 py-0.5 text-[11px] font-medium text-gray-600'
+                            : overrideNotApplied(route)
+                              ? 'inline-flex rounded bg-red-50 px-1.5 py-0.5 text-[11px] font-medium text-red-700'
+                              : route.source === 'override'
+                                ? 'inline-flex rounded bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-700'
+                                : route.source === 'runtime'
+                                  ? 'inline-flex rounded bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium text-blue-700'
+                                  : 'inline-flex rounded bg-gray-100 px-1.5 py-0.5 text-[11px] font-medium text-gray-600'
+                        }
+                        title={
+                          !routeDisabled && overrideNotApplied(route)
+                            ? 'The saved override failed to apply at startup, so the config default shown here is serving. Edit the route or reset its config.'
+                            : undefined
                         }
                       >
                         {routeDisabled ? 'Disabled' : sourceLabel(route)}
@@ -2161,6 +2285,126 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                 </div>
               )}
 
+              {creatingModel && (
+                <div className="mb-3">
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                    <div>
+                      <label
+                        className="text-[12px] font-medium text-gray-500"
+                        htmlFor="new-model-context-length"
+                      >
+                        Context length (tokens)
+                      </label>
+                      <input
+                        id="new-model-context-length"
+                        type="number"
+                        min="1"
+                        step="1"
+                        value={createForm.contextLength}
+                        onChange={(event) => {
+                          setCreateForm((current) => ({
+                            ...current,
+                            contextLength: event.target.value,
+                          }));
+                          setVerifiedCreateSignature(null);
+                        }}
+                        className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
+                        required
+                      />
+                      {createContextLengthError && (
+                        <p className="mt-1 text-[11px] leading-5 text-red-600">
+                          {createContextLengthError}
+                        </p>
+                      )}
+                    </div>
+                    <div>
+                      <label
+                        className="text-[12px] font-medium text-gray-500"
+                        htmlFor="new-model-max-output-length"
+                      >
+                        Max output (tokens)
+                      </label>
+                      <input
+                        id="new-model-max-output-length"
+                        type="number"
+                        min="1"
+                        step="1"
+                        value={createForm.maxOutputLength}
+                        onChange={(event) => {
+                          setCreateForm((current) => ({
+                            ...current,
+                            maxOutputLength: event.target.value,
+                          }));
+                          setVerifiedCreateSignature(null);
+                        }}
+                        className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
+                        required
+                      />
+                      {createMaxOutputLengthError && (
+                        <p className="mt-1 text-[11px] leading-5 text-red-600">
+                          {createMaxOutputLengthError}
+                        </p>
+                      )}
+                    </div>
+                    <div>
+                      <label
+                        className="text-[12px] font-medium text-gray-500"
+                        htmlFor="new-model-image-input"
+                      >
+                        Image input
+                      </label>
+                      <select
+                        id="new-model-image-input"
+                        value={createForm.imageInput}
+                        onChange={(event) => {
+                          setCreateForm((current) => ({
+                            ...current,
+                            imageInput: event.target.value as DeclaredChoice,
+                          }));
+                          setVerifiedCreateSignature(null);
+                        }}
+                        className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
+                        required
+                      >
+                        <option value="">Choose…</option>
+                        <option value="no">Text only</option>
+                        <option value="yes">Accepts images</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label
+                        className="text-[12px] font-medium text-gray-500"
+                        htmlFor="new-model-tool-calling"
+                      >
+                        Tool calling
+                      </label>
+                      <select
+                        id="new-model-tool-calling"
+                        value={createForm.toolCalling}
+                        onChange={(event) => {
+                          setCreateForm((current) => ({
+                            ...current,
+                            toolCalling: event.target.value as DeclaredChoice,
+                          }));
+                          setVerifiedCreateSignature(null);
+                        }}
+                        className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
+                        required
+                      >
+                        <option value="">Choose…</option>
+                        <option value="no">Not supported</option>
+                        <option value="yes">Supported</option>
+                      </select>
+                    </div>
+                  </div>
+                  <p className="mt-1 text-[11px] leading-5 text-gray-400">
+                    Take these from the provider&apos;s model page. Requests follow them: tool
+                    definitions are dropped without tool calling, max_tokens is capped at the max
+                    output, and images reach the model only if it accepts them.
+                  </p>
+                </div>
+              )}
+
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 <div>
                   <label className="text-[12px] font-medium text-gray-500" htmlFor="new-route-type">
@@ -2275,6 +2519,14 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                   />
                 </div>
               </div>
+
+              <RouteDeploymentField
+                id="new-route-deployment-type"
+                value={createForm.deploymentType}
+                onChange={(deploymentType) =>
+                  setCreateForm((current) => ({ ...current, deploymentType }))
+                }
+              />
 
               {createForm.upstreamProvider === 'openrouter' && (
                 <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -2540,12 +2792,24 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                   type="url"
                   value={form.baseUrl}
                   onChange={(event) =>
-                    setForm((current) => ({ ...current, baseUrl: event.target.value }))
+                    setForm((current) => ({
+                      ...current,
+                      baseUrl: event.target.value,
+                      deploymentType: null,
+                    }))
                   }
                   className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
                   required
                 />
               </div>
+
+              <RouteDeploymentField
+                id="route-deployment-type"
+                value={editDeploymentType}
+                onChange={(deploymentType) =>
+                  setForm((current) => ({ ...current, deploymentType }))
+                }
+              />
 
               <div className="mt-3">
                 <label

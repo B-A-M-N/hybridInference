@@ -5,7 +5,15 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, StrictInt, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SecretStr,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from serving.config.settings import ROUTE_TYPE_ORDER
 
@@ -1270,19 +1278,38 @@ class UpdateSettingRequest(BaseModel):
     value: Any
 
 
+class TestAlertRequest(BaseModel):
+    """Test the selected saved channel, or an unsaved webhook draft."""
+
+    channel: Literal["slack", "wecom"]
+    webhook_url: SecretStr | None = Field(
+        None,
+        max_length=4096,
+        description="Omit to test the latest saved webhook, including pending restart changes.",
+    )
+
+
+class TestAlertResponse(BaseModel):
+    """A channel accepted a test message; no alert incident was created."""
+
+    channel: Literal["slack", "wecom"]
+    sent: Literal[True] = True
+    test_id: str
+
+
 class SnoozeAlertsRequest(BaseModel):
-    """Request payload for snoozing Slack alerts for a duration."""
+    """Request payload for snoozing alerts for a duration."""
 
     duration_seconds: int = Field(
         ...,
         gt=0,
         le=7 * 24 * 60 * 60,
-        description="How long to suppress Slack alerts, in seconds (max 7 days).",
+        description="How long to suppress alerts, in seconds (max 7 days).",
     )
 
 
 class AlertSnoozeStatus(BaseModel):
-    """Current Slack-alert snooze state."""
+    """Current alert snooze state."""
 
     snoozed: bool
     snooze_until: float | None = None
@@ -1290,7 +1317,7 @@ class AlertSnoozeStatus(BaseModel):
 
 
 class MuteAlertTypeRequest(BaseModel):
-    """Request payload for muting one alert type's Slack alerts."""
+    """Request payload for muting one alert type's notifications."""
 
     duration_seconds: int | None = Field(
         None,
@@ -1304,7 +1331,7 @@ class MuteAlertTypeRequest(BaseModel):
 
 
 class AlertTypeMuteStatus(BaseModel):
-    """One alert type from the catalog, and whether its Slack alerts are muted."""
+    """One alert type from the catalog, and whether its notifications are muted."""
 
     alert_type: str
     label: str
@@ -1587,6 +1614,7 @@ class ProviderRouteItem(BaseModel):
     openrouter_sort: Literal["price", "throughput", "latency"] | None = None
     key_provider: str
     base_url: str
+    deployment_type: Literal["auto", "self_hosted", "provider_api"] = "auto"
     api_key_id: str | None = None
     api_key: ProviderRouteApiKeyRef
     provider_model_id: str | None = None
@@ -1600,6 +1628,9 @@ class ProviderRouteItem(BaseModel):
     yaml_weight: float
     effective_weight: float
     source: Literal["yaml", "override", "runtime"]
+    # False when a saved override exists but its endpoint is not the one
+    # serving (it failed to apply at boot); the other fields show the live route.
+    override_applied: bool = True
     updated_at: datetime | None = None
     updated_by: str | None = None
 
@@ -1636,11 +1667,53 @@ class CreateProviderRouteRequest(BaseModel):
     openrouter_provider: str | None = Field(None, min_length=1, max_length=64)
     openrouter_sort: Literal["price", "throughput", "latency"] | None = None
     base_url: str = Field(..., min_length=1, max_length=2048)
+    deployment_type: Literal["auto", "self_hosted", "provider_api"] = "auto"
     api_key_id: str | None = Field(None, min_length=1, max_length=128)
     provider_model_id: str = Field(..., min_length=1, max_length=512)
     quota_limit: int | None = Field(None, ge=1)
     concurrency_limit: int | None = Field(None, ge=1)
     weight: float = Field(1.0, gt=0)
+
+
+# Image is the only non-text input the console offers for a runtime model.
+RUNTIME_MODEL_INPUT_MODALITIES = ("text", "image")
+# The largest window a model ships with today (10M tokens). A larger value is a
+# typo, and an unbounded one could exceed what JSON clients read exactly.
+RUNTIME_MODEL_MAX_TOKENS = 10_000_000
+
+
+class RuntimeModelCapabilities(BaseModel):
+    """What a runtime model accepts, stated by the admin who creates it.
+
+    Each value changes what a request does: tool definitions reach the upstream
+    only when ``supports_tools`` is set, ``max_tokens`` is clamped to
+    ``max_output_length``, image blocks reach the upstream only on a route
+    that lists ``image``, and Auto and the context-overflow fallback both read
+    ``context_length``. ``ModelConfig``'s defaults for them (an 8,192-token
+    window, 4,096 output tokens, text only, no tools) are not facts about any
+    upstream, so none of them may stand in for a value nobody declared.
+    """
+
+    # Strict, so ``true`` or ``"131072"`` is rejected instead of read as 1 or a number.
+    context_length: StrictInt = Field(..., ge=1, le=RUNTIME_MODEL_MAX_TOKENS)
+    max_output_length: StrictInt = Field(..., ge=1, le=RUNTIME_MODEL_MAX_TOKENS)
+    input_modalities: list[Literal["text", "image"]] = Field(..., min_length=1)
+    supports_tools: StrictBool
+
+    @field_validator("input_modalities")
+    @classmethod
+    def validate_input_modalities(cls, value: list[str]) -> list[str]:
+        """Require text and store each modality once, in a fixed order."""
+        if "text" not in value:
+            raise ValueError("input_modalities must include text")
+        return [modality for modality in RUNTIME_MODEL_INPUT_MODALITIES if modality in value]
+
+    @model_validator(mode="after")
+    def validate_output_fits_context(self) -> "RuntimeModelCapabilities":
+        """Reject an output cap the context window could never hold."""
+        if self.max_output_length > self.context_length:
+            raise ValueError("max_output_length must not exceed context_length")
+        return self
 
 
 class CreateProviderRouteModelRequest(CreateProviderRouteRequest):
@@ -1650,6 +1723,7 @@ class CreateProviderRouteModelRequest(CreateProviderRouteRequest):
     strategy: Literal["fixed", "routewise"] = "fixed"
     required_role: Literal["free", "pro", "internal", "admin"] = "admin"
     pricing: dict[str, str] = Field(..., min_length=1)
+    capabilities: RuntimeModelCapabilities
 
     @field_validator("model_id")
     @classmethod
@@ -1700,6 +1774,7 @@ class UpdateProviderRouteRequest(BaseModel):
     openrouter_provider: str | None = Field(None, min_length=1, max_length=64)
     openrouter_sort: Literal["price", "throughput", "latency"] | None = None
     base_url: str = Field(..., min_length=1, max_length=2048)
+    deployment_type: Literal["auto", "self_hosted", "provider_api"] | None = None
     api_key_id: str | None = Field(None, min_length=1, max_length=128)
     provider_model_id: str | None = Field(None, min_length=1, max_length=512)
     quota_limit: int | None = Field(None, ge=1)

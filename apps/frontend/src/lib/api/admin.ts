@@ -2408,6 +2408,7 @@ export async function getRoutewiseDecisions(
 
 export type ProviderRouteKeySource = 'default' | 'db' | 'env' | 'missing';
 export type ProviderRouteSource = 'yaml' | 'override' | 'runtime';
+export type RouteDeploymentType = 'auto' | 'self_hosted' | 'provider_api';
 
 export interface ProviderRouteApiKeyRef {
   id: string | null;
@@ -2448,6 +2449,7 @@ export interface ProviderRoute {
   openrouter_sort?: OpenRouterSortPolicy | null;
   key_provider: string;
   base_url: string;
+  deployment_type?: RouteDeploymentType;
   api_key_id: string | null;
   api_key: ProviderRouteApiKeyRef;
   provider_model_id: string | null;
@@ -2461,6 +2463,7 @@ export interface ProviderRoute {
   yaml_weight: number;
   effective_weight: number;
   source: ProviderRouteSource;
+  override_applied?: boolean;
   updated_at: string | null;
   updated_by: string | null;
 }
@@ -2483,6 +2486,7 @@ export interface UpdateProviderRoutePayload {
   openrouter_provider?: string | null;
   openrouter_sort?: OpenRouterSortPolicy | null;
   base_url: string;
+  deployment_type?: RouteDeploymentType;
   api_key_id?: string | null;
   provider_model_id?: string | null;
   quota_limit?: number | null;
@@ -2498,6 +2502,7 @@ export interface CreateProviderRoutePayload {
   openrouter_provider?: string | null;
   openrouter_sort?: OpenRouterSortPolicy | null;
   base_url: string;
+  deployment_type?: RouteDeploymentType;
   api_key_id?: string | null;
   provider_model_id: string;
   quota_limit?: number | null;
@@ -2509,11 +2514,20 @@ export interface UpdateProviderRouteCandidatePayload {
   concurrency_limit: number;
 }
 
+/** What a runtime model accepts; every field is required when it is created. */
+export interface RuntimeModelCapabilities {
+  context_length: number;
+  max_output_length: number;
+  input_modalities: Array<'text' | 'image'>;
+  supports_tools: boolean;
+}
+
 export interface CreateProviderRouteModelPayload extends CreateProviderRoutePayload {
   model_id: string;
   strategy: ProviderRouteStrategy;
   required_role?: Role;
   pricing: Record<string, string>;
+  capabilities: RuntimeModelCapabilities;
 }
 
 export interface VerifyProviderRouteResponse {
@@ -2590,6 +2604,7 @@ export async function updateProviderRoute(
         openrouter_provider: payload.openrouter_provider ?? null,
         openrouter_sort: payload.openrouter_sort ?? null,
         base_url: payload.base_url,
+        deployment_type: payload.deployment_type,
         api_key_id: payload.api_key_id ?? null,
         provider_model_id: payload.provider_model_id ?? null,
         quota_limit: payload.quota_limit ?? null,
@@ -2616,6 +2631,7 @@ export async function verifyProviderRoute(
         openrouter_provider: payload.openrouter_provider ?? null,
         openrouter_sort: payload.openrouter_sort ?? null,
         base_url: payload.base_url,
+        deployment_type: payload.deployment_type,
         api_key_id: payload.api_key_id ?? null,
         provider_model_id: payload.provider_model_id ?? null,
         quota_limit: payload.quota_limit ?? null,

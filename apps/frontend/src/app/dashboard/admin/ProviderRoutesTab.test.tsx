@@ -143,6 +143,24 @@ function fillRuntimeModelPricing() {
   fireEvent.change(screen.getByLabelText('Completion $/M'), { target: { value: '0.28' } });
 }
 
+const RUNTIME_MODEL_CAPABILITIES = {
+  context_length: 131072,
+  max_output_length: 65536,
+  input_modalities: ['text', 'image'],
+  supports_tools: true,
+};
+
+function fillRuntimeModelCapabilities() {
+  fireEvent.change(screen.getByLabelText('Context length (tokens)'), {
+    target: { value: '131072' },
+  });
+  fireEvent.change(screen.getByLabelText('Max output (tokens)'), {
+    target: { value: '65536' },
+  });
+  fireEvent.change(screen.getByLabelText('Image input'), { target: { value: 'yes' } });
+  fireEvent.change(screen.getByLabelText('Tool calling'), { target: { value: 'yes' } });
+}
+
 const route = {
   model_id: 'minimax-fast',
   strategy: 'routewise',
@@ -152,6 +170,7 @@ const route = {
   upstream_provider: 'featherless',
   key_provider: 'featherless',
   base_url: 'https://api.featherless.ai/v1',
+  deployment_type: 'auto' as const,
   api_key_id: null,
   api_key: {
     id: null,
@@ -179,6 +198,7 @@ const quotaRoute = {
   upstream_provider: 'chutes',
   key_provider: 'chutes',
   base_url: 'https://llm.chutes.ai/v1',
+  deployment_type: 'auto' as const,
   provider_model_id: 'MiniMaxAI/MiniMax-M2.5-TEE',
   quota_limit: 5000,
   concurrency_limit: null,
@@ -233,6 +253,7 @@ describe('ProviderRoutesTab', () => {
       upstream_provider: 'openrouter',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       endpoint_id: 'minimax-fast:openrouter-api',
     };
     vi.mocked(listProviderRoutes).mockResolvedValue({
@@ -375,6 +396,7 @@ describe('ProviderRoutesTab', () => {
       upstream_provider: 'lkeap',
       key_provider: 'lkeap',
       base_url: 'https://api.lkeap.cloud.tencent.com/v1',
+      deployment_type: 'auto' as const,
       provider_model_id: 'MiniMax-M2.5',
       endpoint_id: 'minimax-fast:lkeap-api',
     };
@@ -759,6 +781,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: 'parasail',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       api_key_id: 'key-1',
       api_key: {
         id: 'key-1',
@@ -888,6 +911,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: 'parasail',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       provider_model_id: 'minimax/minimax-m2.5',
       endpoint_id: 'minimax-fast:openrouter[parasail]-api',
     };
@@ -946,6 +970,7 @@ describe('ProviderRoutesTab', () => {
       upstream_provider: 'chutes',
       key_provider: 'chutes',
       base_url: 'https://llm.chutes.ai/v1',
+      deployment_type: 'auto' as const,
       provider_model_id: 'MiniMaxAI/MiniMax-M2.5-TEE',
       quota_limit: 5000,
     };
@@ -970,6 +995,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: 'parasail',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       provider_model_id: 'minimax/minimax-m2.5',
       quota_limit: 8000,
       source: 'override',
@@ -1013,6 +1039,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: 'parasail',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       api_key_id: 'key-1',
       api_key: {
         id: 'key-1',
@@ -1058,6 +1085,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: 'deepinfra',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'provider_api' as const,
       provider_model_id: 'minimax/minimax-m2.5',
       endpoint_id: 'minimax-fast:openrouter[deepinfra]-api',
     };
@@ -1078,6 +1106,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: 'inceptron',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'provider_api' as const,
       api_key_id: 'key-1',
       api_key: {
         id: 'key-1',
@@ -1094,6 +1123,10 @@ describe('ProviderRoutesTab', () => {
     render(<ProviderRoutesTab />);
 
     fireEvent.click(await screen.findByRole('button', { name: 'Add provider' }));
+    expect(screen.getByLabelText('Deployment type')).toHaveValue('auto');
+    fireEvent.change(screen.getByLabelText('Deployment type'), {
+      target: { value: 'provider_api' },
+    });
 
     await waitFor(() => {
       expect(listOpenRouterProviderOptions).toHaveBeenCalledWith('minimax/minimax-m2.5');
@@ -1124,6 +1157,7 @@ describe('ProviderRoutesTab', () => {
         openrouter_provider: 'inceptron',
         openrouter_sort: null,
         base_url: 'https://openrouter.ai/api/v1',
+        deployment_type: 'provider_api' as const,
         api_key_id: 'key-1',
         provider_model_id: 'minimax/minimax-m2.5',
         quota_limit: null,
@@ -1191,6 +1225,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: 'parasail',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       api_key_id: 'key-1',
       api_key: {
         id: 'key-1',
@@ -1245,6 +1280,7 @@ describe('ProviderRoutesTab', () => {
         openrouter_provider: 'parasail',
         openrouter_sort: null,
         base_url: 'https://openrouter.ai/api/v1',
+        deployment_type: 'auto' as const,
         api_key_id: 'key-1',
         provider_model_id: 'minimax/minimax-m2.5',
         quota_limit: null,
@@ -1265,6 +1301,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: 'deepinfra',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       provider_model_id: 'minimax/minimax-m2.5',
       endpoint_id: 'minimax-fast:openrouter[deepinfra]-api',
     };
@@ -1292,6 +1329,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: 'minimax/highspeed',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       api_key_id: 'key-1',
       api_key: {
         id: 'key-1',
@@ -1331,6 +1369,7 @@ describe('ProviderRoutesTab', () => {
         openrouter_provider: 'minimax/highspeed',
         openrouter_sort: null,
         base_url: 'https://openrouter.ai/api/v1',
+        deployment_type: 'auto' as const,
         api_key_id: 'key-1',
         provider_model_id: 'minimax/minimax-m2.5',
         quota_limit: null,
@@ -1350,6 +1389,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: 'parasail',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       api_key_id: 'key-1',
       api_key: {
         id: 'key-1',
@@ -1415,6 +1455,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: null,
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       api_key_id: 'key-1',
       api_key: {
         id: 'key-1',
@@ -1452,6 +1493,7 @@ describe('ProviderRoutesTab', () => {
       target: { value: 'deepseek/deepseek-v4-flash' },
     });
     fillRuntimeModelPricing();
+    fillRuntimeModelCapabilities();
 
     await waitFor(() => {
       expect(listProviderKeys).toHaveBeenCalledWith('openrouter');
@@ -1472,6 +1514,7 @@ describe('ProviderRoutesTab', () => {
         openrouter_provider: null,
         openrouter_sort: null,
         base_url: 'https://openrouter.ai/api/v1',
+        deployment_type: 'auto' as const,
         api_key_id: 'key-1',
         provider_model_id: 'deepseek/deepseek-v4-flash',
         quota_limit: null,
@@ -1481,6 +1524,7 @@ describe('ProviderRoutesTab', () => {
           prompt: '0.14',
           completion: '0.28',
         },
+        capabilities: RUNTIME_MODEL_CAPABILITIES,
       });
     });
     expect(await screen.findByText('deepseek-v4-flash')).toBeInTheDocument();
@@ -1499,6 +1543,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: 'parasail',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       api_key_id: 'key-1',
       api_key: {
         id: 'key-1',
@@ -1550,6 +1595,7 @@ describe('ProviderRoutesTab', () => {
       target: { value: '2' },
     });
     fillRuntimeModelPricing();
+    fillRuntimeModelCapabilities();
 
     await waitFor(() => {
       expect(listProviderKeys).toHaveBeenCalledWith('openrouter');
@@ -1568,6 +1614,7 @@ describe('ProviderRoutesTab', () => {
         openrouter_provider: 'parasail',
         openrouter_sort: null,
         base_url: 'https://openrouter.ai/api/v1',
+        deployment_type: 'auto' as const,
         api_key_id: 'key-1',
         provider_model_id: 'deepseek/deepseek-v4-flash',
         quota_limit: null,
@@ -1577,6 +1624,7 @@ describe('ProviderRoutesTab', () => {
           prompt: '0.14',
           completion: '0.28',
         },
+        capabilities: RUNTIME_MODEL_CAPABILITIES,
       });
     });
     expect(await screen.findByText('deepseek-v4-flash')).toBeInTheDocument();
@@ -1604,6 +1652,7 @@ describe('ProviderRoutesTab', () => {
       target: { value: 'deepseek/deepseek-v4-flash' },
     });
     fillRuntimeModelPricing();
+    fillRuntimeModelCapabilities();
     fireEvent.click(screen.getByRole('button', { name: 'Verify' }));
 
     await waitFor(() => {
@@ -1616,6 +1665,7 @@ describe('ProviderRoutesTab', () => {
         openrouter_provider: null,
         openrouter_sort: null,
         base_url: 'https://openrouter.ai/api/v1',
+        deployment_type: 'auto' as const,
         api_key_id: null,
         provider_model_id: 'deepseek/deepseek-v4-flash',
         quota_limit: null,
@@ -1625,6 +1675,7 @@ describe('ProviderRoutesTab', () => {
           prompt: '0.14',
           completion: '0.28',
         },
+        capabilities: RUNTIME_MODEL_CAPABILITIES,
       });
     });
     expect(createProviderRouteModel).not.toHaveBeenCalled();
@@ -1652,6 +1703,7 @@ describe('ProviderRoutesTab', () => {
       target: { value: 'deepseek/deepseek-v4-flash' },
     });
     fillRuntimeModelPricing();
+    fillRuntimeModelCapabilities();
     fireEvent.click(screen.getByRole('button', { name: 'Verify' }));
 
     await waitFor(() => {
@@ -1662,6 +1714,139 @@ describe('ProviderRoutesTab', () => {
         }),
       );
     });
+  });
+
+  it('keeps a new model unsubmittable until every capability is answered', async () => {
+    vi.mocked(listProviderRoutes).mockResolvedValue({
+      provider_options: providerOptions,
+      openrouter_provider_options: openRouterProviderOptions,
+      routes: [route],
+    });
+    vi.mocked(listProviderKeys).mockResolvedValue({ provider: 'openrouter', keys: [] });
+
+    render(<ProviderRoutesTab />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Create model' }));
+    fireEvent.change(screen.getByLabelText('Model ID'), {
+      target: { value: 'deepseek-v4-flash' },
+    });
+    fireEvent.change(screen.getByLabelText('Provider model ID'), {
+      target: { value: 'deepseek/deepseek-v4-flash' },
+    });
+    fillRuntimeModelPricing();
+
+    const create = screen.getByRole('button', { name: 'Create' });
+    const verify = screen.getByRole('button', { name: 'Verify' });
+    expect(screen.getByLabelText('Image input')).toHaveValue('');
+    expect(screen.getByLabelText('Tool calling')).toHaveValue('');
+    expect(create).toBeDisabled();
+    expect(verify).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText('Context length (tokens)'), {
+      target: { value: '65536' },
+    });
+    fireEvent.change(screen.getByLabelText('Max output (tokens)'), {
+      target: { value: '8192' },
+    });
+    fireEvent.change(screen.getByLabelText('Image input'), { target: { value: 'no' } });
+    // Unanswered is not "no": leaving tool calling unset still blocks the form.
+    expect(create).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText('Tool calling'), { target: { value: 'no' } });
+    expect(create).toBeEnabled();
+    fireEvent.click(verify);
+
+    await waitFor(() => {
+      expect(verifyProviderRouteModel).toHaveBeenCalledWith(
+        expect.objectContaining({
+          capabilities: {
+            context_length: 65536,
+            max_output_length: 8192,
+            input_modalities: ['text'],
+            supports_tools: false,
+          },
+        }),
+      );
+    });
+  });
+
+  it('refuses a max output larger than the context length', async () => {
+    vi.mocked(listProviderRoutes).mockResolvedValue({
+      provider_options: providerOptions,
+      openrouter_provider_options: openRouterProviderOptions,
+      routes: [route],
+    });
+    vi.mocked(listProviderKeys).mockResolvedValue({ provider: 'openrouter', keys: [] });
+
+    render(<ProviderRoutesTab />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Create model' }));
+    fireEvent.change(screen.getByLabelText('Model ID'), {
+      target: { value: 'deepseek-v4-flash' },
+    });
+    fireEvent.change(screen.getByLabelText('Provider model ID'), {
+      target: { value: 'deepseek/deepseek-v4-flash' },
+    });
+    fillRuntimeModelPricing();
+    fillRuntimeModelCapabilities();
+    expect(screen.getByRole('button', { name: 'Create' })).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText('Max output (tokens)'), {
+      target: { value: '262144' },
+    });
+
+    expect(screen.getByText('Max output cannot exceed the context length.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create' })).toBeDisabled();
+  });
+
+  it.each([
+    ['Context length (tokens)', '128e3'],
+    ['Context length (tokens)', '0'],
+    ['Context length (tokens)', '20000000'],
+    ['Max output (tokens)', '1.5'],
+  ])('says which field blocks Create when %s is %s', async (label, value) => {
+    vi.mocked(listProviderRoutes).mockResolvedValue({
+      provider_options: providerOptions,
+      openrouter_provider_options: openRouterProviderOptions,
+      routes: [route],
+    });
+    vi.mocked(listProviderKeys).mockResolvedValue({ provider: 'openrouter', keys: [] });
+
+    render(<ProviderRoutesTab />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Create model' }));
+    fireEvent.change(screen.getByLabelText('Model ID'), {
+      target: { value: 'deepseek-v4-flash' },
+    });
+    fireEvent.change(screen.getByLabelText('Provider model ID'), {
+      target: { value: 'deepseek/deepseek-v4-flash' },
+    });
+    fillRuntimeModelPricing();
+    fillRuntimeModelCapabilities();
+    expect(screen.queryByText(/Enter a whole number of tokens/)).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+
+    expect(
+      screen.getByText('Enter a whole number of tokens from 1 to 10,000,000.'),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create' })).toBeDisabled();
+  });
+
+  it('does not ask for capabilities when adding a route to an existing model', async () => {
+    vi.mocked(listProviderRoutes).mockResolvedValue({
+      provider_options: providerOptions,
+      openrouter_provider_options: openRouterProviderOptions,
+      routes: [route],
+    });
+    vi.mocked(listProviderKeys).mockResolvedValue({ provider: 'openrouter', keys: [] });
+
+    render(<ProviderRoutesTab />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add provider' }));
+    await screen.findByRole('dialog', { name: 'Add provider route' });
+    expect(screen.queryByLabelText('Context length (tokens)')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Tool calling')).not.toBeInTheDocument();
   });
 
   it('does not filter create-model providers by the selected model routes', async () => {
@@ -1680,6 +1865,7 @@ describe('ProviderRoutesTab', () => {
       upstream_provider: 'chutes',
       key_provider: 'chutes',
       base_url: 'https://llm.chutes.ai/v1',
+      deployment_type: 'auto' as const,
       provider_model_id: 'MiniMaxAI/MiniMax-M2.5-TEE',
       quota_limit: 5000,
       endpoint_id: 'minimax-fast:chutes-api',
@@ -1731,6 +1917,7 @@ describe('ProviderRoutesTab', () => {
         openrouter_provider: null,
         openrouter_sort: 'throughput',
         base_url: 'https://openrouter.ai/api/v1',
+        deployment_type: 'auto' as const,
         api_key_id: null,
         provider_model_id: 'minimax/minimax-m2.5',
         quota_limit: null,
@@ -1752,6 +1939,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: null,
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       provider_model_id: 'minimax/minimax-m2.5',
       endpoint_id: 'minimax-fast:openrouter-api',
     };
@@ -1816,6 +2004,7 @@ describe('ProviderRoutesTab', () => {
         openrouter_provider: 'novita',
         openrouter_sort: null,
         base_url: 'https://openrouter.ai/api/v1',
+        deployment_type: 'auto' as const,
         api_key_id: 'key-1',
         provider_model_id: 'minimax/minimax-m2.5',
         quota_limit: null,
@@ -1842,6 +2031,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_sort: 'throughput',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       provider_model_id: 'minimax/minimax-m2.5',
       endpoint_id: 'minimax-fast:openrouter-api',
       source: 'runtime',
@@ -1867,6 +2057,7 @@ describe('ProviderRoutesTab', () => {
         openrouter_provider: null,
         openrouter_sort: 'throughput',
         base_url: 'https://openrouter.ai/api/v1',
+        deployment_type: 'auto' as const,
         api_key_id: null,
         provider_model_id: 'minimax/minimax-m2.5',
         quota_limit: null,
@@ -1886,6 +2077,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: 'deepinfra',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       provider_model_id: 'minimax/minimax-m2.5',
       endpoint_id: 'minimax-fast:openrouter[deepinfra]-api',
     };
@@ -1964,6 +2156,7 @@ describe('ProviderRoutesTab', () => {
       upstream_provider: 'chutes',
       key_provider: 'chutes',
       base_url: 'https://llm.chutes.ai/v1',
+      deployment_type: 'auto' as const,
       provider_model_id: 'MiniMaxAI/MiniMax-M2.5-TEE',
       quota_limit: 5000,
       endpoint_id: 'minimax-fast:chutes-api',
@@ -2016,6 +2209,7 @@ describe('ProviderRoutesTab', () => {
       openrouter_provider: 'parasail',
       key_provider: 'openrouter',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'auto' as const,
       provider_model_id: 'minimax/minimax-m2.5',
       endpoint_id: 'minimax-fast:openrouter[parasail]-api',
       source: 'runtime' as const,
@@ -2055,6 +2249,7 @@ describe('ProviderRoutesTab', () => {
       upstream_provider: 'zai',
       key_provider: 'zai',
       base_url: 'https://api.z.ai/api/paas/v4',
+      deployment_type: 'auto' as const,
       provider_model_id: 'glm-4.5',
       source: 'override' as const,
     };
@@ -2102,5 +2297,122 @@ describe('ProviderRoutesTab', () => {
       expect(updateProviderRouteStrategy).toHaveBeenCalledWith('minimax-fast', 'fixed');
     });
     expect(screen.getByLabelText('Routing policy')).toHaveValue('fixed');
+  });
+
+  it('preserves an engine declaration and invalidates verification when deployment changes', async () => {
+    const engineRoute = { ...route, deployment_type: 'self_hosted' as const };
+    vi.mocked(listProviderRoutes).mockResolvedValue({
+      provider_options: providerOptions,
+      routes: [engineRoute],
+    });
+    vi.mocked(listProviderKeys).mockResolvedValue({ provider: 'featherless', keys: [] });
+    vi.mocked(verifyProviderRoute).mockResolvedValue({ ok: true });
+    vi.mocked(updateProviderRoute).mockResolvedValue({
+      ...engineRoute,
+      deployment_type: 'provider_api',
+    });
+    render(<ProviderRoutesTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    expect(screen.getByLabelText('Deployment type')).toHaveValue('self_hosted');
+    fireEvent.click(screen.getByRole('button', { name: 'Verify' }));
+    await screen.findByRole('button', { name: 'Verified' });
+    // Untouched, the declaration is left to the server, which keeps it.
+    const verified = vi.mocked(verifyProviderRoute).mock.calls[0];
+    expect(verified.slice(0, 2)).toEqual([route.model_id, route.route_id]);
+    expect(verified[2]).toMatchObject({ base_url: route.base_url });
+    expect(verified[2]).not.toHaveProperty('deployment_type');
+    fireEvent.change(screen.getByLabelText('Deployment type'), {
+      target: { value: 'provider_api' },
+    });
+    expect(screen.getByRole('button', { name: 'Verify' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Base URL')).toHaveValue(route.base_url);
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    await waitFor(() => {
+      expect(updateProviderRoute).toHaveBeenCalledWith(
+        route.model_id,
+        route.route_id,
+        expect.objectContaining({ deployment_type: 'provider_api', base_url: route.base_url }),
+      );
+    });
+  });
+
+  it('does not carry an engine declaration to a new base URL', async () => {
+    const engineRoute = { ...route, deployment_type: 'self_hosted' as const };
+    vi.mocked(listProviderRoutes).mockResolvedValue({
+      provider_options: providerOptions,
+      routes: [engineRoute],
+    });
+    vi.mocked(listProviderKeys).mockResolvedValue({ provider: 'featherless', keys: [] });
+    vi.mocked(verifyProviderRoute).mockResolvedValue({ ok: true });
+    vi.mocked(updateProviderRoute).mockResolvedValue({ ...engineRoute, deployment_type: 'auto' });
+    render(<ProviderRoutesTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    fireEvent.change(screen.getByLabelText('Deployment type'), {
+      target: { value: 'self_hosted' },
+    });
+    fireEvent.change(screen.getByLabelText('Base URL'), {
+      target: { value: 'https://api.featherless.ai/v2' },
+    });
+    expect(screen.getByLabelText('Deployment type')).toHaveValue('auto');
+    fireEvent.change(screen.getByLabelText('Base URL'), {
+      target: { value: 'https://API.featherless.ai/v1/' },
+    });
+    // Back on the route's own endpoint, its declaration shows again.
+    expect(screen.getByLabelText('Deployment type')).toHaveValue('self_hosted');
+    fireEvent.change(screen.getByLabelText('Base URL'), {
+      target: { value: 'https://api.featherless.ai/v2' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Verify' }));
+    await screen.findByRole('button', { name: 'Verified' });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    await waitFor(() => expect(updateProviderRoute).toHaveBeenCalled());
+    const payload = vi.mocked(updateProviderRoute).mock.calls[0][2];
+    expect(payload).toMatchObject({ base_url: 'https://api.featherless.ai/v2' });
+    expect(payload).not.toHaveProperty('deployment_type');
+  });
+
+  it('keeps a pinned OpenRouter declaration only while the pin is unchanged', async () => {
+    const openRouterRoute = {
+      ...route,
+      route_id: 'minimax-fast:openrouter[parasail]-api',
+      route_type: 'on_demand',
+      provider: 'openrouter',
+      upstream_provider: 'openrouter',
+      openrouter_provider: 'parasail',
+      key_provider: 'openrouter',
+      base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'provider_api' as const,
+      provider_model_id: 'minimax/minimax-m2.5',
+      endpoint_id: 'minimax-fast:openrouter[parasail]-api',
+    };
+    vi.mocked(listProviderRoutes).mockResolvedValue({
+      provider_options: providerOptions,
+      openrouter_provider_options: openRouterProviderOptions,
+      routes: [openRouterRoute],
+    });
+    vi.mocked(listProviderKeys).mockResolvedValue({ provider: 'openrouter', keys: [] });
+    render(<ProviderRoutesTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    expect(screen.getByLabelText('Deployment type')).toHaveValue('provider_api');
+    // Another pin is another endpoint; the server resets its declaration.
+    fireEvent.change(screen.getByLabelText('OpenRouter routing'), {
+      target: { value: 'provider:deepinfra' },
+    });
+    expect(screen.getByLabelText('Deployment type')).toHaveValue('auto');
+    fireEvent.change(screen.getByLabelText('OpenRouter routing'), {
+      target: { value: 'provider:parasail' },
+    });
+    expect(screen.getByLabelText('Deployment type')).toHaveValue('provider_api');
+  });
+
+  it('flags a saved override that is not in effect', async () => {
+    vi.mocked(listProviderRoutes).mockResolvedValue({
+      provider_options: providerOptions,
+      routes: [{ ...route, source: 'override', override_applied: false }],
+    });
+    render(<ProviderRoutesTab />);
+    expect(await screen.findByText('Override not applied')).toBeInTheDocument();
+    expect(screen.queryByText('Override active')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Reset config' })).toBeInTheDocument();
   });
 });
