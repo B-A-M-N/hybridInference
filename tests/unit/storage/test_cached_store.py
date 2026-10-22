@@ -75,7 +75,7 @@ class TestInMemoryCache:
         assert await cache.get("key") == "value"
 
     async def test_ttl_expiry(self, cache):
-        with patch("serving.storage.cache.time.monotonic") as mock_time:
+        with patch("serving.storage.cache_backend.time.monotonic") as mock_time:
             mock_time.return_value = 1000.0
             await cache.set("key", "value", ttl=10)
 
