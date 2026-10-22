@@ -54,6 +54,30 @@ class CacheBackend(ABC):
     async def set(self, key: str, value: Any, ttl: int) -> None:
         """Store *value* under *key* with a TTL in seconds."""
 
+    async def set_if_generation(
+        self,
+        key: str,
+        value: Any,
+        ttl: int,
+        *,
+        generation: int,
+    ) -> bool:
+        """Atomically publish *value* iff the store's generation still matches.
+
+        The generation check and the insert happen under the same backend
+        synchronization boundary, so an invalidation that races a fill cannot
+        interleave between the check and the write. Returns True if the value
+        was published, False if the generation changed (a stale fill was
+        dropped). The default implementation performs a check-then-set and is
+        safe only for backends whose invalidation and publication are already
+        atomic within :meth:`set`; tracking backends SHOULD override this with
+        a single critical section.
+        """
+        if self.current_generation() != generation:
+            return False
+        await self.set(key, value, ttl)
+        return True
+
     @abstractmethod
     async def delete(self, key: str) -> None:
         """Remove a single key (no-op if missing)."""
@@ -113,14 +137,21 @@ class InMemoryCache(CacheBackend):
             self._evictions += 1
 
     def _purge_expired_locked(self, bound: int = 256) -> None:
-        """Drop up to *bound* expired entries, oldest-first, without scanning
-        the whole map on every miss."""
+        """Drop up to *bound* expired entries, oldest-first.
+
+        Only the first *bound* items (oldest by insertion order) are inspected,
+        so a cache miss never pays for a full-map scan. An expired entry that
+        falls beyond the inspected window is still evicted lazily when it is
+        accessed on a later get(); bounding the sweep here only caps the
+        per-miss cleanup cost.
+        """
         now = time.monotonic()
         purged = 0
-        expired_keys = [k for k, (_, exp) in self._store.items() if now > exp]
-        for k in expired_keys[:bound]:
-            del self._store[k]
-            purged += 1
+        for key in list(self._store.keys())[:bound]:
+            _, expires_at = self._store[key]
+            if now > expires_at:
+                del self._store[key]
+                purged += 1
         if purged:
             # Expiry is a form of eviction for observability purposes.
             self._evictions += purged
@@ -153,6 +184,28 @@ class InMemoryCache(CacheBackend):
             self._store.move_to_end(key)
             self._evict_lru_if_needed()
 
+    async def set_if_generation(
+        self,
+        key: str,
+        value: Any,
+        ttl: int,
+        *,
+        generation: int,
+    ) -> bool:
+        """Publish *value* atomically iff the generation still matches.
+
+        The check and the insert share one critical section, so an invalidation
+        (delete / delete_pattern) that races the fill cannot interleave between
+        them. Returns True on publish, False when the generation changed.
+        """
+        async with self._lock:
+            if self._generation != generation:
+                return False
+            self._store[key] = (value, time.monotonic() + ttl)
+            self._store.move_to_end(key)
+            self._evict_lru_if_needed()
+            return True
+
     async def delete(self, key: str) -> None:
         """Remove a single key.
 
@@ -181,9 +234,15 @@ class InMemoryCache(CacheBackend):
     # -- generation hooks ----------------------------------------------------
 
     def current_generation(self) -> int:
+        """Return the current invalidation generation counter."""
         return self._generation
 
     def bump_generation(self) -> int:
+        """Advance the generation counter and return the new value.
+
+        Used to force a fill to drop its snapshot when an invalidation overlaps
+        an in-flight read without deleting a key or pattern.
+        """
         self._generation += 1
         return self._generation
 
@@ -336,8 +395,8 @@ class CachedOperationalStore(OperationalStore):
             return cached
         gen_before = self._cache.current_generation()
         result = await self._store.get_user_by_id(user_id)
-        if result is not None and self._cache.current_generation() == gen_before:
-            await self._cache.set(ck, result, _USER_TTL)
+        if result is not None:
+            await self._cache.set_if_generation(ck, result, _USER_TTL, generation=gen_before)
         return result
 
     async def get_auth_context_by_key_hash(self, key_hash: str) -> Row | None:
@@ -348,8 +407,10 @@ class CachedOperationalStore(OperationalStore):
             return cached
         gen_before = self._cache.current_generation()
         result = await self._store.get_auth_context_by_key_hash(key_hash)
-        if result is not None and self._cache.current_generation() == gen_before:
-            await self._cache.set(ck, result, _AUTH_CONTEXT_TTL)
+        if result is not None:
+            await self._cache.set_if_generation(
+                ck, result, _AUTH_CONTEXT_TTL, generation=gen_before
+            )
         return result
 
     async def get_auth_context_lightweight(self, key_hash: str) -> Row | None:
@@ -360,8 +421,10 @@ class CachedOperationalStore(OperationalStore):
             return cached
         gen_before = self._cache.current_generation()
         result = await self._store.get_auth_context_lightweight(key_hash)
-        if result is not None and self._cache.current_generation() == gen_before:
-            await self._cache.set(ck, result, _AUTH_CONTEXT_TTL)
+        if result is not None:
+            await self._cache.set_if_generation(
+                ck, result, _AUTH_CONTEXT_TTL, generation=gen_before
+            )
         return result
 
     async def get_key_owner_for_audit(self, key_hash: str) -> Row | None:
@@ -391,8 +454,8 @@ class CachedOperationalStore(OperationalStore):
         result = await self._store.get_key_owner_for_audit(key_hash)
         if result is not None:
             ttl = _audit_entry_ttl(result)
-            if ttl > 0 and self._cache.current_generation() == gen_before:
-                await self._cache.set(ck, result, ttl)
+            if ttl > 0:
+                await self._cache.set_if_generation(ck, result, ttl, generation=gen_before)
         return result
 
     # -- user writes (invalidate user cache) ---------------------------------
