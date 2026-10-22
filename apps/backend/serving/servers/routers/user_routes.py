@@ -54,11 +54,11 @@ from serving.servers.deps import (
     get_router,
 )
 from serving.servers.routers.models import _build_model_list_async
+from serving.servers.routers.reauth import confirm_account_owner
 from serving.servers.routers.recent_requests import (
     present_recent_requests,
     query_recent_requests,
 )
-from serving.servers.routers.reauth import confirm_account_owner
 from serving.utils import password as password_utils
 from serving.utils.email import is_email_enabled, send_password_changed_email
 from serving.utils.logging import get_logger
