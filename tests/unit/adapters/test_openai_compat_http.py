@@ -240,6 +240,22 @@ async def test_parallel_tool_calls_reaches_the_upstream_only_when_supported(upst
 
 
 @pytest.mark.parametrize("mode", ["chat", "stream"])
+async def test_parallel_tool_calls_is_omitted_without_tools(upstream, mode):
+    adapter = _adapter(
+        upstream,
+        supported_params=["temperature", "max_tokens", "parallel_tool_calls"],
+    )
+    if mode == "chat":
+        await adapter.chat_completion(USER, parallel_tool_calls=False)
+    else:
+        upstream.frames = [_chunk({"content": "ok"}, "stop"), "[DONE]"]
+        await _stream(adapter, parallel_tool_calls=False)
+
+    assert "tools" not in upstream.sent
+    assert "parallel_tool_calls" not in upstream.sent
+
+
+@pytest.mark.parametrize("mode", ["chat", "stream"])
 async def test_a_model_without_tool_support_is_sent_no_tools(upstream, mode):
     adapter = _adapter(upstream, supports_tools=False)
     params = {"tools": TOOLS, "tool_choice": "required"}
