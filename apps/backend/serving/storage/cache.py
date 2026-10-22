@@ -1506,6 +1506,7 @@ class CachedOperationalStore(OperationalStore):
         """Delegate to wrapped store."""
         return await self._store.list_provider_env_key_reservations(provider)
 
+
 __all__ = [
     "CacheBackend",
     "CachedOperationalStore",
