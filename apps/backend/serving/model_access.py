@@ -151,8 +151,9 @@ def default_required_role_for_model(model: Mapping[str, Any]) -> str:
     Issue #1576: an omitted ``required_role`` used to publish every such model
     free-tier — including the paid-upstream Claude compatibility routes. A
     model that costs anything defaults to ``pro``; an all-zero-priced model
-    keeps the historical ``free`` default. An explicit value always wins, even
-    an invalid one (callers fail that closed themselves).
+    keeps the historical ``free`` default. ``admin_only`` defaults to
+    ``admin`` when no role is explicit. An explicit value always wins, even an
+    invalid one (callers fail that closed themselves).
 
     The unknown-cost half of the gap: a model with no pricing metadata whose
     routes are not all provably local defaults to ``pro`` as well. Provably
@@ -165,6 +166,8 @@ def default_required_role_for_model(model: Mapping[str, Any]) -> str:
     """
     if "required_role" in model:
         return str(model["required_role"])
+    if model.get("admin_only"):
+        return "admin"
     if model_pricing_indicates_paid(model):
         return "pro"
     if model_cost_is_unknown_remote(model):

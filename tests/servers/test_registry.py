@@ -1209,6 +1209,32 @@ def test_a_paid_model_without_required_role_defaults_to_pro(tmp_path, monkeypatc
 
 
 @pytest.mark.unit
+def test_admin_only_model_without_required_role_stays_admin(tmp_path):
+    """An omitted role must not weaken the explicit admin_only policy."""
+    p = tmp_path / "models.yaml"
+    p.write_text(
+        "models:\n"
+        "  - id: admin-paid\n"
+        "    name: Admin Paid\n"
+        "    provider: openai_compat\n"
+        "    admin_only: true\n"
+        "    pricing:\n"
+        '      prompt: "2.00"\n'
+        '      completion: "8.00"\n'
+        "    route:\n"
+        "      - kind: openai_compat\n"
+        "        weight: 1.0\n"
+        "        base_url: https://paid.example.test/v1\n"
+    )
+
+    exe = RouteExecutor()
+    registry.register_from_models_yaml(exe, Path(p))
+
+    assert exe.routes["admin-paid"].admin_only is True
+    assert exe.routes["admin-paid"].required_role == "admin"
+
+
+@pytest.mark.unit
 def test_explicit_required_role_still_wins_over_the_pricing_default(tmp_path):
     """An explicit ``required_role`` is never overridden by pricing."""
     yaml_text = (
@@ -1216,6 +1242,7 @@ def test_explicit_required_role_still_wins_over_the_pricing_default(tmp_path):
         "  - id: sponsored-pro\n"
         "    name: Sponsored Pro\n"
         "    provider: openai_compat\n"
+        "    admin_only: true\n"
         "    required_role: free\n"
         "    pricing:\n"
         '      prompt: "2.00"\n'
@@ -1231,6 +1258,7 @@ def test_explicit_required_role_still_wins_over_the_pricing_default(tmp_path):
     exe = RouteExecutor()
     registry.register_from_models_yaml(exe, Path(p))
 
+    assert exe.routes["sponsored-pro"].admin_only is False
     assert exe.routes["sponsored-pro"].required_role == "free"
 
 
