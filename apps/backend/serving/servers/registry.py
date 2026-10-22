@@ -940,8 +940,10 @@ def register_from_models_yaml(
                         embedding_adapters[alias] = emb_adapter
                 count += 1 + len(aliases)
             else:
-                # Chat models go through the full FixedRouter
-                admin_only = bool(m.get("admin_only", False))
+                # Chat models go through the full FixedRouter.
+                # Preserve explicit required_role as the source of truth;
+                # admin_only supplies the default only when it is omitted.
+                admin_only = bool(m.get("admin_only", False)) and "required_role" not in m
                 # Issue #1576: an omitted required_role used to publish every
                 # such model free-tier, including the paid-upstream Claude
                 # compatibility routes. A model that costs anything defaults
