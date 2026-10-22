@@ -102,6 +102,54 @@ def test_embedding_model_without_role_shares_the_chat_cost_default(tmp_path):
 
 
 @pytest.mark.unit
+def test_embedding_admin_only_without_role_defaults_to_admin(tmp_path):
+    body = _embedding_yaml(role=None).replace(
+        "    model_type: embedding\n", "    model_type: embedding\n    admin_only: true\n"
+    )
+    p = _write_models_yaml(tmp_path, body)
+
+    exe = FixedRouter()
+    register_from_models_yaml(exe, p, {})
+
+    gate = exe.embedding_routes["emb-x"]
+    assert gate.required_role == "admin"
+
+
+@pytest.mark.unit
+def test_embedding_explicit_role_overrides_admin_only_compatibility(tmp_path):
+    body = _embedding_yaml(role="free").replace(
+        "    model_type: embedding\n", "    model_type: embedding\n    admin_only: true\n"
+    )
+    p = _write_models_yaml(tmp_path, body)
+
+    exe = FixedRouter()
+    register_from_models_yaml(exe, p, {})
+
+    gate = exe.embedding_routes["emb-x"]
+    assert gate.required_role == "free"
+    assert gate.admin_only is False
+
+
+@pytest.mark.unit
+def test_embedding_with_only_unconfigured_optional_routes_is_skipped(tmp_path, monkeypatch):
+    body = _embedding_yaml(role=None).replace(
+        "      - kind: openai_compat\n        base_url: https://gateway.example/api/v2/",
+        "      - kind: openai_compat\n        optional: true\n"
+        "        base_url: ${OPTIONAL_EMBEDDING_BASE_URL}",
+    )
+    monkeypatch.delenv("OPTIONAL_EMBEDDING_BASE_URL", raising=False)
+    p = _write_models_yaml(tmp_path, body)
+
+    exe = FixedRouter()
+    adapters: dict = {}
+    count, _infos = register_from_models_yaml(exe, p, adapters)
+
+    assert count == 0
+    assert adapters == {}
+    assert exe.embedding_routes == {}
+
+
+@pytest.mark.unit
 def test_embedding_model_on_a_local_engine_keeps_the_free_default(tmp_path):
     # The cost-derived default reaches embeddings too: a locally-served
     # engine route (the one free-by-construction shape) with no role and no
@@ -119,8 +167,8 @@ def test_embedding_model_on_a_local_engine_keeps_the_free_default(tmp_path):
 
 
 @pytest.mark.unit
-def test_embedding_model_with_zero_pricing_keeps_the_free_default(tmp_path):
-    # Explicit pricing at zero is the other provably-free declaration.
+def test_embedding_model_with_zero_user_pricing_keeps_remote_cost_gate(tmp_path):
+    # Zero user-facing prices do not prove that a remote provider is free.
     body = _embedding_yaml(role=None).replace(
         "    route:",
         '    pricing:\n      prompt: "0"\n      completion: "0"\n    route:',
@@ -130,7 +178,7 @@ def test_embedding_model_with_zero_pricing_keeps_the_free_default(tmp_path):
     exe = FixedRouter()
     register_from_models_yaml(exe, p, {})
 
-    assert exe.embedding_routes["emb-x"].required_role == "free"
+    assert exe.embedding_routes["emb-x"].required_role == "pro"
 
 
 @pytest.mark.unit

@@ -38,8 +38,8 @@ def _route(
     )
 
 
-def _exec(routes: dict) -> SimpleNamespace:
-    return SimpleNamespace(routes=routes)
+def _exec(routes: dict, embedding_routes: dict | None = None) -> SimpleNamespace:
+    return SimpleNamespace(routes=routes, embedding_routes=embedding_routes or {})
 
 
 async def test_role_gates_match_the_inference_path():
@@ -81,6 +81,24 @@ async def test_unpublished_disabled_and_embedding_models_are_excluded():
     user_ctx = {"role": "internal", "disabled_models": ["banned"]}
 
     assert await agent_visible_models(router_exec, user_ctx=user_ctx) == ["usable"]
+
+
+async def test_grant_catalog_can_include_authorized_embedding_models():
+    router_exec = _exec(
+        {"chat": _route("chat")},
+        {
+            "embed": _route("embed", model_type="embedding"),
+            "admin-embed": _route("admin-embed", model_type="embedding", admin_only=True),
+        },
+    )
+
+    assert await agent_visible_models(router_exec, user_ctx={"role": "free"}) == ["chat"]
+    assert await agent_visible_models(
+        router_exec, include_embeddings=True, user_ctx={"role": "free"}
+    ) == ["chat", "embed"]
+    assert await agent_visible_models(
+        router_exec, include_embeddings=True, user_ctx={"role": "admin"}
+    ) == ["chat", "embed", "admin-embed"]
 
 
 async def test_visibility_resolver_override_wins_both_ways():

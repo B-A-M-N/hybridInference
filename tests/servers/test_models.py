@@ -556,7 +556,10 @@ async def test_models_tag_embedding_models_with_the_embeddings_feature():
     """
     router = FixedRouter()
     router.register_route("chat-model", [(_Adapter(_cfg(id="chat-model")), 1.0)])
-    embedding = _Adapter(_cfg(id="embed-model", provider="embedder"))
+    embedding_cfg = _cfg(id="embed-model", provider="embedder")
+    embedding_cfg.model_type = "embedding"
+    embedding = _Adapter(embedding_cfg)
+    router.register_embedding_route("embed-model", [(embedding, 1.0)], required_role="free")
 
     app = FastAPI(title="Models App")
     app.state.services = AppServices(  # type: ignore[attr-defined]
@@ -574,3 +577,60 @@ async def test_models_tag_embedding_models_with_the_embeddings_feature():
             by_id = {item["id"]: item for item in resp.json()["data"]}
             assert by_id["embed-model"]["supported_features"] == ["embeddings"]
             assert "embeddings" not in by_id["chat-model"]["supported_features"]
+
+
+@pytest.mark.asyncio
+async def test_embedding_model_list_obeys_role_and_visibility_override():
+    from serving.config.model_visibility import ModelVisibilityResolver
+    from serving.servers.auth import optional_verify_api_key
+
+    router = RouteExecutor()
+    embedding_cfg = _cfg(id="restricted-embed", provider="embedder")
+    embedding_cfg.model_type = "embedding"
+    embedding = _Adapter(embedding_cfg)
+    router.register_embedding_route("restricted-embed", [(embedding, 1.0)], required_role="admin")
+    store = type("Store", (), {})()
+    store.get_model_visibility_override = AsyncMock(
+        return_value={"model_id": "restricted-embed", "required_role": "free"}
+    )
+    resolver = ModelVisibilityResolver(store)
+
+    app = FastAPI()
+    app.state.services = AppServices(  # type: ignore[attr-defined]
+        router=router,
+        db_logger=None,
+        embedding_adapters={"restricted-embed": embedding},
+        model_visibility_resolver=resolver,
+    )
+    app.dependency_overrides[optional_verify_api_key] = lambda: {"role": "free"}
+    app.include_router(models.router)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/v1/models")
+
+    assert response.status_code == status.HTTP_200_OK
+    assert [item["id"] for item in response.json()["data"]] == ["restricted-embed"]
+
+
+@pytest.mark.asyncio
+async def test_embedding_model_list_hides_admin_only_model_from_free_user():
+    router = RouteExecutor()
+    embedding_cfg = _cfg(id="admin-embed", provider="embedder")
+    embedding_cfg.model_type = "embedding"
+    embedding = _Adapter(embedding_cfg)
+    router.register_embedding_route("admin-embed", [(embedding, 1.0)], admin_only=True)
+
+    app = FastAPI()
+    app.state.services = AppServices(  # type: ignore[attr-defined]
+        router=router,
+        db_logger=None,
+        embedding_adapters={"admin-embed": embedding},
+    )
+    app.dependency_overrides[optional_verify_api_key] = lambda: {"role": "free"}
+    app.include_router(models.router)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/v1/models")
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["data"] == []
