@@ -644,22 +644,32 @@ async def chat_completions(
     # multi-backend routes pick an adapter lazily inside the router, and by the
     # time the choice is known the response headers are already on the wire;
     # the exact identity reaches the logs through ``_routing`` (issue #1504).
-    def get_single_route_identity() -> tuple[str | None, str | None]:
-        """Return (provider, endpoint_id) when the route has exactly one backend."""
+    def get_single_route_identity() -> tuple[str | None, str | None, bool]:
+        """Return provider identity only when registration gives one backend."""
         route_config = router_exec.routes.get(model)
         if route_config is None or len(route_config.adapters) != 1:
-            return None, None
+            return None, None, False
         only_adapter = route_config.adapters[0][0]
-        return getattr(only_adapter.config, "provider", None), endpoint_id_for_adapter(only_adapter)
+        config = only_adapter.config
+        return (
+            getattr(config, "provider", None),
+            endpoint_id_for_adapter(only_adapter),
+            bool(getattr(config, "endpoint_identity_publishable", False)),
+        )
 
-    single_provider, single_endpoint = get_single_route_identity()
-    identity_headers = served_identity_headers(
-        requested_model=requested_model,
-        # Auto conceals which model serves: the endpoint and provider name the
-        # same model, so they are withheld with it.
-        served_model=None if auto_selection is not None else model,
-        endpoint_id=None if auto_selection is not None else single_endpoint,
-        provider=None if auto_selection is not None else single_provider,
+    single_provider, single_endpoint, single_endpoint_publishable = get_single_route_identity()
+    identity_headers = (
+        served_identity_headers(
+            requested_model=requested_model,
+            # Auto conceals which model serves: the endpoint and provider name the
+            # same model, so they are withheld with it.
+            served_model=None if auto_selection is not None else model,
+            endpoint_id=None if auto_selection is not None else single_endpoint,
+            provider=None if auto_selection is not None else single_provider,
+            endpoint_publishable=single_endpoint_publishable,
+        )
+        if is_synthetic_probe
+        else {}
     )
 
     # Check if model has routing configured
@@ -995,6 +1005,21 @@ async def chat_completions(
                 # parameter's headers into a returned Response.
                 **identity_headers,
             }
+            if is_synthetic_probe and auto_selection is None:
+                observed = session.routing_info
+                if observed.provider and observed.endpoint_id:
+                    config = get_adapter_config_for_provider(observed.provider, observed.base_url)
+                    streaming_headers.update(
+                        served_identity_headers(
+                            requested_model=requested_model,
+                            served_model=model,
+                            endpoint_id=observed.endpoint_id,
+                            provider=observed.provider,
+                            endpoint_publishable=bool(
+                                getattr(config, "endpoint_identity_publishable", False)
+                            ),
+                        )
+                    )
             if is_synthetic_probe:
                 provider_header = get_single_route_provider()
                 if provider_header:
@@ -1043,6 +1068,21 @@ async def chat_completions(
             "X-Accel-Buffering": "no",
             **identity_headers,
         }
+        if is_synthetic_probe and auto_selection is None:
+            observed = session.routing_info
+            if observed.provider and observed.endpoint_id:
+                config = get_adapter_config_for_provider(observed.provider, observed.base_url)
+                response_headers.update(
+                    served_identity_headers(
+                        requested_model=requested_model,
+                        served_model=model,
+                        endpoint_id=observed.endpoint_id,
+                        provider=observed.provider,
+                        endpoint_publishable=bool(
+                            getattr(config, "endpoint_identity_publishable", False)
+                        ),
+                    )
+                )
         if is_synthetic_probe:
             provider_header = get_single_route_provider()
             if provider_header:
@@ -1220,14 +1260,19 @@ async def chat_completions(
             http_response.headers["X-Provider"] = provider
         # Non-streaming: the adapter has run, so the enriched routing carries
         # the exact served endpoint, not just a single-route guess.
-        http_response.headers.update(
-            served_identity_headers(
-                requested_model=requested_model,
-                served_model=None if auto_selection is not None else model,
-                endpoint_id=None if auto_selection is not None else routing.endpoint_id,
-                provider=provider if provider != "router" and auto_selection is None else None,
+        if is_synthetic_probe:
+            config = get_adapter_config_for_provider(provider, routing.base_url)
+            http_response.headers.update(
+                served_identity_headers(
+                    requested_model=requested_model,
+                    served_model=None if auto_selection is not None else model,
+                    endpoint_id=None if auto_selection is not None else routing.endpoint_id,
+                    provider=provider if provider != "router" and auto_selection is None else None,
+                    endpoint_publishable=bool(
+                        getattr(config, "endpoint_identity_publishable", False)
+                    ),
+                )
             )
-        )
         if isinstance(response, dict) and isinstance(response.get("usage"), dict):
             # The client's copy only: the response model requires all three totals.
             return {**response, "usage": sanitize_usage(response["usage"], complete=True)}

@@ -367,19 +367,12 @@ async def test_bare_auto_is_the_default_tier(gateway):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("path", "body"), _SURFACES[:2])
-async def test_auto_served_headers_carry_the_request_but_not_the_serving_identity(
-    gateway, path, body
-):
-    """Auto's concealment extends to the X-FI-* served-identity headers.
-
-    The requested model is the caller's own string, but which model, endpoint
-    or provider served it is exactly what auto declines to say (issue #1504).
-    """
+async def test_auto_does_not_expose_identity_headers_to_ordinary_callers(gateway, path, body):
+    """Served-identity headers are limited to trusted diagnostic callers."""
     response = await gateway.post(path, body("auto-balance"), SESSION)
 
     assert response.status_code == 200
-    assert response.headers["x-fi-requested-model"] == "auto-balance"
-    assert not any(name.lower().startswith("x-fi-served") for name in response.headers)
+    assert not any(name.lower().startswith("x-fi-") for name in response.headers)
 
 
 @pytest.mark.asyncio
@@ -440,6 +433,37 @@ async def test_a_model_the_caller_may_not_use_is_never_chosen(gateway):
     assert gateway.served() == [FRONTIER]
     auto = (await gateway.logged())["metadata"]["auto"]
     assert auto["dropped"] == {MID: "unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["chat", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_trusted_probe_auto_selection_still_conceals_served_identity(
+    mock_db_logger, mock_log_store, surface, stream
+):
+    gateway = _Gateway(
+        mock_db_logger,
+        mock_log_store,
+        user={**USER, "role": "internal"},
+    )
+    if surface == "chat":
+        path = "/v1/chat/completions"
+        body = _chat("auto-balance", stream=stream)
+    else:
+        path = "/v1/messages"
+        body = _anthropic("auto-balance", stream=stream)
+
+    response = await gateway.post(
+        path,
+        body,
+        headers={"x-probe": "synthetic"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers.get("x-fi-requested-model") == "auto-balance"
+    assert "x-fi-served-model" not in response.headers
+    assert "x-fi-served-endpoint" not in response.headers
+    assert "x-fi-served-provider" not in response.headers
 
 
 @pytest.mark.asyncio

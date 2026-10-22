@@ -11,13 +11,9 @@ that dispatch already knows:
 ``X-FI-Served-Endpoint``  the sanitized logical endpoint id
 ``X-FI-Served-Provider``  the provider label of the serving adapter
 
-The endpoint id degrades to the provider label unless it is exactly
-``{served_model}:{location}`` with ``served_model`` the trusted name the
-response already publishes and the location one of the registry's
-sanitized shapes: a gateway-owned LAN server is stamped
-``<first-octet>-api`` and an admin-supplied route_id is kept verbatim, so
-neither a hostname nor an untrusted prefix dressed up with a
-registry-shaped location reaches a caller-visible header. The api_logs
+An endpoint id is emitted to trusted diagnostic callers only when registration
+retained publishability metadata and it is exactly ``{served_model}:{location}``.
+A safe-looking suffix is not proof that its origin is public. The api_logs
 columns keep the full id either way.
 
 Every served-* field is optional: auto-selection deliberately conceals which
@@ -29,24 +25,29 @@ pass only the requested model there.
 from __future__ import annotations
 
 import re
+from typing import Any
 
 REQUESTED_MODEL_HEADER = "X-FI-Requested-Model"
 SERVED_MODEL_HEADER = "X-FI-Served-Model"
 SERVED_ENDPOINT_HEADER = "X-FI-Served-Endpoint"
 SERVED_PROVIDER_HEADER = "X-FI-Served-Provider"
+SERVED_IDENTITY_HEADER_NAMES = frozenset(
+    (REQUESTED_MODEL_HEADER, SERVED_MODEL_HEADER, SERVED_ENDPOINT_HEADER, SERVED_PROVIDER_HEADER)
+)
 
-# Location shapes _make_provider_id mints that are safe to publish: a local
-# port ("local-12003", or bare "local") and a single lowercase service label
-# with the -api suffix ("zai-api", "openrouter-api"). Anything else — LAN
-# octet stamps ("10-api"), hostnames ("gpu-7-api"), admin route_ids —
-# degrades to the provider label.
+# Location grammar is only a final format check. The separately retained
+# registry publishability bit is the authority for whether a location may be
+# disclosed at all.
 _SAFE_LOCATION_RE = re.compile(r"^(?:local(?:-\d+)?|[a-z][a-z0-9]*-api)$")
 
 
 def header_endpoint_id(
-    endpoint_id: str | None, provider: str | None, served_model: str | None
+    endpoint_id: str | None,
+    served_model: str | None,
+    *,
+    publishable: bool = False,
 ) -> str | None:
-    """Sanitized endpoint identity for a public response header.
+    """Sanitized endpoint identity for a trusted diagnostic response header.
 
     The api_logs column may carry a LAN or cluster-DNS stamp the registry
     derived from base_url, or an admin-supplied route_id kept verbatim; a
@@ -55,8 +56,8 @@ def header_endpoint_id(
     carries, resolved through the registry — not in any lexical property of
     ``endpoint_id``: the identifier is republished only when it is exactly
     ``{served_model}:{location}`` and the location is one of the registry's
-    sanitized shapes. Anything else degrades to the provider label, and both
-    absent degrade to ``None`` so the header is omitted entirely.
+    sanitized shapes. Anything else returns ``None`` so the endpoint header
+    is omitted entirely.
 
     A location that merely looks registry-minted grants nothing: an endpoint
     id like ``private.internal:local-12003`` ends in a legitimate location,
@@ -65,15 +66,23 @@ def header_endpoint_id(
     endpoint's prefix degrades the same way — the header set stays
     internally consistent with the model the caller was told about.
     """
-    if not endpoint_id:
-        return provider
-    if not served_model:
-        # No trusted name to anchor the prefix: nothing is publishable.
-        return provider
+    if not publishable or not endpoint_id or not served_model:
+        return None
     prefix, sep, location = endpoint_id.rpartition(":")
     if sep and prefix == served_model and _SAFE_LOCATION_RE.fullmatch(location):
         return endpoint_id
-    return provider
+    return None
+
+
+def _latin1_header_value(value: str | None) -> str | None:
+    """Return an HTTP-header-safe Latin-1 value, or omit it."""
+    if not value or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        return None
+    try:
+        value.encode("latin-1")
+    except UnicodeEncodeError:
+        return None
+    return value
 
 
 def served_identity_headers(
@@ -82,6 +91,7 @@ def served_identity_headers(
     served_model: str | None = None,
     endpoint_id: str | None = None,
     provider: str | None = None,
+    endpoint_publishable: bool = False,
 ) -> dict[str, str]:
     """Build the X-FI-* header set; a field is omitted when its value is None.
 
@@ -90,13 +100,25 @@ def served_identity_headers(
     model the concealment hides, so they are withheld with it.
     """
     headers: dict[str, str] = {}
-    if requested_model:
-        headers[REQUESTED_MODEL_HEADER] = requested_model
-    if served_model:
-        headers[SERVED_MODEL_HEADER] = served_model
-    if provider:
-        headers[SERVED_PROVIDER_HEADER] = provider
-    endpoint = header_endpoint_id(endpoint_id, provider, served_model)
-    if endpoint:
-        headers[SERVED_ENDPOINT_HEADER] = endpoint
+    for header, value in (
+        (REQUESTED_MODEL_HEADER, requested_model),
+        (SERVED_MODEL_HEADER, served_model),
+        (SERVED_PROVIDER_HEADER, provider),
+    ):
+        safe_value = _latin1_header_value(value)
+        if safe_value is not None:
+            headers[header] = safe_value
+    endpoint = header_endpoint_id(endpoint_id, served_model, publishable=endpoint_publishable)
+    safe_endpoint = _latin1_header_value(endpoint)
+    if safe_endpoint is not None:
+        headers[SERVED_ENDPOINT_HEADER] = safe_endpoint
     return headers
+
+
+def copy_served_identity_headers(headers: Any) -> dict[str, str]:
+    """Copy only the opt-in identity headers from a delegated response."""
+    return {
+        name: value
+        for name in SERVED_IDENTITY_HEADER_NAMES
+        if (value := headers.get(name)) is not None
+    }

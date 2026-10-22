@@ -81,6 +81,7 @@ from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
 from serving.utils.request_ip import derive_affinity_key, get_client_ip_info
 from serving.utils.session_identity import consume_session_fields, session_identity
+from serving.utils.synthetic_probe import is_trusted_probe
 from serving.utils.token_utils import usage_count
 from serving.utils.tokens import estimate_prompt_tokens, estimate_text_tokens
 
@@ -1677,11 +1678,18 @@ async def anthropic_messages(
     # place requested != served stays visible to the client (issue #1504).
     # Auto rewrote ``model_id`` above, so the requested name comes from the
     # selection.
-    identity_headers = served_identity_headers(
-        requested_model=(auto_selection.requested if auto_selection is not None else model_id),
-        served_model=None if auto_selection is not None else canonical,
-        endpoint_id=None if auto_selection is not None else dispatch_endpoint_id,
-        provider=None if auto_selection is not None else adapter.config.provider,
+    identity_headers = (
+        served_identity_headers(
+            requested_model=(auto_selection.requested if auto_selection is not None else model_id),
+            served_model=None if auto_selection is not None else canonical,
+            endpoint_id=None if auto_selection is not None else dispatch_endpoint_id,
+            provider=None if auto_selection is not None else adapter.config.provider,
+            endpoint_publishable=bool(
+                getattr(adapter.config, "endpoint_identity_publishable", False)
+            ),
+        )
+        if is_trusted_probe(request, user_ctx)
+        else {}
     )
 
     # Snapshot messages before _sanitize_for_openai_backend mutates them in-place

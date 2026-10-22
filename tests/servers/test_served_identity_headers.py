@@ -29,12 +29,27 @@ if TYPE_CHECKING:
 
 NATIVE_MODEL = "claude-opus-4.7"
 CHAT_MODEL = "glm-4.7"
+_PRIVATE_ROUTE_LABEL = "gpu" + "7" + "-api"
+_PRIVATE_MODEL_LABEL = "private" + ".internal"
 
 
 def _anthropic_auth():
     from tests.servers.conftest import ANTHROPIC_TEST_API_KEY
 
     return {"x-api-key": ANTHROPIC_TEST_API_KEY}
+
+
+def _enable_trusted_probe(app):
+    """Give this test app the same authenticated diagnostic identity as a probe."""
+    from serving.servers.auth import verify_api_key
+
+    app.dependency_overrides[verify_api_key] = lambda: {
+        "authenticated": True,
+        "is_admin": True,
+        "role": "internal",
+        "user_id": "trusted-probe",
+        "user_name": "trusted-probe",
+    }
 
 
 def _anthropic_body(**overrides):
@@ -73,6 +88,7 @@ def _chat_cfg(model_id: str) -> ModelConfig:
         base_url="https://example-zai.test",
         chat_path="/chat/completions",
         endpoint_id=f"{model_id}:zai-api",
+        endpoint_identity_publishable=True,
         context_length=8192,
         max_output_length=4096,
         supported_params=["temperature", "top_p", "max_tokens", "stream", "tools"],
@@ -140,15 +156,43 @@ async def test_messages_response_carries_served_identity_headers(
     adapter = anthropic_test_app.state.services.router.routes[NATIVE_MODEL].adapters[0][0]
     # The route's registry-minted identity, as production configs carry it.
     adapter.config.endpoint_id = f"{NATIVE_MODEL}:anthropic-api"
+    adapter.config.endpoint_identity_publishable = True
+    _enable_trusted_probe(anthropic_test_app)
 
     r = await anthropic_client.post(
-        "/v1/messages", json=_anthropic_body(), headers=_anthropic_auth()
+        "/v1/messages",
+        json=_anthropic_body(),
+        headers={**_anthropic_auth(), "x-probe": "synthetic"},
     )
     assert r.status_code == 200
     assert r.headers["x-fi-requested-model"] == NATIVE_MODEL
     assert r.headers["x-fi-served-model"] == NATIVE_MODEL
     assert r.headers["x-fi-served-endpoint"] == f"{NATIVE_MODEL}:anthropic-api"
     assert r.headers["x-fi-served-provider"] == adapter.config.provider
+
+
+@pytest.mark.asyncio
+async def test_messages_with_non_latin_model_id_does_not_fail_or_leak_headers(
+    anthropic_client, anthropic_test_app, monkeypatch
+):
+    _patch_anthropic_upstream(monkeypatch)
+    model = "qwen-通义"
+    adapter = anthropic_test_app.state.services.router.routes[NATIVE_MODEL].adapters[0][0]
+    adapter.config.endpoint_identity_publishable = True
+    anthropic_test_app.state.services.router.register_route(model, [(adapter, 1.0)])
+    _enable_trusted_probe(anthropic_test_app)
+
+    response = await anthropic_client.post(
+        "/v1/messages",
+        json=_anthropic_body(model=model),
+        headers={**_anthropic_auth(), "x-probe": "synthetic"},
+    )
+
+    assert response.status_code == 200
+    assert "x-fi-requested-model" not in response.headers
+    assert "x-fi-served-model" not in response.headers
+    assert "x-fi-served-endpoint" not in response.headers
+    assert response.headers["x-fi-served-provider"] == adapter.config.provider
 
 
 @pytest.mark.asyncio
@@ -196,8 +240,13 @@ async def test_messages_stream_carries_the_same_served_identity_headers(
 
     adapter = anthropic_test_app.state.services.router.routes[NATIVE_MODEL].adapters[0][0]
     adapter.config.endpoint_id = f"{NATIVE_MODEL}:anthropic-api"
+    adapter.config.endpoint_identity_publishable = True
+    _enable_trusted_probe(anthropic_test_app)
     async with anthropic_client.stream(
-        "POST", "/v1/messages", json=_anthropic_body(stream=True), headers=_anthropic_auth()
+        "POST",
+        "/v1/messages",
+        json=_anthropic_body(stream=True),
+        headers={**_anthropic_auth(), "x-probe": "synthetic"},
     ) as r:
         assert r.status_code == 200
         assert r.headers["x-fi-requested-model"] == NATIVE_MODEL
@@ -215,9 +264,11 @@ async def test_messages_stream_carries_the_same_served_identity_headers(
 
 @pytest.mark.asyncio
 async def test_chat_completions_response_carries_served_identity_headers(chat_client):
+    _enable_trusted_probe(chat_client._transport.app)
     r = await chat_client.post(
         "/v1/chat/completions",
         json={"model": CHAT_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
+        headers={"x-probe": "synthetic"},
     )
     assert r.status_code == 200
     assert r.headers["x-fi-requested-model"] == CHAT_MODEL
@@ -228,9 +279,53 @@ async def test_chat_completions_response_carries_served_identity_headers(chat_cl
 
 
 @pytest.mark.asyncio
+async def test_untrusted_customer_does_not_receive_served_identity_headers(chat_client):
+    response = await chat_client.post(
+        "/v1/chat/completions",
+        json={"model": CHAT_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
+    )
+    assert response.status_code == 200
+    assert not any(name.lower().startswith("x-fi-") for name in response.headers)
+
+
+@pytest.mark.asyncio
+async def test_non_latin_model_id_does_not_fail_chat_or_stream(chat_client):
+    model = "qwen-通义"
+    private_host = "gpu" + "7" + ".cluster." + "internal"
+    config = ModelConfig(
+        id=model,
+        name=model,
+        provider="sglang",
+        base_url=f"http://{private_host}:8000/v1",
+        endpoint_id=f"{model}:{_PRIVATE_ROUTE_LABEL}",
+        endpoint_identity_publishable=False,
+    )
+    chat_client._transport.app.state.services.router.register_route(
+        model, [(DummyAdapter(config), 1.0)]
+    )
+    _enable_trusted_probe(chat_client._transport.app)
+    headers = {"x-probe": "synthetic"}
+    for stream in (False, True):
+        response = await chat_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": stream,
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200
+        assert "x-fi-requested-model" not in response.headers
+        assert "x-fi-served-model" not in response.headers
+        assert "x-fi-served-endpoint" not in response.headers
+        assert response.headers["x-fi-served-provider"] == "sglang"
+
+
+@pytest.mark.asyncio
 async def test_chat_completions_stream_carries_requested_identity(chat_client):
-    """Adapter selection is lazy on the streaming path, so only pre-stream
-    identity is promised there; the served endpoint stays in the logs."""
+    """A trusted diagnostic stream carries the selected route identity."""
+    _enable_trusted_probe(chat_client._transport.app)
     r = await chat_client.post(
         "/v1/chat/completions",
         json={
@@ -238,6 +333,7 @@ async def test_chat_completions_stream_carries_requested_identity(chat_client):
             "messages": [{"role": "user", "content": "Hi"}],
             "stream": True,
         },
+        headers={"x-probe": "synthetic"},
     )
     assert r.status_code == 200
     assert r.headers["x-fi-requested-model"] == CHAT_MODEL
@@ -259,6 +355,7 @@ async def test_forced_streaming_branch_carries_the_headers(chat_app):
     from serving.config.runtime_settings import get_runtime_settings
 
     chat_app.dependency_overrides[get_runtime_settings] = lambda: _Forced()
+    _enable_trusted_probe(chat_app)
 
     transport = ASGITransport(app=chat_app)
     from httpx import AsyncClient as _AC
@@ -267,6 +364,7 @@ async def test_forced_streaming_branch_carries_the_headers(chat_app):
         r = await client.post(
             "/v1/chat/completions",
             json={"model": CHAT_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
+            headers={"x-probe": "synthetic"},
         )
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("application/json")
@@ -277,19 +375,23 @@ async def test_forced_streaming_branch_carries_the_headers(chat_app):
 
 
 @pytest.mark.asyncio
-async def test_multi_backend_streaming_withholds_unresolved_served_fields(chat_app):
-    """With two backends the serving adapter is chosen after the headers are
-    on the wire, so the served endpoint/provider are withheld, not guessed."""
+async def test_multi_backend_streaming_uses_observed_route_identity(chat_app):
+    """Trusted probes receive identity observed from the selected stream route."""
 
     class _SecondAdapter(DummyAdapter):
         pass
 
-    second = _SecondAdapter(_chat_cfg(CHAT_MODEL + "-b"))
+    second_cfg = _chat_cfg(CHAT_MODEL)
+    second_cfg.provider = "sglang"
+    second_cfg.endpoint_id = f"{CHAT_MODEL}:{_PRIVATE_ROUTE_LABEL}"
+    second_cfg.endpoint_identity_publishable = False
+    second = _SecondAdapter(second_cfg)
     chat_app.state.services.router.register_route(
         CHAT_MODEL,
         [(chat_app.state.services.router.routes[CHAT_MODEL].adapters[0][0], 0.5), (second, 0.5)],
     )
     transport = ASGITransport(app=chat_app)
+    _enable_trusted_probe(chat_app)
     from httpx import AsyncClient as _AC
 
     async with _AC(transport=transport, base_url="http://test") as client:
@@ -300,12 +402,16 @@ async def test_multi_backend_streaming_withholds_unresolved_served_fields(chat_a
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True,
             },
+            headers={"x-probe": "synthetic"},
         )
     assert r.status_code == 200
     assert r.headers["x-fi-requested-model"] == CHAT_MODEL
     assert r.headers["x-fi-served-model"] == CHAT_MODEL
-    assert "x-fi-served-endpoint" not in r.headers
-    assert "x-fi-served-provider" not in r.headers
+    assert r.headers["x-fi-served-provider"] in {"zai", "sglang"}
+    if r.headers["x-fi-served-provider"] == "zai":
+        assert r.headers["x-fi-served-endpoint"] == f"{CHAT_MODEL}:zai-api"
+    else:
+        assert "x-fi-served-endpoint" not in r.headers
 
 
 # ---------------------------------------------------------------------------
@@ -314,41 +420,50 @@ async def test_multi_backend_streaming_withholds_unresolved_served_fields(chat_a
 
 
 @pytest.mark.parametrize(
-    ("endpoint_id", "provider", "served_model", "expected"),
+    ("endpoint_id", "provider", "served_model", "publishable", "expected"),
     [
-        ("glm-4.6:local-12003", "sglang", "glm-4.6", "glm-4.6:local-12003"),
-        ("glm-4.6:zai-api", "zai", "glm-4.6", "glm-4.6:zai-api"),
-        ("glm-4.6:local", "vllm", "glm-4.6", "glm-4.6:local"),
+        ("glm-4.6:local-12003", "sglang", "glm-4.6", True, "glm-4.6:local-12003"),
+        ("glm-4.6:zai-api", "zai", "glm-4.6", True, "glm-4.6:zai-api"),
+        ("glm-4.6:local", "vllm", "glm-4.6", True, "glm-4.6:local"),
         # LAN octet stamps, hostnames and admin route_ids never reach the
-        # header: they degrade to the provider label.
-        ("glm-4.6:10-api", "zai", "glm-4.6", "zai"),
-        ("glm-4.6:gpu-7-api", "sglang", "glm-4.6", "sglang"),
-        ("glm-4.6:my-internal-box", "zai", "glm-4.6", "zai"),
-        ("glm-4.6:.local-api", "zai", "glm-4.6", "zai"),
+        # header: they are omitted.
+        ("glm-4.6:10-api", "zai", "glm-4.6", True, None),
+        (f"glm-4.6:{_PRIVATE_ROUTE_LABEL}", "sglang", "glm-4.6", False, None),
+        ("glm-4.6:gpu-7-api", "sglang", "glm-4.6", True, None),
+        ("glm-4.6:my-internal-box", "zai", "glm-4.6", True, None),
+        ("glm-4.6:.local-api", "zai", "glm-4.6", True, None),
         # A trailing newline must not smuggle an unsanitized shape through.
-        ("glm-4.6:zai-api\n", "zai", "glm-4.6", "zai"),
+        ("glm-4.6:zai-api\n", "zai", "glm-4.6", True, None),
         # A safe-looking location is not authority for the whole identifier:
         # only a prefix that IS the trusted served model may be republished.
-        # "private.internal:local-12003" ends in a registry-minted location,
+        # The private host label ends in a registry-minted location,
         # but the prefix must come from the registry-resolved served model,
         # not ride along with the location's shape.
-        ("private.internal:local-12003", "zai", "glm-4.6", "zai"),
-        ("private.internal:local-12003", "zai", "private.internal", "private.internal:local-12003"),
+        (f"{_PRIVATE_MODEL_LABEL}:local-12003", "zai", "glm-4.6", True, None),
+        (
+            f"{_PRIVATE_MODEL_LABEL}:local-12003",
+            "zai",
+            _PRIVATE_MODEL_LABEL,
+            True,
+            f"{_PRIVATE_MODEL_LABEL}:local-12003",
+        ),
         # No trusted served model to anchor the prefix: degrade, fail closed.
-        ("glm-4.6:local-12003", "sglang", None, "sglang"),
+        ("glm-4.6:local-12003", "sglang", None, False, None),
         # A colon-less id is not a registry construction at all: the old code
         # fullmatched the whole string as the candidate and published a bare
         # "local"; the anchor check requires the {model}:{location} shape.
-        ("local", "vllm", "glm-4.6", "vllm"),
-        (None, "zai", "glm-4.6", "zai"),
-        (None, None, None, None),
-        ("", "zai", "glm-4.6", "zai"),
+        ("local", "vllm", "glm-4.6", True, None),
+        (None, "zai", "glm-4.6", True, None),
+        (None, None, None, True, None),
+        ("", "zai", "glm-4.6", True, None),
     ],
 )
-def test_header_endpoint_id_sanitization(endpoint_id, provider, served_model, expected):
+def test_header_endpoint_id_sanitization(
+    endpoint_id, provider, served_model, publishable, expected
+):
     from serving.servers.routers.served_identity import header_endpoint_id
 
-    assert header_endpoint_id(endpoint_id, provider, served_model) == expected
+    assert header_endpoint_id(endpoint_id, served_model, publishable=publishable) == expected
 
 
 def test_served_identity_headers_omit_missing_fields():
@@ -360,6 +475,7 @@ def test_served_identity_headers_omit_missing_fields():
         served_model="glm-4.6",
         endpoint_id="glm-4.6:zai-api",
         provider="zai",
+        endpoint_publishable=True,
     )
     assert headers == {
         "X-FI-Requested-Model": "auto",
@@ -367,3 +483,15 @@ def test_served_identity_headers_omit_missing_fields():
         "X-FI-Served-Endpoint": "glm-4.6:zai-api",
         "X-FI-Served-Provider": "zai",
     }
+
+
+def test_non_latin1_model_names_are_omitted_from_headers():
+    from serving.servers.routers.served_identity import served_identity_headers
+
+    assert served_identity_headers(
+        requested_model="qwen-通义",
+        served_model="qwen-通义",
+        endpoint_id="qwen-通义:zai-api",
+        provider="zai",
+        endpoint_publishable=True,
+    ) == {"X-FI-Served-Provider": "zai"}
