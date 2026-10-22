@@ -420,13 +420,25 @@ def _parse_role_gate(model: dict[str, Any], model_id: str) -> tuple[bool, str]:
     """Parse a model entry's access gate: ``(admin_only, required_role)``.
 
     Shared by the chat and embedding registration branches so both spellings
-    of the model-level tier declaration validate identically: an invalid
-    ``required_role`` fails closed to ``admin`` (a typo must gate the model,
-    not open it), and ``admin_only: true`` stays the older spelling of
-    ``required_role: admin``.
+    of the model-level tier declaration validate identically: an omitted
+    ``required_role`` reads as the same cost-derived default the registry and
+    the public page apply (:func:`default_required_role_for_model` — paid or
+    unknown-cost models publish as ``pro``; provably free ones as ``free``),
+    an invalid ``required_role`` fails closed to ``admin`` (a typo must gate
+    the model, not open it), and ``admin_only: true`` stays the older
+    spelling of ``required_role: admin``.
     """
     admin_only = bool(model.get("admin_only", False))
-    required_role = str(model.get("required_role", "free"))
+    if "required_role" in model:
+        # An explicit value always wins, even an invalid one: the VALID_ROLES
+        # check below fails it closed. Only the omission reads as the
+        # cost-derived default.
+        admin_only = False
+        required_role = str(model["required_role"])
+    elif admin_only:
+        required_role = "admin"
+    else:
+        required_role = default_required_role_for_model(model)
     # Validate required_role to prevent fail-open on typos
     from serving.config.settings import VALID_ROLES
 
@@ -949,33 +961,25 @@ def register_from_models_yaml(
                     embedding_adapters[model_id] = emb_adapter
                     for alias in aliases:
                         embedding_adapters[alias] = emb_adapter
-                # The gate chat reads off the route table would be dead config
-                # here: embedding models never enter it, so without recording
-                # it separately, /v1/embeddings served any authenticated
-                # caller regardless of the declared tier. Same fail-closed
-                # parse as chat; the surface enforces it through the shared
-                # model-access check.
-                admin_only, required_role = _parse_role_gate(m, model_id)
-                router.register_embedding_route(
-                    model_id,
-                    adapters_with_weights,
-                    aliases=aliases,
-                    admin_only=admin_only,
-                    required_role=required_role,
-                )
-                # Registration invariant: every embedding adapter key —
-                # including aliases — must have a matching access-gate record
-                # before the registry hands either table to a request surface.
-                # /v1/embeddings now refuses an adapter whose gate record is
-                # missing (fail-closed), so an inconsistency here is a bug,
-                # not a silent hole; assert it at the source.
-                _gate = router.embedding_routes
-                for _key in [model_id, *aliases]:
-                    assert _key in _gate and _key in embedding_adapters, (
-                        f"embedding registration invariant violated for {_key!r}: "
-                        "adapter table and access-gate record must both exist"
+                    # Embedding models bypass the weighted RouteExecutor.
+                    # Record their gate only when an adapter was configured;
+                    # an optional route whose environment is unset is skipped.
+                    admin_only, required_role = _parse_role_gate(m, model_id)
+                    router.register_embedding_route(
+                        model_id,
+                        adapters_with_weights,
+                        aliases=aliases,
+                        admin_only=admin_only,
+                        required_role=required_role,
                     )
-                count += 1 + len(aliases)
+                    # Every adapter key, including aliases, must have a gate.
+                    _gate = router.embedding_routes
+                    for _key in [model_id, *aliases]:
+                        assert _key in _gate and _key in embedding_adapters, (
+                            f"embedding registration invariant violated for {_key!r}: "
+                            "adapter table and access-gate record must both exist"
+                        )
+                    count += 1 + len(aliases)
             else:
                 # Chat models go through the full RouteExecutor
                 admin_only, required_role = _parse_role_gate(m, model_id)

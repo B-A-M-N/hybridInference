@@ -65,7 +65,8 @@ _LOCAL_ROUTE_HOSTS = frozenset(("localhost", "127.0.0.1", "0.0.0.0", "host.docke
 # localhost base_url for one of those can be a reverse proxy in front of an
 # externally billed upstream, and "localhost" carries no cost information.
 # A deployment that wants free-tier for such a route says so explicitly
-# (``required_role: free`` or a zero ``pricing`` block).
+# with ``required_role: free``; reported zero user pricing does not prove the
+# upstream itself is free.
 _PROVABLY_LOCAL_INFERENCE_KINDS = frozenset(("sglang", "vllm", "ollama"))
 
 
@@ -98,37 +99,30 @@ def _route_is_locally_served(
 def _route_cost_is_unknown(
     route: Mapping[str, Any], provider_kind: Any = None, model_base_url: Any = None
 ) -> bool:
-    """Whether a route has no pricing metadata and is not provably local.
+    """Whether a route may incur upstream cost and is not provably local.
 
     The conservative half of the #1605 gap: a model with no pricing block
     at all cannot be proven free, and unless the route is a local host
     serving a self-hosted engine API, the request can cost real money
-    upstream even though the config says nothing about it.
+    upstream even when user-facing pricing is zero or omitted.
     """
-    if route.get("pricing") is not None:
-        return False
     return not _route_is_locally_served(route, provider_kind, model_base_url)
 
 
 def model_cost_is_unknown_remote(model: Mapping[str, Any]) -> bool:
-    """Whether a model has no pricing metadata and no provably local route.
+    """Whether a model has no nonzero price evidence and a route that may cost.
 
-    Distinguishes the three states the access gate cares about: explicitly
-    or provably free (pricing present and all zero, or every route a local
-    host serving a self-hosted engine API), explicitly or provably paid
+    Distinguishes the three states the access gate cares about: provably free
+    (every route is a local host serving a self-hosted engine API), explicitly
+    or provably paid
     (non-zero / unparseable / scheduled / sourced price —
-    :func:`model_pricing_indicates_paid`), and unknown cost (no pricing
-    metadata, and at least one route that is neither). Only the last one is
-    new: it defaults to ``pro`` too, because an externally billed upstream
-    without pricing metadata must not fall through to free — and a
-    localhost reverse proxy in front of one must not either.
+    :func:`model_pricing_indicates_paid`), and unknown cost (no nonzero price
+    evidence, and at least one route that is not provably local). That last
+    state defaults to ``pro`` too: an externally billed upstream must not
+    fall through to free just because customer-facing pricing is zero or
+    absent, and neither should a localhost reverse proxy in front of one.
     """
     if model_pricing_indicates_paid(model):
-        return False
-    if model.get("pricing") is not None:
-        # Priced (at zero, given the check above): free is proven; the route
-        # list cannot un-prove it. Route-level price overrides are covered by
-        # model_pricing_indicates_paid itself.
         return False
     provider_kind = model.get("provider")
     model_base_url = model.get("base_url")
@@ -136,9 +130,9 @@ def model_cost_is_unknown_remote(model: Mapping[str, Any]) -> bool:
     if not isinstance(routes, list):
         # A single-route model without a route list: the registry synthesizes
         # one route from the top-level base_url and the model's provider
-        # field. No top-level base_url either means the model is a stub with
-        # no endpoint to spend through (free by construction).
-        return "base_url" in model and _route_cost_is_unknown(model, provider_kind)
+        # field. Built-in remote providers can use their own endpoint and
+        # still incur upstream cost even without a configured base_url.
+        return _route_cost_is_unknown(model, provider_kind)
     return any(
         isinstance(route, Mapping) and _route_cost_is_unknown(route, provider_kind, model_base_url)
         for route in routes
@@ -149,20 +143,19 @@ def default_required_role_for_model(model: Mapping[str, Any]) -> str:
     """The tier a models.yaml model publishes as when it does not name one.
 
     Issue #1576: an omitted ``required_role`` used to publish every such model
-    free-tier — including the paid-upstream Claude compatibility routes. A
-    model that costs anything defaults to ``pro``; an all-zero-priced model
-    keeps the historical ``free`` default. ``admin_only`` defaults to
-    ``admin`` when no role is explicit. An explicit value always wins, even an
-    invalid one (callers fail that closed themselves).
+    free-tier — including paid-upstream compatibility routes. Known paid
+    models default to ``pro``; unknown remote costs do too unless the route is
+    provably local. ``admin_only`` defaults to ``admin`` when no role is
+    explicit. An explicit value always wins, even an invalid one (callers fail
+    that closed themselves).
 
     The unknown-cost half of the gap: a model with no pricing metadata whose
     routes are not all provably local defaults to ``pro`` as well. Provably
     local means both a local host and a self-hosted engine API kind
     (sglang, vllm) — a localhost compatibility proxy is a forwarding
     dialect and can relay to an externally billed upstream, so local
-    placement alone proves nothing about cost. Models priced at zero and
-    models with no endpoint at all keep the ``free`` default; anything
-    else silent stays free-tier only by explicit configuration.
+    placement and zero user-facing pricing alone prove nothing about cost.
+    Explicit ``required_role`` remains authoritative.
     """
     if "required_role" in model:
         return str(model["required_role"])
