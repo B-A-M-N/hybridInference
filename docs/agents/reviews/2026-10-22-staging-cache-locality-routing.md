@@ -16,8 +16,10 @@ selection with no locality term, so a conversation's warm prefix was ignored by
 the weighted draw. The short-prefix boundary that motivated the brief is **not**
 staging-specific: it is the engine's, and production shows identical values (see
 "The reuse boundary, measured, on both deployments"). Nothing here has been
-deployed, so no improvement in staging behaviour is claimed; the comparison to
-run is specified in "Controlled staging comparison (prepared, not run)".
+deployed, so no improvement in staging behaviour is claimed; the controlled
+local comparison that *was* run is in "Controlled local experiment (run)", and
+the staging comparison to run after deployment is specified in "Controlled
+staging comparison (prepared, not run)".
 
 ## Authorized observability used
 
@@ -653,6 +655,49 @@ Rejected as fixes: disabling offload, pinning every request to `vllm`, or
 declaring the boundary a configuration finding. The first two trade capacity
 protection and fallback for a hit rate; the third reports a measurement as a
 repair.
+
+## Controlled local experiment (run)
+
+Before the staging comparison, the two policies were compared under control
+here: the real `FixedRouter`, `PrefillLoadTracker` and `OffloadPolicy` driven
+against simulated engines — a cache-capable local engine calibrated to the
+measured 9.1k cold tail (0.30 s + 164 µs/token = 1.79 s, the sample the old
+budget cancels) on one GPU slot, and a remote route at the measured 1.8 s that
+never caches. The harness lives in `.tmp-probe/experiment.py.scratch`
+(read-only scratch, not committed). This isolates the *policy*; it says nothing
+about staging's actual engine.
+
+| workload | old (proportional) | new (offset) |
+|---|---|---|
+| idle: one cold 9.1k prefill | offloaded 1/1, TTFT 3 605 ms | served locally, TTFT 1 805 ms |
+| warm: seed 9.1k, then 3 continuations | offloaded **4/4**, all cold | offloaded 0/4; seed 1 803 ms, continuations ~21 ms |
+| moderate: 4 concurrent cold 9.1k, one GPU slot | offloaded 4/4 | offloaded 3/4 (head of line survives) |
+| overload: 8 concurrent cold 16k | offloaded 7/8, p50 4 930 ms | offloaded 7/8, p50 5 744 ms |
+
+Two readings, one on each side of the ledger:
+
+- **The warm row is the staging complaint reproduced.** The old rule cancels the
+  seed 10 ms before it finishes, so the prefix never forms; every subsequent
+  identical request is cold again, and all of them — not just the first — pay
+  the full remote latency. A deadline that mis-sizes one prefill doesn't cost
+  one request; it costs the whole conversation's cache.
+- **The overload row is the honest cost.** Under a deep engine queue both rules
+  shed the same 7 of 8, but the longer budget delays each departure by ~0.8 s.
+  Offloading load faster is something the old rule did *better*. Whether
+  staging's engine ever queues deep enough for this to matter is precisely what
+  the staging comparison's bounded-overload phase measures.
+
+Selection-layer probes from the same harness, for the locality half: 16
+concurrent `select_adapter` calls for distinct conversations with no affinity
+split 6/2 across equal-weight replicas (the cache-blind draw), while a burst
+under one shared API key converges on the replica that served its first request
+— the pre-existing per-(key, model) affinity pin, which precedes locality and
+dominates same-key traffic in one process. Sixteen concurrent 11k prefills
+collapse onto one replica outright through the elephant gate. So in-process,
+the locality term is a backup for when the pin is dropped (backlog ceiling,
+which locality deliberately respects too), and the burst split the objective
+opens with is either that drop or more than one gateway instance — which is a
+staging observation to take, not a local one.
 
 ## Controlled staging comparison (prepared, not run)
 
