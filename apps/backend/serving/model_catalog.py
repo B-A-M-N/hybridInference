@@ -55,12 +55,12 @@ async def agent_visible_models(
     *,
     visibility_resolver: Any | None = None,
     user_ctx: dict[str, Any] | None = None,
-    include_embeddings: bool = False,
 ) -> list[str]:
-    """Canonical model ids this user's agent jobs can call, in registry order.
+    """Canonical chat-model ids this user's agent jobs can call, in registry order.
 
-    Embeddings stay out of the agent picker, but grant scopes include them so
-    clients authorized for the embedding surface can use the same grant.
+    Chat routes only: /v1/embeddings is outside the grant surface, so a minted
+    scope can never name an embedding model and a grant-authenticated caller
+    is refused there as outside its scope.
     """
     visible: list[str] = []
     seen: set[str] = set()
@@ -79,22 +79,6 @@ async def agent_visible_models(
             continue
         seen.add(canonical)
         visible.append(canonical)
-    if include_embeddings:
-        for _model_id, route in tuple(getattr(router_exec, "embedding_routes", {}).items()):
-            configs = [adapter.config for adapter, _ in route.adapters]
-            if not configs:
-                continue
-            canonical = configs[0].id
-            if canonical in seen:
-                continue
-            if getattr(configs[0], "model_type", "embedding") != "embedding":
-                continue
-            if not await _route_allows(
-                route, canonical, visibility_resolver=visibility_resolver, user_ctx=user_ctx
-            ):
-                continue
-            seen.add(canonical)
-            visible.append(canonical)
     return visible
 
 

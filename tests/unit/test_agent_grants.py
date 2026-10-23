@@ -369,7 +369,6 @@ def test_a_model_the_owner_disabled_is_not_granted(client, store, monkeypatch) -
     granted = _mint(http).json()["allowed_models"]
 
     assert seen["user_ctx"]["disabled_models"] == ["glm-5.1"]
-    assert seen["include_embeddings"] is True
     assert "glm-5.1" not in granted
     assert "kimi-k2" in granted, "the denylist narrowed more than the one model"
 
