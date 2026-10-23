@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from routing.endpoints import endpoint_id_for_adapter
+from routing.prefill_load import AFFINITY_BACKLOG_CEILING
 from routing.protocols import RoutingRequestOptions
 from routing.routers import (
     AFFINITY_MAX_AGE_SECONDS,
@@ -132,6 +133,72 @@ def test_first_pick_creates_entry():
     entry = r._affinity[("u1", "m")]
     assert entry.endpoint_id in {a.config.provider, b.config.provider}
     assert entry.expires_at > time.monotonic()
+
+
+@pytest.mark.unit
+def test_warm_prefix_outranks_the_weighted_draw(monkeypatch):
+    """A caller's resident prefix beats a draw that only sees weights.
+
+    Without a locality term the draw hands this conversation to the cold replica,
+    which is the measured staging symptom: identical-prefix requests reached the
+    cache-capable endpoint only about half the time. The hint is the tracker's
+    own, so this exercises route selection, not the sticky pin table -- no
+    affinity entry exists when the draw runs.
+    """
+    r = FixedRouter()
+    cold = _EchoAdapter(_cfg("m", provider="A", base_url="http://A"))
+    warm = _EchoAdapter(_cfg("m", provider="B", base_url="http://B"))
+    r.register_route("m", [(cold, 0.9), (warm, 0.1)])
+
+    warm_id = endpoint_id_for_adapter(warm)
+    tracker = r.prefill_load
+    tracker.release(tracker.acquire(warm_id, 5_000, affinity_key="u1"), prefill_confirmed=True)
+
+    # Both draws choose index 0: the cold, heavily weighted candidate.
+    monkeypatch.setattr("random.random", lambda: 0.0)
+    req_ctx.set({"affinity_key": "u1"})
+
+    assert r._select_adapter("m", prefill_tokens=10_000) is warm
+    # Selection records what it chose, so the next turn pins to the warm endpoint.
+    assert r._affinity[("u1", "m")].endpoint_id == warm_id
+
+
+@pytest.mark.unit
+def test_backlogged_warm_endpoint_does_not_capture_the_request(monkeypatch):
+    """Locality loses to capacity: a queue past the ceiling costs more than prefill."""
+    r = FixedRouter()
+    cold = _EchoAdapter(_cfg("m", provider="A", base_url="http://A"))
+    warm = _EchoAdapter(_cfg("m", provider="B", base_url="http://B"))
+    r.register_route("m", [(cold, 0.9), (warm, 0.1)])
+
+    warm_id = endpoint_id_for_adapter(warm)
+    tracker = r.prefill_load
+    tracker.release(tracker.acquire(warm_id, 5_000, affinity_key="u1"), prefill_confirmed=True)
+    # Someone else's cold mega-prefill is now queued on the warm endpoint.
+    tracker.acquire(warm_id, AFFINITY_BACKLOG_CEILING + 1, affinity_key="other")
+
+    monkeypatch.setattr("random.random", lambda: 0.0)
+    req_ctx.set({"affinity_key": "u1"})
+
+    assert r._select_adapter("m", prefill_tokens=10_000) is cold
+
+
+@pytest.mark.unit
+def test_locality_does_not_override_an_explicit_pin():
+    """An operator's pin collapses the route; locality must not second-guess it."""
+    r = FixedRouter()
+    a = _EchoAdapter(_cfg("m", provider="A", base_url="http://A"))
+    b = _EchoAdapter(_cfg("m", provider="B", base_url="http://B"))
+    r.register_route("m", [(a, 0.9), (b, 0.1)])
+
+    a_id = endpoint_id_for_adapter(a)
+    tracker = r.prefill_load
+    tracker.release(tracker.acquire(a_id, 5_000, affinity_key="u1"), prefill_confirmed=True)
+    req_ctx.set({"affinity_key": "u1"})
+
+    # The draw would avoid 'A', and 'A' is the worst possible choice by weight,
+    # but the pin is the caller's instruction.
+    assert r._select_adapter("m", pin_provider=a_id, prefill_tokens=10_000) is a
 
 
 @pytest.mark.unit
