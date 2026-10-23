@@ -102,8 +102,23 @@ OFFLOAD_ENGINE_WAIT = "engine_wait"
 #: ``_routing["offload"]`` when no other route could serve the request.
 OFFLOAD_LAST_RESORT = "last_resort"
 
-#: Estimated un-cached prefill tokens an engine is credited with inside
-#: ``wait_seconds`` before the engine wait starts to extend.
+#: Estimated un-cached prefill tokens one ``wait_seconds`` of engine time is
+#: credited with. The budget is ``wait_seconds * (1 + uncached / credit)``: the
+#: configured wait is a *fixed* allowance (queueing, scheduling, the first
+#: decode step) plus one credit's worth of prefill, and every further credit
+#: buys another base wait of prefill. Offsetting rather than scaling is what
+#: makes the floor mean something -- a purely proportional
+#: ``wait_seconds * uncached / credit`` gives a prompt of exactly one credit the
+#: same 0.8 s a warm continuation gets, which is precisely the cold prefill that
+#: was being cancelled.
+#:
+#: The credit is calibrated conservatively against measured staging cold
+#: prefills (pinned vLLM, small ``max_tokens``): 1.8k tokens in ~0.5 s, 4.5k in
+#: ~0.86 s, 9.1k in ~1.5 s, 18.3k in ~1.5-1.8 s. That is roughly 80 us per token
+#: of marginal prefill on top of a few hundred ms of fixed cost, while one base
+#: wait per credit is 195 us per token at the 0.8 s staging base -- a ~2.4x
+#: margin over the slowest measured rate, so a healthy engine finishes and an
+#: engine that is genuinely queueing still fails over.
 #:
 #: The engine wait bounds ``prefill + time-to-first-token``, and only the engine
 #: knows where prefill ends -- the first token is the first evidence the gateway
@@ -121,6 +136,13 @@ OFFLOAD_PREFILL_CREDIT_TOKENS: int = 4_096
 #: Ceiling on the extended engine wait, so an engine that is genuinely wedged
 #: still fails over. Bounds the extra latency a cold prompt may add before the
 #: fallback the policy already had.
+#:
+#: Sizing against the same measurements: 8 s is about the extrapolated cold
+#: prefill of a 100k-token prompt on the measured rate, so the cap does not fire
+#: before a legitimate prefill of any prompt the route can accept. It also stays
+#: below the remote TTFT the offload route was observed serving under contention
+#: (30-49 s at the tail), so waiting out the engine is still the cheaper choice
+#: at the cap.
 OFFLOAD_MAX_WAIT_SECONDS: float = 8.0
 
 
@@ -178,12 +200,14 @@ class OffloadPolicy:
     def engine_wait_seconds(self, uncached_tokens: int) -> float:
         """Return the first-token budget for a request needing ``uncached_tokens`` prefill.
 
-        The budget this attempt's engine wait runs under. ``wait_seconds`` is the
-        floor -- a warm continuation, which prefills only the growth since the
-        caller's last turn, is answered inside it, and so is a short cold prompt.
-        A request that must prefill more than
-        :data:`OFFLOAD_PREFILL_CREDIT_TOKENS` is given time proportional to the
-        work, up to :data:`OFFLOAD_MAX_WAIT_SECONDS`.
+        The budget this attempt's engine wait runs under: the configured
+        ``wait_seconds`` covers queueing, scheduling and the first decode step,
+        and each :data:`OFFLOAD_PREFILL_CREDIT_TOKENS` of un-cached prefill buys
+        another ``wait_seconds`` of it. A warm continuation -- which prefills
+        only the growth since the caller's last turn -- stays at or just above
+        the floor, and a short cold prompt finishes inside the fixed allowance;
+        a long cold prompt gets time proportional to the work it actually has to
+        do.
 
         Bounded by construction: the ceiling is a fixed constant, not a function
         of load, so a wedged engine still fails over within a known time, and the
@@ -194,8 +218,8 @@ class OffloadPolicy:
         if uncached_tokens <= 0:
             return base
         credit = max(OFFLOAD_PREFILL_CREDIT_TOKENS, 1)
-        scaled = base * (uncached_tokens / credit)
-        return float(min(max(base, scaled), max(OFFLOAD_MAX_WAIT_SECONDS, base)))
+        scaled = base * (1.0 + uncached_tokens / credit)
+        return float(min(scaled, max(OFFLOAD_MAX_WAIT_SECONDS, base)))
 
 
 @runtime_checkable

@@ -2147,6 +2147,39 @@ class FixedRouter:
         """Return the leaf that executes ``binding``."""
         return LeafBackend.for_binding(binding)
 
+    def _engine_wait_tokens(
+        self,
+        endpoint_id: str,
+        prefill_tokens: int,
+        affinity_key: str | None,
+        fingerprint: str | None,
+        messages: Sequence[dict[str, Any]] | None,
+    ) -> int:
+        """Un-cached prefill the engine wait is sized on, with strict evidence.
+
+        The same argument as selection, with the opposite failure direction.
+        A locality verdict on loose evidence moves a request it should not have
+        moved; a *wait* on loose evidence is merely too short, and a short wait
+        is exactly what cancels a legitimate cold prefill, aborts it at the
+        engine and re-sends it cold elsewhere. ``affinity_key`` is the API-key
+        hash and the hint table keeps one prefix per (key, endpoint), so a
+        sibling conversation's hint reads as "warm" for a prompt this engine has
+        never seen.
+
+        With no conversation identity the request is charged in full rather than
+        on that hint. Over-waiting costs nothing while the engine answers, and
+        the ceiling bounds it when the engine does not.
+        """
+        if affinity_key is None or fingerprint is None:
+            return prefill_tokens
+        return self._prefill_load.uncached_estimate(
+            endpoint_id,
+            prefill_tokens,
+            affinity_key,
+            fingerprint=fingerprint,
+            messages=messages,
+        )
+
     def _dispatch_priority(
         self,
         endpoint_id: str,
@@ -2598,8 +2631,8 @@ class FixedRouter:
                 primary,
                 primary_plan.policy,
                 primary_plan.deadline,
-                uncached_tokens=self._prefill_load.uncached_estimate(
-                    primary_endpoint_id, prefill_tokens, affinity_key
+                uncached_tokens=self._engine_wait_tokens(
+                    primary_endpoint_id, prefill_tokens, affinity_key, fingerprint, messages
                 ),
             )
             with req_ctx.push(
@@ -2772,8 +2805,8 @@ class FixedRouter:
                         adapter,
                         offload_policy,
                         queue_deadline,
-                        uncached_tokens=self._prefill_load.uncached_estimate(
-                            adapter_endpoint_id, prefill_tokens, affinity_key
+                        uncached_tokens=self._engine_wait_tokens(
+                            adapter_endpoint_id, prefill_tokens, affinity_key, fingerprint, messages
                         ),
                     )
                     with req_ctx.push(

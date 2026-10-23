@@ -190,20 +190,38 @@ def test_policy_normalizes_an_integer_wait_to_float():
     assert isinstance(policy.wait_seconds, float)
 
 
-def test_engine_wait_keeps_the_base_for_a_warm_or_short_prompt():
-    """A prefix already resident, or a prompt under the credit, waits the base."""
+def test_engine_wait_keeps_the_base_for_a_warm_prompt():
+    """A prefix already resident prefills ~nothing and waits the base, unchanged."""
     policy = _policy(wait_seconds=0.05)
     assert policy.engine_wait_seconds(0) == 0.05
     assert policy.engine_wait_seconds(-1) == 0.05
-    assert policy.engine_wait_seconds(1) == 0.05
-    assert policy.engine_wait_seconds(OFFLOAD_PREFILL_CREDIT_TOKENS) == 0.05
+
+
+def test_engine_wait_offsets_the_base_it_does_not_multiply_it():
+    """One credit of prefill buys one *extra* base wait, not merely the base.
+
+    The offset is the whole correction: a 4.1k-token cold prefill was being
+    given exactly the 0.8 s a warm continuation gets, so a healthy engine
+    finishing in 0.86 s missed the deadline by ~60 ms and had its prefill
+    cancelled. Measured staging local: ~0.5 s at 1.8k, ~0.86 s at 4.5k,
+    ~1.5 s at 9.1k, ~1.5-1.8 s at 18.3k.
+    """
+    policy = _policy(wait_seconds=0.8)
+    assert policy.engine_wait_seconds(OFFLOAD_PREFILL_CREDIT_TOKENS) == pytest.approx(1.6)
+    assert policy.engine_wait_seconds(4_519) == pytest.approx(1.68, abs=0.01)
+    assert policy.engine_wait_seconds(9_119) == pytest.approx(2.58, abs=0.01)
+    assert policy.engine_wait_seconds(18_319) == pytest.approx(4.38, abs=0.01)
+    # Every measured prefill above finishes inside its own budget.
+    for tokens, measured in ((1_819, 0.56), (4_519, 0.86), (9_119, 1.79), (18_319, 1.79)):
+        assert measured < policy.engine_wait_seconds(tokens)
 
 
 def test_engine_wait_extends_with_the_uncached_prefill():
     """A cold prefill of a long prompt gets time proportional to the work."""
     policy = _policy(wait_seconds=0.05)
-    assert policy.engine_wait_seconds(2 * OFFLOAD_PREFILL_CREDIT_TOKENS) == pytest.approx(0.1)
-    assert policy.engine_wait_seconds(4 * OFFLOAD_PREFILL_CREDIT_TOKENS) == pytest.approx(0.2)
+    assert policy.engine_wait_seconds(OFFLOAD_PREFILL_CREDIT_TOKENS) == pytest.approx(0.1)
+    assert policy.engine_wait_seconds(2 * OFFLOAD_PREFILL_CREDIT_TOKENS) == pytest.approx(0.15)
+    assert policy.engine_wait_seconds(4 * OFFLOAD_PREFILL_CREDIT_TOKENS) == pytest.approx(0.25)
 
 
 def test_engine_wait_is_capped_so_a_wedged_engine_still_fails_over():
