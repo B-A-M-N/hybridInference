@@ -119,6 +119,21 @@ The endpoint mix depends on prompt size: `ollama` served 1/12 (8 %) of 2.7k
 prefixes but 9/16 (56 %) of 8.8k prefixes. Selection is therefore influenced by
 the request itself, not a fixed weight.
 
+The *sequence* of choices (lowercase `o` = `ollama`, `v` = `vllm` miss,
+`V` = `vllm` hit) shows runs, not independent draws:
+
+| prefix | sequence |
+|---|---|
+| 2.7k, unpinned | `vvovvvvvvvvv` |
+| 8.8k, unpinned | `ooVVVVooVoooooVV` |
+| 8.8k, pinned to `vllm` | `VVVVVVVVVVVV` |
+
+When the eligible run leaves `vllm` it stays away for up to five consecutive
+requests and then returns. That is the shape of a pin being lost and re-drawn —
+and, on re-draw, the cache-blind endpoint winning and holding the caller for its
+TTL — rather than a per-request coin flip. Each excursion costs a full cold
+prefill on a prefix that was already warm in the sibling endpoint.
+
 ### Streaming behaves the same, and `ollama`'s telemetry gap is real
 
 - `vllm`, streaming with `stream_options.include_usage` → a usage chunk is
