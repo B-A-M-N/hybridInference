@@ -274,7 +274,7 @@ async def test_chat_completions_response_carries_served_identity_headers(chat_cl
     assert r.headers["x-fi-requested-model"] == CHAT_MODEL
     assert r.headers["x-fi-served-model"] == CHAT_MODEL
     assert r.headers["x-fi-served-endpoint"] == f"{CHAT_MODEL}:zai-api"
-    assert r.headers["x-fi-served-provider"] == "sglang"
+    assert r.headers["x-fi-served-provider"] == "zai"
     assert r.headers["x-fi-served-endpoint"].count("http") == 0
 
 
@@ -339,7 +339,7 @@ async def test_chat_completions_stream_carries_requested_identity(chat_client):
     assert r.headers["x-fi-requested-model"] == CHAT_MODEL
     assert r.headers["x-fi-served-model"] == CHAT_MODEL
     assert r.headers["x-fi-served-endpoint"] == f"{CHAT_MODEL}:zai-api"
-    assert r.headers["x-fi-served-provider"] == "sglang"
+    assert r.headers["x-fi-served-provider"] == "zai"
 
 
 @pytest.mark.asyncio
@@ -371,7 +371,7 @@ async def test_forced_streaming_branch_carries_the_headers(chat_app):
     assert r.headers["x-fi-requested-model"] == CHAT_MODEL
     assert r.headers["x-fi-served-model"] == CHAT_MODEL
     assert r.headers["x-fi-served-endpoint"] == f"{CHAT_MODEL}:zai-api"
-    assert r.headers["x-fi-served-provider"] == "sglang"
+    assert r.headers["x-fi-served-provider"] == "zai"
 
 
 @pytest.mark.asyncio
