@@ -1188,21 +1188,36 @@ class PrefillLoadTracker:
         chosen_cost = None if uncached is None else uncached.get(chosen)
         if chosen_cost is None or len(eligible) < 2:
             return chosen
+        chosen_weight = max(weights[chosen], 0.0)
+        if chosen_weight <= 0.0:
+            return chosen
+        # Filter first, then take the lowest strict cost among the survivors.
+        # Picking the globally cheapest candidate first and gating it afterwards
+        # would miss a second cache-warm candidate that clears both gates when
+        # the cheapest one fails one -- a model with three or more ordinary
+        # candidates would keep sending warm conversations cold.
+        min_weight = chosen_weight * LOCALITY_MIN_WEIGHT_SHARE
+        with self._lock:
+            backlogs = {i: self._backlog.get(keys[i], 0) for i in eligible if i != chosen}
         best, best_cost = chosen, chosen_cost
         for i in eligible:
+            if i == chosen:
+                continue
+            if weights[i] < min_weight:
+                # The draw's candidate is the operator's preference by more than
+                # a prefix-cache hit is worth. Leave the decision with the weights.
+                continue
+            if backlogs[i] > AFFINITY_BACKLOG_CEILING:
+                # Past that the queue costs more than the prefill it saves,
+                # the same judgement :meth:`should_keep_affinity` makes for a
+                # sticky pin.
+                continue
             cost = uncached.get(i)
             if cost is not None and cost < best_cost:
                 best, best_cost = i, cost
         if best == chosen or chosen_cost - best_cost < LOCALITY_MIN_SAVING_TOKENS:
             return chosen
-        chosen_weight = max(weights[chosen], 0.0)
-        if chosen_weight <= 0.0 or weights[best] < chosen_weight * LOCALITY_MIN_WEIGHT_SHARE:
-            # The draw's candidate is the operator's preference by more than a
-            # prefix-cache hit is worth. Leave the decision with the weights.
-            return chosen
-        with self._lock:
-            foreign = self._backlog.get(keys[best], 0)
-        return best if foreign <= AFFINITY_BACKLOG_CEILING else chosen
+        return best
 
     def snapshot(self) -> dict[str, dict[str, int]]:
         """Return a copy of current per-endpoint load, for logging and admin views."""

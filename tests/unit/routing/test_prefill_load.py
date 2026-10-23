@@ -579,6 +579,51 @@ def test_select_keeps_the_draw_when_the_cached_endpoint_is_backlogged():
 
 
 @pytest.mark.unit
+def test_select_moves_to_the_next_warm_candidate_when_the_cheapest_fails_the_weight_gate():
+    """Gates filter candidates; they do not veto the single cheapest one.
+
+    Three ordinary candidates: the drawn one is cold, the *cheapest* warm one is
+    weighted below the locality share, and a second warm one is comparable. The
+    cheapest-first ordering would inspect only the 0.4-weighted endpoint, fail it
+    on the weight contract, and hand the conversation back to the cold replica --
+    even though an eligible warm endpoint was sitting right there. Filter first,
+    then take the lowest strict cost among the survivors.
+    """
+    t = PrefillLoadTracker()
+    _remember(t, "teaser", 8_000, fingerprint="conv-a")
+    _remember(t, "warm", 4_096, fingerprint="conv-a")
+    chosen = t.select_index(
+        ["drawn", "teaser", "warm"],
+        [1.0, 0.4, 0.6],
+        10_000,
+        _fixed_rand(0.0),
+        "caller",
+        fingerprint="conv-a",
+    )
+    assert chosen == 2
+
+
+@pytest.mark.unit
+def test_select_moves_to_the_next_warm_candidate_when_the_cheapest_is_backlogged():
+    """Same filter-then-select shape, with the backlog ceiling as the failing gate."""
+    t = PrefillLoadTracker()
+    _remember(t, "packed", 5_000, fingerprint="conv-a")
+    _remember(t, "warm", 5_000, fingerprint="conv-a")
+    # Someone else's cold mega-prefill is queued on the cheapest warm endpoint;
+    # ties on cost resolve to the first survivor, so "packed" is inspected first.
+    t.acquire("packed", prefill_load.AFFINITY_BACKLOG_CEILING + 1, affinity_key="other")
+    chosen = t.select_index(
+        ["drawn", "packed", "warm"],
+        [1.0, 1.0, 1.0],
+        10_000,
+        _fixed_rand(0.0),
+        "caller",
+        fingerprint="conv-a",
+    )
+    assert chosen == 2
+
+
+@pytest.mark.unit
 def test_select_has_no_locality_without_a_caller():
     """No caller identity means no prefix history: the draw stands, as before."""
     t = PrefillLoadTracker()
