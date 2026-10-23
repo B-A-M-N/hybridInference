@@ -103,6 +103,15 @@ ELEPHANT_LIMIT: int = 1
 # well above an ordinary prompt so normal traffic never trips it.
 INTERVENE_TOKENS: int = 50_000
 
+# Estimated un-cached prefill an endpoint must save for selection to prefer it
+# over the weighted draw's choice. A prefix-cache hit is the single largest
+# latency term a request can avoid, but route weights encode cost and
+# contractual preference, and a difference smaller than this is jitter or a
+# partly-shared prefix -- not the conversation's own warm head. Below the
+# threshold the configured weight keeps deciding, exactly as it did before
+# locality was considered.
+LOCALITY_MIN_SAVING_TOKENS: int = 4_096
+
 # Session affinity is a cache-locality optimization, not a correctness
 # guarantee. Above this in-flight backlog the pin costs more (queueing behind a
 # mega-prefill) than the prefix-cache hit it buys, so selection is re-run.
@@ -1056,16 +1065,17 @@ class PrefillLoadTracker:
             remaining = [i for i in eligible if keys[i] != avoid]
             if remaining:
                 eligible = remaining
+        uncached_here: dict[int, int] = {}
         if PREFILL_AWARE_ENABLED:
             # Keyed by candidate index, not by position in ``eligible``: ``avoid``
             # may already have dropped entries, so a positional list would be
             # shorter than ``count`` while the loop below still indexes it with
             # indices into ``keys``.
             # Computed before taking the lock; uncached_estimate locks too.
-            elephant_here = {
-                i: self.is_elephant(self.uncached_estimate(keys[i], tokens, affinity_key))
-                for i in eligible
+            uncached_here = {
+                i: self.uncached_estimate(keys[i], tokens, affinity_key) for i in eligible
             }
+            elephant_here = {i: self.is_elephant(uncached_here[i]) for i in eligible}
             if any(elephant_here.values()):
                 with self._lock:
                     unsaturated = [
@@ -1081,14 +1091,56 @@ class PrefillLoadTracker:
         if not PREFILL_AWARE_ENABLED:
             return first
         second = _weighted_pick(eligible, weights, rand)
-        if first == second:
-            return first
+        if first != second:
+            with self._lock:
+                first_load = self._backlog.get(keys[first], 0)
+                second_load = self._backlog.get(keys[second], 0)
+            if max(first_load, second_load) < INTERVENE_TOKENS:
+                chosen = first
+            else:
+                chosen = first if first_load <= second_load else second
+        else:
+            chosen = first
+        return self._prefer_cached(chosen, eligible, keys, uncached_here)
+
+    def _prefer_cached(
+        self,
+        chosen: int,
+        eligible: list[int],
+        keys: Sequence[str],
+        uncached: dict[int, int],
+    ) -> int:
+        """Return ``chosen``, or the candidate holding materially more of the prefix.
+
+        Route selection has a locality signal already -- ``uncached_estimate``
+        knows how much of this caller's prompt each endpoint must prefill -- but
+        it was used only to discount load and gate elephants, so a warm
+        conversation could be sent to a cold replica by a weighted draw that saw
+        nothing but weights and backlog. Preferring the cached candidate when the
+        saving is material is what makes repeated-prefix inference actually reuse
+        what is already resident.
+
+        Deliberately not a hard pin. The candidate must be an ordinary
+        admissible one (the elephant and ``avoid`` filters have already run),
+        must save at least :data:`LOCALITY_MIN_SAVING_TOKENS`, and must not be
+        carrying a foreign backlog past
+        :data:`AFFINITY_BACKLOG_CEILING` -- past that the queue costs more than
+        the prefill it saves, which is the same judgement ``should_keep_affinity``
+        makes for a sticky pin.
+        """
+        chosen_cost = uncached.get(chosen)
+        if chosen_cost is None or len(eligible) < 2:
+            return chosen
+        best, best_cost = chosen, chosen_cost
+        for i in eligible:
+            cost = uncached.get(i)
+            if cost is not None and cost < best_cost:
+                best, best_cost = i, cost
+        if best == chosen or chosen_cost - best_cost < LOCALITY_MIN_SAVING_TOKENS:
+            return chosen
         with self._lock:
-            first_load = self._backlog.get(keys[first], 0)
-            second_load = self._backlog.get(keys[second], 0)
-        if max(first_load, second_load) < INTERVENE_TOKENS:
-            return first
-        return first if first_load <= second_load else second
+            foreign = self._backlog.get(keys[best], 0)
+        return best if foreign <= AFFINITY_BACKLOG_CEILING else chosen
 
     def snapshot(self) -> dict[str, dict[str, int]]:
         """Return a copy of current per-endpoint load, for logging and admin views."""

@@ -398,6 +398,68 @@ def test_kill_switch_restores_single_weighted_draw(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Locality-aware selection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_select_prefers_the_endpoint_holding_the_callers_prefix():
+    """A warm conversation must not be handed to a cold replica by the draw.
+
+    Both draws land on the heavily weighted index 0, and nothing else in the
+    tracker would redirect them: the backlog is trivial. The only reason to
+    choose index 1 is that this caller's prefix is already resident there, which
+    is exactly the signal route selection used to ignore.
+    """
+    t = PrefillLoadTracker()
+    t.release(t.acquire("warm", 5_000, affinity_key="caller"), prefill_confirmed=True)
+    chosen = t.select_index(["cold", "warm"], [0.9, 0.1], 10_000, _fixed_rand(0.0), "caller")
+    assert chosen == 1
+
+
+@pytest.mark.unit
+def test_select_keeps_the_draw_when_the_locality_saving_is_immaterial():
+    """A few shared tokens is jitter, not the conversation; weights still decide."""
+    t = PrefillLoadTracker()
+    resident = prefill_load.LOCALITY_MIN_SAVING_TOKENS - 1
+    t.release(t.acquire("warm", resident, affinity_key="caller"), prefill_confirmed=True)
+    prompt = resident + prefill_load.LOCALITY_MIN_SAVING_TOKENS
+    assert t.uncached_estimate("warm", prompt, "caller") == prefill_load.LOCALITY_MIN_SAVING_TOKENS
+    chosen = t.select_index(["cold", "warm"], [0.9, 0.1], prompt, _fixed_rand(0.0), "caller")
+    assert chosen == 0
+
+
+@pytest.mark.unit
+def test_select_keeps_the_draw_when_the_cached_endpoint_is_backlogged():
+    """Past the affinity ceiling the queue costs more than the prefill it saves."""
+    t = PrefillLoadTracker()
+    t.release(t.acquire("warm", 5_000, affinity_key="caller"), prefill_confirmed=True)
+    # Someone else's cold mega-prefill is now queued on the warm endpoint.
+    t.acquire("warm", prefill_load.AFFINITY_BACKLOG_CEILING + 1, affinity_key="other")
+    chosen = t.select_index(["cold", "warm"], [0.9, 0.1], 10_000, _fixed_rand(0.0), "caller")
+    assert chosen == 0
+
+
+@pytest.mark.unit
+def test_select_has_no_locality_without_a_caller():
+    """No caller identity means no prefix history: the draw stands, as before."""
+    t = PrefillLoadTracker()
+    t.release(t.acquire("warm", 5_000, affinity_key="caller"), prefill_confirmed=True)
+    assert t.select_index(["cold", "warm"], [0.9, 0.1], 10_000, _fixed_rand(0.0)) == 0
+
+
+@pytest.mark.unit
+def test_select_does_not_revisit_an_avoided_warm_endpoint():
+    """Locality must not override ``avoid`` and hand back the endpoint just left."""
+    t = PrefillLoadTracker()
+    t.release(t.acquire("warm", 5_000, affinity_key="caller"), prefill_confirmed=True)
+    chosen = t.select_index(
+        ["cold", "warm"], [0.9, 0.1], 10_000, _fixed_rand(0.0), "caller", "warm"
+    )
+    assert chosen == 0
+
+
+# ---------------------------------------------------------------------------
 # Warm-continuation discounting
 # ---------------------------------------------------------------------------
 
