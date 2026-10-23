@@ -1711,6 +1711,8 @@ class FixedRouter:
         preferred_endpoint_id: str | None = None,
         endpoint_scope: frozenset[str] | None = None,
         require_target: bool = False,
+        fingerprint: str | None = None,
+        messages: Sequence[dict[str, Any]] | None = None,
     ) -> BaseAdapter | None:
         """Select an adapter using weighted random selection with optional affinity.
 
@@ -1742,6 +1744,11 @@ class FixedRouter:
                 admissible raises :class:`TargetUnavailableError` instead of
                 being replaced by the ordinary draw, so a caller that planned one
                 candidate per attempt is told which candidate it lost.
+            fingerprint: Conversation identity, forwarded to locality selection.
+                Without it the draw keeps its full authority -- see
+                :meth:`PrefillLoadTracker.select_index`.
+            messages: This request's messages, so locality can also require that
+                the prompt still contains the remembered one.
 
         Returns:
             Selected adapter or None if no route configured / no match.
@@ -1884,6 +1891,8 @@ class FixedRouter:
                         prefill_tokens=prefill_tokens,
                         affinity_key=affinity_key,
                         avoid_endpoint_id=None,
+                        fingerprint=fingerprint,
+                        messages=messages,
                     ),
                     affinity_key,
                 )
@@ -1901,6 +1910,8 @@ class FixedRouter:
             prefill_tokens=prefill_tokens,
             affinity_key=affinity_key,
             avoid_endpoint_id=avoid_endpoint_id,
+            fingerprint=fingerprint,
+            messages=messages,
         )
         return self._record_affinity_and_return(model_id, chosen, affinity_key)
 
@@ -1930,6 +1941,8 @@ class FixedRouter:
         prefill_tokens: int,
         affinity_key: str | None,
         avoid_endpoint_id: str | None,
+        fingerprint: str | None = None,
+        messages: Sequence[dict[str, Any]] | None = None,
     ) -> BaseAdapter:
         """Draw one adapter from ``allowed`` by weight, prefill-aware.
 
@@ -1960,6 +1973,8 @@ class FixedRouter:
                 random.random,
                 affinity_key,
                 avoid_endpoint_id,
+                fingerprint,
+                messages,
             )
         except Exception:
             logger.error(
@@ -1995,6 +2010,8 @@ class FixedRouter:
         preferred_endpoint_id: str | None = None,
         endpoint_scope: frozenset[str] | None = None,
         require_target: bool = False,
+        fingerprint: str | None = None,
+        messages: Sequence[dict[str, Any]] | None = None,
     ) -> tuple[BaseAdapter | None, DispatchClaim | None]:
         """Select an adapter and claim the dispatch slot for its endpoint.
 
@@ -2059,6 +2076,8 @@ class FixedRouter:
                 preferred_endpoint_id=preferred_endpoint_id,
                 endpoint_scope=endpoint_scope,
                 require_target=require_target,
+                fingerprint=fingerprint,
+                messages=messages,
             )
             if preferred is not None:
                 preferred_endpoint = endpoint_id_for_adapter(preferred)
@@ -2084,6 +2103,8 @@ class FixedRouter:
                 prefill_tokens=prefill_tokens,
                 exclude=exclude,
                 endpoint_scope=endpoint_scope,
+                fingerprint=fingerprint,
+                messages=messages,
             )
             if adapter is None:
                 return None, None
@@ -2157,10 +2178,15 @@ class FixedRouter:
         passes ``fingerprint`` *and* ``messages``, so a fork that shares only the
         opening fails the anchor check; ``acquire`` passes ``fingerprint`` alone,
         enough to keep one caller's unrelated conversations from inheriting each
-        other's prefix on the admission gate; ``select_index`` passes neither,
-        because a mis-estimated *load* skews one draw and self-corrects. So
-        priority and the elephant count can still disagree about a fork or a
-        retry, and selection can disagree with both.
+        other's prefix on the admission gate. Selection splits by purpose: its
+        load and elephant numbers use the loose caller-scoped discount, because
+        a mis-estimated *load* skews one draw and self-corrects, while a
+        *locality* verdict uses the same strict pair as this method -- it moves
+        the request and then records affinity, so an error persists. Without a
+        fingerprint, selection skips locality entirely rather than trust the
+        caller-scoped hint. So priority and the elephant count can still disagree
+        about a fork or a retry, and selection is the most conservative of the
+        three.
 
         Per endpoint, because the discount is: a prefix resident on the replica
         the caller has been talking to is not resident on a fallback that has
@@ -2238,6 +2264,8 @@ class FixedRouter:
                     preferred_endpoint_id=preferred_endpoint_id,
                     endpoint_scope=endpoint_scope,
                     require_target=require_target,
+                    fingerprint=fingerprint,
+                    messages=messages,
                 )
                 if primary is not None:
                     lease = self._prefill_load.acquire(
@@ -2542,6 +2570,8 @@ class FixedRouter:
                     preferred_endpoint_id=preferred_endpoint_id,
                     endpoint_scope=endpoint_scope,
                     require_target=require_target,
+                    fingerprint=fingerprint,
+                    messages=messages,
                 )
                 if primary is not None:
                     lease = self._prefill_load.acquire(
