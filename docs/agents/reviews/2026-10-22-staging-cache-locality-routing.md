@@ -558,6 +558,13 @@ Mutation checks: removing the fingerprint gate, removing the weight guard,
 sizing the wait on loose evidence, and dropping the call-site argument each fail
 a test; the end-to-end cases are the ones that catch the last of those.
 
+**The second entry point.** The opt-in hybrid composition draws globally in
+`FixedPolicy.select_backend` and then forces the target it names, so that draw
+also needed the conversation: `select_adapter()`/`_select_adapter()` carry the
+fingerprint and `select_backend` computes it from the same inputs, or the one
+remaining cache-blind selection would be the first one in that path. Covered by
+`test_policy_carries_the_conversation_into_locality_selection`.
+
 Status: local commit only, as above.
 
 ## The reuse boundary, measured, on both deployments
