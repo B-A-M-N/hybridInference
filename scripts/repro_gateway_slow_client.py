@@ -151,10 +151,12 @@ def install_queue_spy() -> None:
 
 
 def remove_queue_spy() -> None:
+    """Restore the real asyncio.Queue (undo the spy)."""
     asyncio.Queue = asyncio.Queue.__bases__[0]  # type: ignore[assignment]
 
 
 def rss_kb() -> int:
+    """Return this process resident set size in KB."""
     with open("/proc/self/status", encoding="ascii") as f:
         for line in f:
             if line.startswith("VmRSS:"):
@@ -307,6 +309,7 @@ async def run_scenario(
 
 
 async def main() -> int:
+    """Run both scenarios and report the verdict (0 = pass)."""
     upstream = await start_upstream()
     gw_task, server = await start_gateway()
     print(f"upstream: http://127.0.0.1:{UPSTREAM_PORT} ({CHUNKS} x ~{PAD_BYTES}B chunks)")
