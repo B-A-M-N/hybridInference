@@ -841,3 +841,18 @@ calibration inputs (staging cold-prefill times), and the route composition (read
 from the console). Not measured, and not claimed: any improvement in staging
 reuse, offload rate, cancellation count, TTFT or cost. Those require the
 deployment in step 1.
+
+## Full-suite qualification (kept record)
+
+A full-suite run initially showed 18 failures in
+`tests/unit/serving/test_http*` and was first mis-attributed to pre-existing
+pollution. A pristine `upstream/dev` checkout (`4b80416f`) runs the identical
+suite clean, which pinned the polluter to this branch's own
+`tests/unit/servers/test_registry_include_usage.py`: it patched `stream_post`
+on the process-wide `AsyncHTTPClient.shared()` singleton instead of shadowing
+the adapter's instance attribute. The fix lands with the usage-capability PR.
+With it, the full `tests/unit tests/api` suite is **6 857 passed, 12 skipped,
+0 failed**. Three `tests/unit/ops/test_classify_changes` failures appear only
+on the qualifying machine: its global git `core.hooksPath` identity guard
+breaks those tests' own commit subprocesses; dev shows the same three under no
+override, which identifies them as environmental.
