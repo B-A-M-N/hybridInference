@@ -543,6 +543,18 @@ msgstr ""
 "`required_role`——能看到并调用该模型的最低用户角色（`admin_only: true` 是 `required_role: "
 "admin` 的旧写法）。"
 
+#: ../developer/adding-models.md:199
+msgid ""
+"When `required_role` is omitted, entries marked `admin_only: true` default "
+"to `admin`. Otherwise, models with known or uncertain provider costs default "
+"to `pro`; only an all-zero `pricing` block, or an unpriced route that is "
+"both on a local host and served by a self-hosted engine API (`sglang`, "
+"`vllm`, `ollama`), keeps the historical `free` default. An omitted role is "
+"no longer a claim that the model is free, so a deployment that serves "
+"unpriced models without cost disclosure must say so explicitly. In "
+"particular:"
+msgstr "未填写 `required_role` 时，标记为 `admin_only: true` 的条目默认要求 `admin`。其他模型如果已知或无法确定 provider 成本，则默认要求 `pro`；只有整体价格为零的 `pricing` 块，或者既位于本地主机、又由自托管推理引擎（`sglang`、`vllm`、`ollama`）服务的未标价路由，才保留历史上的 `free` 默认值。省略 `required_role` 不再表示模型免费；部署若要继续无差别开放未标价模型，必须显式声明。特别地："
+
 #: ../developer/adding-models.md:197
 msgid "Calendar-aware prices"
 msgstr "按日历调整价格"
