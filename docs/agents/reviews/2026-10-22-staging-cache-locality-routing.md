@@ -856,3 +856,31 @@ With it, the full `tests/unit tests/api` suite is **6 857 passed, 12 skipped,
 on the qualifying machine: its global git `core.hooksPath` identity guard
 breaks those tests' own commit subprocesses; dev shows the same three under no
 override, which identifies them as environmental.
+
+### Rollout and rollback
+
+Merge order A → B → C. A first: it carries the test-pollution fix that keeps
+the full suite green for everything after it, and its behavior change
+(`stream_options.include_usage` on by default for the usage-capable kinds) is
+exactly what B's `cached_tokens` verification wants to see. B and C are mutually
+independent — either order merges clean; B before C only because C carries the
+shared record that references B's merged locality contract. No PR touches
+storage, migrations, or required configuration, so a rollback is a revert, not
+a migration.
+
+Per-PR rollback, independent of the others:
+
+| PR | revert | behavior restored |
+|---|---|---|
+| A usage capability | revert the PR (or set `include_usage_in_stream: false` on affected routes in models.yaml — the per-route escape hatch is the flag itself) | no `stream_options` sent unless a route declares it |
+| B locality selection | revert the PR | weighted draw + load only; affinity hints stop influencing selection |
+| C offload deadlines | revert the PR | fixed 0.8 s engine deadline; pre-cancellation offload behavior |
+
+Rollback safety notes: no candidate adds an operator-visible config surface
+that must be removed by hand; no candidate changes a persisted schema; the
+runtime-route inheritance gap documented for #1630/#1631 (#1630-32 territory)
+is unaffected by rollback order. During the comparison window, stage A and B
+together before C only if the engine-wait comparison needs both — the metrics
+table above attributes each effect to its own PR's mechanism, so staggered
+deploys are also valid: B's effect reads in `endpoint_id` distribution, C's in
+`engine_wait` offload counts, A's in `cached_tokens` presence.
