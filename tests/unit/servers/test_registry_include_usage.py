@@ -66,7 +66,14 @@ async def _stream_and_capture(adapter, *, usage: dict | None = None) -> tuple[di
         yield _chunk(delta={}, finish_reason="stop")
         yield "data: [DONE]"
 
-    adapter.http.stream_post = MagicMock(side_effect=fake_stream_post)
+    # Replace the adapter's client wholesale. ``adapter.http`` is the
+    # process-wide ``AsyncHTTPClient.shared()`` singleton, so patching a method
+    # on it in place would leak the mock into every later test that streams --
+    # exactly what a full-suite run of ``tests/unit/serving/test_http.py``
+    # caught. Shadowing the instance attribute leaves the singleton pristine.
+    http = MagicMock()
+    http.stream_post = MagicMock(side_effect=fake_stream_post)
+    adapter.http = http
     chunks = [
         chunk async for chunk in adapter.stream_chat_completion([{"role": "user", "content": "hi"}])
     ]
