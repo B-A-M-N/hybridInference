@@ -311,6 +311,12 @@ it. Custom providers are `openai_compat` only; a protocol the generic adapter
 cannot speak needs an adapter, which is a code change
 ([Writing a Provider Adapter](provider-adapters.md)).
 
+Each row is a provider that at least one route goes through. A slug the model
+registry only mentions is reserved the same way but gets no row of its own: a
+model's own `provider:`, which names who makes the model while its routes say
+who serves it, and the `kind:` of a route whose `route_metadata` names a
+different `key_provider`, a route listed under that `key_provider` instead.
+
 A key added here joins the same pool as the keys the registry names through
 `${VAR}` and rotates with them. A key the registry names — an *environment
 key* on this tab, whose value comes from the
@@ -346,11 +352,21 @@ use any of the three.
 A model created here is a **runtime model**: it exists only in the database,
 carries an id, a first route, a pricing table, a router strategy and a
 `required_role` (default `admin`, so a new model stays invisible to ordinary
-users until you lower it), and is restored at every start. It does not carry
-the catalog metadata a registry entry declares — context length, modalities,
-supported parameters, aliases — and takes `ModelConfig`'s defaults for those:
-`context_length` 8192, `max_output_length` 4096, text in and out, no tool
-support. When a model needs any of that, put it in the registry.
+users until you lower it), and is restored at every start. It also declares
+what it accepts, as `capabilities` in the request: `context_length`,
+`max_output_length`, `input_modalities` (`text`, optionally `image`) and
+`supports_tools`. All four are required, because each changes what a request
+does: a model without tool support has tool definitions dropped, `max_tokens`
+is clamped to `max_output_length`, an image reaches only a route that accepts
+images, and Auto and the context-overflow fallback read `context_length`. The
+two lengths are whole numbers of tokens, at most 10,000,000. A route added to
+the model later copies the four from its first route. Each route stores and
+restores its own four, since routes of one model can differ. A runtime model
+created before they could be declared keeps the defaults it was given:
+`context_length` 8192, `max_output_length` 4096, text only, no tool support.
+Supported parameters such as `reasoning_effort`, structured output and aliases
+still take `ModelConfig`'s defaults; when a model needs any of those, put it in
+the registry.
 
 ### Settings tab
 

@@ -493,6 +493,10 @@ class TestHedgedAdapterNonStreaming:
         await asyncio.wait_for(primary_cleanup_started.wait(), timeout=0.2)
 
         assert tracker.backlog("test:primary") == 0
+        # After await on primary_cleanup_started, the primary's finally block
+        # has appended "primary-cancellation-started".  The deterministic order
+        # is capacity (backup dispatch release) → prefill (lease release callback)
+        # → primary-cancellation-started (primary's cancellation finally).
         assert events == ["capacity", "prefill", "primary-cancellation-started"]
         assert not allow_primary_cleanup.is_set()
         assert not request.done()
