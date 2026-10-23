@@ -147,6 +147,7 @@ async def mint_grant(
     visible = await agent_visible_models(
         router_exec,
         visibility_resolver=visibility_resolver,
+        include_embeddings=True,
         user_ctx={
             "role": user.get("role") or "free",
             "user_id": user["id"],

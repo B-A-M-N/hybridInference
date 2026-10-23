@@ -63,13 +63,32 @@ class TestDefaultRequiredRoleForModel:
         model = {"id": "claude-opus-4.8", "pricing": {"prompt": "1.2", "completion": "4.8"}}
         assert default_required_role_for_model(model) == "pro"
 
-    def test_an_omitted_role_on_a_zero_priced_model_stays_free(self):
-        model = {"id": "free-chat", "pricing": {"prompt": "0", "completion": "0"}}
+    def test_zero_user_price_does_not_make_a_remote_route_free(self):
+        model = {
+            "id": "sponsored-chat",
+            "provider": "openai_compat",
+            "pricing": {"prompt": "0", "completion": "0"},
+            "route": [{"kind": "openai_compat", "base_url": "https://api.example.test/v1"}],
+        }
+        assert default_required_role_for_model(model) == "pro"
+
+    def test_explicit_free_role_can_override_zero_price_remote_default(self):
+        model = {
+            "id": "sponsored-chat",
+            "required_role": "free",
+            "provider": "openai_compat",
+            "pricing": {"prompt": "0", "completion": "0"},
+            "route": [{"kind": "openai_compat", "base_url": "https://api.example.test/v1"}],
+        }
         assert default_required_role_for_model(model) == "free"
 
-    def test_an_omitted_role_on_a_model_without_pricing_stays_free(self):
-        # No pricing block at all (local GPU default): the historical default.
-        assert default_required_role_for_model({"id": "local-only"}) == "free"
+    def test_an_unpriced_local_engine_stays_free(self):
+        model = {
+            "id": "local-only",
+            "provider": "sglang",
+            "base_url": "http://localhost:12003/v1",
+        }
+        assert default_required_role_for_model(model) == "free"
 
     def test_an_unknown_cost_remote_route_defaults_to_pro(self):
         # The #1605 gap: an externally billed upstream configured with no
@@ -165,14 +184,19 @@ class TestDefaultRequiredRoleForModel:
         }
         assert default_required_role_for_model(model) == "free"
 
-    def test_an_explicit_zero_price_still_frees_a_local_proxy(self):
-        # Explicit pricing at zero is the other deliberate free declaration.
+    def test_zero_user_pricing_does_not_prove_a_local_proxy_is_free(self):
+        # A local compatibility proxy may still relay to a paid provider.
         model = {
             "id": "local-proxy",
             "pricing": {"prompt": "0", "completion": "0"},
             "route": [{"kind": "openai_compat", "base_url": "http://localhost:8080/v1"}],
         }
-        assert default_required_role_for_model(model) == "free"
+        assert default_required_role_for_model(model) == "pro"
+
+    def test_endpointless_anthropic_model_defaults_to_pro(self):
+        model = {"id": "claude-endpointless", "provider": "anthropic"}
+        assert model_cost_is_unknown_remote(model) is True
+        assert default_required_role_for_model(model) == "pro"
 
     def test_a_synthesized_single_route_inherits_the_model_provider_kind(self):
         # A model with no route list synthesizes one from the top-level
