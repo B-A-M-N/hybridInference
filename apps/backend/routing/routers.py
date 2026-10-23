@@ -1619,6 +1619,8 @@ class FixedRouter:
         prefill_tokens: int = 0,
         preferred_endpoint_id: str | None = None,
         endpoint_scope: frozenset[str] | None = None,
+        fingerprint: str | None = None,
+        messages: Sequence[dict[str, Any]] | None = None,
     ) -> BaseAdapter | None:
         """Return the adapter automatic routing would choose, without dispatching.
 
@@ -1637,6 +1639,12 @@ class FixedRouter:
                 route can serve it. Unlike ``pin_provider`` it does not turn the
                 selection into a single-candidate dispatch: the result is still
                 an ordinary selection subject to the caller's fallback loop.
+            fingerprint: Conversation identity, without which locality is skipped
+                (see :meth:`PrefillLoadTracker.select_index`). A caller that
+                selects here and dispatches later must pass it, or the draw it
+                gets is the cache-blind one.
+            messages: This request's messages, so locality can also require that
+                the prompt still contains the remembered one.
 
         Returns:
             Selected adapter or None if no route configured / no match.
@@ -1647,6 +1655,8 @@ class FixedRouter:
             prefill_tokens=prefill_tokens,
             preferred_endpoint_id=preferred_endpoint_id,
             endpoint_scope=endpoint_scope,
+            fingerprint=fingerprint,
+            messages=messages,
         )
 
     def preferred_endpoint_for_provider(
