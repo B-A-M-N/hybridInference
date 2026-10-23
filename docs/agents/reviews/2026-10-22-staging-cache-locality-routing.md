@@ -237,15 +237,14 @@ Component 1 cannot be fixed in this repository. Component 2 splits in two once
 the console has been read: the **offload** half is gateway-side and was
 corrected here (see "Correction implemented"), because the deadline was
 cancelling cold prefills that would have completed. The **ordinary-candidate**
-half — whether the residual split between `zai` and `vllm` is the configured
-weights or affinity failing to hold — is still not settled; the numeric weights
-are the missing input, and changing selection semantics on a hypothesis is what
-the objective forbids. A separate, already-identified gap is worth recording:
-`PrefillLoadTracker` *knows* the per-endpoint un-cached estimate and uses it only
-to discount load and gate elephants (`select_index` breaks ties by backlog), so
-`FixedRouter` selection has no locality term at all. `RouteWise` has one
-(`routing.routewise.prefix_cache`). That gap, not the weight values, is the
-principled place to make selection prefer the worker holding a caller's prefix.
+half had a structural gap that did not depend on the missing weight values, and
+that gap is now closed too (see "Selection now accounts for locality"):
+`PrefillLoadTracker` already knew the per-endpoint un-cached estimate and used it
+only to discount load and gate elephants, while `select_index` broke ties by
+backlog — so `FixedRouter` selection had no locality term at all, although
+`RouteWise` has one (`routing.routewise.prefix_cache`). What still is not settled
+is how much of the measured residual split the configured weights explain; that
+needs the numeric weights, and is a tuning question rather than a mechanism gap.
 
 ## Reproduce
 
@@ -413,6 +412,59 @@ short-prompt test still passes, confirming the fix is targeted.
 
 Status: local commit only. Nothing was pushed, deployed, or configured on
 staging, and no live routing policy was changed.
+
+## Selection now accounts for locality
+
+The requirement is that route selection account for expected un-cached prefill
+cost, actual endpoint capacity and cache locality, and that it distinguish a
+healthy cache-warm endpoint from a short recoverable queue, an overloaded one,
+and one with no known prefix. Two of those three inputs already existed and were
+not used for selection:
+
+- `PrefillLoadTracker.uncached_estimate(endpoint, tokens, affinity_key)` — how
+  much of *this caller's* prompt that endpoint must still prefill. Used to
+  discount backlog and to gate elephants; never to choose.
+- `self._backlog[endpoint]` — the live, capacity-relevant load. Used only as the
+  power-of-two tie-break, and only above `INTERVENE_TOKENS`.
+
+So the draw could give a conversation with a resident prefix to a cold replica
+while the tracker knew the warm one would cost thousands fewer tokens. That is
+the Fixed-versus-RouteWise asymmetry: `routing.routewise.prefix_cache` tracks
+reuse evidence per endpoint, `FixedRouter` had no locality term.
+
+`PrefillLoadTracker.select_index` now ends with `_prefer_cached`, which reuses the
+un-cached estimates it already computes:
+
+- prefer the candidate with the materially smaller un-cached estimate;
+- **only** when it saves at least `LOCALITY_MIN_SAVING_TOKENS` (4096) — below
+  that it is jitter or a partly-shared prefix, and the configured weight (cost,
+  contractual preference) keeps deciding;
+- **only** while that candidate's foreign backlog is within
+  `AFFINITY_BACKLOG_CEILING` — the same judgement `should_keep_affinity` already
+  makes for a sticky pin, so a *short ok queue* is preferred but an overloaded
+  endpoint is not;
+- never resurrecting a candidate dropped by `avoid` or by the elephant
+  saturation filter.
+
+The mapping to the four states the requirement names: a warm endpoint with a
+short queue wins on the un-cached saving; the same endpoint with a foreign
+backlog past the ceiling loses to capacity; an overloaded or unavailable endpoint
+is already excluded by health/elephant filters; an endpoint with no known prefix
+has no discount, so it competes only on weights and backlog as before.
+
+Not a hard pin and not a cache-hit maximizer: weights still decide below the
+saving threshold, and the backlog ceiling keeps a warm-but-queued endpoint from
+absorbing traffic. `ROUTING_PREFILL_AWARE_ENABLED=0` still disables the whole
+prefill-aware path.
+
+Regression coverage in `tests/unit/routing/test_prefill_load.py`: a material
+saving redirecting the draw; an immaterial saving leaving it alone; a backlogged
+warm endpoint losing; no caller identity leaving the draw alone; `avoid` not
+being overridden. Mutation check: disabling `_prefer_cached` fails only the
+material-saving test, so the other four are genuine no-change assertions rather
+than incidental passes.
+
+Status: local commit only, as above.
 
 ## Still open — the ~4.1k-token head on staging `vllm`
 
