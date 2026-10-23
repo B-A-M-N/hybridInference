@@ -699,6 +699,60 @@ which locality deliberately respects too), and the burst split the objective
 opens with is either that drop or more than one gateway instance — which is a
 staging observation to take, not a local one.
 
+## Open-PR landscape and cross-PR audit (2026-10-23)
+
+`upstream/dev` moved `4b80416f` -> `9b48afd9` mid-review: #1627 (DeepSeek-profile
+OpenAI-spelled cache counts, `adapters/profiles.py`) and #1628 (Next.js). Neither
+touches this branch's files. New in the open set: #1632 (static provider-key
+lookup on route edit), extending the #1631/#1630 route-editing family. All the
+PRs this work depends on or overlaps are MERGEABLE; #1609 and #1616 carry
+CHANGES_REQUESTED and #1462/#1502 still hold their known open threads
+(fallback-lease; duplicate-classification) — none of which this branch touches,
+and none of which it should resolve.
+
+Capability loader against the runtime admin paths (#1631/#1630), audited in
+source at the base the branch carries:
+
+- **YAML routes** re-derive `include_usage_in_stream` from models.yaml on every
+  reload, kind defaults included, so the explicit-False-must-not-flip-to-default
+  contract holds across restarts and restores.
+- **Runtime-created routes** copy the template route's config
+  (`_config_to_dict` walks every `ModelConfig` field, the flag among them), so
+  the new route carries the template's value — including one the template only
+  had as a *kind default*, now silently pinned as if declared.
+- **The edit path can repoint a route at a different kind**
+  (`UpdateProviderRouteRequest.upstream_provider` -> `_make_adapter(target.kind,
+  cfg)`). Because the copied key is present, the new kind's default never
+  applies: a route moved from vLLM (assumed True) onto a kind that rejects the
+  unknown body field keeps sending `stream_options.include_usage` there. That
+  is a narrow, admin-invoked drift, and the right home for fixing it is the
+  capability schema #1630 is actively reshaping (`RuntimeModelCapabilities`
+  persists exactly four fields today) — recorded here for those reviewers, not
+  patched across their open PRs.
+- **Restore** rebuilds from the stored row, which persists only the four
+  declared capabilities; the usage flag falls back to template copy or kind
+  default. Same owner.
+
+Hot-path composition with #1462's transaction boundary and #1461's priority
+propagation, measured (3 ordinary candidates):
+
+| evidence | cost | where it runs |
+|---|---|---|
+| `conversation_fingerprint` | <= 4 messages x 2 048 chars, microseconds | before `routing_transaction()`, outside the lock |
+| `prompt_anchor` (full prefix) | 0.8 ms at 9k tok; ~3 ms at 500k tok | before the transaction, outside the lock |
+| anchor re-verification per warm candidate (in `select_index`) | 0.27 ms at 45k; ~3 ms at 500k tok | inside the transaction, per hinted candidate |
+| provider I/O in either | none | — |
+
+No provider I/O enters the transaction, and the fingerprint/anchor hashing the
+router itself performs sits outside it. What remains inside is the anchor
+re-verification `uncached_estimate` does for a candidate whose hint fingerprint
+matches — one incremental blake2b pass over the request prefix, scaling with the
+remembered turn, worst case a few ms for a 500k-token conversation with two warm
+candidates. Hoisting it out would mean reading the hint table outside the
+transaction and a stale-hint race argued against #1462's reservation semantics —
+that boundary is #1462's to own while its fallback-lease thread is open, so the
+measurement is recorded for those reviewers rather than restructured here.
+
 ## Controlled staging comparison (prepared, not run)
 
 Nothing above is a deployed measurement. The two corrections are local commits
