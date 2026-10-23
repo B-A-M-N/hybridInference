@@ -418,31 +418,44 @@ the work it bounds:
   fingerprint (see below).
 
 **Offset, not proportion.** The first revision scaled the base
-(`max(base, base * uncached / credit)`), which hands a prompt of exactly one
-credit — 4.1k tokens — the same 0.8 s a warm continuation gets. Measured staging
-cold prefills make that a real defect, not a hypothetical: 0.86 s at 4.5k
-tokens, i.e. ~60 ms past the deadline, so a healthy engine was being cancelled
-just before it finished. Offsetting gives the base as a fixed allowance
-(queueing, scheduling, the first decode step) and buys another base wait of
-prefill per credit.
+(`max(base, base * uncached / credit)`), which gives a prompt of exactly one
+credit — 4.1k tokens — the base and nothing more. Replaying that rule against
+the measured staging prefills shows the defect is in the *tail*, not the mean:
+twelve cold 2.6k-token requests on the pinned engine finished in 0.49–0.97 s
+(mean 0.63 s) under the 0.80 s floor, so two of twelve successful prefills would
+have been cancelled and re-sent cold elsewhere; at 9.1k the 1.78 s budget sat ten
+milliseconds *under* a measured 1.79 s. Offsetting gives the base as a fixed
+allowance — queueing, scheduling, the first decode step — and buys another base
+wait of prefill per credit.
 
-Calibration against measured staging cold prefills (pinned vLLM, `max_tokens`
-8/512/1 — identical):
+Replay of both rules over the 27 successfully completed pinned prefills measured
+on staging (TTFT, i.e. prefill plus first token, as the observable proxy; the
+same samples the calibration below is drawn from):
 
-| un-cached prefill | measured | engine wait at staging's 0.8 s base |
-|---|---|---|
-| 0 (warm continuation) | ~0 | 0.8 s |
-| 1 819 | 0.46–0.56 s | 1.16 s |
-| 4 519 | 0.86 s | 1.68 s |
-| 9 119 | 1.52–1.79 s | 2.58 s |
-| 18 319 | 1.52–1.79 s | 4.38 s |
-| ≥ 40 960 | — | 8.0 s (ceiling) |
+| un-cached prefill | measured TTFT | old budget | new budget | old would cancel | new would cancel |
+|---|---|---|---|---|---|
+| 1 819 | 0.46–0.56 s | 0.80 s | 1.16 s | 0/2 | 0/2 |
+| 2 659 ×12 | 0.49–0.97 s | 0.80 s | 1.32 s | **2/12** | 0/12 |
+| 4 519 | 0.86 s | 0.88 s | 1.68 s | 0/1 | 0/1 |
+| 4 321 (8.9k prompt, 4.6k cached) ×7 | 0.67–0.77 s | 0.84 s | 1.64 s | 0/7 | 0/7 |
+| 9 119 ×2 | 1.52–1.79 s | 1.78 s | 2.58 s | **1/2** | 0/2 |
+| 18 319 ×2 | 1.52–1.79 s | 3.58 s | 4.38 s | 0/2 | 0/2 |
 
-The slope is 195 µs/token against a measured marginal cost near 83 µs/token, a
-~2.4x margin over the slowest measured rate. The ceiling is about the
-extrapolated cold prefill of a 100k-token prompt and well under the contended
-remote TTFT already observed on the offload route (30–49 s at the tail), so
-waiting out the engine stays the cheaper choice even when the ceiling binds.
+Three of twenty-seven measured successful prefills would have been cancelled by
+the old rule; none by the new one. This is a replay of a decision rule over
+measured observations, not a deployment measurement — it says the rule was
+mis-sized against the engine that is actually running, and nothing more.
+
+Headroom is deliberately not uniform. The new budget is above every measured
+sample, but the tightest case is the one where the deadline binds on the tail:
+1.32 s against 0.97 s at 2.6k (1.36×), versus 1.44× at 9.1k and 2.45× at 18.3k.
+A fit through these points is not a straight line — the 9.1k and 18.3k runs both
+land at ~1.5–1.8 s, which looks like a scheduling quantum rather than
+token-proportional prefill — so the constant encodes a conservative bound, not a
+measured rate. The ceiling is about the extrapolated cold prefill of a
+100k-token prompt and well under the contended remote TTFT already observed on
+the offload route (30–49 s at the tail), so waiting out the engine stays the
+cheaper choice even when the ceiling binds.
 
 **Evidence scope.** The budget is sized on an *un-cached* estimate, so it
 inherited the same weakness the locality term had: `affinity_key` is the API-key

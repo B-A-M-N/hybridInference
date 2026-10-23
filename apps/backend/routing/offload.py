@@ -112,13 +112,16 @@ OFFLOAD_LAST_RESORT = "last_resort"
 #: same 0.8 s a warm continuation gets, which is precisely the cold prefill that
 #: was being cancelled.
 #:
-#: The credit is calibrated conservatively against measured staging cold
-#: prefills (pinned vLLM, small ``max_tokens``): 1.8k tokens in ~0.5 s, 4.5k in
-#: ~0.86 s, 9.1k in ~1.5 s, 18.3k in ~1.5-1.8 s. That is roughly 80 us per token
-#: of marginal prefill on top of a few hundred ms of fixed cost, while one base
-#: wait per credit is 195 us per token at the 0.8 s staging base -- a ~2.4x
-#: margin over the slowest measured rate, so a healthy engine finishes and an
-#: engine that is genuinely queueing still fails over.
+#: The credit is calibrated against measured staging prefills (pinned vLLM,
+#: small ``max_tokens``), and the number that matters is the *tail*: twelve cold
+#: 2.6k-token requests finished in 0.49-0.97 s, and at 9.1k the old proportional
+#: budget of 1.78 s sat ten milliseconds under a measured 1.79 s. Replaying both
+#: rules over 27 measured successful prefills, the old one would have cancelled
+#: three; this one none. Its tightest headroom is the 2.6k tail (0.97 s measured
+#: against 1.32 s) rather than the 18.3k case (1.79 s against 4.38 s), because
+#: the measured cost is not a straight line in tokens -- 9.1k and 18.3k both land
+#: at ~1.5-1.8 s, which looks like a scheduling quantum. The constant therefore
+#: encodes a conservative bound, not a measured rate.
 #:
 #: The engine wait bounds ``prefill + time-to-first-token``, and only the engine
 #: knows where prefill ends -- the first token is the first evidence the gateway

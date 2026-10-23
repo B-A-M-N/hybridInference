@@ -200,19 +200,28 @@ def test_engine_wait_keeps_the_base_for_a_warm_prompt():
 def test_engine_wait_offsets_the_base_it_does_not_multiply_it():
     """One credit of prefill buys one *extra* base wait, not merely the base.
 
-    The offset is the whole correction: a 4.1k-token cold prefill was being
-    given exactly the 0.8 s a warm continuation gets, so a healthy engine
-    finishing in 0.86 s missed the deadline by ~60 ms and had its prefill
-    cancelled. Measured staging local: ~0.5 s at 1.8k, ~0.86 s at 4.5k,
-    ~1.5 s at 9.1k, ~1.5-1.8 s at 18.3k.
+    The offset is the whole correction. The old proportional form gave a
+    4.1k-token cold prefill exactly the 0.8 s floor a warm continuation gets, and
+    the measured distribution shows why that fails: twelve cold 2.6k requests
+    completed in 0.49-0.97 s, so two of them crossed a 0.80 s deadline, and at
+    9.1k the 1.78 s budget sat under a measured 1.79 s. Replaying both rules over
+    27 measured successful prefills, the old one cancels three and this one none.
     """
     policy = _policy(wait_seconds=0.8)
     assert policy.engine_wait_seconds(OFFLOAD_PREFILL_CREDIT_TOKENS) == pytest.approx(1.6)
+    assert policy.engine_wait_seconds(2_659) == pytest.approx(1.32, abs=0.01)
     assert policy.engine_wait_seconds(4_519) == pytest.approx(1.68, abs=0.01)
     assert policy.engine_wait_seconds(9_119) == pytest.approx(2.58, abs=0.01)
     assert policy.engine_wait_seconds(18_319) == pytest.approx(4.38, abs=0.01)
-    # Every measured prefill above finishes inside its own budget.
-    for tokens, measured in ((1_819, 0.56), (4_519, 0.86), (9_119, 1.79), (18_319, 1.79)):
+    # Every measured sample -- including the 2.6k tail and the 9.1k edge the old
+    # rule would have cut -- finishes inside the new budget.
+    for tokens, measured in (
+        (1_819, 0.56),
+        (2_659, 0.97),
+        (4_519, 0.86),
+        (9_119, 1.79),
+        (18_319, 1.79),
+    ):
         assert measured < policy.engine_wait_seconds(tokens)
 
 
