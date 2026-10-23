@@ -708,7 +708,10 @@ lookup on route edit), extending the #1631/#1630 route-editing family. All the
 PRs this work depends on or overlaps are MERGEABLE; #1609 and #1616 carry
 CHANGES_REQUESTED and #1462/#1502 still hold their known open threads
 (fallback-lease; duplicate-classification) — none of which this branch touches,
-and none of which it should resolve.
+and none of which it should resolve. The full 18-commit stack was cherry-picked
+onto `9b48afd9` in a throwaway worktree as a merge rehearsal: zero conflicts,
+and routing + servers + adapters (including #1627's new profile tests) pass
+together — 2 872 passed, 2 skipped.
 
 Capability loader against the runtime admin paths (#1631/#1630), audited in
 source at the base the branch carries:
