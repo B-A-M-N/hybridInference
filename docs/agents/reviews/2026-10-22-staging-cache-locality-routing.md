@@ -283,9 +283,15 @@ That is a tuning question, and this record proposes no weight change.
 
 ## Reproduce
 
+The commands below are the **historical local procedures** that produced the
+measurements in this record. They ran from this branch's own scratch area
+(`.tmp-probe/*.py.scratch`, renamed so the lint gate does not format them) and
+that scratch is deliberately **not part of this PR** — a checkout of this
+branch does not contain them, and the deployment overlays they pointed at are
+not published in this repository. They are kept here as the exact record of
+what was run, not as executable instructions for reviewers.
+
 ```bash
-# The one-off readers here were scratch and are renamed ``*.py.scratch`` so the
-# repository lint gate does not format them; the durable evidence is this file.
 # staging, automatic routing, 2.7k-token identical prefix
 python3 .tmp-probe/probe.py.scratch --mode chat --count 12 --salt U1
 # staging, pinned to the cache-capable endpoint
@@ -297,6 +303,25 @@ python3 .tmp-probe/probe.py.scratch --provider production --mode chat --count 6
 # the pin oracle
 python3 .tmp-probe/enumerate_pins.py.scratch glm-5.3-flash staging
 ```
+
+Independently executable verification on a checkout of this branch:
+
+- **Unit-level evidence (no deployment needed):**
+  `uv run pytest -q tests/unit/routing tests/unit/serving -p no:cacheprovider`
+  exercises every contract this record motivated — the strict
+  `uncached_estimate` evidence semantics, the locality gates, the
+  prefill-aware engine wait, and the offload accounting — against fakes.
+- **Deployment-level reproduction (needs an authorized host and its overlay
+  credentials):** any OpenAI-compatible client suffices. Send
+  `count` consecutive turns of one conversation whose prompt is a fixed
+  preamble plus a per-turn delta, with no pin, and compare
+  `usage.prompt_tokens_details.cached_tokens` between the first turn and
+  turn N+1, then repeat with `route_id` pinned to each candidate. The
+  expected shape is exactly what the Measurements section shows: cached on
+  the warm endpoint after the engine's size boundary, a full charge
+  elsewhere. `/metrics` `gpu_prefix_cache_hit_rate` on the vLLM engine
+  corroborates that the reuse is physical.
+
 
 ## Recommendation
 
@@ -818,10 +843,13 @@ with latency, fallback or cost is the failure mode the objective forbids.
 
 ### Reproduce
 
-The probe used for the measurements above lives in the worktree at
-`.tmp-probe/probe.py.scratch` (read-only, not committed) and takes
-`--pin vllm|zai|ollama`, `--count`, `--provider staging|production`. The
-comparison itself is a scripted loop around the same endpoint:
+The probe used for the measurements above lived in this branch's scratch area
+(`.tmp-probe/probe.py.scratch`, read-only, **not committed** — a checkout of
+this PR does not contain it). The commands that follow are the historical
+local procedure, kept for the record rather than as reviewer-runnable steps;
+the independently executable path is the unit suite under
+[Reproduce](#reproduce) above, and the deployment-level recipe there applies
+per cell once staging is authorized.
 
 ```bash
 # one cell: 16 identical-prefix turns on one conversation, pinned to nothing
@@ -872,7 +900,7 @@ Per-PR rollback, independent of the others:
 
 | PR | revert | behavior restored |
 |---|---|---|
-| A usage capability | revert the PR (or set `include_usage_in_stream: false` on affected routes in models.yaml — the per-route escape hatch is the flag itself) | no `stream_options` sent unless a route declares it |
+| A usage capability | revert the PR (or set `include_usage_in_stream: false` on affected routes in models.yaml, while the PR is deployed — the explicit per-route escape hatch is the PR's own addition and does not survive its revert) | restores dev's original kind defaults: `deepseek`, `zai`, `kimi`, `minimax`, `sglang` and `vllm` resume sending `stream_options.include_usage` unconditionally, and the ability to override them explicitly (including `false`) is removed; kinds outside the set (e.g. `ollama`) behave exactly as before the PR |
 | B locality selection | revert the PR | weighted draw + load only; affinity hints stop influencing selection |
 | C offload deadlines | revert the PR | fixed 0.8 s engine deadline; pre-cancellation offload behavior |
 
