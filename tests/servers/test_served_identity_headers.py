@@ -274,7 +274,7 @@ async def test_chat_completions_response_carries_served_identity_headers(chat_cl
     assert r.headers["x-fi-requested-model"] == CHAT_MODEL
     assert r.headers["x-fi-served-model"] == CHAT_MODEL
     assert r.headers["x-fi-served-endpoint"] == f"{CHAT_MODEL}:zai-api"
-    assert r.headers["x-fi-served-provider"] == "zai"
+    assert r.headers["x-fi-served-provider"] == "sglang"
     assert r.headers["x-fi-served-endpoint"].count("http") == 0
 
 
@@ -339,7 +339,7 @@ async def test_chat_completions_stream_carries_requested_identity(chat_client):
     assert r.headers["x-fi-requested-model"] == CHAT_MODEL
     assert r.headers["x-fi-served-model"] == CHAT_MODEL
     assert r.headers["x-fi-served-endpoint"] == f"{CHAT_MODEL}:zai-api"
-    assert r.headers["x-fi-served-provider"] == "zai"
+    assert r.headers["x-fi-served-provider"] == "sglang"
 
 
 @pytest.mark.asyncio
@@ -371,7 +371,7 @@ async def test_forced_streaming_branch_carries_the_headers(chat_app):
     assert r.headers["x-fi-requested-model"] == CHAT_MODEL
     assert r.headers["x-fi-served-model"] == CHAT_MODEL
     assert r.headers["x-fi-served-endpoint"] == f"{CHAT_MODEL}:zai-api"
-    assert r.headers["x-fi-served-provider"] == "zai"
+    assert r.headers["x-fi-served-provider"] == "sglang"
 
 
 @pytest.mark.asyncio
@@ -412,6 +412,56 @@ async def test_multi_backend_streaming_uses_observed_route_identity(chat_app):
         assert r.headers["x-fi-served-endpoint"] == f"{CHAT_MODEL}:zai-api"
     else:
         assert "x-fi-served-endpoint" not in r.headers
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_chat_fallback_reports_the_route_that_served(chat_app):
+    """After a fallback, the non-streaming headers must describe the route that
+    actually served, and a private host label must still not be published."""
+
+    class _FailingAdapter(BaseAdapter):
+        async def chat_completion(self, messages: list[dict[str, Any]], **params) -> dict[str, Any]:
+            raise RuntimeError("primary adapter failed")
+
+        async def stream_chat_completion(self, messages, **params):
+            raise RuntimeError("primary adapter failed")
+            if False:  # pragma: no cover
+                yield ""
+
+    primary_cfg = _chat_cfg(CHAT_MODEL)
+    primary_cfg.provider = "zai"
+    primary_cfg.base_url = "https://example-zai.test"
+    primary_cfg.endpoint_id = f"{CHAT_MODEL}:zai-api"
+    primary_cfg.endpoint_identity_publishable = True
+
+    fallback_cfg = _chat_cfg(CHAT_MODEL)
+    fallback_cfg.provider = "sglang"
+    fallback_cfg.base_url = "https://example-sglang.test"
+    fallback_cfg.endpoint_id = f"{CHAT_MODEL}:{_PRIVATE_ROUTE_LABEL}"
+    fallback_cfg.endpoint_identity_publishable = False
+
+    chat_app.state.services.router.register_route(
+        CHAT_MODEL,
+        [(_FailingAdapter(primary_cfg), 0.9), (DummyAdapter(fallback_cfg), 0.1)],
+    )
+    _enable_trusted_probe(chat_app)
+
+    transport = ASGITransport(app=chat_app)
+    from httpx import AsyncClient as _AC
+
+    async with _AC(transport=transport, base_url="http://test") as client:
+        r = await client.post(
+            "/v1/chat/completions",
+            json={"model": CHAT_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
+            headers={"x-probe": "synthetic"},
+        )
+    assert r.status_code == 200
+    assert r.headers["x-fi-requested-model"] == CHAT_MODEL
+    assert r.headers["x-fi-served-model"] == CHAT_MODEL
+    # The route that served is the fallback, not the failed primary.
+    assert r.headers["x-fi-served-provider"] == "sglang"
+    # Its endpoint label is a private host label: it is omitted, not published.
+    assert "x-fi-served-endpoint" not in r.headers
 
 
 # ---------------------------------------------------------------------------
