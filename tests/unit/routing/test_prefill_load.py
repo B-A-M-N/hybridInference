@@ -624,6 +624,30 @@ def test_select_moves_to_the_next_warm_candidate_when_the_cheapest_is_backlogged
 
 
 @pytest.mark.unit
+def test_select_stands_when_every_warm_candidate_is_disqualified():
+    """All alternates failing gates -- each a different one -- leaves the draw.
+
+    The cheapest warm endpoint is weighted below the locality share and the
+    second is past the backlog ceiling, so the survivor set is the drawn
+    candidate alone: filtering, not vetoing, means an exhausted warm pool
+    degrades to the plain weighted draw rather than to "no route".
+    """
+    t = PrefillLoadTracker()
+    _remember(t, "teaser", 8_000, fingerprint="conv-a")
+    _remember(t, "packed", 5_000, fingerprint="conv-a")
+    t.acquire("packed", prefill_load.AFFINITY_BACKLOG_CEILING + 1, affinity_key="other")
+    chosen = t.select_index(
+        ["drawn", "teaser", "packed"],
+        [1.0, 0.4, 1.0],
+        10_000,
+        _fixed_rand(0.0),
+        "caller",
+        fingerprint="conv-a",
+    )
+    assert chosen == 0
+
+
+@pytest.mark.unit
 def test_select_has_no_locality_without_a_caller():
     """No caller identity means no prefix history: the draw stands, as before."""
     t = PrefillLoadTracker()
