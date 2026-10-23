@@ -20,6 +20,8 @@ from routing.engine_wait import EngineWaitExpired
 from routing.offload import (
     OFFLOAD_ENGINE_WAIT,
     OFFLOAD_LAST_RESORT,
+    OFFLOAD_MAX_WAIT_SECONDS,
+    OFFLOAD_PREFILL_CREDIT_TOKENS,
     OFFLOAD_QUEUE_WAIT,
     FallbackOrder,
     OffloadPolicy,
@@ -186,6 +188,37 @@ def test_policy_normalizes_an_integer_wait_to_float():
     policy = OffloadPolicy(route_id="r", wait_seconds=3)
     assert policy.wait_seconds == 3.0
     assert isinstance(policy.wait_seconds, float)
+
+
+def test_engine_wait_keeps_the_base_for_a_warm_or_short_prompt():
+    """A prefix already resident, or a prompt under the credit, waits the base."""
+    policy = _policy(wait_seconds=0.05)
+    assert policy.engine_wait_seconds(0) == 0.05
+    assert policy.engine_wait_seconds(-1) == 0.05
+    assert policy.engine_wait_seconds(1) == 0.05
+    assert policy.engine_wait_seconds(OFFLOAD_PREFILL_CREDIT_TOKENS) == 0.05
+
+
+def test_engine_wait_extends_with_the_uncached_prefill():
+    """A cold prefill of a long prompt gets time proportional to the work."""
+    policy = _policy(wait_seconds=0.05)
+    assert policy.engine_wait_seconds(2 * OFFLOAD_PREFILL_CREDIT_TOKENS) == pytest.approx(0.1)
+    assert policy.engine_wait_seconds(4 * OFFLOAD_PREFILL_CREDIT_TOKENS) == pytest.approx(0.2)
+
+
+def test_engine_wait_is_capped_so_a_wedged_engine_still_fails_over():
+    policy = _policy(wait_seconds=0.05)
+    assert policy.engine_wait_seconds(10_000_000) == pytest.approx(OFFLOAD_MAX_WAIT_SECONDS)
+    # Monotone up to the ceiling, never past it.
+    huge = policy.engine_wait_seconds(OFFLOAD_PREFILL_CREDIT_TOKENS * 10_000)
+    assert huge == pytest.approx(OFFLOAD_MAX_WAIT_SECONDS)
+
+
+def test_engine_wait_never_shortens_a_base_wait_longer_than_the_ceiling():
+    """A deployment that set a wait above the ceiling keeps its own wait."""
+    policy = _policy(wait_seconds=OFFLOAD_MAX_WAIT_SECONDS * 2)
+    assert policy.engine_wait_seconds(0) == pytest.approx(OFFLOAD_MAX_WAIT_SECONDS * 2)
+    assert policy.engine_wait_seconds(10_000_000) == pytest.approx(OFFLOAD_MAX_WAIT_SECONDS * 2)
 
 
 def test_only_gateway_queue_refusals_count_as_a_queue_wait():

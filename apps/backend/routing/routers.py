@@ -1040,6 +1040,8 @@ class FixedRouter:
         adapter: BaseAdapter,
         policy: OffloadPolicy | None,
         deadline: float | None,
+        *,
+        uncached_tokens: int = 0,
     ) -> FirstTokenWatch | None:
         """Return the first-token watch for one streaming attempt, or None.
 
@@ -1048,10 +1050,19 @@ class FixedRouter:
         request waits as long as the engine needs. The watch is this attempt's
         alone, and nothing it sees outlives the attempt: the next request to the
         same endpoint gets a watch, and a wait, of its own.
+
+        The wait is ``policy.engine_wait_seconds(uncached_tokens)``, not the flat
+        ``wait_seconds``: the deadline bounds prefill plus time-to-first-token,
+        so a request that must prefill a long prompt cold is given the time that
+        work needs rather than being cancelled mid-prefill. The caller passes the
+        endpoint's estimated un-cached prefill; ``0`` keeps the base wait.
         """
         if policy is None or deadline is None:
             return None
-        return FirstTokenWatch(endpoint_id_for_adapter(adapter), wait_seconds=policy.wait_seconds)
+        return FirstTokenWatch(
+            endpoint_id_for_adapter(adapter),
+            wait_seconds=policy.engine_wait_seconds(uncached_tokens),
+        )
 
     def _engine_queue_limit(self, model_id: str) -> int | None:
         """Return the engine queue limit the model's stored offload policy sets, or None.
@@ -2583,7 +2594,14 @@ class FixedRouter:
             primary_endpoint_id = endpoint_id_for_adapter(primary)
             if primary_plan.reason is not None:
                 self._log_offload(model_id, primary, primary_plan.reason, primary_plan.policy, ())
-            primary_watch = self._watch_for(primary, primary_plan.policy, primary_plan.deadline)
+            primary_watch = self._watch_for(
+                primary,
+                primary_plan.policy,
+                primary_plan.deadline,
+                uncached_tokens=self._prefill_load.uncached_estimate(
+                    primary_endpoint_id, prefill_tokens, affinity_key
+                ),
+            )
             with req_ctx.push(
                 model=model_id,
                 provider=execution.config.provider,
@@ -2750,7 +2768,14 @@ class FixedRouter:
                             refused_window=refused_window,
                         )
                     )
-                    fallback_watch = self._watch_for(adapter, offload_policy, queue_deadline)
+                    fallback_watch = self._watch_for(
+                        adapter,
+                        offload_policy,
+                        queue_deadline,
+                        uncached_tokens=self._prefill_load.uncached_estimate(
+                            adapter_endpoint_id, prefill_tokens, affinity_key
+                        ),
+                    )
                     with req_ctx.push(
                         model=model_id,
                         provider=execution.config.provider,

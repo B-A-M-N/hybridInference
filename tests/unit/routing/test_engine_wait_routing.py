@@ -255,6 +255,73 @@ async def test_only_streaming_attempts_on_other_routes_are_watched():
     assert reserved.watches == [None]
 
 
+# ------------------------------------------- the wait the prompt actually needs
+
+
+def _big_prompt(tokens: int) -> list[dict[str, Any]]:
+    """A prompt that estimates to about *tokens* (the estimator is four bytes a token)."""
+    return [{"role": "user", "content": "x" * (tokens * 4)}]
+
+
+@needs_timeout
+async def test_a_cold_prefill_longer_than_the_base_wait_is_not_cancelled_mid_prefill():
+    """A long cold prefill is given the time its own un-cached work needs.
+
+    The engine needs longer than the base wait to produce a first token -- what a
+    cold prefill of a long prompt costs -- but well inside the budget that
+    prompt's un-cached estimate earns. A flat deadline cancelled the attempt at
+    the base wait, which aborts the request at the engine, discards the prefill
+    it had already done, and re-sends the prompt cold to the offload route.
+    """
+    engine = _Engine("engine", answered=True, delay=0.3)
+    reserved = _Engine("reserved", route_id="offload", answered=True, prelude=False)
+    policy = _policy(wait_seconds=0.1)
+    router = _router([(engine, 1.0), (reserved, 1.0)], policy)
+
+    chunks = await _collect(router.stream_chat_completion(MODEL, _big_prompt(24_576)))
+
+    assert _content(chunks) == "engine"
+    assert reserved.calls == 0
+    assert engine.cancelled == 0
+    (watch,) = engine.watches
+    assert isinstance(watch, FirstTokenWatch)
+    assert watch.wait_seconds > policy.wait_seconds
+
+
+@needs_timeout
+async def test_a_short_prompt_still_offloads_at_the_base_wait():
+    """The correction must not hold a short request for a prefill it does not have."""
+    engine = _Engine("engine", answered=True, delay=0.3)
+    reserved = _Engine("reserved", route_id="offload", answered=True, prelude=False)
+    policy = _policy(wait_seconds=0.1)
+    router = _router([(engine, 1.0), (reserved, 1.0)], policy)
+
+    chunks = await _collect(router.stream_chat_completion(MODEL, MESSAGES))
+
+    assert _content(chunks) == "reserved"
+    assert engine.cancelled == 1
+    (watch,) = engine.watches
+    assert watch.wait_seconds == pytest.approx(policy.wait_seconds)
+
+
+@needs_timeout
+async def test_a_fallback_stream_is_watched_under_its_own_budget():
+    """The fallback call site scales the wait too, not just the primary's."""
+    first = _Engine("first", fail_with=RuntimeError("503"))
+    second = _Engine("second", answered=True, delay=0.3)
+    reserved = _Engine("reserved", route_id="offload", answered=True, prelude=False)
+    policy = _policy(wait_seconds=0.1)
+    router = _router([(first, 1.0), (second, 1.0), (reserved, 1.0)], policy)
+
+    chunks = await _collect(router.stream_chat_completion(MODEL, _big_prompt(24_576)))
+
+    assert _content(chunks) == "second"
+    assert reserved.calls == 0
+    (watch,) = second.watches
+    assert isinstance(watch, FirstTokenWatch)
+    assert watch.wait_seconds > policy.wait_seconds
+
+
 # ---------------------------------------------------- one decision per request
 
 
