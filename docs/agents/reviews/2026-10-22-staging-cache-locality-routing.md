@@ -165,12 +165,14 @@ prefill on a prefix that was already warm in the sibling endpoint.
 - **F2 — Endpoint behaviour differs by an order of magnitude in usefulness.**
   `ollama`: different tokenizer, no usage/cache telemetry, ~2× slower, empty
   completion. `vllm`: cache-aware, fast, correct content.
-- **F3 — The dominant reuse failure for ordinary prompts is endpoint-side.**
-  Even pinned to `vllm` with locality guaranteed, identical prefixes below
-  ~4.2k tokens never reuse (`cached=0`, 12/12 and 8/8 and 10/10 across runs).
-  Above that the endpoint reuses only `prompt − ~4.1k` tokens. Production reuses
-  98.7 % of the same 2.6k-token prompt. This is a staging worker/provider
-  behaviour, not a gateway behaviour.
+- **F3 — The short-prefix reuse boundary is the engine's, and production has it
+  too.** A pinned `vllm` request for a 2.6k-token identical prompt reports
+  `cached=0`; so does the *same* request against production. At 18k both
+  deployments report exactly `cached=13824` with the same ~4.5k un-reused tail,
+  so the earlier "production reuses 2560/2595, therefore staging is broken"
+  reading does not reproduce and must have come from a different route instance.
+  See "The reuse boundary, measured, on both deployments" for the proof set.
+  What *is* deployment-specific is contention and offload, not this boundary.
 - **F4 — For eligible prefixes, reuse is deterministic once the request lands
   on `vllm`** (11/11). The residual loss is selection, not the cache.
 - **F5 — Normal staging routing reuses eligible warmed prefixes only ~44–50 %
@@ -269,9 +271,13 @@ python3 .tmp-probe/enumerate_pins.py.scratch glm-5.3-flash staging
    staging `glm-5.3-flash`, plus `api_logs` for the probe requests. That is the
    remaining input for the *ordinary-candidate* half of F5; the offload half is
    no longer open (see "Correction implemented").
-2. Treat the staging `vllm` ~4.1k-token no-reuse head as a provider defect to
-   raise with that endpoint's operator; it makes every ordinary prompt
-   cold-start a prefill that production reuses.
+2. Collect the engine's prefix-cache facts (`/metrics`
+   `gpu_prefix_cache_hit_rate`/`queries`/`hits`, vLLM version and the
+   `--block-size` / `--max-num-batched-tokens` / `--num-gpu-blocks-override`
+   flags) next to production's. The "~4.1k no-reuse head" is **not** a
+   staging-only provider defect — production reports identical values — so what
+   remains is to decide whether the last-chunk-not-retained behaviour is a
+   known vLLM limit worth upgrading or tuning for, not to raise a staging bug.
 3. Consider whether a cache-blind, `include_usage`-incompatible endpoint should
    serve `glm-5.3-flash` traffic at all, or at a low weight behind the
    cache-capable one. This is a routing-configuration decision, not a code fix.
@@ -466,31 +472,76 @@ than incidental passes.
 
 Status: local commit only, as above.
 
-## Still open — the ~4.1k-token head on staging `vllm`
+## The reuse boundary, measured, on both deployments
 
-Unchanged by the above and still not root-caused. The observed relation is
-`cached ≈ prompt − ~4100`, with a hard `0` below ~4.1k, while production reuses
-`2560/2595` of the *same* 2.6k prompt. That rules out a shared gateway cause:
-identical gateway code produces both. What remains is the staging engine's own
-configuration, or a difference in what staging sends.
+Measured directly, after the console read, with the probe in `.tmp-probe/`
+(pinned `X-Route-Pin: vllm` on staging; production unpinned). Each row is the
+*second* of two byte-identical requests, so the engine has had a chance to
+populate its cache. `SALT` differs per experiment, so no row inherits another's
+prefix.
 
-Discriminators that would settle it, in order of cheapness:
+### The law
 
-1. **Head-only perturbation.** Hold the size above 4.1k and change only the first
-   ~100 tokens. `cached` staying at `prompt − 4100` means the head is excluded
-   from matching (engine-side); `cached` collapsing to 0 means the head is what
-   diverges (request-side).
-2. **Direct to the engine, bypassing the gateway.** The same small prefix sent
-   straight to `local-8004`. Caching there but not through the gateway localizes
-   the head to the gateway; not caching there either makes it engine-side.
-3. **Engine facts**, which this session cannot read (the engine is reachable from
-   the staging host, not from here): the vLLM version, its startup flags
-   (`--enable-prefix-caching`, `--block-size`, `--max-num-batched-tokens`,
-   `--num-gpu-blocks-override`), and its prefix-cache counters
-   (`gpu_prefix_cache_hit_rate` on `/metrics`) next to production's. These are
-   non-secret and are the exact telemetry needed.
+| prompt | staging cached | staging tail | production cached | production tail |
+|---|---|---|---|---|
+| 1819 | 0 | 1819 | 0 | 1819 |
+| 4519 | 0 | 4519 | 0 | 4519 |
+| 9119 | 4608 | 4511 | 4608 | 4511 |
+| 18319 | 13824 | 4495 | 13824 | 4495 |
 
-No server or configuration correction is claimed here: without those three
-readings, a physical reuse threshold and a cache-*accounting* threshold are still
-indistinguishable, and the objective forbids reporting a configuration finding as
-a fix.
+Production is *numerically identical* to staging at every size. Controls:
+
+| request | cached | tail |
+|---|---|---|
+| production, 2809 tokens, `max_tokens=8` | 0 | 2809 |
+| staging, 2809 tokens, `max_tokens=8` | 0 | 2809 |
+| staging, 2809 tokens, `max_tokens=512` | 0 | 2809 |
+| staging, 4679 tokens, `max_tokens=1` | 2304 | 2375 |
+| staging, 9369 tokens, `max_tokens=1` | 6912 | 2457 |
+
+So `cached = prompt − tail`, where the tail is **not** fixed: it ranges from
+about 2.4k to 4.5k with what the engine scheduled, and a prompt that fits inside
+one such chunk reports `cached = 0` in full. `max_tokens` is irrelevant (8 vs
+512 vs 1 changes nothing), so it is not a generation-side reservation.
+
+### Reuse is physically real — this is prefix matching, not a counter
+
+| probe | cached | TTFT first → second |
+|---|---|---|
+| staging, 9369 tokens | 6912 | 1517 ms → 720 ms (**2.11×**) |
+| staging, 18319 tokens | 13824 | 1519 ms → 787 ms (**1.93×**) |
+| staging, 18019 tokens, **tail changed** | 13824 | unchanged from identical |
+| staging, 18020 tokens, **head changed** | **0** | full recompute |
+
+A one-character change at the *head* destroys reuse; the same change at the
+*tail* does not. That is the signature of a head-anchored block-hash prefix
+cache: the matched part is a genuine prefix of the prompt, and what is never
+retained is its final chunk.
+
+### What this means
+
+- There is **no staging-specific short-prefix defect**. The "~4.1k threshold"
+  in the original brief is this engine-side cache-insertion boundary, and
+  production exhibits it identically. Any claim that production caches a 2.6k
+  prompt and staging does not is not reproducible against the current
+  deployments.
+- The boundary is **engine- and capacity-dependent, not a fixed number**: the
+  same 9k prompt reported `4608` in one run and `0` in another, which is what a
+  shared, capacity-limited block pool looks like from outside. That makes it a
+  scheduling/occupancy property, not a configured threshold.
+- No gateway change can make a 2.6k prompt reuse on this engine. What the
+  gateway *can* control is already addressed above: send the request to the
+  endpoint that holds the prefix (locality selection) and stop cancelling the
+  prefill before it finishes (the bounded engine wait). Both were implemented.
+- For the engine side, the exact non-secret telemetry to collect next to
+  production's is: the vLLM version, `--enable-prefix-caching`, `--block-size`,
+  `--max-num-batched-tokens`, `--num-gpu-blocks-override` and the prefix-cache
+  counters on `/metrics` (`gpu_prefix_cache_hit_rate`, `gpu_prefix_cache_queries`,
+  `gpu_prefix_cache_hits`). Those distinguish "one chunk is never inserted into
+  the cache" from "the block pool is too small to retain it", which is the only
+  remaining question and is not answerable from the gateway.
+
+Rejected as fixes: disabling offload, pinning every request to `vllm`, or
+declaring the boundary a configuration finding. The first two trade capacity
+protection and fallback for a hit rate; the third reports a measurement as a
+repair.
