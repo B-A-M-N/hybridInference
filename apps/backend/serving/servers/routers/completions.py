@@ -49,7 +49,11 @@ from serving.servers.deps import (
     get_router,
 )
 from serving.servers.model_availability import model_not_found_detail
-from serving.servers.routers.completions_stream import StreamSession, ToolCallAccumulator
+from serving.servers.routers.completions_stream import (
+    _KEEPALIVE_QUEUE_MAXSIZE,
+    StreamSession,
+    ToolCallAccumulator,
+)
 from serving.servers.routers.routing_info import (
     RoutingInfo,
     _publish_error_provider,
@@ -190,12 +194,8 @@ async def _should_force_chat_completions_streaming(
 
 
 _FORCE_STREAMING_KEEPALIVE_S = 15
-
-# Hand-off depth between the upstream reader and the keepalive generator in
-# ``_streaming_response_with_keepalive``: enough slack for a fast consumer to
-# never stall, small enough that a stalled client cannot buffer the whole
-# generation a second time in the queue (issue: forced-stream buffer growth).
-_KEEPALIVE_QUEUE_MAXSIZE = 256
+# _KEEPALIVE_QUEUE_MAXSIZE (the shared chain-bound constant) is imported from
+# completions_stream.py, which owns the inner hop of the same chain.
 
 
 def _timeout_fired_probe(request: Request) -> Callable[[], bool]:
@@ -278,14 +278,27 @@ async def _streaming_response_with_keepalive(
     The leading whitespace before the JSON object is harmless — all standard
     JSON parsers ignore it.
 
-    The hand-off queue is bounded (``_KEEPALIVE_QUEUE_MAXSIZE``): a stalled
-    or slow client suspends this generator while ``_reader`` keeps draining
-    the upstream, so an unbounded queue would buffer a second full copy of
-    the generation (plus whatever the provider sends next) in memory for as
-    long as the client stalls. With the bound, the reader blocks on
-    ``put`` instead and the backpressure propagates to the provider
-    connection. Cancellation-safe: a reader blocked on ``put`` when the
-    consumer disappears is cancelled without blocking on the sentinel.
+    Both hand-off queues in the forced-streaming chain are bounded with
+    ``_KEEPALIVE_QUEUE_MAXSIZE`` (shared with ``StreamSession.stream``): the
+    upstream reader → this generator queue here, and the adapter reader →
+    stream-session queue one hop upstream. The chain is therefore bounded
+    end-to-end and a stalled or slow client applies real backpressure along
+    all of it: this generator suspends, the outer reader blocks on ``put``,
+    the stream-session consumer blocks on its own bounded ``put``, the
+    adapter reader blocks in turn, and the block propagates through the
+    aiohttp stream to the provider connection. No queue can buffer a second
+    full copy of the generation (plus whatever the provider sends next) in
+    memory for as long as the client stalls. Failure mode: a stalled client
+    blocks the adapter reader — no data loss, SSE semantics preserved.
+
+    What this bound guarantees: the APPLICATION-side buffering of the chain
+    is capped (both hops), and once those caps fill, the reader stops pulling
+    from the adapter, so the provider observes the stall through the socket.
+    It does not claim the provider socket holds nothing: the kernel socket
+    buffers and the HTTP client own read buffer remain, both small and
+    outside this chain.
+    Cancellation-safe: a reader blocked on ``put`` when the consumer
+    disappears is cancelled without blocking on the sentinel.
     """
     content_parts: list[str] = []
     reasoning_parts: list[str] = []

@@ -1,0 +1,26 @@
+gateway:  http://127.0.0.1:18942 (real create_app on uvicorn)
+
+[force-streaming] client head: HTTP/1.1 200 OK
+[force-streaming] client stalled (socket open, reads stopped) -- sampling...
+[force-streaming] queues captured: 2 (bound 256 each)
+[force-streaming] queue[0] maxsize=256 peak_depth=2 puts=4207 gets=4206
+[force-streaming] queue[1] maxsize=256 peak_depth=1 puts=4208 gets=4208
+[force-streaming] max inner qsize : 1  (bound 256)
+[force-streaming] max outer qsize : 2  (bound 256)
+[force-streaming] max total buffered: 3  (contract <= 520)
+[force-streaming] settled depths after upstream finished: (1, 0)
+[force-streaming] RSS before=130796KB peak=164192KB delta=33396KB
+[force-streaming] queue depths after client disconnect: (2, 209)
+
+[sse-stall] client head: HTTP/1.1 200 OK
+[sse-stall] client stalled (socket open, reads stopped) -- sampling...
+[sse-stall] queues captured: 1 (bound 256 each)
+[sse-stall] queue[0] maxsize=256 peak_depth=256 puts=1578 gets=1322
+[sse-stall] max inner qsize : 256  (bound 256)
+[sse-stall] max outer qsize : 0  (bound 256)
+[sse-stall] max total buffered: 256  (contract <= 520)
+[sse-stall] settled depths after upstream finished: (0, 256)
+[sse-stall] RSS before=164504KB peak=174144KB delta=9640KB
+[sse-stall] queue depths after client disconnect: (0, 256)
+
+PASS: chain bounded end-to-end -- queue depths held their bounds and backpressure reached the provider
