@@ -642,6 +642,7 @@ describe('provider route client', () => {
       upstream_provider: 'openrouter',
       openrouter_provider: 'parasail',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'provider_api',
       api_key_id: 'key-1',
       provider_model_id: 'minimax/minimax-m2.5',
       quota_limit: 8000,
@@ -659,6 +660,7 @@ describe('provider route client', () => {
       openrouter_provider: 'parasail',
       openrouter_sort: null,
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'provider_api',
       api_key_id: 'key-1',
       provider_model_id: 'minimax/minimax-m2.5',
       quota_limit: 8000,
@@ -828,6 +830,12 @@ describe('provider route client', () => {
         prompt: '0.14',
         completion: '0.28',
       },
+      capabilities: {
+        context_length: 131072,
+        max_output_length: 65536,
+        input_modalities: ['text', 'image'],
+        supports_tools: true,
+      },
     });
 
     expect(out.model_id).toBe('deepseek-v4-flash');
@@ -852,6 +860,12 @@ describe('provider route client', () => {
       pricing: {
         prompt: '0.14',
         completion: '0.28',
+      },
+      capabilities: {
+        context_length: 131072,
+        max_output_length: 65536,
+        input_modalities: ['text', 'image'],
+        supports_tools: true,
       },
     });
   });
@@ -882,6 +896,12 @@ describe('provider route client', () => {
         prompt: '0.14',
         completion: '0.28',
       },
+      capabilities: {
+        context_length: 131072,
+        max_output_length: 65536,
+        input_modalities: ['text', 'image'],
+        supports_tools: true,
+      },
     });
 
     expect(out.ok).toBe(true);
@@ -905,6 +925,12 @@ describe('provider route client', () => {
       pricing: {
         prompt: '0.14',
         completion: '0.28',
+      },
+      capabilities: {
+        context_length: 131072,
+        max_output_length: 65536,
+        input_modalities: ['text', 'image'],
+        supports_tools: true,
       },
     });
   });
