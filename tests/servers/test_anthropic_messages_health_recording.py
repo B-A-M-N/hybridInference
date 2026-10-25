@@ -13,6 +13,7 @@ read side (which adapter the surface is allowed to pick).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 
 import aiohttp
@@ -308,6 +309,45 @@ async def test_streaming_first_content_delta_closes_an_open_circuit(
 
     assert registry.snapshot()[endpoint_id]["circuit_state"] == _CircuitState.CLOSED
     await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_streaming_success_releases_before_the_stream_finalizes(
+    anthropic_test_client, anthropic_compat_router, monkeypatch, quiet_alerts, no_log_store
+):
+    """Useful output must close recovery while the upstream stream is still open."""
+    registry = anthropic_compat_router.endpoint_health_registry
+    success_seen = asyncio.Event()
+    success_before_finish = False
+    original_record_success = registry.record_success
+
+    def _record(endpoint_id, *, outcome):
+        success_seen.set()
+        original_record_success(endpoint_id, outcome=outcome)
+
+    monkeypatch.setattr(registry, "record_success", _record)
+
+    async def _iter():
+        nonlocal success_before_finish
+        yield _MESSAGE_START + _TEXT_DELTA
+        # This barrier is inside the not-yet-finalized upstream iterator. A
+        # deferred-only implementation cannot pass it and observes the timeout.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(success_seen.wait(), timeout=1.0)
+            success_before_finish = True
+        yield _MESSAGE_STOP
+
+    from serving.http import AsyncHTTPClient
+
+    monkeypatch.setattr(AsyncHTTPClient, "_ensure_session", _fake_session_from_iter(_iter))
+
+    async with anthropic_test_client.stream(
+        "POST", "/v1/messages", json=_body(stream=True), headers=_auth()
+    ) as response:
+        async for _ in response.aiter_bytes():
+            pass
+
+    assert success_before_finish is True
 
 
 @pytest.mark.asyncio

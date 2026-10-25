@@ -28,7 +28,10 @@ import aiohttp
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from routing.completion_outcome import classify_completion_outcome
+from routing.completion_outcome import (
+    CompletionOutcome,
+    classify_completion_outcome,
+)
 from routing.endpoints import endpoint_id_for_adapter
 from routing.prefill_load import (
     conversation_fingerprint,
@@ -1865,6 +1868,7 @@ async def anthropic_messages(
             # deferred to the end of the stream so a thinking-first stream is
             # not classified EMPTY from its first delta.
             saw_content_delta = False
+            health_success_recorded = False
             ttft_ms: int | None = None
             ttft_buffer = b""
             response_acc: dict | None = None
@@ -1917,7 +1921,7 @@ async def anthropic_messages(
                     nothing either way; the return exists so the wire and the
                     accounting cannot disagree about what was delivered.
                     """
-                    nonlocal sse_buffer, response_acc, saw_content_delta
+                    nonlocal sse_buffer, response_acc, saw_content_delta, health_success_recorded
                     events, sse_buffer = _parse_sse_chunk(sse_buffer, raw)
                     well_formed = bool(events)
                     for event_type, data in events:
@@ -1932,6 +1936,15 @@ async def anthropic_messages(
                             # thinking-first stream is not classified EMPTY from
                             # its first delta.
                             saw_content_delta = True
+                            # The first useful output proves recovery while the
+                            # response is still streaming. Waiting for terminal
+                            # classification held a half-open probe (and allowed
+                            # no other dispatch) for a whole Claude Code turn.
+                            health_registry.record_success(
+                                dispatch_endpoint_id,
+                                outcome=CompletionOutcome.PROGRESS,
+                            )
+                            health_success_recorded = True
                             # Prefill is done once content flows; the prompt
                             # is resident, so the endpoint is decoding and
                             # its prefix is safe to remember.
@@ -2174,7 +2187,7 @@ async def anthropic_messages(
                 # client disconnect mid-prefill -- unwinds here, and must not
                 # leave the endpoint charged for a prefill nobody is doing.
                 prefill_load.release(prefill_lease)
-                if not stream_failed and saw_content_delta:
+                if not stream_failed and saw_content_delta and not health_success_recorded:
                     # Record serving health after the accumulated response can
                     # be classified, not at the first delta. A thinking-first
                     # stream has no prose yet at that point; the final
