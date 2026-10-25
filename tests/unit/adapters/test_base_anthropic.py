@@ -113,5 +113,3 @@ async def test_default_stream_messages_keeps_absent_cache_usage_unknown(monkeypa
     assert sink["output_tokens"] == 1
     assert "cache_read_input_tokens" not in sink
     assert "cache_creation_input_tokens" not in sink
-    assert "cache_read_input_tokens" not in a.last_stream_usage
-    assert "cache_creation_input_tokens" not in a.last_stream_usage

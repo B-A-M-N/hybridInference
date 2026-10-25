@@ -5,9 +5,18 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, StrictInt, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SecretStr,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from serving.config.settings import ROUTE_TYPE_ORDER
+from serving.schemas import CONTENT_BLOCK_MODALITY
 
 
 class CreateAPIKeyRequest(BaseModel):  # type: ignore[no-any-unimported]
@@ -1257,19 +1266,38 @@ class UpdateSettingRequest(BaseModel):
     value: Any
 
 
+class TestAlertRequest(BaseModel):
+    """Test the selected saved channel, or an unsaved webhook draft."""
+
+    channel: Literal["slack", "wecom"]
+    webhook_url: SecretStr | None = Field(
+        None,
+        max_length=4096,
+        description="Omit to test the latest saved webhook, including pending restart changes.",
+    )
+
+
+class TestAlertResponse(BaseModel):
+    """A channel accepted a test message; no alert incident was created."""
+
+    channel: Literal["slack", "wecom"]
+    sent: Literal[True] = True
+    test_id: str
+
+
 class SnoozeAlertsRequest(BaseModel):
-    """Request payload for snoozing Slack alerts for a duration."""
+    """Request payload for snoozing alerts for a duration."""
 
     duration_seconds: int = Field(
         ...,
         gt=0,
         le=7 * 24 * 60 * 60,
-        description="How long to suppress Slack alerts, in seconds (max 7 days).",
+        description="How long to suppress alerts, in seconds (max 7 days).",
     )
 
 
 class AlertSnoozeStatus(BaseModel):
-    """Current Slack-alert snooze state."""
+    """Current alert snooze state."""
 
     snoozed: bool
     snooze_until: float | None = None
@@ -1277,7 +1305,7 @@ class AlertSnoozeStatus(BaseModel):
 
 
 class MuteAlertTypeRequest(BaseModel):
-    """Request payload for muting one alert type's Slack alerts."""
+    """Request payload for muting one alert type's notifications."""
 
     duration_seconds: int | None = Field(
         None,
@@ -1291,7 +1319,7 @@ class MuteAlertTypeRequest(BaseModel):
 
 
 class AlertTypeMuteStatus(BaseModel):
-    """One alert type from the catalog, and whether its Slack alerts are muted."""
+    """One alert type from the catalog, and whether its notifications are muted."""
 
     alert_type: str
     label: str
@@ -1492,6 +1520,41 @@ class UpdateModelConcurrencyRequest(BaseModel):
     exempt: bool
 
 
+#: Highest per-model batch concurrency cap an administrator may set.
+MAX_BATCH_MODEL_CONCURRENCY = 10_000
+
+
+class BatchModelLimitItem(BaseModel):
+    """A model's batch concurrency cap and the batch requests it holds now."""
+
+    model_id: str
+    max_concurrency: int | None = Field(
+        None, description="The model's own cap; null when it takes the default."
+    )
+    effective_concurrency: int = Field(
+        ...,
+        description="The cap in force, across every gateway process. 0 pauses batch work.",
+    )
+    running: int = Field(0, description="Batch requests of the model running now.")
+    queued: int = Field(0, description="Batch requests of the model waiting to run.")
+
+
+class ListBatchModelLimitsResponse(BaseModel):
+    """Response payload for listing per-model batch concurrency caps."""
+
+    default_concurrency: int = Field(
+        ..., description="BATCH_MODEL_CONCURRENCY: the cap of a model without its own."
+    )
+    models: list[BatchModelLimitItem]
+
+
+class UpdateBatchModelLimitRequest(BaseModel):
+    """Request payload for setting a model's batch concurrency cap, or clearing it with null."""
+
+    # Strict, so ``true`` or ``"4"`` is rejected instead of read as 1 or a number.
+    max_concurrency: StrictInt | None = Field(..., ge=0, le=MAX_BATCH_MODEL_CONCURRENCY)
+
+
 class RouteWeightItem(BaseModel):
     """Current route weight state for one model endpoint."""
 
@@ -1561,6 +1624,15 @@ class ListOpenRouterProviderOptionsResponse(BaseModel):
     providers: list[OpenRouterProviderOption]
 
 
+class RouteCapabilitiesItem(BaseModel):
+    """A route's context window, output cap, input modalities and tool support, as served."""
+
+    context_length: int
+    max_output_length: int
+    input_modalities: list[str]
+    supports_tools: bool
+
+
 class ProviderRouteItem(BaseModel):
     """Runtime provider target for one model route candidate."""
 
@@ -1574,6 +1646,7 @@ class ProviderRouteItem(BaseModel):
     openrouter_sort: Literal["price", "throughput", "latency"] | None = None
     key_provider: str
     base_url: str
+    deployment_type: Literal["auto", "self_hosted", "provider_api"] = "auto"
     api_key_id: str | None = None
     api_key: ProviderRouteApiKeyRef
     provider_model_id: str | None = None
@@ -1587,8 +1660,20 @@ class ProviderRouteItem(BaseModel):
     yaml_weight: float
     effective_weight: float
     source: Literal["yaml", "override", "runtime"]
+    # False when a saved override exists but its endpoint is not the one
+    # serving (it failed to apply at boot); the other fields show the live route.
+    override_applied: bool = True
+    # Disabled by an admin: configured and weighted as shown, selected by nothing.
+    disabled: bool = False
+    # A config route removed from this deployment; listed so it can be restored.
+    removed: bool = False
     updated_at: datetime | None = None
     updated_by: str | None = None
+    # What the route serves with now, and what it had from models.yaml or its
+    # creation; they differ only while an admin capability override is set.
+    capabilities: RouteCapabilitiesItem
+    capabilities_baseline: RouteCapabilitiesItem
+    capabilities_overridden: bool = False
 
 
 class ListProviderRoutesResponse(BaseModel):
@@ -1615,6 +1700,54 @@ class UpdateProviderRouteStrategyRequest(BaseModel):
     strategy: Literal["fixed", "routewise"]
 
 
+# Text, then each modality the request gate holds media to (image, audio,
+# video). The console sets image; a route's others come from models.yaml or the
+# API, and the console keeps them as they are when it saves.
+RUNTIME_MODEL_INPUT_MODALITIES = ("text", *dict.fromkeys(CONTENT_BLOCK_MODALITY.values()))
+# The largest window a model ships with today (10M tokens). A larger value is a
+# typo, and an unbounded one could exceed what JSON clients read exactly.
+RUNTIME_MODEL_MAX_TOKENS = 10_000_000
+
+
+class RuntimeModelCapabilities(BaseModel):
+    """What a route accepts, stated by the admin who creates or edits it.
+
+    Each value changes what a request does: tool definitions reach the upstream
+    only when ``supports_tools`` is set, ``max_tokens`` is clamped to
+    ``max_output_length``, image, audio and video blocks reach the upstream
+    only on a route that lists their modality, and Auto and the
+    context-overflow fallback both read ``context_length``. ``ModelConfig``'s
+    defaults for them (an 8,192-token window, 4,096 output tokens, text only,
+    no tools) are not facts about any upstream, so none of them may stand in
+    for a value nobody declared.
+    """
+
+    # Strict, so ``true`` or ``"131072"`` is rejected instead of read as 1 or a number.
+    context_length: StrictInt = Field(..., ge=1, le=RUNTIME_MODEL_MAX_TOKENS)
+    max_output_length: StrictInt = Field(..., ge=1, le=RUNTIME_MODEL_MAX_TOKENS)
+    input_modalities: list[str] = Field(..., min_length=1)
+    supports_tools: StrictBool
+
+    @field_validator("input_modalities")
+    @classmethod
+    def validate_input_modalities(cls, value: list[str]) -> list[str]:
+        """Require text, refuse unknown modalities, and store each once, in a fixed order."""
+        if any(modality not in RUNTIME_MODEL_INPUT_MODALITIES for modality in value):
+            raise ValueError(
+                f"input_modalities may only list {', '.join(RUNTIME_MODEL_INPUT_MODALITIES)}"
+            )
+        if "text" not in value:
+            raise ValueError("input_modalities must include text")
+        return [modality for modality in RUNTIME_MODEL_INPUT_MODALITIES if modality in value]
+
+    @model_validator(mode="after")
+    def validate_output_fits_context(self) -> "RuntimeModelCapabilities":
+        """Reject an output cap the context window could never hold."""
+        if self.max_output_length > self.context_length:
+            raise ValueError("max_output_length must not exceed context_length")
+        return self
+
+
 class CreateProviderRouteRequest(BaseModel):
     """Request payload for adding one runtime provider route candidate."""
 
@@ -1623,11 +1756,15 @@ class CreateProviderRouteRequest(BaseModel):
     openrouter_provider: str | None = Field(None, min_length=1, max_length=64)
     openrouter_sort: Literal["price", "throughput", "latency"] | None = None
     base_url: str = Field(..., min_length=1, max_length=2048)
+    deployment_type: Literal["auto", "self_hosted", "provider_api"] = "auto"
     api_key_id: str | None = Field(None, min_length=1, max_length=128)
     provider_model_id: str = Field(..., min_length=1, max_length=512)
     quota_limit: int | None = Field(None, ge=1)
     concurrency_limit: int | None = Field(None, ge=1)
     weight: float = Field(1.0, gt=0)
+    # Each route declares its own: routes of one model can differ, so a new
+    # route never takes the first route's values without the admin saying so.
+    capabilities: RuntimeModelCapabilities
 
 
 class CreateProviderRouteModelRequest(CreateProviderRouteRequest):
@@ -1674,9 +1811,34 @@ class CreateProviderRouteModelRequest(CreateProviderRouteRequest):
 
 
 class UpdateProviderRouteCandidateRequest(BaseModel):
-    """Request payload for updating one runtime provider route candidate."""
+    """Request payload for editing one runtime provider route candidate in place.
 
-    concurrency_limit: int = Field(..., ge=1)
+    A field left out keeps the route's current value, so ``{"concurrency_limit":
+    4}`` changes only the limit. Sending any target field (provider, base URL,
+    key, provider model ID) replaces the whole target: ``upstream_provider``,
+    ``base_url`` and ``provider_model_id`` are then required, and an omitted
+    ``openrouter_provider``, ``openrouter_sort`` or ``api_key_id`` means none
+    (OpenRouter auto routing, the provider's default key). An omitted
+    ``deployment_type`` keeps the route's declaration while it stays on the
+    same endpoint, and resets to ``auto`` when it moves. The route type and
+    weight are not edited here.
+    """
+
+    upstream_provider: str | None = Field(None, min_length=1, max_length=64)
+    openrouter_provider: str | None = Field(None, min_length=1, max_length=64)
+    openrouter_sort: Literal["price", "throughput", "latency"] | None = None
+    base_url: str | None = Field(None, min_length=1, max_length=2048)
+    deployment_type: Literal["auto", "self_hosted", "provider_api"] | None = None
+    api_key_id: str | None = Field(None, min_length=1, max_length=128)
+    provider_model_id: str | None = Field(None, min_length=1, max_length=512)
+    quota_limit: int | None = Field(None, ge=1)
+    concurrency_limit: int | None = Field(None, ge=1)
+
+
+class UpdateProviderRouteStateRequest(BaseModel):
+    """Request payload for disabling or enabling one provider route."""
+
+    disabled: bool
 
 
 class UpdateProviderRouteRequest(BaseModel):
@@ -1687,6 +1849,7 @@ class UpdateProviderRouteRequest(BaseModel):
     openrouter_provider: str | None = Field(None, min_length=1, max_length=64)
     openrouter_sort: Literal["price", "throughput", "latency"] | None = None
     base_url: str = Field(..., min_length=1, max_length=2048)
+    deployment_type: Literal["auto", "self_hosted", "provider_api"] | None = None
     api_key_id: str | None = Field(None, min_length=1, max_length=128)
     provider_model_id: str | None = Field(None, min_length=1, max_length=512)
     quota_limit: int | None = Field(None, ge=1)
@@ -1845,6 +2008,7 @@ __all__ = [
     "ApproveUserRequest",
     "ApproveUserResponse",
     "AuditLogEntry",
+    "BatchModelLimitItem",
     "BulkUserCostHistoryResponse",
     "CreateAPIKeyRequest",
     "CreateAPIKeyResponse",
@@ -1860,6 +2024,7 @@ __all__ = [
     "ListAllProviderRoutesResponse",
     "ListAllRouteWeightsResponse",
     "ListAuditLogResponse",
+    "ListBatchModelLimitsResponse",
     "ListModelVisibilityResponse",
     "ListOffloadRoutesResponse",
     "ListOpenRouterProviderOptionsResponse",
@@ -1913,6 +2078,7 @@ __all__ = [
     "SummaryUserItem",
     "UpdateAPIKeyRequest",
     "UpdateAPIKeyResponse",
+    "UpdateBatchModelLimitRequest",
     "UpdateModelVisibilityRequest",
     "UpdateOffloadRouteRequest",
     "UpdateProviderDefinitionRequest",
@@ -2583,44 +2749,6 @@ class PublicSiteUpdatesResponse(BaseModel):  # type: ignore[no-any-unimported]
 
     banner: PublicSiteUpdate | None
     updates: list[PublicSiteUpdate]
-
-
-class AgentRunnerHost(BaseModel):  # type: ignore[no-any-unimported]
-    """One machine in the agent runner pool."""
-
-    host: str
-    active: bool
-    last_worker_id: str | None
-    first_seen_at: datetime
-    last_seen_at: datetime
-    seconds_since_seen: float = Field(
-        ...,
-        description=(
-            "Age of the last claim poll, by the server's clock. A runner polls "
-            "only between jobs, so a busy machine can look quiet for as long as "
-            "its longest job."
-        ),
-    )
-
-
-class ListAgentRunnerHostsResponse(BaseModel):  # type: ignore[no-any-unimported]
-    """The runner pool and which member currently takes jobs."""
-
-    hosts: list[AgentRunnerHost]
-    active_host: str | None = Field(
-        None,
-        description="Pinned host, or null when any runner may claim.",
-    )
-
-
-class SetActiveAgentRunnerHostRequest(BaseModel):  # type: ignore[no-any-unimported]
-    """Pin agent jobs to one host, or unpin with ``null``."""
-
-    host: str | None = Field(
-        None,
-        max_length=253,
-        description="A host that has polled at least once, or null to unpin.",
-    )
 
 
 class AuthBlockItem(BaseModel):  # type: ignore[no-any-unimported]

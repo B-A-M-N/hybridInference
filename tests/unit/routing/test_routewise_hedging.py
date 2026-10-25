@@ -7,6 +7,7 @@ import contextlib
 import json
 import time
 from dataclasses import replace
+from datetime import UTC
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
@@ -21,7 +22,6 @@ from routing.routewise.config import RouteWiseConfig
 from routing.routewise.hedging import (
     HedgedAdapter,
     HedgeStreamRaceTimeout,
-    ProviderEventSink,
 )
 
 if TYPE_CHECKING:
@@ -105,11 +105,11 @@ def _quota_pool(router):
 
 def _seed_quota_snapshots(router, *, used: float = 0.0) -> None:
     """Install a ready provider snapshot for every quota pool on the router."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from routing.routewise.quota import ProviderQuotaSnapshot
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for pool in router.quota_pools.values():
         router.quota_snapshots._snapshots[pool.source] = ProviderQuotaSnapshot(
             source=pool.source,
@@ -488,7 +488,13 @@ class TestHedgedAdapterNonStreaming:
         await asyncio.wait_for(prefill_released.wait(), timeout=0.2)
 
         assert tracker.backlog("test:primary") == 0
-        assert events == ["capacity", "prefill"]
+        # The prefill lease is released before the primary cancellation is
+        # awaited, so once `prefill_released` fires the primary's cleanup may
+        # already have appended `primary-cancellation-started` to `events`.
+        # Assert the ordering that is actually observable: capacity (backup
+        # dispatch release) then the primary's prefill release. The exact
+        # three-event ordering is asserted again below after cleanup.
+        assert events[:2] == ["capacity", "prefill"]
 
         allow_primary_cleanup.set()
         result = await request
@@ -2357,23 +2363,19 @@ class TestRouterHedgeMode:
 
 
 # ===========================================================================
-# TestProviderEventSinkCompatibility
+# TestHedgeOutcomeRecorder
 # ===========================================================================
 
 
 @pytest.mark.unit
-class TestProviderEventSinkCompatibility:
-    def test_canonical_fake_and_registry_satisfy_compatibility_protocol(self):
-        """Canonical outcome recorders satisfy the deprecated protocol."""
-        assert isinstance(_FakeEventSink(), ProviderEventSink)
-        assert isinstance(EndpointHealthRegistry(), ProviderEventSink)
-
-    def test_router_does_not_satisfy_compatibility_protocol(self):
+class TestHedgeOutcomeRecorder:
+    def test_router_is_not_a_hedge_outcome_sink(self):
         """The router no longer acts as a hedge outcome forwarding sink."""
         config = RouteWiseConfig()
         router, _, _ = _make_router_with_two_api(config)
         assert isinstance(router._health_registry, EndpointHealthRegistry)
-        assert not isinstance(router, ProviderEventSink)
+        assert not hasattr(router, "record_success")
+        assert not hasattr(router, "record_failure")
         assert not hasattr(router, "on_provider_success")
         assert not hasattr(router, "on_provider_failure")
 

@@ -26,13 +26,13 @@ apps/backend/serving/     # FastAPI app — HTTP layer, SSE streaming, middlewar
 apps/backend/routing/      # Routing engine — strategies, circuit breaker, EWMA health, provider registry
   routewise/               # Per-model routing config
 apps/frontend/             # Next.js frontend
-config/                    # YAML configs: models.yaml, routing.yaml, alerts.yaml
+config/examples/           # Reference models.yaml / routing.yaml; a deployment's own are in distributions/<name>/config/
 services/                  # sidecar workers, where a deployment ships them
 tests/
   unit/                    # Pure unit tests (mocked adapters, routing logic, auth, config)
-  api/                     # API-level tests per provider (test_openai_api, test_claude_api, etc.)
+  api/                     # API-surface tests (signup quota, admin routes)
+  servers/                 # FastAPI app, router and middleware tests
   integration/             # Tests hitting real DB or external services
-  e2e/                     # End-to-end Makefile-driven tests (direct local, gateway routing, hybrid)
   external/                # Live server tests
 ```
 
@@ -54,10 +54,12 @@ Or the full suite:
 make test-verbose
 ```
 
-For database-dependent tests:
+For database-dependent tests (a shared local PostgreSQL in Docker; see
+`ops/dev/test-db-local.sh`):
 
 ```bash
-uv run pytest -vv -m dbtest
+make test-db-local                                        # the whole dbtest tier
+make test-db-local ARGS="-vv tests/path/to/test_file.py"  # one file
 ```
 
 ### Runtime / API error on staging
@@ -180,7 +182,7 @@ If you can't form a confident hypothesis, report what you found and ask the user
 
 Place the test in the appropriate directory following existing patterns:
 
-- **Adapter bug** → `tests/unit/adapters/` or `tests/api/test_<provider>_api.py`
+- **Adapter bug** → `tests/unit/adapters/`
 - **Routing bug** → `tests/unit/routing/`
 - **Auth bug** → `tests/unit/auth/`
 - **Config bug** → `tests/unit/config/`
@@ -220,7 +222,7 @@ make format
 
 - Grep for other callers of the changed function.
 - Grep for other uses of the changed data structure.
-- If the fix touches an adapter, run that provider's API tests: `uv run pytest tests/api/test_<provider>_api.py`.
+- If the fix touches an adapter, run the adapter tests: `uv run pytest tests/unit/adapters/`.
 - If the fix touches routing, run all routing tests: `uv run pytest tests/unit/routing/`.
 
 ## Step 5 — Report
