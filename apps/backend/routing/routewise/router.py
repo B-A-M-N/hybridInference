@@ -2574,7 +2574,7 @@ class RouteWiseRouter:
             reserve_prefill = reserve_prefill and self._prefill_lease_needed(model_id)
             tracker_transaction = (
                 self._prefill_load.routing_transaction()
-                if reserve_prefill and self.config.prefill_load_routing_enabled
+                if reserve_prefill
                 else contextlib.nullcontext()
             )
             with tracker_transaction:
