@@ -519,6 +519,10 @@ async def chat_completions(
     # The client's own spelling, taken before auto selection rewrites the
     # payload: the X-FI-Requested-Model header's value (issue #1504).
     requested_model = model
+    # An alias is the caller's spelling, never the canonical model id. Resolve
+    # it through the route table so served-model and endpoint headers describe
+    # the actual model rather than degrading on every alias request.
+    canonical_model = router_exec.canonical_id(model)
     messages = [m.model_dump() for m in payload.messages]
 
     # Debug-only: log inbound message roles to verify client behavior.
@@ -663,7 +667,7 @@ async def chat_completions(
             requested_model=requested_model,
             # Auto conceals which model serves: the endpoint and provider name the
             # same model, so they are withheld with it.
-            served_model=None if auto_selection is not None else model,
+            served_model=None if auto_selection is not None else canonical_model,
             endpoint_id=None if auto_selection is not None else single_endpoint,
             provider=None if auto_selection is not None else single_provider,
             endpoint_publishable=single_endpoint_publishable,
@@ -1012,7 +1016,7 @@ async def chat_completions(
                     streaming_headers.update(
                         served_identity_headers(
                             requested_model=requested_model,
-                            served_model=model,
+                            served_model=canonical_model,
                             endpoint_id=observed.endpoint_id,
                             provider=observed.provider,
                             endpoint_publishable=bool(
@@ -1075,7 +1079,7 @@ async def chat_completions(
                 response_headers.update(
                     served_identity_headers(
                         requested_model=requested_model,
-                        served_model=model,
+                        served_model=canonical_model,
                         endpoint_id=observed.endpoint_id,
                         provider=observed.provider,
                         endpoint_publishable=bool(
@@ -1265,7 +1269,7 @@ async def chat_completions(
             http_response.headers.update(
                 served_identity_headers(
                     requested_model=requested_model,
-                    served_model=None if auto_selection is not None else model,
+                    served_model=None if auto_selection is not None else canonical_model,
                     endpoint_id=None if auto_selection is not None else routing.endpoint_id,
                     provider=provider if provider != "router" and auto_selection is None else None,
                     endpoint_publishable=bool(

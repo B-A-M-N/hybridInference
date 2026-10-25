@@ -279,6 +279,29 @@ async def test_chat_completions_response_carries_served_identity_headers(chat_cl
 
 
 @pytest.mark.asyncio
+async def test_alias_request_publishes_canonical_model_and_endpoint(chat_client):
+    """An alias remains the requested spelling; identity uses the canonical id."""
+    chat_client._transport.app.state.services.router.register_route(
+        CHAT_MODEL,
+        [(chat_client._transport.app.state.services.router.routes[CHAT_MODEL].adapters[0][0], 1.0)],
+        aliases=["glm-latest"],
+    )
+    _enable_trusted_probe(chat_client._transport.app)
+
+    response = await chat_client.post(
+        "/v1/chat/completions",
+        json={"model": "glm-latest", "messages": [{"role": "user", "content": "Hi"}]},
+        headers={"x-probe": "synthetic"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-fi-requested-model"] == "glm-latest"
+    assert response.headers["x-fi-served-model"] == CHAT_MODEL
+    assert response.headers["x-fi-served-endpoint"] == f"{CHAT_MODEL}:zai-api"
+    assert response.headers["x-fi-served-provider"] == "zai"
+
+
+@pytest.mark.asyncio
 async def test_untrusted_customer_does_not_receive_served_identity_headers(chat_client):
     response = await chat_client.post(
         "/v1/chat/completions",
