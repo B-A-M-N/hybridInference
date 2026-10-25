@@ -911,6 +911,115 @@ def test_stream_text_mid_tool_call_does_not_reopen_an_orphan_tool_block():
     assert not open_at, "a block never closed"
 
 
+def test_stream_text_between_two_tool_calls_flushes_before_second_block():
+    """Content buffered behind tool 0 is emitted before tool 1 opens."""
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    parts = [
+        _openai_chunk({"role": "assistant"}),
+        _openai_chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city"'},
+                    }
+                ]
+            }
+        ),
+        _openai_chunk({"content": "between tools"}),
+        _openai_chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 1,
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "get_time", "arguments": "{}"},
+                    }
+                ]
+            }
+        ),
+        _openai_chunk({}, finish_reason="tool_calls"),
+    ]
+    out = b""
+    for chunk in parts:
+        out += b"".join(t.feed(chunk))
+    out += b"".join(t.finalize())
+    events = _events([out])
+
+    starts = [
+        (event["index"], event["content_block"]["type"])
+        for name, event in events
+        if name == "content_block_start"
+    ]
+    assert starts == [(0, "tool_use"), (1, "text"), (2, "tool_use")]
+
+    open_block: set[int] = set()
+    for name, event in events:
+        if name == "content_block_start":
+            assert not open_block, f"overlapping block at {event['index']}"
+            open_block.add(event["index"])
+        elif name == "content_block_stop":
+            open_block.remove(event["index"])
+
+
+def test_stream_thinking_between_two_tool_calls_flushes_before_second_block():
+    """Thinking and text buffered behind tool 0 precede tool 1 without overlap."""
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    parts = [
+        _openai_chunk({"role": "assistant"}),
+        _openai_chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }
+                ]
+            }
+        ),
+        _openai_chunk({"reasoning_content": "reason first"}),
+        _openai_chunk({"content": "then text"}),
+        _openai_chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 1,
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "get_time", "arguments": "{}"},
+                    }
+                ]
+            }
+        ),
+        _openai_chunk({}, finish_reason="tool_calls"),
+    ]
+    out = b""
+    for chunk in parts:
+        out += b"".join(t.feed(chunk))
+    out += b"".join(t.finalize())
+    events = _events([out])
+
+    starts = [
+        (event["index"], event["content_block"]["type"])
+        for name, event in events
+        if name == "content_block_start"
+    ]
+    assert starts == [(0, "tool_use"), (1, "thinking"), (2, "text"), (3, "tool_use")]
+
+    open_block: set[int] = set()
+    for name, event in events:
+        if name == "content_block_start":
+            assert not open_block, f"overlapping block at {event['index']}"
+            open_block.add(event["index"])
+        elif name == "content_block_stop":
+            open_block.remove(event["index"])
+
+
 def test_stream_thinking_mid_tool_call_does_not_reopen_an_orphan_tool_block():
     """Issue #876 P1, thinking variant: reasoning interleaved mid-arguments.
 

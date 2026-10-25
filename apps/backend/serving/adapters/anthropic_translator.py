@@ -868,9 +868,16 @@ class OpenAIToAnthropicStreamTranslator:
             if self._pending_thinking:
                 thinking, self._pending_thinking = self._pending_thinking, ""
                 yield from self._emit_thinking(thinking)
+                yield from self._close_thinking()
             if self._pending_text:
                 text, self._pending_text = self._pending_text, ""
                 yield from self._emit_text(text)
+                if self._current_text_index is not None:
+                    yield self._sse(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": self._current_text_index},
+                    )
+                    self._current_text_index = None
         finally:
             self._flushing_pending = False
 
@@ -887,6 +894,18 @@ class OpenAIToAnthropicStreamTranslator:
                     {"type": "content_block_stop", "index": self._current_text_index},
                 )
                 self._current_text_index = None
+            # A second OpenAI tool call is a second Anthropic block. Close the
+            # preceding calls and flush content buffered behind them before the
+            # new block starts, preserving both one-open-block ordering and the
+            # chronological thinking-before-text order.
+            if self._pending_thinking or self._pending_text:
+                for tb in list(self._tool_blocks.values()):
+                    yield self._sse(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": tb["anthropic_index"]},
+                    )
+                self._tool_blocks.clear()
+                yield from self._flush_pending_thinking_then_text()
 
         if idx not in self._tool_blocks:
             anthropic_index = self._next_index
