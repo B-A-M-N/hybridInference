@@ -181,25 +181,66 @@ async def test_login_bucket_key_cardinality_is_bounded_and_new_keys_still_admit(
 
 
 @pytest.mark.asyncio
-async def test_primary_map_overflow_collisions_are_conservative_and_bounded(monkeypatch):
-    """Distinct saturated keys sharing a hash slot remain accounted."""
+async def test_full_account_address_map_fails_open_without_shared_slot_lockout(
+    monkeypatch,
+):
+    """Distributed saturation cannot use shared pair slots to deny new users."""
     monkeypatch.setattr(settings, "login_rate_limit_per_15min", 1)
+    monkeypatch.setattr(settings, "login_account_rate_limit_per_15min", 2)
     monkeypatch.setattr(limiter, "_MAX_ACTIVE_BUCKETS", 1)
     monkeypatch.setattr(limiter, "_OVERFLOW_BUCKET_COUNT", 1)
 
     assert await limiter.check_and_record_login("resident", OWNER) == (True, None)
     assert await limiter.check_and_record_login("overflow-a", ATTACKER) == (True, None)
 
-    # Every overflow identity hashes to the same bounded slot. It is
-    # conservatively rate limited after the first identity used that slot.
-    assert await limiter.check_and_record_login("overflow-b", "192.0.2.18") == (
-        False,
-        "email",
+    # Every new pair hashes to the same slot, but that slot must not become a
+    # lockout for an unrelated legitimate client.
+    assert await limiter.check_and_record_login("legitimate", "192.0.2.18") == (
+        True,
+        None,
     )
     assert len(limiter._account_address_attempts) == 1
-    assert len(limiter._account_attempts) == 1
-    assert len(limiter._ip_attempts) == 1
-    assert len(limiter._overflow_attempts) <= 3
+    assert "account_address" not in {scope for scope, _slot in limiter._overflow_attempts}
+
+    # The account-wide window still bounds a repeated identity under saturation.
+    assert await limiter.check_and_record_login("legitimate", "192.0.2.19") == (
+        False,
+        "account",
+    )
+
+
+@pytest.mark.asyncio
+async def test_saturated_pair_slots_do_not_lock_out_new_legitimate_clients(monkeypatch):
+    """The reviewer's distributed-IPv6 saturation shape must not deny newcomers."""
+    monkeypatch.setattr(limiter, "_MAX_ACTIVE_BUCKETS", 2)
+    monkeypatch.setattr(limiter, "_OVERFLOW_BUCKET_COUNT", 1)
+    monkeypatch.setattr(settings, "login_rate_limit_per_15min", 2)
+    monkeypatch.setattr(settings, "login_account_rate_limit_per_15min", 500)
+    monkeypatch.setattr(settings, "login_rate_limit_per_hour_per_ip", 1_000)
+
+    # Fill every live map and force all later keys into one shared slot.
+    for i in range(80):
+        prefix = f"2001:db8:abcd:{i:04x}::"
+        for low in range(2):
+            ip = f"{prefix}{low + 1}"
+            assert await limiter.check_and_record_login(f"attacker-{i}-{low}", ip) == (
+                True,
+                None,
+            )
+
+    # Victims use distinct /64s, accounts, and addresses. Before this fix the
+    # saturated account/address slots refused almost all of them as "email".
+    admitted = 0
+    for i in range(100):
+        allowed, reason = await limiter.check_and_record_login(
+            f"victim-{i}", f"2001:db8:ffff:{i:04x}::1"
+        )
+        if allowed:
+            admitted += 1
+        assert reason != "email"
+
+    assert admitted == 100
+    assert len(limiter._account_address_attempts) == 2
 
 
 @pytest.mark.asyncio
@@ -304,6 +345,7 @@ async def test_full_bucket_maps_do_not_deny_unrelated_users(monkeypatch):
     now = [5_000.0]
     monkeypatch.setattr(limiter, "_now", lambda: now[0])
     monkeypatch.setattr(limiter, "_MAX_ACTIVE_BUCKETS", 3)
+    monkeypatch.setattr(settings, "login_account_rate_limit_per_15min", 2)
 
     for i in range(6):
         ip = f"198.51.100.{i + 10}"
@@ -322,11 +364,11 @@ async def test_full_bucket_maps_do_not_deny_unrelated_users(monkeypatch):
         True,
         None,
     )
-    # Saturated maps use overflow accounting, so her third attempt is refused
-    # at the ordinary account/address limit rather than becoming untracked.
+    # Pair saturation fails open, but her account-wide window still bounds the
+    # third attempt rather than admitting an identity without any limit.
     assert await limiter.check_and_record_login("alice@example.com", OWNER) == (
         False,
-        "email",
+        "account",
     )
     assert ("alice@example.com", OWNER) not in limiter._account_address_attempts
     now[0] += 15 * 60 + 1
@@ -437,10 +479,11 @@ async def test_saturation_does_not_evict_live_state_and_bypass_is_bounded(monkey
     assert ("victim", "198.51.100.50") in limiter._account_address_attempts
     assert await limiter.check_and_record_login("victim", "198.51.100.50") == (False, "email")
 
-    # The same overflow identity stays tracked and cannot reset its window.
+    # Pair saturation fails open rather than sharing a lockout slot. Live
+    # victim state survives and the map remains bounded.
     now[0] += 1
-    assert await limiter.check_and_record_login("atk3", "198.51.100.3") == (True, None)
-    assert await limiter.check_and_record_login("atk3", "198.51.100.3") == (False, "email")
+    assert await limiter.check_and_record_login("atk3", "198.51.100.4") == (True, None)
+    assert ("victim", "198.51.100.50") in limiter._account_address_attempts
     assert len(limiter._account_address_attempts) == 2
 
 
@@ -454,7 +497,7 @@ async def test_capacity_pressure_logs_and_diagnostic_counts_are_bounded(monkeypa
     assert await limiter.check_and_record_login("first", "198.51.100.1") == (True, None)
     assert await limiter.check_and_record_login("second", "198.51.100.2") == (True, None)
     assert await limiter.check_and_record_login("second", "198.51.100.2") == (True, None)
-    assert await limiter.check_and_record_login("second", "198.51.100.2") == (False, "email")
+    assert await limiter.check_and_record_login("second", "198.51.100.3") == (True, None)
 
     counts = limiter.get_login_rate_limit_capacity_pressure_counts()
     assert set(counts) == {"device", "account_address", "account", "ip", "refusal"}
@@ -475,7 +518,7 @@ async def test_capacity_pressure_logs_and_diagnostic_counts_are_bounded(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_refusal_pressure_overflow_does_not_block_unrelated_addresses(monkeypatch):
+async def test_full_pair_map_does_not_create_refusal_slot_lockout(monkeypatch):
     now = [9_000.0]
     monkeypatch.setattr(limiter, "_now", lambda: now[0])
     monkeypatch.setattr(limiter, "_MAX_ACTIVE_BUCKETS", 1)
@@ -485,7 +528,6 @@ async def test_refusal_pressure_overflow_does_not_block_unrelated_addresses(monk
     assert await limiter.check_and_record_login("first", "198.51.100.1") == (True, None)
     assert await limiter.check_and_record_login("first", "198.51.100.1") == (False, "email")
     assert await limiter.check_and_record_login("second", "198.51.100.2") == (True, None)
-    assert await limiter.check_and_record_login("second", "198.51.100.2") == (False, "email")
     assert await limiter.check_and_record_login("third", "198.51.100.3") == (True, None)
-    assert await limiter.check_and_record_login("third", "198.51.100.3") == (False, "email")
-    assert limiter.get_login_rate_limit_capacity_pressure_counts()["refusal"] > 0
+    assert limiter.get_login_rate_limit_capacity_pressure_counts()["account_address"] > 0
+    assert not limiter._ip_refusal_overflow

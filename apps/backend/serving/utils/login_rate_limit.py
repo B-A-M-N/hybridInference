@@ -14,8 +14,11 @@ account refusals reach that threshold, the IP-wide policy applies to every
 account at that address. Recognized devices retain their independent window
 and do not consume or get blocked by the other login windows.
 
-Login bucket maps are bounded. Expired keys are reclaimed first; when a map
-is full of live keys, new keys use fixed-size overflow windows selected by a
+Login bucket maps are bounded. Expired keys are reclaimed first. New
+account/address keys are not accounted through a shared overflow window: once
+that map is full, a distributed attacker could fill its slots and deny legitimate
+new sign-ins. That scope fails open while the account-wide and IP windows still
+apply. Other scopes use fixed-size overflow windows selected by a
 process-randomized hash. Collisions can conservatively rate-limit unrelated
 keys for the remainder of a window, but overflow requests are never admitted
 without accounting. Live entries are never evicted. Recognized devices keep
@@ -230,6 +233,21 @@ def _needs_overflow(
     if use_overflow:
         _note_capacity_pressure(scope, now)
     return use_overflow
+
+
+def _should_fail_open_full_map(
+    buckets: dict[_Key, deque[float]],
+    key: _Key,
+    scope: str,
+    cutoff: float,
+    *,
+    now: float,
+) -> bool:
+    """Return whether a new key should bypass accounting because the map is full."""
+    if key in buckets or _can_add_bucket_key(buckets, key, cutoff, now=now, scope=scope):
+        return False
+    _note_capacity_pressure(scope, now)
+    return True
 
 
 def _can_add_bucket_key(
@@ -457,11 +475,14 @@ async def check_and_record_login(
         # window cannot leave a partial admission in another. New keys that
         # cannot use a full map are still counted by its fixed-size overflow
         # window; hash collisions can conservatively share a limit.
-        spill_address = _needs_overflow(
+        # The pair scope is the only per-user gate available to a legitimate
+        # first-time client. Overflow hashing it would let distributed attackers
+        # fill shared slots and lock out unrelated new sign-ins, so saturation
+        # fails open here; the account-wide and IP windows below still apply.
+        bypass_address = _should_fail_open_full_map(
             _account_address_attempts,
             address_key,
             "account_address",
-            address_key,
             account_cutoff,
             now=now,
         )
@@ -486,29 +507,18 @@ async def check_and_record_login(
             else False
         )
 
-        overflow_address = (
-            _prune_overflow_bucket("account_address", address_key, account_cutoff)
-            if spill_address
-            else None
-        )
         overflow_account = (
             _prune_overflow_bucket("account", account_key, account_cutoff)
             if spill_account
             else None
         )
         overflow_ip = _prune_overflow_bucket("ip", ip_key, ip_cutoff) if spill_ip else None
-        if overflow_address is not None and len(overflow_address) >= per_account_address:
-            if resolved and not _record_ip_refusal_pressure(ip_key, now, per_ip):
-                return False, "ip"
-            return False, "email"
         if overflow_account is not None and len(overflow_account) >= per_account:
             return False, "account"
         if overflow_ip is not None and len(overflow_ip) >= per_ip:
             return False, "ip"
 
-        if spill_address:
-            _record_overflow_attempt("account_address", address_key, now)
-        else:
+        if not bypass_address:
             _account_address_attempts.setdefault(address_key, deque()).append(now)
         if spill_account:
             _record_overflow_attempt("account", account_key, now)
