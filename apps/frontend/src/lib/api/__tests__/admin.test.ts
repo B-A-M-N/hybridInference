@@ -5,6 +5,8 @@ import {
   clearRouteWeight,
   createProviderRouteModel,
   createProviderRouteCandidate,
+  resetProviderRouteCapabilities,
+  updateProviderRouteCapabilities,
   deleteProviderRoute,
   deleteProviderRouteCandidate,
   getGeoAnalytics,
@@ -31,7 +33,15 @@ import {
   verifyProviderRouteCandidate,
   updateModelVisibility,
 } from '../admin';
+import type { RuntimeModelCapabilities } from '../admin';
 import { setAccessToken } from '../client';
+
+const ROUTE_CAPABILITIES: RuntimeModelCapabilities = {
+  context_length: 32768,
+  max_output_length: 8192,
+  input_modalities: ['text'],
+  supports_tools: false,
+};
 
 const fetchMock = vi.fn();
 
@@ -642,6 +652,7 @@ describe('provider route client', () => {
       upstream_provider: 'openrouter',
       openrouter_provider: 'parasail',
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'provider_api',
       api_key_id: 'key-1',
       provider_model_id: 'minimax/minimax-m2.5',
       quota_limit: 8000,
@@ -659,6 +670,7 @@ describe('provider route client', () => {
       openrouter_provider: 'parasail',
       openrouter_sort: null,
       base_url: 'https://openrouter.ai/api/v1',
+      deployment_type: 'provider_api',
       api_key_id: 'key-1',
       provider_model_id: 'minimax/minimax-m2.5',
       quota_limit: 8000,
@@ -755,6 +767,7 @@ describe('provider route client', () => {
       quota_limit: null,
       concurrency_limit: null,
       weight: 1,
+      capabilities: ROUTE_CAPABILITIES,
     });
 
     expect(out.source).toBe('runtime');
@@ -772,6 +785,7 @@ describe('provider route client', () => {
       quota_limit: null,
       concurrency_limit: null,
       weight: 1,
+      capabilities: ROUTE_CAPABILITIES,
     });
   });
 
@@ -828,6 +842,12 @@ describe('provider route client', () => {
         prompt: '0.14',
         completion: '0.28',
       },
+      capabilities: {
+        context_length: 131072,
+        max_output_length: 65536,
+        input_modalities: ['text', 'image'],
+        supports_tools: true,
+      },
     });
 
     expect(out.model_id).toBe('deepseek-v4-flash');
@@ -852,6 +872,12 @@ describe('provider route client', () => {
       pricing: {
         prompt: '0.14',
         completion: '0.28',
+      },
+      capabilities: {
+        context_length: 131072,
+        max_output_length: 65536,
+        input_modalities: ['text', 'image'],
+        supports_tools: true,
       },
     });
   });
@@ -882,6 +908,12 @@ describe('provider route client', () => {
         prompt: '0.14',
         completion: '0.28',
       },
+      capabilities: {
+        context_length: 131072,
+        max_output_length: 65536,
+        input_modalities: ['text', 'image'],
+        supports_tools: true,
+      },
     });
 
     expect(out.ok).toBe(true);
@@ -906,7 +938,52 @@ describe('provider route client', () => {
         prompt: '0.14',
         completion: '0.28',
       },
+      capabilities: {
+        context_length: 131072,
+        max_output_length: 65536,
+        input_modalities: ['text', 'image'],
+        supports_tools: true,
+      },
     });
+  });
+
+  it("updateProviderRouteCapabilities PUTs one route's capabilities", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ route_id: 'minimax-fast:openrouter[parasail]-api' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    await updateProviderRouteCapabilities(
+      'minimax-fast',
+      'minimax-fast:openrouter[parasail]-api',
+      ROUTE_CAPABILITIES,
+    );
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain(
+      '/admin/routing/provider-route-capabilities/minimax-fast/minimax-fast%3Aopenrouter%5Bparasail%5D-api',
+    );
+    expect(init.method).toBe('PUT');
+    expect(JSON.parse(init.body as string)).toEqual(ROUTE_CAPABILITIES);
+  });
+
+  it("resetProviderRouteCapabilities DELETEs the route's override", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ route_id: 'minimax-fast:chutes-api' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    await resetProviderRouteCapabilities('minimax-fast', 'minimax-fast:chutes-api');
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain(
+      '/admin/routing/provider-route-capabilities/minimax-fast/minimax-fast%3Achutes-api',
+    );
+    expect(init.method).toBe('DELETE');
   });
 
   it('verifyProviderRouteCandidate POSTs runtime route body to dry-run endpoint', async () => {
@@ -928,6 +1005,7 @@ describe('provider route client', () => {
       quota_limit: null,
       concurrency_limit: null,
       weight: 1,
+      capabilities: ROUTE_CAPABILITIES,
     });
 
     expect(out.ok).toBe(true);
@@ -947,6 +1025,7 @@ describe('provider route client', () => {
       quota_limit: null,
       concurrency_limit: null,
       weight: 1,
+      capabilities: ROUTE_CAPABILITIES,
     });
   });
 

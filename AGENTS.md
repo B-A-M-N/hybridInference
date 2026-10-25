@@ -31,7 +31,7 @@ under "Repository layout". Two things it does not tell you:
 
 ## 3. Getting set up
 
-Prerequisites: Python 3.10–3.13 (3.12 recommended) and [uv](https://github.com/astral-sh/uv).
+Prerequisites: Python 3.11–3.13 (3.12 recommended) and [uv](https://github.com/astral-sh/uv).
 
 ```bash
 make setup-dev
@@ -153,14 +153,14 @@ For the full diagram (network layer, observability, storage), see
   owner across updates; preserving configuration alone is not proof of this.
   Execution scopes currently come from the composition root
   ([hybrid_composition.py](apps/backend/serving/servers/hybrid_composition.py)).
-  Explicit `local_scope` / `local_ownership` are supported; bootstrap currently
-  uses the hostname default, which can classify an owned LAN or cluster DNS
-  endpoint as remote. Do not infer a RouteWise resource type from that domain.
+  Explicit `local_scope` / `local_ownership` are supported. Bootstrap uses the
+  route's `deployment_type`: `self_hosted` owns a LAN or cluster DNS endpoint,
+  `provider_api` keeps a loopback proxy in the cloud scope, and `auto` retains
+  the hostname default. Outbound admission uses the same classification.
+  This does not change endpoint IDs or RouteWise resource types.
   See
   [docs/agents/specs/2026-09-14-composable-hybrid-routing-design.zh.md](docs/agents/specs/2026-09-14-composable-hybrid-routing-design.zh.md)
   for the current router, leaf and pool contracts, opt-in wiring and deferred work.
-- **`routing/executor.py`** — backward-compatibility shim that re-exports
-  `FixedRouter` as `RouteExecutor`. **Do not edit it** — edit `routers.py` instead.
 - **Strategy** — two layers. The deployment-wide weight strategy
   (`FixedRatioStrategy` in
   [apps/backend/routing/strategies/weight.py](apps/backend/routing/strategies/weight.py))
@@ -218,7 +218,8 @@ always kept). To run anything else against that database,
   are read by no code. There is one SQL dialect — write Postgres.
 - Alerting has two permanent, independent paths (decision: issue #1103).
   Backend gateway alerts go through `alert_slack()`
-  (`apps/backend/serving/observability/alerts.py`) to a Slack webhook;
+  (`apps/backend/serving/observability/alerts.py`) to one configured Slack or
+  WeCom webhook;
   status-monitor alerts go through the status monitor and alert control plane
   workers owned and deployed by the external
   [freeInference repository](https://github.com/HarvardMadSys/freeInference).

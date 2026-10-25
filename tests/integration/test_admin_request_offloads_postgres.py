@@ -15,7 +15,7 @@ import hashlib
 import itertools
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -24,7 +24,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from routing.executor import RouteExecutor
+from routing.routers import FixedRouter
 from serving.servers.deps import AppServices, verify_admin_access
 from serving.servers.routers import admin
 from serving.servers.routers.admin import metrics as admin_metrics
@@ -140,7 +140,7 @@ def _row(
 
 
 async def _seed(pool: asyncpg.Pool, rows: list[dict[str, Any]]) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     async with pool.acquire() as conn:
         await conn.executemany(
             """
@@ -356,7 +356,7 @@ async def test_the_endpoint_serves_the_summary(db_logger):
         [_row(), _row(offload="engine_wait", endpoint=OFFLOAD, status=502, error="boom")],
     )
     app = FastAPI(title="Admin Offloads Postgres Test")
-    app.state.services = AppServices(router=RouteExecutor(), db_logger=db_logger)  # type: ignore[attr-defined]
+    app.state.services = AppServices(router=FixedRouter(), db_logger=db_logger)  # type: ignore[attr-defined]
     app.dependency_overrides[verify_admin_access] = lambda: "admin-1"
     app.include_router(admin.router)
 

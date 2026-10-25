@@ -59,15 +59,15 @@ def auth_database_detail() -> str:
 
 
 if TYPE_CHECKING:
-    from routing.executor import RouteExecutor
     from routing.manager import RoutingManager
     from routing.model_router_registry import ModelRouterRegistry
-    from routing.routers import ManagedRouter
+    from routing.routers import FixedRouter, ManagedRouter
     from serving.auto_mode import AutoMode
     from serving.config.disabled_providers import DisabledProviderResolver
     from serving.config.model_concurrency import ModelConcurrencyResolver
     from serving.config.model_visibility import ModelVisibilityResolver
     from serving.config.offload_routes import OffloadRouteResolver
+    from serving.config.route_states import RouteStateResolver
     from serving.config.routewise_model_settings import RouteWiseSettingsResolver
     from serving.config.weight_overrides import WeightOverrideResolver
     from serving.observability.alert_rules import AlertEngine
@@ -89,7 +89,7 @@ class AppServices:
     when accessing ``app.state``.
     """
 
-    router: RouteExecutor
+    router: FixedRouter
     embedding_adapters: dict[str, Any] | None = None
     db_logger: DatabaseLogger | None = None
     operational_store: OperationalStore | None = None
@@ -103,6 +103,7 @@ class AppServices:
     weight_override_resolver: WeightOverrideResolver | None = None
     routewise_settings_resolver: RouteWiseSettingsResolver | None = None
     disabled_provider_resolver: DisabledProviderResolver | None = None
+    route_state_resolver: RouteStateResolver | None = None
     offload_route_resolver: OffloadRouteResolver | None = None
     user_concurrency_limiter: UserConcurrencyLimiter | None = None
     alert_engine: AlertEngine | None = None
@@ -118,6 +119,7 @@ class AppServices:
     weight_override_refresh_task: Any | None = None
     routewise_settings_refresh_task: Any | None = None
     disabled_provider_refresh_task: Any | None = None
+    route_state_refresh_task: Any | None = None
     offload_route_refresh_task: Any | None = None
 
 
@@ -137,8 +139,8 @@ def get_services(request: Request) -> AppServices:
     return request.app.state.services  # type: ignore[attr-defined]
 
 
-def get_router(services: AppServices = Depends(get_services)) -> RouteExecutor:
-    """Dependency to obtain the RouteExecutor."""
+def get_router(services: AppServices = Depends(get_services)) -> FixedRouter:
+    """Dependency to obtain the FixedRouter."""
     return services.router
 
 
@@ -226,10 +228,7 @@ def get_completions_logger(
     if services.completions_logger is None:
         from serving.servers.routers.completions_logging import CompletionsLogger as _CL
 
-        services.completions_logger = _CL(
-            log_store=services.log_store,
-            model_router_registry=services.model_router_registry,
-        )
+        services.completions_logger = _CL(log_store=services.log_store)
     return services.completions_logger
 
 
@@ -268,18 +267,6 @@ def get_cost_tracker(
 
     pricing = services.pricing_lookup or _PL(router=services.router)
     return _CT(op_store=services.operational_store, pricing=pricing)
-
-
-def is_database_connected(db_logger: DatabaseLogger | None) -> bool:
-    """Check if database connection is active.
-
-    Args:
-        db_logger: DatabaseLogger instance from get_db_logger dependency
-
-    Returns:
-        True if database is connected and pool is available, False otherwise
-    """
-    return db_logger is not None and db_logger.pool is not None
 
 
 async def get_current_user(
@@ -387,18 +374,6 @@ async def get_current_user(
         # The auth session this token was issued for; ``auth_sessions.sid``.
         "sid": payload.get("sid"),
     }
-
-
-async def require_admin(
-    current_user: dict[str, Any] = Depends(get_current_user),
-) -> dict[str, Any]:
-    """Require admin privileges. Raises 403 if user is not an admin.
-
-    Uses the authoritative ``users.role`` from DB (set by get_current_user).
-    """
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required.")
-    return current_user
 
 
 def require_role(min_role: str):

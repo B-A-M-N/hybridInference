@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -150,11 +150,10 @@ def _make_alerter(pool, *, threshold=20, window=5, cooldown=5, now_fn=None):
 
     return FailedRequestAlerter(
         pool=pool,
-        webhook_url="https://hooks.slack.test/abc",
         threshold=threshold,
         window_minutes=window,
         cooldown_minutes=cooldown,
-        now_fn=now_fn or (lambda: datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)),
+        now_fn=now_fn or (lambda: datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)),
     )
 
 
@@ -300,8 +299,8 @@ async def test_alerter_cooldown_suppresses_repeat():
     pool.fetchrow = AsyncMock(return_value=None)
 
     times = [
-        datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
-        datetime(2026, 1, 1, 12, 2, 0, tzinfo=timezone.utc),  # +2 min, cooldown is 5
+        datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 12, 2, 0, tzinfo=UTC),  # +2 min, cooldown is 5
     ]
 
     def _clock():
@@ -328,8 +327,8 @@ async def test_alerter_cooldown_expires_then_fires():
     pool.fetchrow = AsyncMock(return_value=None)
 
     times = [
-        datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
-        datetime(2026, 1, 1, 12, 6, 0, tzinfo=timezone.utc),  # +6 min, cooldown is 5
+        datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 12, 6, 0, tzinfo=UTC),  # +6 min, cooldown is 5
     ]
 
     def _clock():
@@ -356,8 +355,8 @@ async def test_alerter_failed_post_does_not_start_cooldown():
     pool.fetchrow = AsyncMock(return_value=None)
 
     times = [
-        datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
-        datetime(2026, 1, 1, 12, 0, 30, tzinfo=timezone.utc),  # +30s, well inside cooldown
+        datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 12, 0, 30, tzinfo=UTC),  # +30s, well inside cooldown
     ]
 
     def _clock():
@@ -379,9 +378,11 @@ async def test_alerter_failed_post_does_not_start_cooldown():
 # ── register_alerter_job ─────────────────────────────────────────────────
 
 
-def _settings_stub(webhook_url=""):
+def _settings_stub(webhook_url="", wecom_url="", slack_alerts_url=""):
     return MagicMock(
         slack_webhook_url=webhook_url,
+        slack_alerts_webhook_url=slack_alerts_url,
+        wecom_alerts_webhook_url=wecom_url,
         failed_request_alert_threshold=20,
         failed_request_alert_window_minutes=5,
         failed_request_alert_cooldown_minutes=5,
@@ -445,6 +446,54 @@ def test_register_adds_job_when_webhook_set():
     assert kwargs["max_instances"] == 1
 
 
+def test_register_adds_job_when_only_wecom_is_set():
+    """WECOM_ALERTS_WEBHOOK_URL alone is enough to enable the DB detector."""
+    from serving.admin import failed_request_alerter
+
+    fake_scheduler = MagicMock()
+    pool = MagicMock()
+
+    with patch.object(
+        failed_request_alerter,
+        "get_scheduler",
+        return_value=fake_scheduler,
+    ):
+        failed_request_alerter.register_alerter_job(
+            pool,
+            _settings_stub(
+                webhook_url="",
+                wecom_url="https://qyapi.weixin.test/cgi-bin/webhook/send?key=abc",
+            ),
+        )
+
+    fake_scheduler.add_job.assert_called_once()
+
+
+def test_register_disabled_when_only_slack_alerts_webhook_is_set():
+    """Only SLACK_WEBHOOK_URL enables this detector; the alerting URL does not.
+
+    That asymmetry predates this change: deployments that set just
+    SLACK_ALERTS_WEBHOOK_URL never registered the DB-query detector, and the
+    WeCom channel must not alter that.
+    """
+    from serving.admin import failed_request_alerter
+
+    fake_scheduler = MagicMock()
+    pool = MagicMock()
+
+    with patch.object(
+        failed_request_alerter,
+        "get_scheduler",
+        return_value=fake_scheduler,
+    ):
+        failed_request_alerter.register_alerter_job(
+            pool,
+            _settings_stub(slack_alerts_url="https://hooks.slack.test/alerting"),
+        )
+
+    fake_scheduler.add_job.assert_not_called()
+
+
 def test_register_no_scheduler_is_safe():
     """If get_scheduler returns None, registration logs and bails — no crash."""
     from serving.admin import failed_request_alerter
@@ -456,92 +505,6 @@ def test_register_no_scheduler_is_safe():
         failed_request_alerter.register_alerter_job(
             pool, _settings_stub(webhook_url="https://hooks.slack.test/xyz")
         )
-
-
-# ── post_slack_alert error swallowing ────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_slack_post_failure_is_swallowed():
-    """httpx errors inside post_slack_alert must NOT propagate — returns False."""
-    import httpx
-
-    from serving.admin.failed_request_alerter import post_slack_alert
-
-    class _BoomCtx:
-        async def __aenter__(self_inner):
-            raise httpx.ConnectError("boom")
-
-        async def __aexit__(self_inner, *_a):
-            return False
-
-    with patch(
-        "serving.admin.failed_request_alerter.httpx.AsyncClient",
-        return_value=_BoomCtx(),
-    ):
-        ok = await post_slack_alert("https://hooks.slack.test/abc", "hi")
-
-    assert ok is False
-
-
-@pytest.mark.asyncio
-async def test_slack_post_does_not_leak_the_webhook_into_the_httpx_log(caplog):
-    """The legacy sender holds the same credential as the framework one.
-
-    A Slack incoming-webhook URL *is* the secret, and httpx logs the full
-    request URL at INFO for every call, so this sender leaked it exactly like
-    ``_post_to_slack`` did. Driven over a real client with a mock transport
-    because the leaking line is httpx's, not this module's.
-    """
-    import logging
-
-    import httpx
-
-    from serving.admin.failed_request_alerter import post_slack_alert
-
-    webhook = "https://hooks.slack.test/services/T00000000/B00000000/nOtArEaLtOkEn"
-    real_client = httpx.AsyncClient
-
-    def factory(*args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(lambda _req: httpx.Response(200))
-        return real_client(*args, **kwargs)
-
-    with (
-        patch("serving.admin.failed_request_alerter.httpx.AsyncClient", factory),
-        caplog.at_level(logging.DEBUG),
-    ):
-        ok = await post_slack_alert(webhook, "hi")
-
-    assert ok is True
-    assert webhook not in caplog.text
-    assert "nOtArEaLtOkEn" not in caplog.text
-    # Redacted rather than muted: the call is still in the log.
-    assert "hooks.slack.test" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_slack_post_non_2xx_returns_false():
-    """A non-2xx response must be treated as a failed post (False)."""
-    from serving.admin.failed_request_alerter import post_slack_alert
-
-    fake_resp = MagicMock(status_code=500, text="upstream broken")
-    fake_client = AsyncMock()
-    fake_client.post = AsyncMock(return_value=fake_resp)
-
-    class _ClientCtx:
-        async def __aenter__(self_inner):
-            return fake_client
-
-        async def __aexit__(self_inner, *_a):
-            return False
-
-    with patch(
-        "serving.admin.failed_request_alerter.httpx.AsyncClient",
-        return_value=_ClientCtx(),
-    ):
-        ok = await post_slack_alert("https://hooks.slack.test/abc", "hi")
-
-    assert ok is False
 
 
 @pytest.mark.asyncio
@@ -564,7 +527,7 @@ async def test_alerter_swallows_query_exception():
 
 # Smoke check: timedelta math is what we expect — fences the cooldown semantics.
 def test_cooldown_arithmetic_uses_timedelta():
-    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     assert (base + timedelta(minutes=5)) - base == timedelta(minutes=5)
 
 
@@ -576,11 +539,10 @@ def _rate_alerter(pool, *, threshold=200, rate=0.02, min_count=10):
 
     return FailedRequestAlerter(
         pool=pool,
-        webhook_url="https://hooks.slack.test/abc",
         threshold=threshold,
         window_minutes=5,
         cooldown_minutes=5,
-        now_fn=lambda: datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        now_fn=lambda: datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
         rate_threshold=rate,
         rate_min_count=min_count,
     )
@@ -651,11 +613,10 @@ async def test_rate_zero_restores_pure_absolute_counting():
     pool.fetch = AsyncMock(return_value=[])
     alerter = FailedRequestAlerter(
         pool=pool,
-        webhook_url="https://hooks.slack.test/abc",
         threshold=200,
         window_minutes=5,
         cooldown_minutes=5,
-        now_fn=lambda: datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        now_fn=lambda: datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
         rate_threshold=0.0,
     )
     with patch(
