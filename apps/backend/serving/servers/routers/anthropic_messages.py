@@ -69,6 +69,7 @@ from serving.servers.auth import (
 )
 from serving.servers.concurrency import enforce_user_concurrency
 from serving.servers.deps import (
+    get_completions_logger,
     get_log_store,
     get_model_visibility_resolver,
     get_operational_store,
@@ -970,6 +971,7 @@ def _schedule_log_store_task(
     operator_error: str | None = None,
     op_store: Any = None,
     user_id: str | None = None,
+    completions_logger=None,
 ) -> None:
     """Schedule a background log store task (fire-and-forget).
 
@@ -1017,28 +1019,37 @@ def _schedule_log_store_task(
         "cache_write_tokens": cache_write,
     }
 
-    async def _log() -> None:
-        try:
-            await log_store.log_request(
-                request_id=request_id,
-                model_id=model_id,
-                provider=provider,
-                prompt=prompt_for_log,
-                response=response,
-                usage=usage_for_cost,
-                latency_ms=latency_ms,
-                status_code=status_code,
-                params=params,
-                metadata=metadata,
-                pricing=pricing,
-                ttft_ms=ttft_ms,
-                error=error,
-                request_payload=request_payload,
-            )
-        except Exception:
-            logger.debug(f"Background log store task failed for {request_id}", exc_info=True)
+    log_payload = {
+        "request_id": request_id,
+        "model_id": model_id,
+        "provider": provider,
+        "prompt": prompt_for_log,
+        "response": response,
+        "usage": usage_for_cost,
+        "latency_ms": latency_ms,
+        "status_code": status_code,
+        "params": params,
+        "metadata": metadata,
+        "pricing": pricing,
+        "ttft_ms": ttft_ms,
+        "error": error,
+        "request_payload": request_payload,
+    }
+    if completions_logger is not None:
+        # Same bounded, shutdown-drained queue as every other api_logs surface.
+        # The quota-authoritative cost increment remains separate below.
+        completions_logger.schedule_log(request_id, log_payload)
+    else:
+        # Compatibility for direct helper callers in older tests/tools. Every
+        # route passes the shared logger; this fallback is not shut down as a
+        # member of app services and must not be used by request handlers.
+        async def _log() -> None:
+            try:
+                await log_store.log_request(**log_payload)
+            except Exception:
+                logger.debug(f"Background log store task failed for {request_id}", exc_info=True)
 
-    asyncio.create_task(_log())  # noqa: RUF006
+        asyncio.create_task(_log())  # noqa: RUF006
 
     # Successful, billed requests must also advance the daily quota counter that
     # verify_api_key enforces; error rows (status != 200) are logged but never
@@ -1368,6 +1379,7 @@ def _log_failure(
     status_code: int,
     error_message: str,
     operator_error: str | None = None,
+    completions_logger=None,
 ) -> None:
     latency_ms = int((time.time() - start) * 1000)
     if log_store:
@@ -1387,6 +1399,7 @@ def _log_failure(
             error=error_message,
             request_payload=request_payload_for_log,
             operator_error=operator_error,
+            completions_logger=completions_logger,
         )
 
 
@@ -1445,6 +1458,7 @@ async def anthropic_messages(
     log_store=Depends(get_log_store),
     op_store=Depends(get_operational_store),
     model_visibility_resolver=Depends(get_model_visibility_resolver),
+    completions_logger=Depends(get_completions_logger),
     _conc=Depends(enforce_user_concurrency),
 ):
     """Handle Anthropic Messages API requests (non-streaming)."""
@@ -2216,6 +2230,7 @@ async def anthropic_messages(
                         operator_error=stream_error_operator if stream_failed else None,
                         op_store=op_store,
                         user_id=user_ctx.get("user_id"),
+                        completions_logger=completions_logger,
                     )
 
         return StreamingResponse(_gen(), media_type="text/event-stream", headers=sse_headers)
@@ -2257,6 +2272,7 @@ async def anthropic_messages(
             status_code=exc.status_code,
             error_message=error_message,
             operator_error=operator_safe_error(exc),
+            completions_logger=completions_logger,
         )
         return _anthropic_error(exc.status_code, error_message)
     except aiohttp.ClientResponseError as exc:
@@ -2288,6 +2304,7 @@ async def anthropic_messages(
             status_code=client_status,
             error_message=error_message,
             operator_error=operator_safe_error(exc),
+            completions_logger=completions_logger,
         )
         return _anthropic_error(client_status, error_message, error_type=err_type)
     except KeyPoolExhausted as exc:
@@ -2316,6 +2333,7 @@ async def anthropic_messages(
             status_code=429,
             error_message=error_message,
             operator_error=operator_safe_error(exc),
+            completions_logger=completions_logger,
         )
         return _anthropic_error(
             429, error_message, headers={"retry-after": str(int(KeyPool.MUTE_SECONDS))}
@@ -2349,6 +2367,7 @@ async def anthropic_messages(
             status_code=429,
             error_message=error_message,
             operator_error=operator_safe_error(exc),
+            completions_logger=completions_logger,
         )
         return _anthropic_error(429, error_message, headers={"retry-after": "1"})
     except (TimeoutError, asyncio.TimeoutError) as exc:
@@ -2376,6 +2395,7 @@ async def anthropic_messages(
             status_code=504,
             error_message=error_message,
             operator_error=operator_safe_error(exc),
+            completions_logger=completions_logger,
         )
         return _anthropic_error(504, error_message)
     except Exception as exc:
@@ -2402,6 +2422,7 @@ async def anthropic_messages(
             status_code=502,
             error_message=error_message,
             operator_error=operator_safe_error(exc),
+            completions_logger=completions_logger,
         )
         return _anthropic_error(502, error_message)
 
@@ -2453,6 +2474,7 @@ async def anthropic_messages(
             request_payload=request_payload_for_log,
             op_store=op_store,
             user_id=user_ctx.get("user_id"),
+            completions_logger=completions_logger,
         )
     return JSONResponse(content=resp)
 

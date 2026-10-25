@@ -296,3 +296,94 @@ async def test_stop_then_restart_is_not_possible_but_refusal_is_loud(caplog):
 
     assert "request_log_admission_refused" in caplog.text
     assert cl._log_store.log_request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_messages_surface_uses_bounded_queue_and_shutdown_drain(monkeypatch):
+    """`/v1/messages` no longer creates its own unbounded logging task.
+
+    The helper still accepts a store for compatibility with direct callers,
+    but when the route supplies the shared CompletionsLogger its payload must
+    go through the same bounded queue and shutdown drain as chat and
+    embeddings. The quota cost increment stays outside this assertion.
+    """
+    from serving.servers.routers import anthropic_messages as amod
+
+    store = _store()
+    cl = CompletionsLogger(log_store=store)
+    created: list[asyncio.Task] = []
+    real_create_task = asyncio.create_task
+
+    def _capture_create_task(coro, **kwargs):
+        task = real_create_task(coro, **kwargs)
+        created.append(task)
+        return task
+
+    monkeypatch.setattr(amod.asyncio, "create_task", _capture_create_task)
+    amod._schedule_log_store_task(
+        store,
+        request_id="amsg-1",
+        model_id="claude",
+        provider="anthropic",
+        usage={},
+        latency_ms=1,
+        status_code=200,
+        pricing={},
+        metadata={},
+        params={},
+        op_store=None,
+        completions_logger=cl,
+    )
+    await cl.stop()
+
+    store.log_request.assert_awaited_once_with(
+        request_id="amsg-1",
+        model_id="claude",
+        provider="anthropic",
+        prompt=[],
+        response=None,
+        usage={
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        },
+        latency_ms=1,
+        status_code=200,
+        params={},
+        metadata={},
+        pricing={},
+        ttft_ms=None,
+        error=None,
+        request_payload=None,
+    )
+    # The only worker was created by CompletionsLogger, not by the Messages
+    # helper's legacy compatibility branch.
+    assert len(created) == 1
+    assert created[0].get_name() == "request_log_worker"
+
+
+@pytest.mark.asyncio
+async def test_messages_stream_log_survives_shutdown_before_store_cleanup():
+    """Rows queued by the Messages stream are drained by app shutdown order."""
+    from serving.servers.routers import anthropic_messages as amod
+
+    store = _store()
+    cl = CompletionsLogger(log_store=store)
+    amod._schedule_log_store_task(
+        store,
+        request_id="amsg-stream",
+        model_id="claude",
+        provider="anthropic",
+        usage={"input_tokens": 3, "output_tokens": 4},
+        latency_ms=9,
+        status_code=200,
+        pricing={},
+        metadata={},
+        params={},
+        completions_logger=cl,
+    )
+    assert store.log_request.await_count == 0
+    await cl.stop()
+    assert store.log_request.await_count == 1
