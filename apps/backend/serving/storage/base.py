@@ -306,7 +306,13 @@ class OperationalStore(ABC):
         """
 
     @abstractmethod
-    async def suspend_user(self, user_id: str, **fields: Any) -> None:
+    async def suspend_user(
+        self,
+        user_id: str,
+        *,
+        expected_status: str | None = None,
+        **fields: Any,
+    ) -> None:
         """Suspend *user_id*: status, *fields*, keys and sessions in one transaction.
 
         Sets ``status='suspended'`` together with any other users-table

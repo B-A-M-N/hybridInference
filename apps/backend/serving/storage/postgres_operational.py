@@ -1510,7 +1510,13 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             else:
                 await conn.execute(sql, *params)
 
-    async def suspend_user(self, user_id: str, **fields: Any) -> None:
+    async def suspend_user(
+        self,
+        user_id: str,
+        *,
+        expected_status: str | None = None,
+        **fields: Any,
+    ) -> None:
         """Suspend *user_id* and revoke its keys and sessions atomically."""
         from .base import USERS_MUTABLE_COLUMNS
 
@@ -1529,11 +1535,17 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             # a suspension must not invalidate an in-flight erasure by
             # flipping the status under the destructive phases.
             row = await conn.fetchrow(
-                "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
+                "SELECT status, hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
                 user_id,
             )
-            if row is not None and row["hard_delete_pending"]:
+            if row is None:
+                raise UserNotFoundError(user_id)
+            if row["hard_delete_pending"]:
                 raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
+            if expected_status is not None and row["status"] != expected_status:
+                raise UserStateChanged(
+                    f"Account {user_id} changed from expected status {expected_status!r}."
+                )
             await conn.execute(f"UPDATE users SET {', '.join(set_parts)} WHERE id = $1", *params)
             await conn.execute("UPDATE api_keys SET status = 'revoked' WHERE user_id = $1", user_id)
             await conn.execute(

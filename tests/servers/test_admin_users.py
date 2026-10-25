@@ -18,6 +18,7 @@ from serving.exceptions import (
     HardDeleteRecoveryAvailable,
     HardDeleteSchemaPending,
     HardDeleteStateChanged,
+    UserStateChanged,
 )
 from serving.servers.deps import AppServices
 from serving.servers.routers import admin as admin_router
@@ -633,7 +634,33 @@ async def test_patch_user_rejects_status_change_during_hard_delete(admin_client)
     assert response.status_code == 409
     # A suspension takes dev's atomic path; the claim re-check lives in the
     # store's suspend_user transaction.
-    op_store.suspend_user.assert_awaited_once_with("u1")
+    op_store.suspend_user.assert_awaited_once_with("u1", expected_status="active")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["suspended", "active"])
+async def test_patch_user_concurrent_status_change_returns_409(admin_client, target):
+    """A status mutation cannot overwrite a concurrent soft-delete."""
+    client, op_store, _log_store, _log = admin_client
+    op_store.get_user_by_id.return_value = _user_row(
+        status="suspended" if target == "active" else "active"
+    )
+    side_effect = UserStateChanged("changed during status update")
+    if target == "suspended":
+        op_store.suspend_user.side_effect = side_effect
+    else:
+        op_store.update_user_fields.side_effect = side_effect
+
+    response = await client.patch("/admin/users/u1", headers=AUTH, json={"status": target})
+
+    assert response.status_code == 409
+    assert "changed concurrently" in response.json()["detail"]
+    if target == "suspended":
+        op_store.suspend_user.assert_awaited_once_with("u1", expected_status="active")
+    else:
+        op_store.update_user_fields.assert_awaited_once_with(
+            "u1", expected_status="suspended", status="active"
+        )
 
 
 @pytest.mark.asyncio
@@ -653,7 +680,9 @@ async def test_patch_user_plain_status_update_rejects_hard_delete_claim(admin_cl
     assert response.json()["detail"] == (
         "This account has a hard-delete in progress and cannot change status."
     )
-    op_store.update_user_fields.assert_awaited_once_with("u1", status="active")
+    op_store.update_user_fields.assert_awaited_once_with(
+        "u1", expected_status="suspended", status="active"
+    )
 
 
 @pytest.mark.asyncio
@@ -2466,10 +2495,12 @@ async def test_status_moves_only_between_active_and_suspended(
     # Only a suspension takes the key, and every signed-in session, away -- with
     # the status, in the store's one transaction rather than three writes.
     if allowed and target == "suspended":
-        op_store.suspend_user.assert_awaited_once_with("u1")
+        op_store.suspend_user.assert_awaited_once_with("u1", expected_status=current)
         op_store.update_user_fields.assert_not_awaited()
     elif allowed:
-        op_store.update_user_fields.assert_awaited_once_with("u1", status=target)
+        op_store.update_user_fields.assert_awaited_once_with(
+            "u1", expected_status=current, status=target
+        )
         op_store.suspend_user.assert_not_awaited()
     else:
         op_store.update_user_fields.assert_not_awaited()
@@ -2491,7 +2522,7 @@ async def test_a_suspension_carries_its_other_fields_into_the_same_write(admin_c
 
     assert response.status_code == 200
     op_store.suspend_user.assert_awaited_once_with(
-        "u1", suspension_message="abuse", admin_note="ticket 9"
+        "u1", expected_status="active", suspension_message="abuse", admin_note="ticket 9"
     )
     op_store.update_user_fields.assert_not_awaited()
 

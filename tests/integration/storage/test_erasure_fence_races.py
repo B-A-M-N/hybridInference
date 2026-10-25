@@ -140,6 +140,32 @@ async def _count_all(pool) -> int:
     return row["n"]
 
 
+async def test_suspension_guard_preserves_concurrent_soft_delete(fence_store):
+    """A stale validated suspension cannot overwrite a concurrent soft-delete."""
+    _log_store, pool = fence_store
+    op_store = _initialized_operational_store(pool)
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE users SET status = 'active' WHERE id = $1", _OWNER)
+
+    await op_store.delete_user(
+        _OWNER,
+        admin_ip="127.0.0.1",
+        admin_id="admin-b",
+        reason="concurrent soft-delete",
+        email=f"{_OWNER}@example.com",
+    )
+    with pytest.raises(UserStateChanged):
+        await op_store.suspend_user(
+            _OWNER,
+            expected_status="active",
+            suspension_message="stale admin action",
+        )
+
+    async with pool.acquire() as conn:
+        status = await conn.fetchval("SELECT status FROM users WHERE id = $1", _OWNER)
+    assert status == "deleted"
+
+
 async def test_patch_status_guard_preserves_concurrent_soft_delete(fence_store):
     """A stale PATCH validation cannot reactivate an account soft-deleted meanwhile."""
     _log_store, pool = fence_store

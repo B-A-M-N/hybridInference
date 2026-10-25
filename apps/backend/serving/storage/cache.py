@@ -264,9 +264,19 @@ class CachedOperationalStore(OperationalStore):
         if fields.keys() & {"role", "status"}:
             await self.invalidate_auth_caches()
 
-    async def suspend_user(self, user_id: str, **fields: Any) -> None:
+    async def suspend_user(
+        self,
+        user_id: str,
+        *,
+        expected_status: str | None = None,
+        **fields: Any,
+    ) -> None:
         """Delegate then invalidate the user and every auth entry (status and keys changed)."""
-        await self._store.suspend_user(user_id, **fields)
+        await self._store.suspend_user(
+            user_id,
+            expected_status=expected_status,
+            **fields,
+        )
         await self._cache.delete(self._user_key(user_id))
         await self.invalidate_auth_caches()
 

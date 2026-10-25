@@ -937,19 +937,33 @@ async def update_user(
         # sessions would come back on resume. Resuming does not restore them.
         fields = {k: v for k, v in user_table_updates.items() if k != "status"}
         try:
-            await op_store.suspend_user(user_id, **fields)
+            await op_store.suspend_user(user_id, expected_status=current_status, **fields)
         except HardDeleteStateChanged:
             raise HTTPException(
                 409,
                 "This account has a hard-delete in progress and cannot change status.",
             ) from None
+        except UserStateChanged:
+            raise HTTPException(
+                409,
+                f"Cannot transition from '{current_status}' to '{new_status}'. "
+                "The account changed concurrently.",
+            ) from None
     elif user_table_updates:
+        mutation_fields = dict(user_table_updates)
+        mutation_kwargs = {"expected_status": current_status} if new_status is not None else {}
         try:
-            await op_store.update_user_fields(user_id, **user_table_updates)
+            await op_store.update_user_fields(user_id, **mutation_kwargs, **mutation_fields)
         except HardDeleteStateChanged:
             raise HTTPException(
                 409,
                 "This account has a hard-delete in progress and cannot change status.",
+            ) from None
+        except UserStateChanged:
+            raise HTTPException(
+                409,
+                f"Cannot transition from '{current_status}' to '{new_status}'. "
+                "The account changed concurrently.",
             ) from None
 
     # Update key-level fields
