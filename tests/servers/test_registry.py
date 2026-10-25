@@ -1200,7 +1200,7 @@ def test_a_paid_model_without_required_role_defaults_to_pro(tmp_path, monkeypatc
     p = tmp_path / "models.yaml"
     p.write_text(_paid_and_free_yaml())
 
-    exe = RouteExecutor()
+    exe = FixedRouter()
     registry.register_from_models_yaml(exe, Path(p))
 
     assert exe.routes["claude-compat"].required_role == "pro"
@@ -1217,7 +1217,7 @@ def test_endpointless_anthropic_defaults_to_pro_through_yaml_registry(tmp_path):
         "    provider: anthropic\n"
     )
 
-    exe = RouteExecutor()
+    exe = FixedRouter()
     registry.register_from_models_yaml(exe, Path(p))
 
     assert exe.routes["claude-endpointless"].required_role == "pro"
@@ -1242,7 +1242,7 @@ def test_admin_only_model_without_required_role_stays_admin(tmp_path):
         "        base_url: https://paid.example.test/v1\n"
     )
 
-    exe = RouteExecutor()
+    exe = FixedRouter()
     registry.register_from_models_yaml(exe, Path(p))
 
     assert exe.routes["admin-paid"].admin_only is True
@@ -1270,7 +1270,7 @@ def test_explicit_required_role_still_wins_over_the_pricing_default(tmp_path):
     p = tmp_path / "models.yaml"
     p.write_text(yaml_text)
 
-    exe = RouteExecutor()
+    exe = FixedRouter()
     registry.register_from_models_yaml(exe, Path(p))
 
     assert exe.routes["sponsored-pro"].admin_only is False
@@ -1296,7 +1296,7 @@ def test_explicit_free_role_can_sponsor_zero_priced_remote_route(tmp_path):
     p = tmp_path / "models.yaml"
     p.write_text(yaml_text)
 
-    exe = RouteExecutor()
+    exe = FixedRouter()
     registry.register_from_models_yaml(exe, Path(p))
 
     assert exe.routes["sponsored-zero-price"].required_role == "free"
@@ -1369,7 +1369,7 @@ def test_unknown_cost_external_routes_default_to_pro_not_free(tmp_path, monkeypa
     p = tmp_path / "models.yaml"
     p.write_text(_unknown_cost_yaml())
 
-    exe = RouteExecutor()
+    exe = FixedRouter()
     registry.register_from_models_yaml(exe, Path(p))
 
     assert exe.routes["zero-priced-remote"].required_role == "pro"
@@ -1411,7 +1411,7 @@ def test_route_level_pricing_makes_the_model_paid_even_when_model_pricing_is_zer
     p = tmp_path / "models.yaml"
     p.write_text(yaml_text)
 
-    exe = RouteExecutor()
+    exe = FixedRouter()
     registry.register_from_models_yaml(exe, Path(p))
 
     assert exe.routes["hybrid-cost"].required_role == "pro"
@@ -1448,7 +1448,7 @@ def test_a_scheduled_price_makes_the_model_paid(tmp_path):
     p = tmp_path / "models.yaml"
     p.write_text(yaml_text)
 
-    exe = RouteExecutor()
+    exe = FixedRouter()
     registry.register_from_models_yaml(exe, Path(p))
 
     assert exe.routes["scheduled"].required_role == "pro"

@@ -265,7 +265,7 @@ async def test_example_chat_is_public_but_unpriced_external_route_stays_restrict
     monkeypatch.setenv("EXAMPLE_UPSTREAM_API_KEY", "example-key")
     monkeypatch.setenv("EXAMPLE_UPSTREAM_MODEL", "example-upstream")
 
-    router = RouteExecutor()
+    router = FixedRouter()
     example_models = (
         Path(__file__).resolve().parents[2] / "distributions/example/config/models.yaml"
     )
@@ -630,7 +630,7 @@ async def test_embedding_model_list_obeys_role_and_visibility_override():
     from serving.config.model_visibility import ModelVisibilityResolver
     from serving.servers.auth import optional_verify_api_key
 
-    router = RouteExecutor()
+    router = FixedRouter()
     embedding_cfg = _cfg(id="restricted-embed", provider="embedder")
     embedding_cfg.model_type = "embedding"
     embedding = _Adapter(embedding_cfg)
@@ -660,7 +660,7 @@ async def test_embedding_model_list_obeys_role_and_visibility_override():
 
 @pytest.mark.asyncio
 async def test_embedding_model_list_hides_admin_only_model_from_free_user():
-    router = RouteExecutor()
+    router = FixedRouter()
     embedding_cfg = _cfg(id="admin-embed", provider="embedder")
     embedding_cfg.model_type = "embedding"
     embedding = _Adapter(embedding_cfg)

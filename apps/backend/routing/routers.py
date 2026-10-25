@@ -1578,7 +1578,7 @@ class FixedRouter:
     ) -> None:
         """Record the access gate for an embedding model.
 
-        Embedding models bypass the weighted RouteExecutor, so they get no
+        Embedding models bypass the weighted FixedRouter, so they get no
         entry in ``routes`` — where the chat surface reads a route's
         ``required_role`` / ``admin_only``. Registered there anyway, the
         model-level declaration would be dead config and /v1/embeddings

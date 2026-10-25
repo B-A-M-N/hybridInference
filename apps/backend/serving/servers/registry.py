@@ -974,7 +974,7 @@ def register_from_models_yaml(
                     embedding_adapters[model_id] = emb_adapter
                     for alias in aliases:
                         embedding_adapters[alias] = emb_adapter
-                    # Embedding models bypass the weighted RouteExecutor.
+                    # Embedding models bypass the weighted FixedRouter.
                     # Record their gate only when an adapter was configured;
                     # an optional route whose environment is unset is skipped.
                     admin_only, required_role = _parse_role_gate(m, model_id)
@@ -994,7 +994,7 @@ def register_from_models_yaml(
                         )
                     count += 1 + len(aliases)
             else:
-                # Chat models go through the full FixedRouter.
+                # Chat models go through the full FixedRouter
                 admin_only, required_role = _parse_role_gate(m, model_id)
                 router.register_route(
                     model_id,
