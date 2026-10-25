@@ -272,7 +272,8 @@ function TtftScatterCard({ model }: { model: AdminTtftScatterModel }) {
     const header = 'timestamp,prompt_tokens,ttft_ms,cache_hit\n';
     const body = safePoints
       .map(
-        (p) => `${p.timestamp},${p.prompt_tokens},${p.ttft_ms},${p.cache_hit === null ? 'unknown' : p.cache_hit ? 'true' : 'false'}`,
+        (p) =>
+          `${p.timestamp},${p.prompt_tokens},${p.ttft_ms},${p.cache_hit === null ? 'unknown' : p.cache_hit ? 'true' : 'false'}`,
       )
       .join('\n');
     const blob = new Blob([`${header}${body}\n`], { type: 'text/csv;charset=utf-8' });

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
@@ -35,7 +35,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.dbtest]
 
 _PROVIDER = "sglang"
 _MODEL = "deepseek-v4.1-flash"
-_BASE = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+_BASE = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 
 
 class _Pool:
@@ -254,7 +254,7 @@ async def test_anthropic_logging_persists_unknown_and_measured_zero(pool):
 async def test_ttft_scatter_keeps_unknown_cache_rows_distinct(pool):
     """Unknown cache rows do not appear in either measured cache class."""
     pool, prefix = pool
-    timestamp = datetime.now(timezone.utc)
+    timestamp = datetime.now(UTC)
     await pool.executemany(
         "INSERT INTO api_logs (request_id, model_id, provider, timestamp, prompt_tokens,"
         " cache_read_tokens, ttft_ms, stream, status_code)"
