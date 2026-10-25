@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import functools
 import os
 import random
 from dataclasses import dataclass
@@ -20,10 +21,11 @@ from dotenv import load_dotenv
 
 from routing.dependencies import RouterBuildDependencies
 from routing.endpoint_health import EndpointHealthRegistry
-from routing.executor import RouteExecutor
 from routing.manager import RoutingManager
 from routing.model_router_registry import ModelRouterRegistry
+from routing.routers import FixedRouter
 from serving.auto_mode import AutoMode, load_auto_mode
+from serving.batch.model_limits import BatchModelLimits
 from serving.config import app_config
 from serving.config.app_config_store import AppConfigStore, connect as connect_app_config
 from serving.config.disabled_providers import DisabledProviderResolver
@@ -31,6 +33,7 @@ from serving.config.distribution import resolve_config_path
 from serving.config.model_concurrency import ModelConcurrencyResolver
 from serving.config.model_visibility import ModelVisibilityResolver
 from serving.config.offload_routes import AppliedOffloadPolicies, OffloadRouteResolver
+from serving.config.route_states import RouteStateResolver
 from serving.config.settings import get_settings
 from serving.config.weight_overrides import WeightOverrideResolver
 from serving.extensions import load_backend_extensions
@@ -42,6 +45,7 @@ from serving.servers.routewise_compat import (
     apply_routewise_settings_to_router,
 )
 from serving.setup_state import init_setup_state
+from serving.storage.batch_store import BatchStore
 from serving.storage.cache import CachedOperationalStore, InMemoryCache
 from serving.storage.database import DatabaseLogger
 from serving.storage.log_schema import ErasureFenceUnavailable, SchemaLockUnavailable
@@ -103,7 +107,7 @@ def _describe_exc(exc: BaseException) -> str:
 
 def _schedule_deferred_schema_migration(
     ensure_schema: Callable[[], Awaitable[None]], subject: str
-) -> None:
+) -> asyncio.Task[None]:
     """Finish a lock-blocked schema migration in the background.
 
     Startup must not block on it. The lock holder is typically a long-running
@@ -113,7 +117,8 @@ def _schedule_deferred_schema_migration(
 
     ``ensure_schema`` must be idempotent (both schema passes are catalog-gated,
     so a retry re-issues only what is still missing); ``subject`` names the
-    schema in log lines so concurrent deferrals stay distinguishable.
+    schema in log lines so concurrent deferrals stay distinguishable. Returns
+    the retry task, which an owner may cancel.
     """
 
     async def _retry() -> None:
@@ -143,6 +148,7 @@ def _schedule_deferred_schema_migration(
     task = asyncio.create_task(_retry())
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
 
 
 async def _initialize_operational_store(pg_operational: PostgresOperationalStore) -> None:
@@ -181,6 +187,80 @@ async def _initialize_operational_store(pg_operational: PostgresOperationalStore
             "the migration in the background."
         )
         _schedule_deferred_schema_migration(pg_operational.initialize, "operational schema")
+
+
+async def _initialize_batch_store(store: BatchStore) -> bool:
+    """Run the batch store's DDL; return whether the store is ready to serve.
+
+    A migration that cannot get its lock (another process holding the batch
+    schema lock, or a long reader on a table it indexes) does not fail startup:
+    the caller finishes it in the background (:func:`_defer_batch_store`).
+    Unlike the operational store, nothing is served from a batch schema that is
+    still missing changes, so batch inference stays unavailable until then.
+
+    Anything other than a lock timeout propagates.
+    """
+    try:
+        await store.initialize()
+    except SchemaLockUnavailable as lock_exc:
+        logger.warning(
+            f"Batch schema migration deferred: {_describe_exc(lock_exc)}. "
+            "Batch inference stays unavailable until it lands; retrying in the background."
+        )
+        return False
+    return True
+
+
+class _DeferredBatchWorker:
+    """Holds the batch worker's place while the batch schema migration is deferred.
+
+    It answers the two calls the gateway makes on a worker: ``notify`` (nothing
+    to wake) and ``stop``, which cancels the deferred migration so no worker
+    starts after shutdown. The app lifespan leaves its app here, for the worker
+    the migration starts once it lands.
+    """
+
+    def __init__(self) -> None:
+        self.app: Any | None = None
+        self.retry: asyncio.Task[None] | None = None
+
+    def notify(self) -> None:
+        """Do nothing: there is no worker to wake yet."""
+
+    async def stop(self) -> None:
+        """Cancel the deferred migration."""
+        if self.retry is not None:
+            self.retry.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.retry
+
+
+def _defer_batch_store(services: AppServices, store: BatchStore) -> None:
+    """Finish a lock-blocked batch schema migration, then make batch inference available.
+
+    Until the DDL lands the services carry no batch store and no caps, so every
+    batch route answers 404, and a placeholder stands where the worker goes; the
+    store is reachable only as ``batch_store_pending``, for the hard-delete purge,
+    since batches stored before this boot are still there. Once it lands, the
+    store and its caps are published together, and the worker starts if the app
+    has asked for one by then.
+    """
+    placeholder = _DeferredBatchWorker()
+    services.batch_scheduler = placeholder
+    services.batch_store_pending = store
+
+    async def finish() -> None:
+        await store.initialize()  # SchemaLockUnavailable: retried by the caller
+        services.batch_model_limits = BatchModelLimits(store)
+        services.batch_store = store
+        services.batch_store_pending = None
+        logger.info("Batch store initialized (Postgres) after a deferred migration")
+        if services.batch_scheduler is placeholder:
+            services.batch_scheduler = None
+            if placeholder.app is not None:
+                start_batch_scheduler(placeholder.app, services)
+
+    placeholder.retry = _schedule_deferred_schema_migration(finish, "batch schema")
 
 
 class _RouteWiseRouterTypeError(TypeError):
@@ -340,6 +420,76 @@ async def _refresh_disabled_provider_snapshots(
             logger.warning("Disabled provider snapshot refresh failed", exc_info=True)
 
 
+async def _refresh_route_state_snapshots(
+    resolver: RouteStateResolver,
+    model_router_registry: ModelRouterRegistry | None = None,
+    *,
+    interval_seconds: float = 10.0,
+    router: Any | None = None,
+    apply_removals: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    """Periodically reload disabled/removed routes so workers converge after admin edits.
+
+    ``apply_removals`` is what boot could not do: take deleted config routes
+    out of the route table. It runs once, after the first reload that
+    succeeds, and again on the next one if it fails.
+    """
+    refresh_state = _EffectiveRouteRefreshState()
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            changed = await _reload_effective_route_state(
+                resolver,
+                model_router_registry,
+                refresh_state,
+            )
+            if apply_removals is not None:
+                await apply_removals()
+                apply_removals = None
+            if changed:
+                _report_route_weight_divergence(router)
+        except Exception:
+            logger.warning("Route state snapshot refresh failed", exc_info=True)
+
+
+async def _attach_route_states(router: Any, store: Any) -> RouteStateResolver:
+    """Attach the per-route admin state resolver to the shared router, loaded if it can be.
+
+    Attached even when the first load fails, as the offload resolver is: the
+    refresh loop retries the read, and until it lands routing sees no route
+    states while the admin state endpoints refuse to write (``ready``).
+    """
+    resolver = RouteStateResolver(store)
+    try:
+        await resolver.load_all()
+    except Exception:
+        logger.warning(
+            "Route state snapshot load failed; retrying in the background",
+            exc_info=True,
+        )
+    router.route_state_resolver = resolver
+    return resolver
+
+
+async def _apply_route_removals_after_boot(services: AppServices) -> None:
+    """Take deleted config routes out of the route table once the states load after boot.
+
+    Admin requests are served by then, so each model's removals run under the
+    transition lock its admin edits take.
+    """
+    from serving.servers.deps import model_router_transition_lock
+    from serving.servers.routers.admin.provider_routes import (
+        apply_persisted_provider_route_removals,
+    )
+
+    resolver = services.route_state_resolver
+    if resolver is None:
+        return
+    for model_id in sorted({model_id for model_id, _route_id in resolver.removed_routes()}):
+        async with model_router_transition_lock(services, model_id):
+            apply_persisted_provider_route_removals(services, model_ids={model_id})
+
+
 async def _refresh_offload_route_snapshots(
     resolver: OffloadRouteResolver,
     *,
@@ -446,7 +596,7 @@ async def _bootstrap_routewise_from_logs(
     """
     if log_store is None:
         return
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     for rw in routewise_routers:
         if not rw.config.db_bootstrap_enabled:
             continue
@@ -528,7 +678,7 @@ async def _bootstrap_routewise_from_probe_samples(
     """Best-effort warmup of RouteWise latency state from persisted probes."""
     if operational_store is None:
         return
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     for rw in routewise_routers:
         if not rw.config.db_bootstrap_enabled:
             continue
@@ -673,7 +823,7 @@ def _init_db_logger() -> DatabaseLogger | None:
 
 
 async def _init_router_and_models(
-    router: RouteExecutor,
+    router: FixedRouter,
 ) -> tuple[dict, list[ModelRegistrationInfo]]:
     """Register models on the router from YAML configuration.
 
@@ -736,7 +886,7 @@ async def _init_router_and_models(
     return embedding_adapters, model_infos
 
 
-def _load_auto_mode(router: RouteExecutor) -> AutoMode | None:
+def _load_auto_mode(router: FixedRouter) -> AutoMode | None:
     """Load the ``auto:`` section of the models registry, or ``None`` to leave auto off.
 
     Called once the route table is complete -- the registry's models and the
@@ -806,7 +956,7 @@ def _attach_hybrid_router_factory(
         logger.warning(f"Hybrid router composition not enabled: {exc}")
 
 
-def _apply_routing_manager(router: RouteExecutor) -> RoutingManager | None:
+def _apply_routing_manager(router: FixedRouter) -> RoutingManager | None:
     """Optionally load the routing manager and apply weights from YAML.
 
     Returns:
@@ -880,7 +1030,7 @@ async def initialize() -> AppServices:
         raise
 
     endpoint_health_registry = EndpointHealthRegistry()
-    router = RouteExecutor(health_registry=endpoint_health_registry)
+    router = FixedRouter(health_registry=endpoint_health_registry)
     router_dependencies = RouterBuildDependencies(
         health_registry=endpoint_health_registry,
         prefill_load=router.prefill_load,
@@ -940,16 +1090,20 @@ async def initialize() -> AppServices:
                             user_usage_rollup.register_rollup_job(sched, db_logger.pool)
                             daily_activity_rollup.register_rollup_job(sched, db_logger.pool)
 
-                            # Failed-request Slack alerter (no-op if
-                            # SLACK_WEBHOOK_URL is unset).
+                            # Failed-request alerter (no-op unless
+                            # SLACK_WEBHOOK_URL or WECOM_ALERTS_WEBHOOK_URL
+                            # is set).
                             from serving.admin.failed_request_alerter import (
                                 register_alerter_job,
                             )
 
                             register_alerter_job(db_logger.pool, settings)
-                        elif settings.slack_webhook_url.strip():
+                        elif (
+                            settings.slack_webhook_url.strip()
+                            or settings.wecom_alerts_webhook_url.strip()
+                        ):
                             logger.warning(
-                                "Slack alerter not registered: APScheduler did not start"
+                                "Failed-request alerter not registered: APScheduler did not start"
                             )
 
                         # Roll up the hours of the last 30 days that
@@ -1178,6 +1332,9 @@ async def initialize() -> AppServices:
     operational_store = None
     log_store = None
     responses_store = None
+    batch_store = None
+    batch_model_limits = None
+    deferred_batch_store = None
 
     if db_logger and db_logger.pool:
         # Resolve the erasure-fence derivation secret. Fail closed: if no
@@ -1212,6 +1369,16 @@ async def initialize() -> AppServices:
             "Responses store initialized (Postgres; persist_enabled=%s)",
             settings.db_store_full_content,
         )
+        # The batch store is built whenever there is a database, whatever
+        # BATCH_ENABLED says, so the surface can be turned on at runtime and the
+        # hard-delete purge reaches stored batches. The per-model caps an
+        # administrator sets are read through a short-lived cache in front of it.
+        batch_store = BatchStore(db_logger.pool)
+        if await _initialize_batch_store(batch_store):
+            batch_model_limits = BatchModelLimits(batch_store)
+            logger.info("Batch store initialized (Postgres)")
+        else:
+            deferred_batch_store, batch_store = batch_store, None
     for rw in routewise_routers:
         rw.attach_operational_store(operational_store)
 
@@ -1281,6 +1448,10 @@ async def initialize() -> AppServices:
     # adapter key pools registered during model loading. Best-effort —
     # a failure here should not prevent the server from starting.
     restored_routewise_model_ids: set[str] = set()
+    route_state_resolver: RouteStateResolver | None = None
+    # Set when boot could not take deleted config routes out of the table, so
+    # the route-state refresh loop does it once the states can be read.
+    late_route_removals: Callable[[], Awaitable[None]] | None = None
     if operational_store is not None:
         try:
             from serving.adapters.provider_registry import apply_provider_definitions_at_boot
@@ -1309,14 +1480,23 @@ async def initialize() -> AppServices:
                 apply_persisted_model_router_strategy_overrides,
                 apply_persisted_provider_route_candidates,
                 apply_persisted_provider_route_configs,
+                apply_persisted_provider_route_removals,
+                sync_route_capability_overrides,
             )
 
+            # Loaded before any route is restored, so a disabled or removed
+            # route is never selectable, not even while boot is still running.
+            route_state_resolver = await _attach_route_states(router, operational_store)
             provider_route_services = AppServices(
                 router=router,
                 operational_store=operational_store,
                 model_router_registry=model_router_registry,
                 managed_routers=managed_routers,
                 model_router_transition_locks=model_router_transition_locks,
+                route_state_resolver=route_state_resolver,
+            )
+            late_route_removals = functools.partial(
+                _apply_route_removals_after_boot, provider_route_services
             )
             await apply_persisted_model_router_strategy_overrides(
                 provider_route_services,
@@ -1347,6 +1527,17 @@ async def initialize() -> AppServices:
                 provider_route_services,
                 operational_store,
             )
+            # After the routes above, so every route an override names is in
+            # place: models.yaml routes, restored runtime routes and their
+            # target overrides. Before the removals, so a deleted config route
+            # still counts as served; restoring it re-applies its override.
+            await sync_route_capability_overrides(
+                provider_route_services,
+                operational_store,
+            )
+            apply_persisted_provider_route_removals(provider_route_services)
+            if route_state_resolver.ready:
+                late_route_removals = None
         except _RouteWiseRouterTypeError:
             raise
         except Exception as exc:
@@ -1445,6 +1636,7 @@ async def initialize() -> AppServices:
     weight_override_refresh_task = None
     disabled_provider_resolver = None
     disabled_provider_refresh_task = None
+    route_state_refresh_task = None
     offload_route_resolver = None
     offload_route_refresh_task = None
     if operational_store is not None:
@@ -1529,6 +1721,17 @@ async def initialize() -> AppServices:
             logger.info("Disabled provider resolver initialized")
         except Exception as exc:
             logger.warning(f"Disabled provider resolver initialization failed: {exc}")
+        if route_state_resolver is not None:
+            route_state_refresh_task = asyncio.create_task(
+                _refresh_route_state_snapshots(
+                    route_state_resolver,
+                    model_router_registry,
+                    router=router,
+                    apply_removals=late_route_removals,
+                )
+            )
+            _BACKGROUND_TASKS.add(route_state_refresh_task)
+            route_state_refresh_task.add_done_callback(_BACKGROUND_TASKS.discard)
         # Attached even when the first load fails: an empty snapshot routes
         # exactly as a gateway without offload routes does, and the refresh loop
         # picks the stored policies up on its next pass instead of leaving them
@@ -1599,10 +1802,7 @@ async def initialize() -> AppServices:
     # instance via ``deps.get_completions_logger``.
     from serving.servers.routers.completions_logging import CompletionsLogger
 
-    completions_logger = CompletionsLogger(
-        log_store=log_store,
-        model_router_registry=model_router_registry,
-    )
+    completions_logger = CompletionsLogger(log_store=log_store)
 
     # PricingLookup + CostTracker — encapsulate the four pricing-lookup
     # blocks and the ``_schedule_cost_increment`` helper that previously
@@ -1674,7 +1874,7 @@ async def initialize() -> AppServices:
     if runtime_settings is not None:
         runtime_settings.start_refresh()
 
-    return AppServices(
+    services = AppServices(
         router=router,
         embedding_adapters=embedding_adapters or None,
         db_logger=db_logger,
@@ -1689,6 +1889,7 @@ async def initialize() -> AppServices:
         routewise_settings_resolver=routewise_settings_resolver,
         weight_override_resolver=weight_override_resolver,
         disabled_provider_resolver=disabled_provider_resolver,
+        route_state_resolver=route_state_resolver,
         offload_route_resolver=offload_route_resolver,
         user_concurrency_limiter=user_concurrency_limiter,
         alert_engine=alert_engine,
@@ -1699,11 +1900,76 @@ async def initialize() -> AppServices:
         cost_tracker=cost_tracker,
         responses_store=responses_store,
         auto_mode=auto_mode,
+        batch_store=batch_store,
+        batch_model_limits=batch_model_limits,
         routewise_settings_refresh_task=routewise_settings_refresh_task,
         weight_override_refresh_task=weight_override_refresh_task,
         disabled_provider_refresh_task=disabled_provider_refresh_task,
+        route_state_refresh_task=route_state_refresh_task,
         offload_route_refresh_task=offload_route_refresh_task,
     )
+    if deferred_batch_store is not None:
+        _defer_batch_store(services, deferred_batch_store)
+    return services
+
+
+def start_batch_scheduler(app: Any, services: AppServices) -> None:
+    """Start the in-process batch worker when there is a batch store.
+
+    Called from the app lifespan once ``app.state.services`` is set: the worker
+    runs each batch request through the chat-completions handler with a
+    synthetic request whose scope carries the live app. It starts whether or not
+    ``BATCH_ENABLED`` is on, reads the setting every round and claims nothing
+    while it is off, so turning batches on needs no restart.
+
+    A worker that fails to start is logged and left out rather than taking the
+    gateway down; stored batches wait for a process whose worker runs.
+
+    Args:
+        app: The FastAPI application the worker dispatches through.
+        services: The services container returned by :func:`initialize`.
+    """
+    current = getattr(services, "batch_scheduler", None)
+    if isinstance(current, _DeferredBatchWorker):
+        # The batch schema migration is still waiting for its lock; it starts
+        # the worker once it lands.
+        current.app = app
+        return
+    store = getattr(services, "batch_store", None)
+    if store is None or current is not None:
+        return
+    try:
+        # Imported here, like the admin routers in initialize(): the worker
+        # imports the chat-completions handler, and this module stays
+        # importable without the HTTP layer.
+        from serving.batch.scheduler import BatchScheduler
+
+        if services.batch_model_limits is None:
+            services.batch_model_limits = BatchModelLimits(store)
+        scheduler = BatchScheduler(
+            app=app,
+            services=services,
+            store=store,
+            limits=services.batch_model_limits,
+        )
+        scheduler.start()
+    except Exception:
+        logger.exception("Batch scheduler failed to start; this process will not run batches")
+        return
+    services.batch_scheduler = scheduler
+    logger.info("Batch scheduler started")
+
+
+async def _stop_batch_scheduler(services: AppServices) -> None:
+    """Stop the batch worker, handing its unfinished requests back to the queue."""
+    scheduler = getattr(services, "batch_scheduler", None)
+    if scheduler is None:
+        return
+    try:
+        await scheduler.stop()
+    except Exception:
+        logger.exception("Batch scheduler shutdown failed")
+    services.batch_scheduler = None
 
 
 async def shutdown(services: AppServices) -> None:
@@ -1712,6 +1978,11 @@ async def shutdown(services: AppServices) -> None:
     Args:
         services: The services container returned by :func:`initialize`.
     """
+    # The batch worker first: its in-flight requests run through the whole
+    # serving stack (router, pricing, stores), so it stops before any of that
+    # is torn down.
+    await _stop_batch_scheduler(services)
+
     if services.pricing_sync is not None:
         await services.pricing_sync.stop()
         from serving.pricing import bind_pricing_snapshot_provider
@@ -1794,6 +2065,11 @@ async def shutdown(services: AppServices) -> None:
         services.disabled_provider_refresh_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await services.disabled_provider_refresh_task
+
+    if services.route_state_refresh_task is not None:
+        services.route_state_refresh_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await services.route_state_refresh_task
 
     if services.offload_route_refresh_task is not None:
         services.offload_route_refresh_task.cancel()

@@ -510,6 +510,21 @@ class OperationalStore(ABC):
         """
 
     @abstractmethod
+    async def get_auth_context_with_spend(self, key_hash: str) -> Row | None:
+        """Auth context plus today's spend, for one round-trip (issue #185).
+
+        Same projection and the same active-key/active-user filters as
+        :meth:`get_auth_context_by_key_hash`, plus a ``cost_usd`` field: the
+        ``user_daily_cost`` counter for the key's owner, UTC-midnight day,
+        ``0.0`` when no counter row exists. ``None`` means the key did not
+        resolve, exactly like the identity-only lookup.
+
+        Not cached: the quota gate reads ``cost_usd`` on every request, and
+        caching the merged row would stale the gate by the auth TTL. The
+        identity-only lookup above keeps its cache; this one stays fresh.
+        """
+
+    @abstractmethod
     async def get_auth_context_lightweight(self, key_hash: str) -> Row | None:
         """Lightweight identity lookup (no quota check, no last_used write).
 
@@ -1265,6 +1280,32 @@ class OperationalStore(ABC):
         """Delete a provider weight override row. Returns True if removed."""
 
     @abstractmethod
+    async def list_route_capability_overrides_for_model(self, model_id: str) -> list[Row]:
+        """Return admin capability overrides for one model's routes, ordered by route_id."""
+
+    @abstractmethod
+    async def list_all_route_capability_overrides(self) -> list[Row]:
+        """Return all admin capability override rows ordered by model_id and route_id."""
+
+    @abstractmethod
+    async def upsert_route_capability_override(
+        self,
+        model_id: str,
+        route_id: str,
+        capabilities: dict[str, Any],
+        updated_by: str | None,
+    ) -> None:
+        """Upsert the capabilities an admin set for one route.
+
+        The row overrides what the route was given by ``models.yaml`` or declared
+        with when it was created; deleting it returns the route to that value.
+        """
+
+    @abstractmethod
+    async def delete_route_capability_override(self, model_id: str, route_id: str) -> bool:
+        """Delete one route's capability override. Returns True if removed."""
+
+    @abstractmethod
     async def list_provider_route_configs_for_model(self, model_id: str) -> list[Row]:
         """Return provider route override rows for one model ordered by route_id."""
 
@@ -1285,6 +1326,7 @@ class OperationalStore(ABC):
         quota_limit: int | None,
         concurrency_limit: int | None,
         updated_by: str | None,
+        deployment_type: str | None = None,
     ) -> None:
         """Upsert a runtime provider route override row."""
 
@@ -1315,9 +1357,83 @@ class OperationalStore(ABC):
         concurrency_limit: int | None,
         weight: float,
         pricing: dict[str, str] | None,
+        capabilities: dict[str, Any] | None,
         updated_by: str | None,
+        deployment_type: str = "auto",
+        endpoint_id: str | None = None,
     ) -> None:
-        """Upsert a DB-backed runtime provider route candidate."""
+        """Upsert a DB-backed runtime provider route candidate.
+
+        ``capabilities`` holds a runtime model's declared context window, output
+        cap, input modalities and tool support. None declares nothing: a new
+        row stores NULL and an existing row keeps what it has, so a stored
+        declaration is never cleared by a write that did not carry one.
+        ``endpoint_id`` is the route's endpoint id when an edit moved it away
+        from ``route_id``; None means the two are the same.
+        """
+
+    @abstractmethod
+    async def update_provider_route_candidate(
+        self,
+        model_id: str,
+        route_id: str,
+        *,
+        expected_updated_at: datetime,
+        provider: str,
+        openrouter_sort: str | None,
+        base_url: str,
+        api_key_id: str | None,
+        provider_model_id: str,
+        quota_limit: int | None,
+        concurrency_limit: int | None,
+        pricing: dict[str, str] | None,
+        deployment_type: str,
+        endpoint_id: str | None,
+        previous_endpoint_id: str,
+        updated_by: str | None,
+    ) -> datetime | None:
+        """Edit one runtime provider route candidate in place.
+
+        The row is written only while its ``updated_at`` still equals
+        ``expected_updated_at``, so an edit made from stale state matches
+        nothing. ``endpoint_id`` None means the route's endpoint id is its
+        ``route_id``. When the effective endpoint id differs from
+        ``previous_endpoint_id``, the route's weight override moves with it in
+        the same transaction, replacing any leftover row at the new id. Route
+        type, weight and capabilities are left as stored.
+
+        Returns the row's new ``updated_at``, or None when no row matched.
+        """
+
+    @abstractmethod
+    async def list_all_provider_route_states(self) -> list[Row]:
+        """Return every route's admin state: disabled and/or removed, by (model, route id)."""
+
+    @abstractmethod
+    async def set_provider_route_state(
+        self,
+        model_id: str,
+        route_id: str,
+        *,
+        disabled: bool,
+        removed: bool,
+        updated_by: str | None,
+        expected_disabled: bool | None = None,
+        expected_removed: bool | None = None,
+    ) -> bool:
+        """Store one route's admin state; neither flag set deletes its row.
+
+        ``disabled`` keeps the route configured but out of selection, retries,
+        fallback and offload. ``removed`` takes a config (models.yaml) route out
+        of this deployment without touching the file. Both are keyed by the
+        route id, which survives edits that move the route's endpoint.
+
+        ``expected_disabled`` and ``expected_removed`` (given together) make the
+        write a compare-and-set: it happens only while the stored flags still
+        equal them, a route without a row counting as neither flag set, so a
+        write built from a stale snapshot cannot overwrite the other flag.
+        Returns whether the state was written (always True without them).
+        """
 
     @abstractmethod
     async def delete_provider_route_candidate(self, model_id: str, route_id: str) -> bool:
@@ -1329,7 +1445,7 @@ class OperationalStore(ABC):
         model_id: str,
         route_id: str,
     ) -> bool:
-        """Atomically delete a route candidate and any matching override row."""
+        """Atomically delete a route candidate, its override row and its route state."""
 
     @abstractmethod
     async def delete_runtime_model_state(

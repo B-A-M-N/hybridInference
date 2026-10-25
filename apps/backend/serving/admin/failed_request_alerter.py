@@ -1,29 +1,23 @@
-"""Periodic Slack alerter for spikes in service-side request failures.
+"""Periodic alerter for spikes in service-side request failures.
 
 Counts rows in ``api_logs`` where ``status_code >= 500`` or ``error IS NOT NULL``
-over a sliding window and posts to a Slack incoming webhook when the count
-exceeds a configured threshold. A cooldown prevents duplicate alerts during
-sustained incidents. Empty ``SLACK_WEBHOOK_URL`` disables the feature entirely.
+over a sliding window and raises an alert when the count exceeds a configured
+threshold. A cooldown prevents duplicate alerts during sustained incidents.
+With both ``SLACK_WEBHOOK_URL`` and ``WECOM_ALERTS_WEBHOOK_URL`` empty, the
+feature is disabled entirely.
 
-Slack delivery now goes through :func:`serving.observability.alerts.alert_slack`,
-the unified sink for the new alerting framework. The legacy
-:func:`post_slack_alert` helper is kept as a thin wrapper for backward
-compatibility (existing call-sites and tests) and delegates to the framework's
-``_post_to_slack``.
+Delivery goes through :func:`serving.observability.alerts.alert_slack`, which
+sends to the one configured channel.
 """
 
 from __future__ import annotations
 
-import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
-
-import httpx  # retained for backward-compat import symbol used by tests
 
 from serving.observability.alerts import AlertSeverity, alert_on_transition
 from serving.utils.email_scheduler import get_scheduler
 from serving.utils.logging import get_logger
-from serving.utils.secret_urls import posting_to, scrub
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -194,48 +188,9 @@ async def fetch_failure_breakdown(pool: asyncpg.Pool, window_minutes: int) -> di
         return {}
 
 
-async def post_slack_alert(webhook_url: str, message: str) -> bool:
-    """POST ``{"text": message}`` to a Slack incoming webhook.
-
-    This wrapper performs its own ``httpx`` POST so that existing callers and
-    test patch-points continue to work.  Network and HTTP errors are caught
-    and logged; this function never raises.
-
-    Args:
-        webhook_url: Slack incoming-webhook URL.
-        message: Plain-text message body.
-
-    Returns:
-        True when Slack returned a 2xx response, False on any error.
-    """
-    # Same credential-in-the-URL problem as the framework sender: httpx logs the
-    # full request URL at INFO, and for a Slack webhook that URL is the secret.
-    # See :mod:`serving.utils.secret_urls`.
-    with posting_to(webhook_url) as sink:
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(webhook_url, json={"text": message})
-            if 200 <= resp.status_code < 300:
-                return True
-            logger.warning(
-                "Slack webhook returned non-2xx: status=%d sink=%s body=%s",
-                resp.status_code,
-                sink,
-                scrub(resp.text[:200], webhook_url),
-            )
-            return False
-        except Exception:
-            logger.error(
-                "Slack webhook POST failed: sink=%s\n%s",
-                sink,
-                scrub(traceback.format_exc(), webhook_url),
-            )
-            return False
-
-
 def _utcnow() -> datetime:
     """Default time source — timezone-aware UTC ``datetime``."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class FailedRequestAlerter:
@@ -250,7 +205,6 @@ class FailedRequestAlerter:
     def __init__(
         self,
         pool: asyncpg.Pool,
-        webhook_url: str,
         threshold: int,
         window_minutes: int,
         cooldown_minutes: int,
@@ -262,7 +216,6 @@ class FailedRequestAlerter:
 
         Args:
             pool: asyncpg pool used to query ``api_logs``.
-            webhook_url: Slack incoming-webhook URL.
             threshold: Strict greater-than threshold; ``count > threshold`` fires.
             window_minutes: Sliding-window size for the failure count.
             cooldown_minutes: Minimum interval between alerts.
@@ -274,7 +227,6 @@ class FailedRequestAlerter:
                 a quiet window (1 failure out of 3 requests) does not page.
         """
         self.pool = pool
-        self.webhook_url = webhook_url
         self.threshold = threshold
         self.window_minutes = window_minutes
         self.cooldown_minutes = cooldown_minutes
@@ -367,16 +319,20 @@ class FailedRequestAlerter:
 def register_alerter_job(pool: asyncpg.Pool, settings: Settings) -> None:
     """Register the failure-rate alerter on the running APScheduler.
 
-    Empty ``settings.slack_webhook_url`` disables the feature: no job is
-    registered and no error is raised. When the scheduler has not been
-    started (rare; e.g. DB init failed earlier), the function logs a
-    warning and returns without crashing.
+    With neither ``settings.slack_webhook_url`` nor
+    ``settings.wecom_alerts_webhook_url`` set, the feature is disabled: no job
+    is registered and no error is raised. ``SLACK_ALERTS_WEBHOOK_URL`` alone
+    does not register it, preserving the existing detector's enablement rule.
+    When the scheduler has not been started (rare; e.g. DB init failed earlier),
+    the function logs a warning and returns without crashing.
     """
     from apscheduler.triggers.interval import IntervalTrigger
 
-    webhook_url = settings.slack_webhook_url.strip()
-    if not webhook_url:
-        logger.info("Slack alerter disabled (SLACK_WEBHOOK_URL not set)")
+    if not (settings.slack_webhook_url.strip() or settings.wecom_alerts_webhook_url.strip()):
+        logger.info(
+            "Failed-request alerter disabled (SLACK_WEBHOOK_URL and "
+            "WECOM_ALERTS_WEBHOOK_URL not set)"
+        )
         return
 
     scheduler = get_scheduler()
@@ -386,7 +342,6 @@ def register_alerter_job(pool: asyncpg.Pool, settings: Settings) -> None:
 
     alerter = FailedRequestAlerter(
         pool=pool,
-        webhook_url=webhook_url,
         threshold=settings.failed_request_alert_threshold,
         window_minutes=settings.failed_request_alert_window_minutes,
         cooldown_minutes=settings.failed_request_alert_cooldown_minutes,

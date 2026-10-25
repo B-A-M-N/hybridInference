@@ -234,10 +234,6 @@ known strategies. Each strategy declares a Pydantic params model with
 `extra="forbid"`, so a typo in `router_params:` fails at boot instead of
 silently falling back to a default.
 
-`apps/backend/routing/executor.py` is a backward-compatibility shim that
-re-exports `FixedRouter` under its old name `RouteExecutor`. Edit
-`apps/backend/routing/routers.py` instead.
-
 ### Two layers of "strategy"
 
 Two different things are called a strategy:
@@ -459,8 +455,9 @@ The gateway reports through these; it has no Prometheus exporter:
   `/health/deep` adds per-endpoint availability and circuit state, and reports
   `degraded` when any endpoint is.
 - **Alerting.** `alert_slack()` and `alert_on_transition()` in
-  `apps/backend/serving/observability/alerts.py` post to a Slack webhook
-  (`SLACK_ALERTS_WEBHOOK_URL`). Thresholds come
+  `apps/backend/serving/observability/alerts.py` post through an `AlertSink` to
+  one Slack or WeCom webhook, selected in Admin Configuration. Channel changes
+  take effect after a restart. Thresholds come
   from the alert config resolved by the same `resolve_config_path()` chain; with
   no alert file present the built-in thresholds apply. The circuit breaker pages
   on `circuit_open` transitions and on upstream-credential rejections, with
@@ -475,6 +472,7 @@ Client-facing groups, all served by the same app:
 | --- | --- | --- |
 | OpenAI-compatible inference | `POST /v1/chat/completions`, `POST /v1/completions`, `POST /completion`, `POST /v1/embeddings`, `POST /v1/responses` | API key |
 | Anthropic-compatible inference | `POST /v1/messages`, `POST /anthropic/v1/messages`, `…/count_tokens` | API key |
+| [Batch inference](batches.md) | `POST /v1/batches`, `GET /v1/batches`, `GET` and `DELETE /v1/batches/{id}`, `POST /v1/batches/{id}/cancel`, `GET /v1/batches/{id}/results` | API key; creating a batch needs the `BATCH_MIN_ROLE` role, `internal` by default |
 | Model catalog | `GET /v1/models`, `GET /models`, `GET /openrouter/models`, `GET /anthropic/v1/models` | Optional — a key only widens what is listed |
 | Health | `GET /health`, `/health/ready`, `/health/deep` | None |
 | Public routing disclosure | `GET /routing` | None |
