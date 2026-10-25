@@ -495,6 +495,7 @@ class StreamSession:
             chunk_queue: asyncio.Queue = asyncio.Queue(maxsize=_KEEPALIVE_QUEUE_MAXSIZE)
 
             async def _adapter_reader() -> None:
+                sentinel_pending = True
                 try:
                     try:
                         async for item in adapter_chunks:
@@ -503,12 +504,18 @@ class StreamSession:
                         await chunk_queue.put(exc)
                     await chunk_queue.put(_SENTINEL)
                 except asyncio.CancelledError:
-                    # The consumer is gone (generator closed/-cancelled).
-                    # Skip the remaining puts: blocking on a full queue here
-                    # would leak the reader task and the upstream connection
-                    # forever. (Mirrors the outer reader in
-                    # ``completions.py::_streaming_response_with_keepalive``.)
-                    pass
+                    # Distinguish reader cancellation from a CancelledError
+                    # raised by the adapter/upstream. The former must not block
+                    # on a full queue after the consumer is gone; the latter is
+                    # terminal and must be delivered to that consumer.
+                    task = asyncio.current_task()
+                    if task is not None and task.cancelling():
+                        sentinel_pending = False
+                        raise
+                    await chunk_queue.put(RuntimeError("upstream stream was cancelled"))
+                finally:
+                    if sentinel_pending:
+                        await chunk_queue.put(_SENTINEL)
 
             reader_task = asyncio.create_task(_adapter_reader())
             try:
@@ -518,6 +525,9 @@ class StreamSession:
                             chunk_queue.get(), timeout=_KEEPALIVE_INTERVAL
                         )
                     except asyncio.TimeoutError:
+                        if reader_task.done() and chunk_queue.empty():
+                            reader_task.result()
+                            raise RuntimeError("stream reader exited without a sentinel") from None
                         if not self._yielded_first_chunk:
                             # Out of time to hold it: the role chunk is this
                             # interval's byte.

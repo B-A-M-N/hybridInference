@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from serving.servers.routers import completions as comp
+from serving.servers.routers import completions as comp, completions_stream
 from serving.servers.routers.completions_cost import CostTracker, PricingLookup
 from serving.servers.routers.completions_stream import StreamSession
 from serving.servers.routers.routing_info import RoutingInfo
@@ -453,4 +453,55 @@ async def test_scenario_d_upstream_cancelled_while_queue_full_and_consumer_stall
     # The reader observed the cancellation through ``async for`` and exited
     # (the guard skipped the sentinel). Close the stalled consumer cleanly.
     await _close_and_assert_completion(gen)
+    await _assert_no_leaked_tasks()
+
+
+@pytest.mark.asyncio
+async def test_upstream_cancellation_terminates_stream_session_without_manual_close(monkeypatch):
+    """External upstream cancellation cannot leave SSE keepalives running forever."""
+    monkeypatch.setattr(completions_stream, "_KEEPALIVE_INTERVAL", 0.05)
+    provider_gone = asyncio.Event()
+    provider_task = asyncio.create_task(provider_gone.wait())
+
+    async def _upstream() -> Any:
+        for _ in range(3):
+            await asyncio.sleep(0)
+            yield _chunk("x")
+        await provider_task
+
+    session = _make_session()
+    gen = session.stream(_upstream())
+    consume = asyncio.create_task(_drain_discard(gen))
+    await asyncio.sleep(0.05)
+    provider_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await provider_task
+
+    received = await asyncio.wait_for(consume, timeout=1.0)
+    assert received >= 3
+    await _assert_no_leaked_tasks()
+
+
+@pytest.mark.asyncio
+async def test_upstream_cancellation_terminates_forced_stream_without_manual_close(monkeypatch):
+    """External upstream cancellation cannot leave forced-stream whitespace running forever."""
+    monkeypatch.setattr(comp, "_FORCE_STREAMING_KEEPALIVE_S", 0.05)
+    provider_gone = asyncio.Event()
+    provider_task = asyncio.create_task(provider_gone.wait())
+
+    async def _upstream() -> Any:
+        for _ in range(3):
+            await asyncio.sleep(0)
+            yield _chunk("x")
+        await provider_task
+
+    gen = _make_gen(_upstream())
+    consume = asyncio.create_task(_drain_discard(gen))
+    await asyncio.sleep(0.05)
+    provider_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await provider_task
+
+    received = await asyncio.wait_for(consume, timeout=1.0)
+    assert received >= 1
     await _assert_no_leaked_tasks()
