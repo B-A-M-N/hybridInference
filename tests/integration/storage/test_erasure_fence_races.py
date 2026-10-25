@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 import pytest_asyncio
@@ -52,6 +52,18 @@ _OWNER = "u-fence-owner"
 _BYSTANDER = "u-fence-bystander"
 
 _INITIALIZED_OPERATIONAL_STORES: dict[int, PostgresOperationalStore] = {}
+
+
+class _NoopBatchStore:
+    """The hard-delete route's batch purge stage, with no batches to purge.
+
+    The route takes the batch store as a FastAPI dependency, so a direct
+    call in a test has to pass a real object; this one records nothing and
+    deletes nothing, which is what these tests assert around it.
+    """
+
+    async def delete_user_batches(self, user_id: str) -> None:
+        return None
 
 
 @pytest_asyncio.fixture
@@ -115,7 +127,7 @@ async def _seed_row(
             "status_code, user_id, metadata) "
             "VALUES ($1, 'm', 'p', $2, 200, $3, $4::jsonb)",
             request_id,
-            datetime.now(timezone.utc),
+            datetime.now(UTC),
             user_id,
             json.dumps(metadata) if metadata else None,
         )
@@ -882,6 +894,7 @@ async def test_resume_endpoint_delete_wins_after_preflight_returns_conflict(
             op_store=op_store,
             log_store=log_store,
             response_store=ResponseStore(),
+            batch_store=_NoopBatchStore(),
         )
         allow_resume.set()
 
@@ -1485,6 +1498,7 @@ async def test_hard_delete_route_stops_after_claim_recovery_between_stages(
             op_store=op_store,
             log_store=PausingLogStore(),
             response_store=ResponseStore(),
+            batch_store=_NoopBatchStore(),
         )
     )
 
@@ -1605,6 +1619,7 @@ async def test_hard_delete_route_cancellation_stops_before_the_next_stage(
             op_store=op_store,
             log_store=PausingLogStore(),
             response_store=ResponseStore(),
+            batch_store=_NoopBatchStore(),
         )
     )
 
@@ -1693,6 +1708,7 @@ async def test_log_store_error_after_fence_commit_retains_claim_and_stops(fence_
             op_store=op_store,
             log_store=CommitThenFailLogStore(),
             response_store=ResponseStore(),
+            batch_store=_NoopBatchStore(),
         )
 
     assert await inner_log_store.account_has_erasure_fence(_OWNER) is True
@@ -1778,6 +1794,7 @@ async def test_status_reactivation_after_admin_read_blocks_hard_delete(fence_sto
             op_store=PausingOperationalStore(),
             log_store=CountingLogStore(),
             response_store=ResponseStore(),
+            batch_store=_NoopBatchStore(),
         )
     )
 
@@ -1988,7 +2005,7 @@ async def test_mixed_version_old_worker_can_still_insert(fence_store):
             "timestamp, status_code, user_id) "
             "VALUES ($1, 'm', 'p', $2, 200, $3)",
             "req-fence-old-worker",
-            datetime.now(timezone.utc),
+            datetime.now(UTC),
             _OWNER,
         )
 

@@ -85,15 +85,8 @@ def _webhook_shape_ok(webhook_url: str) -> bool:
 def _official_webhook_ok(channel: str, webhook_url: str) -> bool:
     """Whether ``webhook_url`` is the platform's own documented endpoint."""
     parts = urlsplit(webhook_url)
-    # An empty query is valid for Slack, and ``parse_qsl("", strict_parsing=True)``
-    # raises ValueError on Python 3.10 (not on 3.11+), so only parse when there
-    # is something to parse.
     try:
-        query = (
-            parse_qsl(parts.query, keep_blank_values=True, strict_parsing=True)
-            if parts.query
-            else []
-        )
+        query = parse_qsl(parts.query, keep_blank_values=True, strict_parsing=True)
     except ValueError:
         # A malformed query string is not an official endpoint.
         return False
@@ -205,7 +198,7 @@ async def test_alert_endpoint(
                 "message": "Sent from Admin Configuration. No alert incident was created.",
             },
         )
-        sent = await sink.post(message, dedupe_key=test_id, record_failure=False)
+        sent = await sink.post(message, dedupe_key=test_id)
     except Exception:
         # Adapter exceptions may contain the credential; retain only safe context.
         logger.warning("alert test failed: channel=%s test_id=%s", payload.channel, test_id)

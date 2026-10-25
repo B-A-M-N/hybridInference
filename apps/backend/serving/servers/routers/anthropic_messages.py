@@ -58,7 +58,7 @@ from serving.exceptions import (
     scrub_error_for_user,
 )
 from serving.grant_auth import ledger_attribution
-from serving.model_access import model_access_denial
+from serving.model_access import model_access_denial, route_canonical_model_id
 from serving.observability.rejection_log import log_rejection
 from serving.observability.tracked_tasks import tracked_task
 from serving.pricing import effective_pricing, require_source_pricing
@@ -67,7 +67,7 @@ from serving.servers.auth import (
     verify_api_key,
     verify_api_key_for_balance,
 )
-from serving.servers.concurrency import enforce_user_concurrency
+from serving.servers.concurrency import enforce_user_concurrency, retarget_interactive_load
 from serving.servers.deps import (
     get_log_store,
     get_model_visibility_resolver,
@@ -1677,6 +1677,11 @@ async def anthropic_messages(
         # The reroute's target serves the request now; keep it from the caller too.
         hide_served_model(auto_selection, *(entry[0].config for entry in _route.adapters))
 
+    # Auto selection (and the small-budget reroute above) happen after the
+    # concurrency dependency admitted the virtual model. Count the request on
+    # the final concrete canonical model for the remainder of its lifetime.
+    retarget_interactive_load(request, route_canonical_model_id(_route, canonical))
+
     forwarded_headers = _extract_forwarded_headers(request)
 
     # Endpoint health is read on the way in (adapter admission) but, until this
@@ -1969,7 +1974,7 @@ async def anthropic_messages(
                             item = await asyncio.wait_for(
                                 chunk_queue.get(), timeout=_KEEPALIVE_INTERVAL
                             )
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             idle_seconds += _KEEPALIVE_INTERVAL
                             # Prefill before the first frame, decode after it.
                             idle_ceiling = (
@@ -2387,7 +2392,7 @@ async def anthropic_messages(
             operator_error=operator_safe_error(exc),
         )
         return _anthropic_error(429, error_message, headers={"retry-after": "1"})
-    except (TimeoutError, asyncio.TimeoutError) as exc:
+    except TimeoutError as exc:
         # Upstream exceeded the (generous) completion timeout. Surface a 504
         # gateway-timeout rather than a generic 502 "Internal server error" so
         # the client can tell a slow upstream from a real server fault.

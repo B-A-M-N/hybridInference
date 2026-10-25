@@ -1015,15 +1015,14 @@ msgid ""
 "Only streaming requests are watched: a non-streaming response arrives "
 "whole, so there is no first token to wait for. The first-token wait "
 "includes the engine's prefill, so a model serving very long prompts needs"
-" a wait above the time it takes to start answering them. The wait needs "
-"Python 3.11 or newer: its deadline is `asyncio.timeout`, which can tell "
-"its own cancellation from a client that hangs up at the same moment. On "
-"Python 3.10 streams are never timed."
+" a wait above the time it takes to start answering them. The wait's "
+"deadline is `asyncio.timeout`, which can tell its own cancellation from a "
+"client that hangs up at the same moment, so a request whose client has "
+"gone is never offloaded."
 msgstr ""
 "只有流式请求会计时：非流式响应是一次性整体返回的，没有首个 token 可等。首 token 等待包含引擎的 prefill 时间，所以处理超长 "
-"prompt 的模型，等待时间要比它开始回答这些 prompt 所需的时间更长。这个等待需要 Python 3.11 或更新版本：截止时间用 "
-"`asyncio.timeout` 实现，它能分清是自己触发的取消，还是客户端恰好在同一时刻断开。在 Python 3.10 "
-"上，流式请求一律不计时。"
+"prompt 的模型，等待时间要比它开始回答这些 prompt 所需的时间更长。这个等待的截止时间用 "
+"`asyncio.timeout` 实现，它能分清是自己触发的取消，还是客户端恰好在同一时刻断开，所以客户端已经断开的请求绝不会被卸载。"
 
 #: ../developer/routing.md:385
 msgid ""
@@ -2016,6 +2015,28 @@ msgstr "把注册表里的路由改指向别处；`DELETE` 恢复 YAML 路由。
 
 #: ../developer/routing.md:661
 #, python-brace-format
+msgid "`PATCH /admin/routing/provider-route-states/{model_id}/{route_id}`"
+msgstr ""
+
+#: ../developer/routing.md:661
+msgid ""
+"Disable or enable a route of either source; a disabled route keeps its "
+"weights but takes no request, retry, fallback or offload."
+msgstr "停用或启用一条路由（两种来源都可以）；停用的路由保留权重，但不接收任何请求、重试、fallback 或 offload。"
+
+#: ../developer/routing.md:661
+#, python-brace-format
+msgid "`POST` / `DELETE /admin/routing/provider-route-removals/{model_id}/{route_id}`"
+msgstr ""
+
+#: ../developer/routing.md:661
+msgid ""
+"Delete a registry route from this deployment, or restore it; models.yaml "
+"is not changed."
+msgstr "从当前部署中删除注册表里的一条路由，或恢复它；models.yaml 不会被修改。"
+
+#: ../developer/routing.md:661
+#, python-brace-format
 msgid "`PUT` / `DELETE /admin/routing/weights/{model_id}/{endpoint_id}`"
 msgstr ""
 
@@ -2138,17 +2159,6 @@ msgid ""
 "Runs the one endpoint the router already chose, or delegates the request "
 "to a pool that chooses inside its own declared range."
 msgstr "调用 router 已经选定的那个端点，或者把请求交给一个池，由池在自己声明的范围内选择。"
-
-#: ../developer/routing.md:706
-msgid ""
-"`apps/backend/routing/executor.py` is a backward-compatibility shim that "
-"re-exports `FixedRouter` as `RouteExecutor` along with "
-"`AllCircuitsOpenError`, `ProviderPinError`, and `RouteConfig`. Do not "
-"edit it — edit `routers.py`."
-msgstr ""
-"`apps/backend/routing/executor.py` 只是为向后兼容保留的一层转发：它把 `FixedRouter` 重新导出为 "
-"`RouteExecutor`，同时导出 `AllCircuitsOpenError`、`ProviderPinError` 和 "
-"`RouteConfig`。不要改它——要改就改 `routers.py`。"
 
 #: ../developer/routing.md:710
 msgid ""
