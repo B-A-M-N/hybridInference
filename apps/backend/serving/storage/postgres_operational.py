@@ -1685,6 +1685,8 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         clear them, because the original worker may still be unwinding after a
         process-level timeout or transient connection failure.
         """
+        if recovery_mode is not None and recovery_mode not in set(HardDeleteRecoveryMode):
+            raise ValueError(f"Unknown hard-delete recovery mode: {recovery_mode!r}")
         async with self._pool.acquire() as conn, conn.transaction():
             recovery_schema_ready = await self._hard_delete_claim_recovery_schema_available(conn)
             if recovery_mode is not None and not recovery_schema_ready:

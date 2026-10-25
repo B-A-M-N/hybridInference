@@ -166,6 +166,14 @@ async def test_suspension_guard_preserves_concurrent_soft_delete(fence_store):
     assert status == "deleted"
 
 
+async def test_recovery_mode_is_validated_at_the_store_boundary(fence_store):
+    """The store, not only the route, rejects an unsupported recovery mode."""
+    _log_store, _pool = fence_store
+    op_store = _initialized_operational_store(_pool)
+    with pytest.raises(ValueError, match="Unknown hard-delete recovery mode"):
+        await op_store.begin_hard_delete_user(_OWNER, recovery_mode="operator-attested")  # type: ignore[arg-type]
+
+
 async def test_patch_status_guard_preserves_concurrent_soft_delete(fence_store):
     """A stale PATCH validation cannot reactivate an account soft-deleted meanwhile."""
     _log_store, pool = fence_store
