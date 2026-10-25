@@ -299,7 +299,7 @@ def _active_refusal_count(ip_key: str, now: float) -> int:
     return pressure.count
 
 
-def _record_ip_refusal_pressure(ip_key: str, now: float, per_ip: int) -> bool:
+def _record_ip_refusal_pressure(ip_key: str, now: float, per_ip: int) -> None:
     """Record bounded refusal pressure without turning map saturation global."""
     pressure = _ip_refusal_pressure.get(ip_key)
     overflow_slot = _overflow_slot("refusal", ip_key)[1]
@@ -327,7 +327,6 @@ def _record_ip_refusal_pressure(ip_key: str, now: float, per_ip: int) -> bool:
                 )
 
     pressure.count = min(pressure.count + 1, per_ip)
-    return True
 
 
 async def check_and_record_login(
@@ -453,8 +452,8 @@ async def check_and_record_login(
             return False, "ip"
 
         if address_count >= per_account_address:
-            if resolved and not _record_ip_refusal_pressure(ip_key, now, per_ip):
-                return False, "ip"
+            if resolved:
+                _record_ip_refusal_pressure(ip_key, now, per_ip)
             return False, "email"
 
         if not resolved:
