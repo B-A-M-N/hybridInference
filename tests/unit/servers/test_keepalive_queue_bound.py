@@ -192,7 +192,7 @@ async def _close_and_assert_completion(gen: Any, timeout: float = 5.0) -> None:
     close_task = asyncio.create_task(gen.aclose())
     try:
         await asyncio.wait_for(close_task, timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         close_task.cancel()
         with suppress(asyncio.CancelledError):
             await close_task
@@ -484,10 +484,17 @@ async def test_upstream_cancellation_terminates_stream_session_without_manual_cl
 
 @pytest.mark.asyncio
 async def test_upstream_cancellation_terminates_forced_stream_without_manual_close(monkeypatch):
-    """External upstream cancellation cannot leave forced-stream whitespace running forever."""
+    """External cancellation cannot leave forced-stream whitespace running forever.
+
+    The first keepalive is the synchronization point. After it has been yielded,
+    cancellation may no longer race the commit decision: the wrapper must emit
+    its terminal JSON error and finish without a manual close. (Before the fix
+    the reader's sentinel put could strand the consumer on keepalives forever.)
+    """
     monkeypatch.setattr(comp, "_FORCE_STREAMING_KEEPALIVE_S", 0.05)
     provider_gone = asyncio.Event()
     provider_task = asyncio.create_task(provider_gone.wait())
+    first_keepalive = asyncio.Event()
 
     async def _upstream() -> Any:
         for _ in range(3):
@@ -495,13 +502,24 @@ async def test_upstream_cancellation_terminates_forced_stream_without_manual_clo
             yield _chunk("x")
         await provider_task
 
+    async def _consume(gen: Any) -> list[bytes]:
+        received: list[bytes] = []
+        async for item in gen:
+            received.append(item)
+            if not first_keepalive.is_set():
+                assert item == b" "
+                first_keepalive.set()
+        return received
+
     gen = _make_gen(_upstream())
-    consume = asyncio.create_task(_drain_discard(gen))
-    await asyncio.sleep(0.05)
+    consume = asyncio.create_task(_consume(gen))
+    await asyncio.wait_for(first_keepalive.wait(), timeout=1.0)
     provider_task.cancel()
     with suppress(asyncio.CancelledError):
         await provider_task
 
     received = await asyncio.wait_for(consume, timeout=1.0)
-    assert received >= 1
+    assert received[0] == b" "
+    body = json.loads(received[-1].decode())
+    assert body["error"]["code"] == 500
     await _assert_no_leaked_tasks()
