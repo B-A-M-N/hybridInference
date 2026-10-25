@@ -181,6 +181,19 @@ async def _assert_no_leaked_tasks() -> None:
     assert not pending, f"leaked tasks: {pending}"
 
 
+async def _wait_until_full(queue: asyncio.Queue, timeout: float = 10.0) -> None:
+    """Wait until the queue reaches its bound, so the test does not depend on
+    a fixed sleep having been long enough for the producer."""
+    deadline = time.monotonic() + timeout
+    while queue.qsize() < queue.maxsize:
+        if time.monotonic() > deadline:
+            pytest.fail(
+                f"queue did not fill within {timeout}s: qsize={queue.qsize()} "
+                f"maxsize={queue.maxsize}"
+            )
+        await asyncio.sleep(0.01)
+
+
 async def _close_and_assert_completion(gen: Any, timeout: float = 5.0) -> None:
     """Drive ``gen.aclose()`` as a task and require it to actually finish.
 
@@ -404,7 +417,11 @@ async def test_scenario_c_generator_closure_while_both_queues_full(monkeypatch):
         first = await gen.__anext__()
     assert first == b" "
     outer, inner = _chain_queues(queues)
-    await asyncio.sleep(0.3)  # fill both queues to the bound
+    # Wait for the queues to actually reach their bound. A fixed sleep only
+    # proves the producer had enough time on an idle machine; under load it
+    # can still be filling, which is a scheduling delay, not a bound failure.
+    await _wait_until_full(inner)
+    await _wait_until_full(outer)
     assert inner.qsize() == _MAX, f"inner queue not full: {inner.qsize()}"
     assert outer.qsize() == _MAX, f"outer queue not full: {outer.qsize()}"
 
