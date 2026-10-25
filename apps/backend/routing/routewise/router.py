@@ -72,7 +72,6 @@ from routing.routers import (
 from routing.streaming import has_non_empty_content
 from routing.telemetry import failed_attempt, routing_chunk
 from serving.exceptions import operator_safe_error
-from serving.pricing import effective_pricing
 from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
 from serving.utils.tokens import estimate_prompt_tokens
@@ -86,7 +85,6 @@ from .candidates import (
     QuotaPolicy,
     QuotaSource,
     build_provider_candidates,
-    endpoint_id_for_adapter as routewise_endpoint_id_for_adapter,
 )
 from .concurrency import ConcurrencyManager
 from .decisions import (
@@ -402,15 +400,8 @@ class RouteWiseRouter:
         params: Any = None,
         health_registry: EndpointHealthRegistry | None = None,
         *,
-        fixed_router: RouteTableView | None = None,
         prefill_load: PrefillLoadTracker | None = None,
     ) -> None:
-        if route_table is not None and fixed_router is not None:
-            raise TypeError("route_table and deprecated fixed_router cannot both be provided")
-        if route_table is None:
-            # One-release compatibility for callers using the former keyword.
-            route_table = fixed_router
-
         self._health_registry = (
             health_registry if health_registry is not None else EndpointHealthRegistry()
         )
@@ -436,7 +427,6 @@ class RouteWiseRouter:
         self._model_routewise_pools: dict[str, str] = {}
         self.classified: dict[str, list[tuple[Any, float, ProviderType]]] = {}
         self._adapter_provider_type: dict[int, ProviderType] = {}
-        self._adapter_endpoint_ids: dict[int, str] = {}
         self._endpoint_adapter: dict[str, Any] = {}
         self._endpoint_models: dict[str, set[str]] = {}
         # Canonical model ids with at least one quota route. The envelope is
@@ -568,25 +558,6 @@ class RouteWiseRouter:
             self._last_lp_weights = {}
             self._rebuild_from_route_table()
 
-    def attach_fixed_router(
-        self,
-        route_table: RouteTableView,
-        *,
-        model_scope: Collection[str] | None = None,
-    ) -> None:
-        """Compatibility alias for :meth:`attach_route_table` for one release."""
-        self.attach_route_table(route_table, model_scope=model_scope)
-
-    @property
-    def fixed_router(self) -> RouteTableView | None:
-        """Return the route table under its former attribute name for one release."""
-        return self.route_table
-
-    @fixed_router.setter
-    def fixed_router(self, route_table: RouteTableView | None) -> None:
-        """Preserve direct assignment to the former attribute for one release."""
-        self.route_table = route_table
-
     def attach_operational_store(self, operational_store: Any | None) -> None:
         """Bind the operational store used for persisted probe samples."""
         self._operational_store = operational_store
@@ -640,7 +611,6 @@ class RouteWiseRouter:
         self.route_candidates = {}
         self._model_routewise_pools = {}
         self._adapter_provider_type = {}
-        self._adapter_endpoint_ids = {}
         self._endpoint_adapter = {}
         self._endpoint_models = {}
         self._quota_bearing_models = set()
@@ -655,7 +625,6 @@ class RouteWiseRouter:
                 adapter = candidate.adapter
                 self._adapter_provider_type[id(adapter)] = candidate.provider_type
                 endpoint_id = candidate.endpoint_id
-                self._adapter_endpoint_ids[id(adapter)] = endpoint_id
                 self._endpoint_adapter[endpoint_id] = adapter
                 self._endpoint_models.setdefault(endpoint_id, set()).add(model_id)
                 if endpoint_id not in self._latency_profiles:
@@ -676,10 +645,6 @@ class RouteWiseRouter:
         """Refresh route-derived state while excluding concurrent decisions."""
         with self._route_commit_lock:
             self._rebuild_from_route_table()
-
-    def _rebuild_from_fixed_router(self) -> None:
-        """Compatibility alias for the former private rebuild hook."""
-        self.refresh_route_table()
 
     async def start(self) -> bool:
         """Start periodic maintenance tasks.
@@ -1106,7 +1071,7 @@ class RouteWiseRouter:
                 ok=result.ok,
                 error=result.error,
                 cost_usd=None,
-                checked_at=dt.datetime.now(dt.timezone.utc),
+                checked_at=dt.datetime.now(dt.UTC),
             )
         except Exception:
             logger.warning(
@@ -1131,18 +1096,6 @@ class RouteWiseRouter:
     # ------------------------------------------------------------------
     # Classification and helpers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _endpoint_id(adapter: BaseAdapter) -> str:
-        return routewise_endpoint_id_for_adapter(adapter)
-
-    def _candidate_endpoint_id(self, adapter: BaseAdapter) -> str:
-        return self._adapter_endpoint_ids.get(id(adapter), self._endpoint_id(adapter))
-
-    @staticmethod
-    def _pricing(adapter: BaseAdapter) -> tuple[float, float]:
-        pricing = effective_pricing(adapter.config) or {}
-        return float(pricing.get("prompt", "0")), float(pricing.get("completion", "0"))
 
     def _classify_all(self) -> None:
         route_table = self.route_table
@@ -1541,21 +1494,6 @@ class RouteWiseRouter:
             response_format=params.get("response_format") if params is not None else None,
         )
 
-    def _api_cost_for_adapter(
-        self,
-        adapter: BaseAdapter,
-        *,
-        prompt_tokens: int,
-        predicted_output_tokens: float,
-    ) -> float:
-        p_in, p_out = self._pricing(adapter)
-        return api_request_cost_usd(
-            prompt_tokens=prompt_tokens,
-            predicted_output_tokens=predicted_output_tokens,
-            input_price_per_m=p_in,
-            output_price_per_m=p_out,
-        )
-
     @staticmethod
     def _api_cost_for_pricing(
         pricing: CandidatePricing,
@@ -1611,17 +1549,6 @@ class RouteWiseRouter:
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
         )
-
-    def _estimate_value(self, model_id: str, prompt_tokens: int) -> float:
-        """Compatibility helper: cheapest cold-cache API cost for one request."""
-        model_id = self.canonical_model_id(model_id)
-        prediction = self.predictor.predict(model_id, prompt_tokens)
-        cost = self._reference_api_cost(
-            model_id,
-            prompt_tokens=prompt_tokens,
-            output_tokens=prediction.tokens,
-        )
-        return cost if cost is not None else 0.0
 
     def _build_candidates(
         self,
@@ -2647,7 +2574,7 @@ class RouteWiseRouter:
             reserve_prefill = reserve_prefill and self._prefill_lease_needed(model_id)
             tracker_transaction = (
                 self._prefill_load.routing_transaction()
-                if reserve_prefill
+                if reserve_prefill and self.config.prefill_load_routing_enabled
                 else contextlib.nullcontext()
             )
             with tracker_transaction:
@@ -2870,6 +2797,8 @@ class RouteWiseRouter:
         endpoint_id: str,
         messages: Any,
         params: Mapping[str, Any] | None,
+        *,
+        tracked_tokens: int | None = None,
     ) -> Any:
         """Reserve one endpoint's prefill work with cache-locality evidence.
 
@@ -2878,10 +2807,8 @@ class RouteWiseRouter:
         lease is attached to the returned decision or hedge dispatch, so the
         attempt owns its release even if dispatch fails before execution.
         """
-        tracked_tokens = self._tracked_prefill_tokens(
-            messages,
-            params,
-        )
+        if tracked_tokens is None:
+            tracked_tokens = self._tracked_prefill_tokens(messages, params)
         affinity_key = req_ctx.get().get("affinity_key") or None
         fingerprint = conversation_fingerprint(
             messages,
@@ -3314,8 +3241,16 @@ class RouteWiseRouter:
                 self.config.prefill_load_routing_enabled
                 or self._priority_scheduling_enabled(adapter)
             ):
+                # Estimate outside the shared lock; acquire inside so the
+                # fallback lease still reserves from the current load snapshot.
+                tracked_tokens = self._tracked_prefill_tokens(messages, params)
                 with self._prefill_load.routing_transaction():
-                    lease = self._acquire_prefill_lease(endpoint_id, messages, params)
+                    lease = self._acquire_prefill_lease(
+                        endpoint_id,
+                        messages,
+                        params,
+                        tracked_tokens=tracked_tokens,
+                    )
             dispatch_context: dict[str, Any] = {
                 "model": model_id,
                 "provider": adapter.config.provider,
@@ -3391,8 +3326,16 @@ class RouteWiseRouter:
                 self.config.prefill_load_routing_enabled
                 or self._priority_scheduling_enabled(adapter)
             ):
+                # Estimate outside the shared lock; acquire inside so the
+                # fallback lease still reserves from the current load snapshot.
+                tracked_tokens = self._tracked_prefill_tokens(messages, params)
                 with self._prefill_load.routing_transaction():
-                    lease = self._acquire_prefill_lease(endpoint_id, messages, params)
+                    lease = self._acquire_prefill_lease(
+                        endpoint_id,
+                        messages,
+                        params,
+                        tracked_tokens=tracked_tokens,
+                    )
             dispatch_context: dict[str, Any] = {
                 "model": model_id,
                 "provider": adapter.config.provider,

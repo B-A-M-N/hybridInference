@@ -7,6 +7,7 @@ import contextlib
 import json
 import time
 from dataclasses import replace
+from datetime import UTC
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
@@ -21,7 +22,6 @@ from routing.routewise.config import RouteWiseConfig
 from routing.routewise.hedging import (
     HedgedAdapter,
     HedgeStreamRaceTimeout,
-    ProviderEventSink,
 )
 from serving.utils import context as req_ctx
 
@@ -106,11 +106,11 @@ def _quota_pool(router):
 
 def _seed_quota_snapshots(router, *, used: float = 0.0) -> None:
     """Install a ready provider snapshot for every quota pool on the router."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from routing.routewise.quota import ProviderQuotaSnapshot
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for pool in router.quota_pools.values():
         router.quota_snapshots._snapshots[pool.source] = ProviderQuotaSnapshot(
             source=pool.source,
@@ -2533,23 +2533,19 @@ class TestRouterHedgeMode:
 
 
 # ===========================================================================
-# TestProviderEventSinkCompatibility
+# TestHedgeOutcomeRecorder
 # ===========================================================================
 
 
 @pytest.mark.unit
-class TestProviderEventSinkCompatibility:
-    def test_canonical_fake_and_registry_satisfy_compatibility_protocol(self):
-        """Canonical outcome recorders satisfy the deprecated protocol."""
-        assert isinstance(_FakeEventSink(), ProviderEventSink)
-        assert isinstance(EndpointHealthRegistry(), ProviderEventSink)
-
-    def test_router_does_not_satisfy_compatibility_protocol(self):
+class TestHedgeOutcomeRecorder:
+    def test_router_is_not_a_hedge_outcome_sink(self):
         """The router no longer acts as a hedge outcome forwarding sink."""
         config = RouteWiseConfig()
         router, _, _ = _make_router_with_two_api(config)
         assert isinstance(router._health_registry, EndpointHealthRegistry)
-        assert not isinstance(router, ProviderEventSink)
+        assert not hasattr(router, "record_success")
+        assert not hasattr(router, "record_failure")
         assert not hasattr(router, "on_provider_success")
         assert not hasattr(router, "on_provider_failure")
 

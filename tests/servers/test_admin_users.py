@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -11,7 +11,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from routing.executor import RouteExecutor
+from routing.routers import FixedRouter
 from serving.adapters.base import BaseAdapter, ModelConfig
 from serving.servers.deps import AppServices
 from serving.servers.routers import admin as admin_router
@@ -65,7 +65,7 @@ async def admin_client(monkeypatch, mock_stores):
             if False:
                 yield ""
 
-    router = RouteExecutor()
+    router = FixedRouter()
     for model_id in ("a-model", "z-model", "old-model"):
         router.register_route(
             model_id,
@@ -121,7 +121,7 @@ async def admin_client(monkeypatch, mock_stores):
 
 AUTH = {"Authorization": "Bearer test-admin"}
 
-_NOW = datetime(2025, 6, 15, tzinfo=timezone.utc)
+_NOW = datetime(2025, 6, 15, tzinfo=UTC)
 
 
 def _user_row(

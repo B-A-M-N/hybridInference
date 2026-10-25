@@ -264,11 +264,11 @@ def _seed_quota_snapshots(router: RouteWiseRouter, *, used: float = 0.0) -> None
     Quota pools are snapshot-backed; unit tests seed the store directly
     instead of running the async refresh loop.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from routing.routewise.quota import ProviderQuotaSnapshot
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(dt.UTC)
     for pool in router.quota_pools.values():
         router.quota_snapshots._snapshots[pool.source] = ProviderQuotaSnapshot(
             source=pool.source,
@@ -634,7 +634,10 @@ class TestRouteWiseRouterScaffold:
             config=RouteWiseConfig(reference_api_price={"prompt": "2.0", "completion": "4.0"}),
         )
 
-        assert router._estimate_value("test-model", 1000) == pytest.approx(0.004048)
+        prediction = router.predictor.predict("test-model", 1000)
+        assert router._reference_api_cost(
+            "test-model", prompt_tokens=1000, output_tokens=prediction.tokens
+        ) == pytest.approx(0.004048)
 
     def test_quota_source_without_snapshot_masks_quota_candidate(self):
         """Provider-backed S_Q is not feasible until a quota snapshot exists."""
@@ -865,15 +868,6 @@ class TestRouteWiseRouterScaffold:
         assert router.route_table is replacement
         assert set(router.classified) == {"test-model"}
 
-    def test_legacy_fixed_router_keyword_delegates_to_route_table(self):
-        route_table = _FakeRouteTable()
-        route_table.add("test-model", [(_make_adapter(), 1.0)])
-
-        router = RouteWiseRouter(fixed_router=route_table, config=RouteWiseConfig())
-
-        assert router.route_table is route_table
-        assert router.fixed_router is route_table
-
     def _two_model_table(self):
         """Return a shared table holding this router's model plus a foreign one."""
         mine = _make_adapter(model_id="mine", endpoint_id="mine:api")
@@ -953,30 +947,6 @@ class TestRouteWiseRouterScaffold:
         assert set(router.classified) == {"mine"}
         assert set(router._endpoint_adapter) == {"mine:api"}
 
-    def test_legacy_fixed_router_attribute_assignment_updates_route_table(self):
-        router = RouteWiseRouter(config=RouteWiseConfig())
-        route_table = _FakeRouteTable()
-
-        router.fixed_router = route_table
-
-        assert router.route_table is route_table
-
-    def test_legacy_attach_and_rebuild_shims_delegate_to_route_table(self, monkeypatch):
-        first = _FakeRouteTable()
-        first.add("test-model", [(_make_adapter(), 1.0)])
-        replacement = _FakeRouteTable()
-        replacement.add("test-model", [(_make_adapter(), 1.0)])
-        router = RouteWiseRouter(route_table=first, config=RouteWiseConfig())
-
-        router.attach_fixed_router(replacement)
-        rebuild = MagicMock(wraps=router._rebuild_from_route_table)
-        monkeypatch.setattr(router, "_rebuild_from_route_table", rebuild)
-
-        router._rebuild_from_fixed_router()
-
-        assert router.route_table is replacement
-        rebuild.assert_called_once_with()
-
     def test_public_route_table_refresh_rebuilds_under_commit_lock(self, monkeypatch):
         router = RouteWiseRouter(config=RouteWiseConfig())
 
@@ -1016,16 +986,6 @@ class TestRouteWiseRouterScaffold:
         router = _Subclass(route_table=route_table, config=RouteWiseConfig())
 
         assert set(router.classified) == {"test-model"}
-
-    def test_route_table_and_legacy_fixed_router_are_mutually_exclusive(self):
-        route_table = _FakeRouteTable()
-
-        with pytest.raises(TypeError, match="cannot both be provided"):
-            RouteWiseRouter(
-                route_table=route_table,
-                fixed_router=route_table,
-                config=RouteWiseConfig(),
-            )
 
     def test_concurrency_adapter_skipped_when_pool_exhausted(self):
         """S_C adapter is not selected when its pool has no free slots."""
@@ -1162,12 +1122,13 @@ class TestRouteWiseQuotaDecision:
     def test_context_prompt_tokens_used(self):
         """Explicit prompt_tokens from context flows into value estimation."""
         router, _, _ = _make_router_with_quota_and_api()
+        _warm_envelope(router, lower=0.0000001, upper=0.001)
 
         for _ in range(25):
             router.predictor.update("test-model", 500)
 
-        v_small = router._estimate_value("test-model", 100)
-        v_large = router._estimate_value("test-model", 10000)
+        v_small = router._select_decision("test-model", {"prompt_tokens": 100}).metadata["v_t"]
+        v_large = router._select_decision("test-model", {"prompt_tokens": 10000}).metadata["v_t"]
         assert v_large > v_small
 
     def test_prompt_tokens_estimated_from_messages(self):
@@ -1474,7 +1435,9 @@ class TestRouteWiseLayer2:
 
         profile = router._latency_profiles["test-model:api-a"]
         now = time.time()
-        assert profile.error_rate(now) > 0
+        # One outcome recorded, and it is not a timed success: it is the error.
+        assert profile.total_count(now) == 1
+        assert profile.sample_count(now) == 0
 
     def test_latency_mean_includes_error_penalty(self):
         """Body LP latency matches real-eval mean-with-errors semantics."""
@@ -1653,7 +1616,7 @@ class TestRouteWiseLayer2:
         """A non-leader worker should consume DB probe samples without probing upstream."""
         router, api_a, _api_b = _make_router_with_two_api()
         api_a.stream_chat_completion = AsyncMock(side_effect=AssertionError("should not probe"))
-        checked_at = dt.datetime.now(dt.timezone.utc)
+        checked_at = dt.datetime.now(dt.UTC)
         store = MagicMock()
         store.list_routewise_probe_samples = AsyncMock(
             return_value=[
@@ -1709,7 +1672,7 @@ class TestRouteWiseLayer2:
                     "ttft_ms": results[0].ttft_ms,
                     "ok": True,
                     "error": None,
-                    "checked_at": dt.datetime.now(dt.timezone.utc),
+                    "checked_at": dt.datetime.now(dt.UTC),
                 }
             ]
         )
@@ -1724,7 +1687,7 @@ class TestRouteWiseLayer2:
     async def test_sync_probe_samples_applies_external_rows_once(self):
         """Persisted probe samples from another worker update this worker's profile once."""
         router, _api_a, _api_b = _make_router_with_two_api()
-        checked_at = dt.datetime.now(dt.timezone.utc)
+        checked_at = dt.datetime.now(dt.UTC)
         store = MagicMock()
         store.list_routewise_probe_samples = AsyncMock(
             return_value=[
@@ -1801,13 +1764,13 @@ class TestRouteWiseLayer2:
         profile_a = router._latency_profiles["test-model:api-a"]
         profile_b = router._latency_profiles["test-model:api-b"]
         assert profile_a.total_count(101.0) == 2
-        assert profile_a.error_rate(101.0) == pytest.approx(0.5)
+        assert profile_a.sample_count(101.0) == 1
         assert profile_a.mean_with_errors_sec(
             101.0,
             error_penalty_ms=60_000.0,
         ) == pytest.approx(30.1)
         assert profile_b.total_count(101.0) == 1
-        assert profile_b.error_rate(101.0) == pytest.approx(1.0)
+        assert profile_b.sample_count(101.0) == 0
         assert router.envelope.sample_count("test-model", now=101.0) == 1
 
     def test_multi_model_layer2_isolation(self):

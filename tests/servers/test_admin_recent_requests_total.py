@@ -13,7 +13,7 @@ contract that replaced it:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,7 +22,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from routing.executor import RouteExecutor
+from routing.routers import FixedRouter
 from serving.servers.deps import AppServices, verify_admin_access
 from serving.servers.routers import admin
 from serving.servers.routers.admin import metrics, request_volume
@@ -37,7 +37,7 @@ def _row(index: int) -> dict[str, Any]:
         "user_email": "ada@example.com",
         "model_id": "glm-4.6",
         "provider": "zai",
-        "timestamp": datetime(2026, 10, 1, tzinfo=timezone.utc),
+        "timestamp": datetime(2026, 10, 1, tzinfo=UTC),
         "status_code": 200,
         "latency_ms": 1200,
         "ttft_ms": 300,
@@ -122,7 +122,7 @@ def _isolate_count_cache():
 def _app(db: _FakeDb, **services: Any) -> FastAPI:
     app = FastAPI(title="Admin Recent Requests Total Test")
     app.state.services = AppServices(  # type: ignore[attr-defined]
-        router=RouteExecutor(), db_logger=MagicMock(pool=db.pool), **services
+        router=FixedRouter(), db_logger=MagicMock(pool=db.pool), **services
     )
     app.dependency_overrides[verify_admin_access] = lambda: "admin-1"
     app.include_router(admin.router)

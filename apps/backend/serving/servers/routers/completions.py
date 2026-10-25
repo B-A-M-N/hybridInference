@@ -14,10 +14,9 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from routing.endpoints import endpoint_id_for_adapter
-from routing.executor import ProviderPinError
 from routing.prefill_load import conversation_fingerprint
 from routing.protocols import RoutingRequestOptions
-from routing.routers import AllCircuitsOpenError, TargetUnavailableError
+from routing.routers import AllCircuitsOpenError, ProviderPinError, TargetUnavailableError
 from serving.auto_mode import (
     AutoModelUnavailable,
     apply_to_chat_request,
@@ -33,6 +32,7 @@ from serving.model_access import ModelAccessDenial, model_access_denial
 from serving.openai_chat_serializer import resolve_mode, sanitize_response
 from serving.pricing import require_route_pricing
 from serving.schemas import (
+    CONTENT_BLOCK_MODALITY,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ErrorResponse,
@@ -80,21 +80,6 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 router = APIRouter()
 _background_tasks: set[asyncio.Task[Any]] = set()
-
-# Maps a multimodal content block "type" to the input modality it requires.
-# Used by the router pre-flight to reject media a model can't accept before
-# any provider call (so streaming and non-streaming both get a clean 400
-# instead of silently dropping the media downstream).
-_CONTENT_BLOCK_MODALITY = {
-    "image_url": "image",
-    "image": "image",
-    "input_image": "image",
-    "input_audio": "audio",
-    "audio": "audio",
-    "video_url": "video",
-    "video": "video",
-    "input_video": "video",
-}
 
 
 def _token_usage_is_sane(
@@ -145,7 +130,7 @@ def _find_unsupported_modality(
         for block in blocks:
             if not isinstance(block, dict):
                 continue
-            required = _CONTENT_BLOCK_MODALITY.get(block.get("type"))
+            required = CONTENT_BLOCK_MODALITY.get(block.get("type"))
             if required and required not in supported:
                 return required
     return None
@@ -169,7 +154,7 @@ def _required_modalities(messages: list[dict[str, Any]]) -> frozenset[str]:
         for block in blocks:
             if not isinstance(block, dict):
                 continue
-            modality = _CONTENT_BLOCK_MODALITY.get(block.get("type"))
+            modality = CONTENT_BLOCK_MODALITY.get(block.get("type"))
             if modality and modality != "text":
                 required.add(modality)
     return frozenset(required)
@@ -300,7 +285,7 @@ async def _streaming_response_with_keepalive(
                 chunk = await asyncio.wait_for(
                     chunk_queue.get(), timeout=_FORCE_STREAMING_KEEPALIVE_S
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 yield b" "
                 yielded_any = True
                 last_client_byte = time.monotonic()

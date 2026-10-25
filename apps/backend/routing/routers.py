@@ -233,6 +233,8 @@ def _affinity_expiry(created_at: float, now: float) -> float:
 EXCLUSION_WEIGHT_OVERRIDE = "weight_override"
 #: A ``disabled_providers`` row zeroes every adapter carrying that provider label.
 EXCLUSION_PROVIDER_DISABLED = "provider_disabled"
+#: A ``provider_route_states`` row disabled (or removed) this one route.
+EXCLUSION_ROUTE_DISABLED = "route_disabled"
 #: ``RoutingManager`` reweighted the route from ``routing.yaml``'s local/remote
 #: split. Only reachable where no weight-override resolver is attached: with one,
 #: selection reads the registration weights and the manager's pass is inert.
@@ -316,17 +318,6 @@ def _describes_request(exc: BaseException) -> bool:
     upstream's status lives would classify the same failure two ways.
     """
     return _http_status_of(exc) in _REQUEST_DESCRIBING_STATUSES
-
-
-def describes_request_error(exc: BaseException) -> bool:
-    """Return whether ``exc`` reports something wrong with the request itself.
-
-    Public because the rule now has two callers: the single-router fallback loop
-    below, and the hybrid layer, which drives candidates drawn from more than one
-    execution domain and therefore has to arrive at the same answer about which
-    failure the caller is told.
-    """
-    return _describes_request(exc)
 
 
 def select_surfaced_error(errors: Sequence[BaseException]) -> int:
@@ -521,10 +512,10 @@ def exceeds_context_window(exc: BaseException) -> bool:
     route stays worthwhile. Whether a prompt fits is a matter of its length and
     the route's window, and every route's window is in its config.
 
-    Public for the same reason as ``describes_request_error``: any router that
-    walks candidates after a failure needs the same answer. The text is read
-    from ``error_body``, where ``serving.http`` keeps a failed response's body,
-    and from the message, where an in-band stream error frame carries it.
+    Public because any router that walks candidates after a failure needs the
+    same answer. The text is read from ``error_body``, where ``serving.http``
+    keeps a failed response's body, and from the message, where an in-band
+    stream error frame carries it.
     """
     if not _describes_request(exc):
         return False
@@ -674,7 +665,7 @@ def adapter_in_endpoint_scope(adapter: BaseAdapter, scope: frozenset[str] | None
 class FixedRouter:
     """Weighted random routing with automatic fallback.
 
-    Drop-in replacement for RouteExecutor. Selects adapters via weighted
+    Drop-in replacement for FixedRouter. Selects adapters via weighted
     random selection and tries remaining adapters on failure.
 
     Args:
@@ -691,6 +682,7 @@ class FixedRouter:
         disabled_provider_resolver: Any | None = None,
         health_registry: EndpointHealthRegistry | None = None,
         offload_policy_resolver: Any | None = None,
+        route_state_resolver: Any | None = None,
     ) -> None:
         self._health_registry = (
             health_registry if health_registry is not None else EndpointHealthRegistry()
@@ -707,6 +699,9 @@ class FixedRouter:
         # weight 0 so the existing ``weight > 0`` gates in selection and every
         # fallback loop skip them without any per-call-site change.
         self.disabled_provider_resolver = disabled_provider_resolver
+        # Per-route admin disable (``serving.config.route_states``), applied the
+        # same way: a disabled route gets weight 0 and every gate skips it.
+        self.route_state_resolver = route_state_resolver
         # Per-model queue-offload routes (``routing.offload.OffloadPolicySource``).
         # None means no model has one, and every path below behaves as it did
         # before offload existed.
@@ -1191,6 +1186,7 @@ class FixedRouter:
         exposes the sync snapshot.
         """
         disabled_resolver = self.disabled_provider_resolver
+        route_states = self.route_state_resolver
         facts: list[dict[str, Any]] = []
         for model_id, route in self._published_routes_snapshot():
             overrides = self._weight_override_snapshot(model_id)
@@ -1252,6 +1248,11 @@ class FixedRouter:
                 ):
                     weight = 0.0
                     reasons.append(EXCLUSION_PROVIDER_DISABLED)
+                if route_states is not None and route_states.is_excluded(
+                    model_id, route_id_for_adapter(adapter)
+                ):
+                    weight = 0.0
+                    reasons.append(EXCLUSION_ROUTE_DISABLED)
                 effective_weights.append(weight)
                 per_route_reasons.append(reasons)
             effective_share = _weight_shares(effective_weights)
@@ -1449,17 +1450,24 @@ class FixedRouter:
             return route.canonical_model_id if route and route.canonical_model_id else model_id
 
     def _apply_disabled_providers(
-        self, adapters: list[tuple[BaseAdapter, float]]
+        self,
+        adapters: list[tuple[BaseAdapter, float]],
+        model_id: str | None = None,
     ) -> list[tuple[BaseAdapter, float]]:
-        """Force weight 0 for adapters whose provider is admin-disabled."""
+        """Force weight 0 for adapters whose provider or route is admin-disabled."""
         resolver = self.disabled_provider_resolver
-        if resolver is None:
+        route_states = self.route_state_resolver if model_id is not None else None
+        if resolver is None and route_states is None:
             return adapters
-        is_disabled = resolver.is_disabled
-        return [
-            (adapter, 0.0 if is_disabled(adapter.config.provider) else weight)
-            for adapter, weight in adapters
-        ]
+        result: list[tuple[BaseAdapter, float]] = []
+        for adapter, weight in adapters:
+            if (resolver is not None and resolver.is_disabled(adapter.config.provider)) or (
+                route_states is not None
+                and route_states.is_excluded(model_id, route_id_for_adapter(adapter))
+            ):
+                weight = 0.0
+            result.append((adapter, weight))
+        return result
 
     def _get_effective_adapters(
         self, model_id: str, route: RouteConfig
@@ -1469,7 +1477,7 @@ class FixedRouter:
         raw_adapters = route.raw_adapters
         override_model_id = route.canonical_model_id or model_id
         if resolver is None or not raw_adapters:
-            return self._apply_disabled_providers(route.adapters)
+            return self._apply_disabled_providers(route.adapters, override_model_id)
 
         get_snapshot = getattr(resolver, "get_snapshot_for_model", None)
         if get_snapshot is not None:
@@ -1478,7 +1486,8 @@ class FixedRouter:
                 [
                     (adapter, float(overrides.get(endpoint_id, raw_weight)))
                     for adapter, raw_weight, endpoint_id in raw_adapters
-                ]
+                ],
+                override_model_id,
             )
 
         result = resolver.get_for_model(override_model_id)
@@ -1498,7 +1507,8 @@ class FixedRouter:
             [
                 (adapter, float(overrides.get(endpoint_id, raw_weight)))
                 for adapter, raw_weight, endpoint_id in raw_adapters
-            ]
+            ],
+            override_model_id,
         )
 
     def register_route(
