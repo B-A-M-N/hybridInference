@@ -43,6 +43,11 @@ MODEL = "m"
 MESSAGES = [{"role": "user", "content": "hi"}]
 KEY = "shared-key"
 
+#: The first-token wait is enforced with ``asyncio.timeout`` (Python 3.11+).
+needs_timeout = pytest.mark.skipif(
+    not hasattr(asyncio, "timeout"), reason="the first-token wait needs asyncio.timeout"
+)
+
 
 class _Engine(BaseAdapter):
     """An upstream that sends its first token only once ``gate`` is set.
