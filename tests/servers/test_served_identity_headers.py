@@ -17,7 +17,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from routing.executor import RouteExecutor
+from routing.routers import FixedRouter as RouteExecutor
 from serving.adapters.base import BaseAdapter, ModelConfig
 from serving.servers.deps import AppServices
 from serving.servers.middleware.error import install_error_handlers
