@@ -1,15 +1,17 @@
-# Keepalive queue bound: gateway-level slow-client reproduction
+# SSE keepalive queue bound: gateway-level slow-client reproduction
 
 Date: 2026-10-23. PR: HarvardMadSys/hybridInference#1560.
 
 ## Question
 
-Does the hand-off bound in the forced-streaming chain actually reach the
-provider through a slow HTTP client, and what does it cost in memory?
+Does the bounded hand-off queue in the SSE chain reach the provider through a
+slow HTTP client, and what does it cost in memory? The forced-streaming
+branch is measured as a comparison, but still buffers the whole generation
+before returning one JSON body by design; it is not the memory fix.
 
 ## Method
 
-scripts/repro_gateway_slow_client.py drives the real serving app
+A local one-off gateway harness drove the real serving app
 (serving.servers.app.create_app, the same factory uvicorn runs) over real
 uvicorn HTTP, against a real local SSE upstream (aiohttp) that emits
 pre-built ~2 KB chunks as fast as the socket takes them. The client is a raw
@@ -61,9 +63,13 @@ the adapter, so the provider observes the stall at the application boundary.
 
 ## What the numbers do and do not show
 
-- After the change, the application-side buffering of the chain is capped at
-  both hops (256 + 256). The inner queue is pinned at its bound, never above
-  it.
+- The behavior change is on the plain SSE path: its inner queue is capped at
+  256 and pins there under a slow consumer, after which the application stops
+  pulling from the adapter.
+- In the forced-streaming branch the outer consumer still accumulates the
+  complete generation in ``content_parts`` before emitting one JSON body, by
+  design. Its hand-off queues are bounded, but the response body remains
+  whole-generation buffering; this PR does not solve that separate issue.
 - Before the change, the inner queue had no cap at all. On this loopback
   setup the provider socket throttled the chain before the unbounded queue
   visibly accumulated (peak depth 1 in the SSE scenario), so unbounded growth
@@ -83,18 +89,15 @@ the adapter, so the provider observes the stall at the application boundary.
 
 ## Reproducing
 
-    python scripts/repro_gateway_slow_client.py
+The harness was a dated local procedure, deliberately not shipped as a
+permanent script. Rebuild it from this section: start the real serving app
+(``create_app``) with uvicorn, provide a local aiohttp SSE upstream, drive a
+stalled raw-socket client, and instrument scoped ``asyncio.Queue`` instances
+for maxsize, peak depth, put/get counts, and post-disconnect depth. Assert
+that no queue exceeds the bound, total buffered items remain within two
+bounds plus slack, and each queue is at or below its bound after disconnect.
+Compare the same workload with the source change stashed.
 
-REPRO_CHUNKS (default 1200), REPRO_UPSTREAM_PORT and REPRO_GATEWAY_PORT
-override the traffic size and the ports. The script exits non-zero if a
-queue exceeds the bound, if the total buffered items exceed 2 x bound plus
-slack, or if a queue still holds more than its bound after the client
-disconnects.
-
-To reproduce the "before" numbers, stash the source change (the script only
-needs the tests and the script itself):
-
-    git stash push apps/backend/serving/servers/routers/completions_stream.py \
-        apps/backend/serving/servers/routers/completions.py
-    python scripts/repro_gateway_slow_client.py
-    git stash pop
+The exact historical script is retained outside the repository in the
+authoring environment for traceability; it is not part of the reviewable
+contract.
