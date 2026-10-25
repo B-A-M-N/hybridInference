@@ -10,6 +10,7 @@ response body and no outcome argument at all, because that is how
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
@@ -234,6 +235,20 @@ class TestWarmupMarkerAnchoring:
 
         outcome = classify_completion_outcome(content=text, http_status=200, terminal=True)
         assert outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS, text
+
+    def test_malformed_notice_suffix_is_bounded(self):
+        """Repeated caller-influenced punctuation cannot backtrack exponentially."""
+        from routing.completion_outcome import CompletionOutcome, classify_completion_outcome
+
+        # At the defective regex's roughly 4x-per-two-characters growth rate,
+        # this caller-influenced output would take minutes to classify.
+        adversarial = "the model is starting up" + (". " * 30) + "x"
+        start = time.perf_counter()
+        outcome = classify_completion_outcome(content=adversarial, http_status=200, terminal=True)
+        elapsed = time.perf_counter() - start
+
+        assert outcome is CompletionOutcome.PROGRESS
+        assert elapsed < 0.1, f"classification took {elapsed:.3f}s"
 
 
 class TestStreamingOutcomePrefixes:

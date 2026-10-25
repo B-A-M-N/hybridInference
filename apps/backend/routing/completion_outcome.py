@@ -111,8 +111,11 @@ _TRANSIENT_SUFFIX_PREFIXES: tuple[str, ...] = (
 )
 
 _NOTICE_SUFFIX = (
-    r"(?:"
+    # Bound the zero-width fallback to exactly one iteration. Repeating an
+    # optional group allowed exponentially many punctuation decompositions and
+    # caused catastrophic backtracking on caller-influenced output.
     r"[\s.!\u2026,;:-]*"
+    r"(?:"
     r"(?:"
     r"this (?:takes|will take) about \d{1,4} (?:seconds?|minutes?)"
     r"|please wait(?: while (?:the )?model (?:loads|starts|initializes))?"
@@ -123,7 +126,7 @@ _NOTICE_SUFFIX = (
     r"|shortly"
     r"|yet"
     r"|now"
-    r")?"
+    r")[\s.!\u2026,;:-]*"
     r")*$"
 )
 _TRANSIENT_MARKERS: tuple[re.Pattern[str], ...] = tuple(
