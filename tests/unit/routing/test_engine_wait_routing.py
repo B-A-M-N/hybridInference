@@ -43,11 +43,6 @@ MODEL = "m"
 MESSAGES = [{"role": "user", "content": "hi"}]
 KEY = "shared-key"
 
-#: The first-token wait is enforced with ``asyncio.timeout`` (Python 3.11+).
-needs_timeout = pytest.mark.skipif(
-    not hasattr(asyncio, "timeout"), reason="the first-token wait needs asyncio.timeout"
-)
-
 
 class _Engine(BaseAdapter):
     """An upstream that sends its first token only once ``gate`` is set.
@@ -206,7 +201,6 @@ def _routing(chunks: list[str]) -> list[dict[str, Any]]:
 # ------------------------------------------------------ the first-token wait
 
 
-@needs_timeout
 async def test_a_stream_with_no_first_token_is_cancelled_and_offloaded():
     engine = _Engine("engine")
     reserved = _Engine("reserved", route_id="offload", answered=True, prelude=False)
@@ -243,7 +237,6 @@ async def test_a_first_token_in_time_goes_out_with_what_came_before_it():
     assert reserved.calls == 0
 
 
-@needs_timeout
 async def test_only_streaming_attempts_on_other_routes_are_watched():
     engine = _Engine("engine")
     reserved = _Engine("reserved", route_id="offload", answered=True)
@@ -332,7 +325,6 @@ async def test_a_fallback_stream_is_watched_under_its_own_budget():
 # ---------------------------------------------------- one decision per request
 
 
-@needs_timeout
 async def test_an_engine_that_kept_one_request_waiting_takes_the_next():
     """Nothing is held against the engine: the next request is sent to it as usual."""
     engine = _Engine("engine")
@@ -353,7 +345,6 @@ async def test_an_engine_that_kept_one_request_waiting_takes_the_next():
     assert reserved.calls == 1
 
 
-@needs_timeout
 async def test_each_request_waits_from_its_own_start():
     """Two requests queued at the same engine: only the one past its own wait moves."""
     engine = _Engine("engine")
@@ -374,7 +365,6 @@ async def test_each_request_waits_from_its_own_start():
     assert reserved.calls == 1
 
 
-@needs_timeout
 async def test_output_a_processor_holds_back_is_not_an_engine_wait(monkeypatch):
     """A MiniMax ``<think>`` block the adapter strips out is the engine answering.
 
@@ -723,7 +713,6 @@ class _SlowThenFailing(_Engine):
             yield chunk
 
 
-@needs_timeout
 async def test_a_stream_cut_short_goes_back_to_its_engine_when_the_offload_route_fails():
     engine = _Engine("engine", answered=True, delay=0.2)
     reserved = _Engine("reserved", route_id="offload", fail_with=RuntimeError("upstream 503"))
@@ -749,7 +738,6 @@ async def test_a_stream_cut_short_goes_back_to_its_engine_when_the_offload_route
     ]
 
 
-@needs_timeout
 async def test_a_stream_whose_retry_fails_reports_the_engines_own_error():
     """Not the deadline that cut its first attempt short."""
     engine = _SlowThenFailing("engine")
