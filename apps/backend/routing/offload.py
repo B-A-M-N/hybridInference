@@ -75,6 +75,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from routing.engine_wait import EngineWaitExpired
 from serving.adapters.upstream_limiter import UpstreamQueueWaitExpired, UpstreamSaturated
+from serving.config.app_config import config_value, on_change
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -85,7 +86,7 @@ __all__ = [
     "OFFLOAD_ENGINE_WAIT",
     "OFFLOAD_LAST_RESORT",
     "OFFLOAD_MAX_WAIT_SECONDS",
-    "OFFLOAD_PREFILL_CREDIT_TOKENS",
+    "OFFLOAD_PREFILL_RATE_TOKENS_PER_SEC",
     "OFFLOAD_QUEUE_WAIT",
     "FallbackOrder",
     "OffloadPolicy",
@@ -102,51 +103,58 @@ OFFLOAD_ENGINE_WAIT = "engine_wait"
 #: ``_routing["offload"]`` when no other route could serve the request.
 OFFLOAD_LAST_RESORT = "last_resort"
 
-#: Estimated un-cached prefill tokens one ``wait_seconds`` of engine time is
-#: credited with. The budget is ``wait_seconds * (1 + uncached / credit)``: the
-#: configured wait is a *fixed* allowance (queueing, scheduling, the first
-#: decode step) plus one credit's worth of prefill, and every further credit
-#: buys another base wait of prefill. Offsetting rather than scaling is what
-#: makes the floor mean something -- a purely proportional
-#: ``wait_seconds * uncached / credit`` gives a prompt of exactly one credit the
-#: same 0.8 s a warm continuation gets, which is precisely the cold prefill that
-#: was being cancelled.
-#:
-#: The credit is calibrated against measured staging prefills (pinned vLLM,
-#: small ``max_tokens``), and the number that matters is the *tail*: twelve cold
-#: 2.6k-token requests finished in 0.49-0.97 s, and at 9.1k the old proportional
-#: budget of 1.78 s sat ten milliseconds under a measured 1.79 s. Replaying both
-#: rules over 27 measured successful prefills, the old one would have cancelled
-#: three; this one none. Its tightest headroom is the 2.6k tail (0.97 s measured
-#: against 1.32 s) rather than the 18.3k case (1.79 s against 4.38 s), because
-#: the measured cost is not a straight line in tokens -- 9.1k and 18.3k both land
-#: at ~1.5-1.8 s, which looks like a scheduling quantum. The constant therefore
-#: encodes a conservative bound, not a measured rate.
-#:
-#: The engine wait bounds ``prefill + time-to-first-token``, and only the engine
-#: knows where prefill ends -- the first token is the first evidence the gateway
-#: gets, and it arrives *after* the prefill. A flat deadline therefore fires
-#: hardest exactly when the engine is doing the most legitimate work: a cold
-#: prefill of a long prompt. On expiry the attempt is cancelled, which aborts the
-#: request at the engine, discards the prefill it had already done, and re-sends
-#: the prompt cold to the offload route -- duplicated work and a guaranteed cache
-#: miss on a route that shares no KV with the engine that was about to answer.
-#: A warm continuation prefills only its delta and stays inside the base wait, so
-#: extending for the un-cached estimate costs the offload nothing where it was
-#: already correct.
-OFFLOAD_PREFILL_CREDIT_TOKENS: int = 4_096
+#: Whether cold-prefill engine waits are extended beyond the configured base.
+#: Setting ``ROUTING_OFFLOAD_ENGINE_WAIT_EXTENSION=0`` is the rollback control:
+#: the next requests keep the admin-configured first-token wait, without a
+#: restart or route edit.
+OFFLOAD_ENGINE_WAIT_EXTENSION: bool = True
+
+#: Tokens per second used to convert un-cached prefill into engine-wait budget.
+#: The formula is additive, ``base + uncached / rate``, so changing the base
+#: wait does not silently change the prefill calibration. At 2,560 tokens/s, a
+#: 0.3 s base still budgets 7.46 s for the measured 18.3k/1.79 s tail, while a
+#: 2 s base receives the same 7.16 s prefill allowance instead of reaching the
+#: cap at roughly 12k tokens.
+OFFLOAD_PREFILL_RATE_TOKENS_PER_SEC: float = 2_560.0
 
 #: Ceiling on the extended engine wait, so an engine that is genuinely wedged
-#: still fails over. Bounds the extra latency a cold prompt may add before the
-#: fallback the policy already had.
-#:
-#: Sizing against the same measurements: 8 s is about the extrapolated cold
-#: prefill of a 100k-token prompt on the measured rate, so the cap does not fire
-#: before a legitimate prefill of any prompt the route can accept. It also stays
-#: below the remote TTFT the offload route was observed serving under contention
-#: (30-49 s at the tail), so waiting out the engine is still the cheaper choice
-#: at the cap.
+#: still fails over. Also bounds the extra latency a cold prompt may add before
+#: the fallback the policy already had. The configured base itself is never
+#: shortened by this ceiling.
 OFFLOAD_MAX_WAIT_SECONDS: float = 8.0
+
+
+def _positive_float_setting(name: str, default: float) -> float:
+    """Read a positive finite routing setting, preserving ``default`` on bad input."""
+    raw = config_value(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value) or value <= 0:
+        return default
+    return value
+
+
+def _load_engine_wait_settings() -> None:
+    """Reload the bounded engine-wait controls for the next routing decision."""
+    global OFFLOAD_ENGINE_WAIT_EXTENSION, OFFLOAD_PREFILL_RATE_TOKENS_PER_SEC
+    global OFFLOAD_MAX_WAIT_SECONDS
+    OFFLOAD_ENGINE_WAIT_EXTENSION = (
+        config_value("ROUTING_OFFLOAD_ENGINE_WAIT_EXTENSION", "1") != "0"
+    )
+    OFFLOAD_PREFILL_RATE_TOKENS_PER_SEC = _positive_float_setting(
+        "ROUTING_OFFLOAD_PREFILL_RATE_TOKENS_PER_SEC", 2_560.0
+    )
+    OFFLOAD_MAX_WAIT_SECONDS = _positive_float_setting(
+        "ROUTING_OFFLOAD_MAX_ENGINE_WAIT_SECONDS", 8.0
+    )
+
+
+_load_engine_wait_settings()
+on_change(_load_engine_wait_settings)
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,24 +213,25 @@ class OffloadPolicy:
 
         The budget this attempt's engine wait runs under: the configured
         ``wait_seconds`` covers queueing, scheduling and the first decode step,
-        and each :data:`OFFLOAD_PREFILL_CREDIT_TOKENS` of un-cached prefill buys
-        another ``wait_seconds`` of it. A warm continuation -- which prefills
-        only the growth since the caller's last turn -- stays at or just above
-        the floor, and a short cold prompt finishes inside the fixed allowance;
-        a long cold prompt gets time proportional to the work it actually has to
-        do.
+        and un-cached prefill adds time at the calibrated
+        :data:`OFFLOAD_PREFILL_RATE_TOKENS_PER_SEC`, independent of the base. A
+        warm continuation -- which prefills only the growth since the caller's
+        last turn -- stays at or just above the floor; a cold prompt gets time
+        for the work it actually has to do.
 
-        Bounded by construction: the ceiling is a fixed constant, not a function
-        of load, so a wedged engine still fails over within a known time, and the
-        result never drops below ``wait_seconds``. Nothing here reads or writes
+        Bounded by construction: the ceiling is configurable but fixed with
+        respect to load, so a wedged engine still fails over within a known
+        time. The result never drops below ``wait_seconds``. Setting
+        :data:`OFFLOAD_ENGINE_WAIT_EXTENSION` false restores the flat base wait
+        without changing queue-wait policy. Nothing here reads or writes
         endpoint health -- a busy engine stays healthy, exactly as before.
         """
         base = self.wait_seconds
-        if uncached_tokens <= 0:
+        if uncached_tokens <= 0 or not OFFLOAD_ENGINE_WAIT_EXTENSION:
             return base
-        credit = max(OFFLOAD_PREFILL_CREDIT_TOKENS, 1)
-        scaled = base * (1.0 + uncached_tokens / credit)
-        return float(min(scaled, max(OFFLOAD_MAX_WAIT_SECONDS, base)))
+        rate = max(OFFLOAD_PREFILL_RATE_TOKENS_PER_SEC, 1.0)
+        effective = base + uncached_tokens / rate
+        return float(min(effective, max(OFFLOAD_MAX_WAIT_SECONDS, base)))
 
 
 @runtime_checkable

@@ -584,11 +584,13 @@ def _remember(router: FixedRouter, endpoint_id: str, tokens: int) -> None:
 async def test_a_warm_continuation_keeps_the_base_wait():
     """A real cache hit prefills its delta, so it is sized on the delta.
 
-    The 576-token growth earns roughly the base wait, and the engine answers
-    inside it. Sizing on the total prompt would hold the request for a prefill
-    the cache has already done.
+    The 576-token growth earns only a small addition to the base wait, and the
+    engine answers well inside it. Sizing on the total prompt would hold the
+    request for a prefill the cache has already done. The delay is deliberately
+    below but not adjacent to that deadline: this test also guards regressions
+    under parallel CI, where a 50 ms margin was observed to flake.
     """
-    engine = _Engine("engine", answered=True, delay=0.05)
+    engine = _Engine("engine", answered=True, delay=0.25)
     reserved = _Engine("reserved", route_id="offload", answered=True, prelude=False)
     policy = _policy(wait_seconds=0.1)
     router = _router([(engine, 1.0), (reserved, 1.0)], policy)
@@ -601,7 +603,9 @@ async def test_a_warm_continuation_keeps_the_base_wait():
     assert engine.cancelled == 0
     (watch,) = engine.watches
     assert watch.wait_seconds == pytest.approx(policy.engine_wait_seconds(576))
-    assert watch.wait_seconds < policy.engine_wait_seconds(24_576) / 4
+    assert watch.wait_seconds < policy.engine_wait_seconds(24_576) / 3
+    assert watch.base_wait_seconds == policy.wait_seconds
+    assert watch.uncached_prefill_tokens == 576
 
 
 @needs_timeout
@@ -666,9 +670,11 @@ async def test_a_large_prompt_is_bounded_by_the_wait_ceiling():
 
     assert _content(chunks) == "engine"
     (watch,) = engine.watches
-    # 1.0 * (1 + 200k/4096) would be ~49 s; the ceiling keeps it at 8.
+    # At the calibrated rate 200k would need ~78 s; the ceiling keeps it at 8.
     assert watch.wait_seconds == pytest.approx(OFFLOAD_MAX_WAIT_SECONDS)
     assert policy.engine_wait_seconds(200_000) == pytest.approx(OFFLOAD_MAX_WAIT_SECONDS)
+    assert watch.base_wait_seconds == policy.wait_seconds
+    assert watch.uncached_prefill_tokens == 200_000
 
 
 @needs_timeout

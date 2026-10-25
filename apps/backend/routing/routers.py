@@ -1017,8 +1017,17 @@ class FixedRouter:
         reason: str,
         policy: OffloadPolicy | None,
         failed_attempts: Sequence[dict[str, str]],
+        *,
+        engine_wait_seconds: float | None = None,
+        engine_wait_uncached_tokens: int | None = None,
     ) -> None:
-        """Record that a request is being sent to its model's offload route."""
+        """Record that a request is being sent to its model's offload route.
+
+        ``wait_seconds`` remains the configured base/queue budget. For an engine
+        wait, ``engine_wait_seconds`` and ``engine_wait_uncached_tokens`` report
+        the effective deadline actually armed for the abandoned attempt so
+        staging telemetry cannot mistake a calibrated wait for the base wait.
+        """
         logger.info(
             "route_offload",
             extra={
@@ -1027,6 +1036,8 @@ class FixedRouter:
                 "endpoint_id": endpoint_id_for_adapter(adapter),
                 "reason": reason,
                 "wait_seconds": policy.wait_seconds if policy is not None else None,
+                "engine_wait_seconds": engine_wait_seconds,
+                "engine_wait_uncached_tokens": engine_wait_uncached_tokens,
                 "after_endpoint_id": (
                     failed_attempts[-1].get("endpoint_id") if failed_attempts else None
                 ),
@@ -1062,6 +1073,8 @@ class FixedRouter:
         return FirstTokenWatch(
             endpoint_id_for_adapter(adapter),
             wait_seconds=policy.engine_wait_seconds(uncached_tokens),
+            base_wait_seconds=policy.wait_seconds,
+            uncached_prefill_tokens=uncached_tokens,
         )
 
     def _engine_queue_limit(self, model_id: str) -> int | None:
@@ -2625,15 +2638,28 @@ class FixedRouter:
         chunks_yielded = False
         try:
             primary_endpoint_id = endpoint_id_for_adapter(primary)
+            primary_uncached_tokens = self._engine_wait_tokens(
+                primary_endpoint_id, prefill_tokens, affinity_key, fingerprint, messages
+            )
             if primary_plan.reason is not None:
-                self._log_offload(model_id, primary, primary_plan.reason, primary_plan.policy, ())
+                self._log_offload(
+                    model_id,
+                    primary,
+                    primary_plan.reason,
+                    primary_plan.policy,
+                    (),
+                    engine_wait_seconds=(
+                        primary_plan.policy.engine_wait_seconds(primary_uncached_tokens)
+                        if primary_plan.policy is not None
+                        else None
+                    ),
+                    engine_wait_uncached_tokens=primary_uncached_tokens,
+                )
             primary_watch = self._watch_for(
                 primary,
                 primary_plan.policy,
                 primary_plan.deadline,
-                uncached_tokens=self._engine_wait_tokens(
-                    primary_endpoint_id, prefill_tokens, affinity_key, fingerprint, messages
-                ),
+                uncached_tokens=primary_uncached_tokens,
             )
             with req_ctx.push(
                 model=model_id,
@@ -2785,9 +2811,22 @@ class FixedRouter:
                 fallback_claim = self._health_registry.begin_dispatch(adapter_endpoint_id)
                 if fallback_claim is None:
                     continue
+                fallback_uncached_tokens = self._engine_wait_tokens(
+                    adapter_endpoint_id, prefill_tokens, affinity_key, fingerprint, messages
+                )
                 if offload_reason is not None:
                     self._log_offload(
-                        model_id, adapter, offload_reason, offload_policy, failed_attempts
+                        model_id,
+                        adapter,
+                        offload_reason,
+                        offload_policy,
+                        failed_attempts,
+                        engine_wait_seconds=(
+                            offload_policy.engine_wait_seconds(fallback_uncached_tokens)
+                            if offload_policy is not None
+                            else None
+                        ),
+                        engine_wait_uncached_tokens=fallback_uncached_tokens,
                     )
                 try:
                     # The offload attempt queues normally and is not watched:
@@ -2805,9 +2844,7 @@ class FixedRouter:
                         adapter,
                         offload_policy,
                         queue_deadline,
-                        uncached_tokens=self._engine_wait_tokens(
-                            adapter_endpoint_id, prefill_tokens, affinity_key, fingerprint, messages
-                        ),
+                        uncached_tokens=fallback_uncached_tokens,
                     )
                     with req_ctx.push(
                         model=model_id,
