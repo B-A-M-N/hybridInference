@@ -13,10 +13,11 @@ sys.path.insert(0, str(project_root))
 
 import pytest
 
-from routing.executor import RouteExecutor
 from routing.manager import RoutingManager
+from routing.routers import FixedRouter
 from routing.routewise.config import RouteWiseConfig
 from routing.routewise.router import RouteWiseRouter
+from serving.adapters.base import BaseAdapter, ModelConfig
 from serving.config.model_visibility import ModelVisibilityResolver
 from serving.servers import bootstrap
 from serving.servers.deps import AppServices
@@ -50,6 +51,7 @@ def _provider_stats_startup(*, scheduler, backfill_missing, backfill_token_colum
         patch("serving.servers.bootstrap.PostgresOperationalStore", return_value=AsyncMock()),
         patch("serving.servers.bootstrap.CachedOperationalStore", return_value=MagicMock()),
         patch("serving.servers.bootstrap.ResponseStore", return_value=AsyncMock()),
+        patch("serving.servers.bootstrap.BatchStore", return_value=AsyncMock()),
         patch("serving.servers.bootstrap.email_scheduler.start_scheduler"),
         patch(
             "serving.servers.bootstrap.email_scheduler.rehydrate_scheduled_broadcasts",
@@ -183,16 +185,11 @@ class TestBootstrapInitialization:
                 "serving.servers.bootstrap.ModelRouterRegistry",
                 wraps=ModelRouterRegistry,
             ) as registry_factory,
-            patch.object(
-                ModelRouterRegistry,
-                "bind_fixed_router",
-                side_effect=AssertionError("bootstrap must inject shared FixedRouter"),
-            ),
         ):
             services = await bootstrap.initialize()
 
             assert isinstance(services, AppServices)
-            assert isinstance(services.router, RouteExecutor)
+            assert isinstance(services.router, FixedRouter)
             assert services.db_logger is None  # Disabled in mock_env
             assert services.routing_manager is None
             assert services.model_visibility_resolver is None
@@ -225,6 +222,7 @@ class TestBootstrapInitialization:
             patch("serving.servers.bootstrap.DatabaseLogger") as MockDBLogger,
             patch("serving.servers.bootstrap.PostgresOperationalStore") as MockPGOp,
             patch("serving.servers.bootstrap.ResponseStore", return_value=AsyncMock()),
+            patch("serving.servers.bootstrap.BatchStore", return_value=AsyncMock()),
         ):
             mock_logger = AsyncMock()
             MockDBLogger.return_value = mock_logger
@@ -257,6 +255,7 @@ class TestBootstrapInitialization:
             patch("serving.servers.bootstrap.PostgresOperationalStore") as MockPGOp,
             patch("serving.servers.bootstrap.CachedOperationalStore") as MockCachedStore,
             patch("serving.servers.bootstrap.ResponseStore", return_value=AsyncMock()),
+            patch("serving.servers.bootstrap.BatchStore", return_value=AsyncMock()),
         ):
             mock_pg_op = AsyncMock()
             MockPGOp.return_value = mock_pg_op
@@ -287,6 +286,7 @@ class TestBootstrapInitialization:
             patch("serving.servers.bootstrap.PostgresOperationalStore") as MockPGOp,
             patch("serving.servers.bootstrap.CachedOperationalStore") as MockCachedStore,
             patch("serving.servers.bootstrap.ResponseStore", return_value=AsyncMock()),
+            patch("serving.servers.bootstrap.BatchStore", return_value=AsyncMock()),
             patch(
                 "serving.servers.bootstrap.ModelVisibilityResolver",
                 side_effect=RuntimeError("boom"),
@@ -622,6 +622,7 @@ models:
             patch("serving.servers.bootstrap.CachedOperationalStore", return_value=cached_store),
             patch("serving.servers.bootstrap.PostgresLogStore", return_value=log_store),
             patch("serving.servers.bootstrap.ResponseStore", return_value=AsyncMock()),
+            patch("serving.servers.bootstrap.BatchStore", return_value=AsyncMock()),
             patch("serving.servers.bootstrap.email_scheduler.start_scheduler"),
             patch(
                 "serving.servers.bootstrap.email_scheduler.rehydrate_scheduled_broadcasts",
@@ -998,7 +999,7 @@ class TestBootstrapShutdown:
     @pytest.mark.asyncio
     async def test_shutdown_handles_none_services(self):
         """Test that shutdown handles None values gracefully."""
-        services = AppServices(router=RouteExecutor(), db_logger=None, routing_manager=None)
+        services = AppServices(router=FixedRouter(), db_logger=None, routing_manager=None)
 
         # Should not raise any errors
         await bootstrap.shutdown(services)
@@ -1073,7 +1074,7 @@ models:
 
         monkeypatch.setenv("MODELS_CONFIG", str(models_yaml))
 
-        router = RouteExecutor()
+        router = FixedRouter()
 
         await bootstrap._init_router_and_models(router)
 
@@ -1106,7 +1107,7 @@ models:
         )
         monkeypatch.setenv("MODELS_CONFIG", str(models_yaml))
 
-        router = RouteExecutor()
+        router = FixedRouter()
         await bootstrap._init_router_and_models(router)
         assert "deepseek-chat" in router.routes
 
@@ -1138,7 +1139,7 @@ models:
         )
         monkeypatch.setenv("MODELS_CONFIG", str(models_yaml))
 
-        router = RouteExecutor()
+        router = FixedRouter()
         await bootstrap._init_router_and_models(router)
         assert "gemini-2.5-flash" in router.routes
 
@@ -1186,3 +1187,443 @@ class TestBootstrapErrorHandling:
             )
             # Should log a warning about routing config failure/missing
             mock_logger.warning.assert_called()
+
+
+class _RouteAdapter(BaseAdapter):
+    """Adapter double for a route-table test; it is never sent a request."""
+
+    def __init__(self, endpoint_id: str) -> None:
+        super().__init__(
+            ModelConfig(
+                id="m",
+                name="m",
+                provider=endpoint_id.split(":")[1],
+                base_url="https://upstream.example/v1",
+                endpoint_id=endpoint_id,
+            )
+        )
+
+    async def chat_completion(self, messages, **params):
+        raise NotImplementedError
+
+    async def stream_chat_completion(self, messages, **params):
+        raise NotImplementedError
+        yield
+
+
+@pytest.mark.asyncio
+async def test_initialize_keeps_route_states_when_their_first_load_fails(mock_env):
+    """One failed read at boot must not turn disabled and deleted routes on until a restart.
+
+    The resolver is attached anyway, as the offload resolver is; its refresh loop
+    retries the read and, once it lands, takes deleted config routes out of the
+    route table, which boot could not do without the states.
+    """
+    db_logger = AsyncMock()
+    db_logger.pool = object()
+    store = MagicMock()
+    store.list_all_provider_route_states = AsyncMock(
+        side_effect=ConnectionError("database unavailable")
+    )
+    for name in (
+        "list_all_provider_route_candidates",
+        "list_all_provider_route_configs",
+        "list_all_route_capability_overrides",
+        "list_settings",
+    ):
+        setattr(store, name, AsyncMock(return_value=[]))
+    refresh_loops: list[dict] = []
+
+    async def record_refresh_loop(resolver, registry, **kwargs):
+        refresh_loops.append({"resolver": resolver, **kwargs})
+
+    with (
+        patch("serving.servers.bootstrap._init_db_logger", return_value=db_logger),
+        patch(
+            "serving.servers.bootstrap._init_router_and_models",
+            new=AsyncMock(return_value=({}, [])),
+        ),
+        patch("serving.servers.bootstrap._apply_routing_manager", return_value=None),
+        patch("serving.servers.bootstrap.PostgresOperationalStore", return_value=AsyncMock()),
+        patch("serving.servers.bootstrap.CachedOperationalStore", return_value=store),
+        patch("serving.servers.bootstrap.ResponseStore", return_value=AsyncMock()),
+        patch("serving.servers.bootstrap.BatchStore", return_value=AsyncMock()),
+        patch(
+            "serving.servers.bootstrap._refresh_route_state_snapshots",
+            new=record_refresh_loop,
+        ),
+    ):
+        services = await bootstrap.initialize()
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    resolver = services.route_state_resolver
+    assert resolver is not None
+    assert services.router.route_state_resolver is resolver
+    # Writes wait for a snapshot they can trust; routing reads the empty one.
+    assert resolver.ready is False
+    (loop,) = refresh_loops
+    assert loop["resolver"] is resolver
+    apply_removals = loop["apply_removals"]
+    assert apply_removals is not None
+
+    # The read recovers: the loop reloads the states, then runs the removals.
+    services.router.register_route(
+        "m", [(_RouteAdapter("m:first-api"), 1.0), (_RouteAdapter("m:deleted-api"), 1.0)]
+    )
+    store.list_all_provider_route_states = AsyncMock(
+        return_value=[
+            {"model_id": "m", "route_id": "m:deleted-api", "disabled": False, "removed": True}
+        ]
+    )
+    assert await resolver.load_all() is True
+    assert resolver.ready is True
+    await apply_removals()
+
+    assert [entry[2] for entry in services.router.routes["m"].raw_adapters] == ["m:first-api"]
+
+
+# --- Batch inference wiring ---------------------------------------------------
+
+
+@contextmanager
+def _database_boot(batch_store):
+    """Stub a database-backed initialize() whose batch store is ``batch_store``.
+
+    Yields the pool and the ``BatchStore`` class double.
+    """
+    db_logger = AsyncMock()
+    db_logger.pool = object()
+    with (
+        patch("serving.servers.bootstrap._init_db_logger", return_value=db_logger),
+        patch(
+            "serving.servers.bootstrap._init_router_and_models",
+            new=AsyncMock(return_value=({}, [])),
+        ),
+        patch("serving.servers.bootstrap._apply_routing_manager", return_value=None),
+        patch("serving.servers.bootstrap.PostgresOperationalStore", return_value=AsyncMock()),
+        patch("serving.servers.bootstrap.CachedOperationalStore", return_value=MagicMock()),
+        patch("serving.servers.bootstrap.ResponseStore", return_value=AsyncMock()),
+        patch("serving.servers.bootstrap.email_scheduler.start_scheduler"),
+        patch(
+            "serving.servers.bootstrap.email_scheduler.rehydrate_scheduled_broadcasts",
+            new=AsyncMock(),
+        ),
+        patch("serving.servers.bootstrap.email_scheduler.get_scheduler", return_value=None),
+        patch("serving.servers.bootstrap.BatchStore", return_value=batch_store) as store_class,
+    ):
+        yield db_logger.pool, store_class
+
+
+@pytest.mark.asyncio
+async def test_initialize_builds_the_batch_store_beside_the_responses_store(mock_env):
+    """A database brings the batch store, initialized, and the caps cache in front of it."""
+    from serving.batch.model_limits import BatchModelLimits
+
+    batch_store = AsyncMock()
+
+    with _database_boot(batch_store) as (pool, batch_store_class):
+        services = await bootstrap.initialize()
+
+    batch_store_class.assert_called_once_with(pool)
+    batch_store.initialize.assert_awaited_once()
+    assert services.batch_store is batch_store
+    assert isinstance(services.batch_model_limits, BatchModelLimits)
+    assert services.batch_model_limits._store is batch_store
+    # The worker starts from the app lifespan, not from initialize().
+    assert services.batch_scheduler is None
+
+
+@pytest.mark.asyncio
+async def test_initialize_without_a_database_has_no_batch_store(mock_env):
+    with (
+        patch("serving.servers.bootstrap._init_db_logger", return_value=None),
+        patch(
+            "serving.servers.bootstrap._init_router_and_models",
+            new=AsyncMock(return_value=({}, [])),
+        ),
+        patch("serving.servers.bootstrap._apply_routing_manager", return_value=None),
+        patch("serving.servers.bootstrap.BatchStore") as batch_store_class,
+    ):
+        services = await bootstrap.initialize()
+
+    batch_store_class.assert_not_called()
+    assert services.batch_store is None
+    assert services.batch_model_limits is None
+
+
+@pytest.fixture
+def batch_scheduler_class():
+    """Stand in for ``serving.batch.scheduler.BatchScheduler``, recording each worker built."""
+
+    class FakeBatchScheduler:
+        instances: list = []  # noqa: RUF012
+
+        def __init__(self, *, app, services, store, limits):
+            self.app = app
+            self.services = services
+            self.store = store
+            self.limits = limits
+            self.started = 0
+            self.stop = AsyncMock()
+            type(self).instances.append(self)
+
+        def start(self):
+            self.started += 1
+
+        def notify(self):
+            pass
+
+    module = SimpleNamespace(BatchScheduler=FakeBatchScheduler)
+    with patch.dict(sys.modules, {"serving.batch.scheduler": module}):
+        yield FakeBatchScheduler
+
+
+def test_the_batch_scheduler_starts_only_with_a_batch_store(batch_scheduler_class):
+    services = AppServices(router=FixedRouter())
+
+    bootstrap.start_batch_scheduler(object(), services)
+
+    assert batch_scheduler_class.instances == []
+    assert services.batch_scheduler is None
+
+
+def test_the_batch_scheduler_starts_with_the_store_and_its_caps(batch_scheduler_class):
+    app = object()
+    store = MagicMock()
+    limits = MagicMock()
+    services = AppServices(router=FixedRouter(), batch_store=store, batch_model_limits=limits)
+
+    bootstrap.start_batch_scheduler(app, services)
+    bootstrap.start_batch_scheduler(app, services)
+
+    (scheduler,) = batch_scheduler_class.instances
+    assert scheduler.app is app
+    assert scheduler.services is services
+    assert scheduler.store is store
+    assert scheduler.limits is limits
+    assert scheduler.started == 1
+    assert services.batch_scheduler is scheduler
+
+
+def test_the_batch_scheduler_gets_caps_when_none_were_built(batch_scheduler_class):
+    from serving.batch.model_limits import BatchModelLimits
+
+    store = MagicMock()
+    services = AppServices(router=FixedRouter(), batch_store=store)
+
+    bootstrap.start_batch_scheduler(object(), services)
+
+    (scheduler,) = batch_scheduler_class.instances
+    assert isinstance(scheduler.limits, BatchModelLimits)
+    assert services.batch_model_limits is scheduler.limits
+
+
+def test_a_batch_scheduler_that_fails_to_start_leaves_the_gateway_up(batch_scheduler_class):
+    def broken_start(self):
+        raise RuntimeError("boom")
+
+    batch_scheduler_class.start = broken_start
+    services = AppServices(router=FixedRouter(), batch_store=MagicMock())
+
+    with patch("serving.servers.bootstrap.logger") as mock_logger:
+        bootstrap.start_batch_scheduler(object(), services)
+
+    assert services.batch_scheduler is None
+    mock_logger.exception.assert_called_once()
+
+
+def test_the_batch_scheduler_ignores_services_without_batch_fields(batch_scheduler_class):
+    """The lifespan tests hand over a bare object as their services."""
+    bootstrap.start_batch_scheduler(object(), object())
+
+    assert batch_scheduler_class.instances == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_stops_the_batch_scheduler_before_the_stores():
+    order: list[str] = []
+    scheduler = MagicMock()
+    scheduler.stop = AsyncMock(side_effect=lambda: order.append("batch scheduler"))
+    db_logger = MagicMock()
+    db_logger.cleanup = AsyncMock(side_effect=lambda: order.append("db logger"))
+    log_store = MagicMock()
+    log_store.cleanup = AsyncMock(side_effect=lambda: order.append("log store"))
+    operational_store = MagicMock()
+    operational_store.cleanup = AsyncMock(side_effect=lambda: order.append("operational store"))
+    services = AppServices(
+        router=FixedRouter(),
+        db_logger=db_logger,
+        log_store=log_store,
+        operational_store=operational_store,
+        batch_store=MagicMock(),
+        batch_scheduler=scheduler,
+    )
+
+    await bootstrap.shutdown(services)
+
+    scheduler.stop.assert_awaited_once()
+    assert order[0] == "batch scheduler"
+    assert set(order) == {"batch scheduler", "db logger", "log store", "operational store"}
+    assert services.batch_scheduler is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_carries_on_when_the_batch_scheduler_fails_to_stop():
+    scheduler = MagicMock()
+    scheduler.stop = AsyncMock(side_effect=RuntimeError("stuck"))
+    db_logger = MagicMock()
+    db_logger.cleanup = AsyncMock()
+    services = AppServices(router=FixedRouter(), db_logger=db_logger, batch_scheduler=scheduler)
+
+    with patch("serving.servers.bootstrap.logger") as mock_logger:
+        await bootstrap.shutdown(services)
+
+    mock_logger.exception.assert_any_call("Batch scheduler shutdown failed")
+    db_logger.cleanup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_the_lifespan_starts_the_batch_scheduler_once_services_are_set(monkeypatch):
+    from fastapi import FastAPI
+
+    from serving.servers import app as app_module
+
+    services = AppServices(router=FixedRouter())
+    started: list[tuple] = []
+
+    async def initialize():
+        return services
+
+    def start_batch_scheduler(app, received):
+        assert app.state.services is received
+        started.append((app, received))
+
+    monkeypatch.setattr(app_module.bootstrap, "initialize", initialize)
+    monkeypatch.setattr(app_module.bootstrap, "shutdown", AsyncMock())
+    monkeypatch.setattr(app_module.bootstrap, "start_batch_scheduler", start_batch_scheduler)
+    monkeypatch.setenv("ADMIN_TOKEN", "configured")
+    app = FastAPI()
+
+    async with app_module.lifespan(app):
+        assert started == [(app, services)]
+
+
+class _LockedBatchSchema:
+    """A batch store whose DDL cannot get its lock until ``release()``."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+        self.locked = True
+
+    async def initialize(self) -> None:
+        from serving.storage.log_schema import SchemaLockUnavailable
+
+        self.attempts += 1
+        if self.locked:
+            raise SchemaLockUnavailable("held by a sibling process")
+
+    def release(self) -> None:
+        self.locked = False
+
+
+async def _until(condition) -> None:
+    """Let background tasks run until ``condition()`` holds."""
+    for _ in range(200):
+        if condition():
+            return
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_a_lock_blocked_batch_schema_keeps_batches_away_until_it_lands(
+    mock_env, monkeypatch, batch_scheduler_class
+):
+    """Startup survives the lock; no store, caps or worker exist until the DDL lands."""
+    from serving.batch.model_limits import BatchModelLimits
+
+    monkeypatch.setattr("serving.servers.bootstrap._SCHEMA_RETRY_INITIAL_DELAY", 0)
+    monkeypatch.setattr("serving.servers.bootstrap._SCHEMA_RETRY_MAX_DELAY", 0)
+    store = _LockedBatchSchema()
+    app = object()
+
+    with _database_boot(store):
+        services = await bootstrap.initialize()
+    bootstrap.start_batch_scheduler(app, services)
+    await _until(lambda: store.attempts >= 3)
+
+    # Still locked: every batch route answers 404 and nothing is claimed, but
+    # the hard-delete purge reaches the batches stored before this boot.
+    assert services.batch_store is None
+    assert services.batch_model_limits is None
+    assert services.batch_store_pending is store
+    assert batch_scheduler_class.instances == []
+    services.batch_scheduler.notify()  # the placeholder takes a wake-up quietly
+
+    store.release()
+    await _until(lambda: services.batch_store is not None)
+
+    assert services.batch_store is store
+    assert services.batch_store_pending is None
+    assert isinstance(services.batch_model_limits, BatchModelLimits)
+    assert services.batch_model_limits._store is store
+    (scheduler,) = batch_scheduler_class.instances
+    assert scheduler.app is app
+    assert scheduler.store is store
+    assert scheduler.limits is services.batch_model_limits
+    assert scheduler.started == 1
+    assert services.batch_scheduler is scheduler
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_batch_schema_without_a_lifespan_starts_no_worker(
+    mock_env, monkeypatch, batch_scheduler_class
+):
+    """Outside the app (a CLI, a test) the store is published but nothing runs it."""
+    monkeypatch.setattr("serving.servers.bootstrap._SCHEMA_RETRY_INITIAL_DELAY", 0)
+    monkeypatch.setattr("serving.servers.bootstrap._SCHEMA_RETRY_MAX_DELAY", 0)
+    store = _LockedBatchSchema()
+
+    with _database_boot(store):
+        services = await bootstrap.initialize()
+    store.release()
+    await _until(lambda: services.batch_store is not None)
+
+    assert services.batch_store is store
+    assert services.batch_scheduler is None
+    assert batch_scheduler_class.instances == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_a_deferred_batch_schema_migration(
+    mock_env, monkeypatch, batch_scheduler_class
+):
+    monkeypatch.setattr("serving.servers.bootstrap._SCHEMA_RETRY_INITIAL_DELAY", 0)
+    monkeypatch.setattr("serving.servers.bootstrap._SCHEMA_RETRY_MAX_DELAY", 0)
+    store = _LockedBatchSchema()
+
+    with _database_boot(store):
+        services = await bootstrap.initialize()
+    bootstrap.start_batch_scheduler(object(), services)
+    placeholder = services.batch_scheduler
+    await _until(lambda: store.attempts >= 2)
+
+    await bootstrap.shutdown(services)
+    store.release()
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+    assert placeholder.retry.cancelled()
+    assert services.batch_scheduler is None
+    assert services.batch_store is None
+    assert batch_scheduler_class.instances == []
+
+
+@pytest.mark.asyncio
+async def test_a_broken_batch_schema_still_fails_startup(mock_env):
+    """Only a lock timeout is deferred; any other schema error stops the boot."""
+    batch_store = AsyncMock()
+    batch_store.initialize.side_effect = RuntimeError("column definition is wrong")
+
+    with _database_boot(batch_store), pytest.raises(RuntimeError, match="column definition"):
+        await bootstrap.initialize()

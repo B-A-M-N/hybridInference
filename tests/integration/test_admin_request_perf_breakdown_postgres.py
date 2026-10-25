@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -27,7 +27,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from routing.executor import RouteExecutor
+from routing.routers import FixedRouter
 from serving.servers.deps import AppServices, verify_admin_access
 from serving.servers.routers import admin
 from serving.servers.routers.admin.metrics import (
@@ -158,7 +158,7 @@ def _row(
 
 
 async def _seed(pool: asyncpg.Pool, rows: list[dict[str, Any]]) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     async with pool.acquire() as conn:
         await conn.executemany(
             """
@@ -384,7 +384,7 @@ async def test_summary_reconciles_with_the_list_views_decode_column(db_logger):
     await _seed(db_logger.pool, rows)
 
     app = FastAPI()
-    app.state.services = AppServices(router=RouteExecutor(), db_logger=db_logger)
+    app.state.services = AppServices(router=FixedRouter(), db_logger=db_logger)
     app.dependency_overrides[verify_admin_access] = lambda: "admin-1"
     app.include_router(admin.router)
 
@@ -449,8 +449,8 @@ def _inside_hour_bucket(hours_back: int) -> datetime:
     ago" would straddle a boundary or not depending on the wall-clock minute the
     suite ran at. Anchoring to the boundary makes placement exact.
     """
-    now = datetime.now(timezone.utc)
-    floor_hour = datetime.fromtimestamp(int(now.timestamp()) // 3600 * 3600, tz=timezone.utc)
+    now = datetime.now(UTC)
+    floor_hour = datetime.fromtimestamp(int(now.timestamp()) // 3600 * 3600, tz=UTC)
     return floor_hour - timedelta(hours=hours_back) + timedelta(minutes=30)
 
 

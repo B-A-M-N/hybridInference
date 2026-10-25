@@ -380,6 +380,24 @@ def _trusted_cloudflare_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IP
     return get_settings().trusted_cloudflare_parsed
 
 
+def preset_client_ip_info(scope_state: dict[str, Any], info: ClientIpInfo) -> None:
+    """Record *info* as the client of a request whose scope is still being built.
+
+    For requests the gateway issues itself on a caller's behalf, with no network
+    peer to resolve (the batch worker's): :func:`get_client_ip_info` then
+    returns *info* instead of resolving the missing peer, which would log
+    ``client_ip_resolution_unresolved`` -- the signal for degraded proxy
+    provenance, not for internal callers.
+
+    Args:
+        scope_state: The ASGI scope's ``state`` dict, before the ``Request`` is
+            built over it.
+        info: The identity to report; never a loopback, private or trusted
+            address, which other checks would read as a trusted caller.
+    """
+    scope_state[_IP_INFO_STATE_KEY] = info
+
+
 def get_client_ip_info(request: Request) -> ClientIpInfo:
     """Return the originating client IP and the socket/proxy peer that supplied it.
 
@@ -585,50 +603,3 @@ def get_client_ip(request: Request) -> str:
         clients behind a shared proxy.
     """
     return get_client_ip_info(request).client_ip
-
-
-def get_client_ip_bucket(request: Request) -> str:
-    """Return the rate-limit/affinity bucket key for a request's client IP.
-
-    .. deprecated::
-        This function preserves the old behavior for backward compatibility but
-        will collapse all ``"unknown"`` callers onto one bucket. Use
-        :func:`get_client_ip_info` and inspect ``resolved`` for new code.
-    """
-    return normalize_ip_bucket(get_client_ip(request))
-
-
-def client_ip_metadata(ip_info: ClientIpInfo) -> dict[str, Any]:
-    """Build the metadata dict for persisting client IP provenance.
-
-    Used by all logging surfaces that record ``api_logs.metadata`` so that
-    the stored IP can be audited: which rung fired, what the socket peer
-    was, and what the forwarding chain said. All fields are present even
-    when their values are None so the schema is stable.
-
-    Keys:
-        ip: resolved client IP or "unknown"
-        peer_ip: socket peer that supplied the connection
-        source: resolution rung that produced the IP
-        resolved: whether client provenance was established
-        trusted_proxy_headers: whether forwarding headers were trusted
-        trusted_forwarded_headers: whether generic proxy headers were trusted
-        trusted_cloudflare_headers: whether Cloudflare headers were trusted
-        x_forwarded_for: raw header value (None if absent)
-        x_real_ip: raw header value (None if absent)
-        cf_connecting_ip: raw header value (None if absent)
-        cf_connecting_ipv6: raw header value (None if absent)
-    """
-    return {
-        "ip": ip_info.client_ip,
-        "peer_ip": ip_info.peer_ip,
-        "ip_source": ip_info.source,
-        "resolved": ip_info.resolved,
-        "trusted_proxy_headers": ip_info.trusted_proxy_headers,
-        "trusted_forwarded_headers": ip_info.trusted_forwarded_headers,
-        "trusted_cloudflare_headers": ip_info.trusted_cloudflare_headers,
-        "x_forwarded_for": ip_info.x_forwarded_for,
-        "x_real_ip": ip_info.x_real_ip,
-        "cf_connecting_ip": ip_info.cf_connecting_ip,
-        "cf_connecting_ipv6": ip_info.cf_connecting_ipv6,
-    }
