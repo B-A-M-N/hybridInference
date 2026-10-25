@@ -3054,7 +3054,7 @@ class TestFragmentedWarmupStreaming:
                     await asyncio.wait_for(stream.__anext__(), timeout=0.2)
                 except StopAsyncIteration:
                     break
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     break
         finally:
             await stream.aclose()
