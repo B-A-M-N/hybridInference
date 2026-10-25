@@ -252,8 +252,6 @@ class BaseAdapter(ABC):
         self.last_stream_usage: dict[str, int] = {
             "input_tokens": 0,
             "output_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
         }
 
     @abstractmethod
@@ -329,9 +327,12 @@ class BaseAdapter(ABC):
         final_usage = {
             "input_tokens": translator_usage.get("input_tokens", 0),
             "output_tokens": translator_usage.get("output_tokens", 0),
-            "cache_creation_input_tokens": translator_usage.get("cache_creation_input_tokens", 0),
-            "cache_read_input_tokens": translator_usage.get("cache_read_input_tokens", 0),
         }
+        # Cache usage is optional. Materializing absent provider fields as zero
+        # would turn an unknown into a measured miss in /v1/messages logging.
+        for key in ("cache_creation_input_tokens", "cache_read_input_tokens"):
+            if key in translator_usage:
+                final_usage[key] = translator_usage[key]
         self.last_stream_usage = final_usage  # keep for backward-compat with tests
         if usage_sink is not None:
             usage_sink.update(final_usage)
