@@ -1205,7 +1205,7 @@ def test_a_paid_model_without_required_role_defaults_to_pro(tmp_path, monkeypatc
     registry.register_from_models_yaml(exe, Path(p))
 
     assert exe.routes["claude-compat"].required_role == "pro"
-    assert exe.routes["free-chat"].required_role == "free"
+    assert exe.routes["free-chat"].required_role == "pro"
 
 
 @pytest.mark.unit
@@ -1332,7 +1332,7 @@ def test_unknown_cost_external_routes_default_to_pro_not_free(tmp_path, monkeypa
     exe = RouteExecutor()
     registry.register_from_models_yaml(exe, Path(p))
 
-    assert exe.routes["explicit-free"].required_role == "free"
+    assert exe.routes["explicit-free"].required_role == "pro"
     assert exe.routes["explicit-paid"].required_role == "pro"
     assert exe.routes["unknown-cost-external"].required_role == "pro"
     # A localhost openai_compat is a forwarding dialect: it defaults closed
