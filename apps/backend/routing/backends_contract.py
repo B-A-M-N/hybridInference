@@ -73,9 +73,6 @@ def _effective_route_source(router: Any) -> Any:
     if callable(iterate):
         return router
     route_table = getattr(router, "route_table", None)
-    if route_table is None:
-        # One-release compatibility for the former attribute name.
-        route_table = getattr(router, "fixed_router", None)
     return route_table if callable(getattr(route_table, "iter_effective_routes", None)) else None
 
 
@@ -243,11 +240,6 @@ class RoutingBackendBase:
     def is_cloud(self) -> bool:
         """Return whether this backend is the cloud execution domain."""
         return False
-
-    @property
-    def started_here(self) -> bool:
-        """Return whether this backend started the wrapped router itself."""
-        return self._started
 
     async def chat_completion(
         self,

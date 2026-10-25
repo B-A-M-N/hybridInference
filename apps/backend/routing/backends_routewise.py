@@ -15,12 +15,11 @@ full candidate pool.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from routing.backends_domains import CloudBackend
 from routing.route_scope import (
     RouteScopeView,
-    adapter_in_endpoint_scope,
     endpoint_ids_in_view,
     scope_view_for_endpoints,
 )
@@ -112,8 +111,6 @@ class RouteWiseCloudBackend(CloudBackend):
     def _bind_view(self) -> None:
         """Bind the current scoped view to the wrapped router."""
         attach = getattr(self._router, "attach_route_table", None)
-        if attach is None:
-            attach = getattr(self._router, "attach_fixed_router", None)
         if callable(attach):
             attach(self._view, model_scope=self._model_scope)
 
@@ -185,9 +182,3 @@ class RouteWiseCloudBackend(CloudBackend):
         if self._model_scope is not None and not self.owns_model(obs.model_id):
             return False
         return obs.endpoint_id in self.allowed_endpoints()
-
-    def adapter_in_scope(self, adapter: Any, weight: float = 1.0) -> bool:
-        """Return whether ``adapter`` is inside the declared cloud range."""
-        if not adapter_in_endpoint_scope(adapter, self._endpoint_scope):
-            return False
-        return self._view.includes_adapter(adapter, weight)

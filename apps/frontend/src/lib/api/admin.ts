@@ -112,26 +112,9 @@ export async function listUsers(opts: ListUsersOptions = {}): Promise<ListUsersR
 // Users cost-history + summary (new in admin Users redesign)
 // ========================================
 
-export interface UserCostHistoryResponse {
-  user_id: string;
-  days: number;
-  points: CostHistoryPoint[];
-}
-
 export interface BulkCostHistoryResponse {
   days: number;
   histories: Record<string, CostHistoryPoint[]>;
-}
-
-export async function getUserCostHistory(
-  userId: string,
-  days = 7,
-): Promise<UserCostHistoryResponse> {
-  const resp = await fetchWithAuth(
-    API_BASE,
-    `/admin/users/${encodeURIComponent(userId)}/cost-history?days=${days}`,
-  );
-  return jsonOrThrow<UserCostHistoryResponse>(resp);
 }
 
 export async function getBulkCostHistory(
@@ -2363,6 +2346,7 @@ export async function getRoutewiseDecisions(
 
 export type ProviderRouteKeySource = 'default' | 'db' | 'env' | 'missing';
 export type ProviderRouteSource = 'yaml' | 'override' | 'runtime';
+export type RouteDeploymentType = 'auto' | 'self_hosted' | 'provider_api';
 
 export interface ProviderRouteApiKeyRef {
   id: string | null;
@@ -2403,6 +2387,7 @@ export interface ProviderRoute {
   openrouter_sort?: OpenRouterSortPolicy | null;
   key_provider: string;
   base_url: string;
+  deployment_type?: RouteDeploymentType;
   api_key_id: string | null;
   api_key: ProviderRouteApiKeyRef;
   provider_model_id: string | null;
@@ -2416,8 +2401,26 @@ export interface ProviderRoute {
   yaml_weight: number;
   effective_weight: number;
   source: ProviderRouteSource;
+  override_applied?: boolean;
+  /** Disabled by an admin: kept with its weights, selected by nothing. */
+  disabled?: boolean;
+  /** A config route deleted from this deployment; listed so it can be restored. */
+  removed?: boolean;
   updated_at: string | null;
   updated_by: string | null;
+  /** What the route serves with now. */
+  capabilities?: RouteCapabilities;
+  /** What it has from models.yaml or its creation; differs only while overridden. */
+  capabilities_baseline?: RouteCapabilities;
+  capabilities_overridden?: boolean;
+}
+
+/** A route's context window, output cap, input modalities and tool support, as served. */
+export interface RouteCapabilities {
+  context_length: number;
+  max_output_length: number;
+  input_modalities: string[];
+  supports_tools: boolean;
 }
 
 export interface ListProviderRoutesResponse {
@@ -2438,6 +2441,7 @@ export interface UpdateProviderRoutePayload {
   openrouter_provider?: string | null;
   openrouter_sort?: OpenRouterSortPolicy | null;
   base_url: string;
+  deployment_type?: RouteDeploymentType;
   api_key_id?: string | null;
   provider_model_id?: string | null;
   quota_limit?: number | null;
@@ -2453,15 +2457,41 @@ export interface CreateProviderRoutePayload {
   openrouter_provider?: string | null;
   openrouter_sort?: OpenRouterSortPolicy | null;
   base_url: string;
+  deployment_type?: RouteDeploymentType;
   api_key_id?: string | null;
   provider_model_id: string;
   quota_limit?: number | null;
   concurrency_limit?: number | null;
   weight: number;
+  /** Each route declares its own; a new route never takes the first route's. */
+  capabilities: RuntimeModelCapabilities;
 }
 
+/**
+ * Edit of a runtime-added route, applied in place. A field left out keeps the
+ * route's value; sending the target (provider, base URL, key, provider model
+ * ID) replaces it whole, and the gateway checks a changed target upstream
+ * before saving it.
+ */
 export interface UpdateProviderRouteCandidatePayload {
-  concurrency_limit: number;
+  upstream_provider?: string;
+  openrouter_provider?: string | null;
+  openrouter_sort?: OpenRouterSortPolicy | null;
+  base_url?: string;
+  deployment_type?: RouteDeploymentType;
+  api_key_id?: string | null;
+  provider_model_id?: string;
+  quota_limit?: number | null;
+  concurrency_limit?: number | null;
+}
+
+/** What a route accepts; every field is required when it is declared or edited. */
+export interface RuntimeModelCapabilities {
+  context_length: number;
+  max_output_length: number;
+  /** `text`, plus any of `image`, `audio` and `video`. */
+  input_modalities: string[];
+  supports_tools: boolean;
 }
 
 export interface CreateProviderRouteModelPayload extends CreateProviderRoutePayload {
@@ -2545,6 +2575,7 @@ export async function updateProviderRoute(
         openrouter_provider: payload.openrouter_provider ?? null,
         openrouter_sort: payload.openrouter_sort ?? null,
         base_url: payload.base_url,
+        deployment_type: payload.deployment_type,
         api_key_id: payload.api_key_id ?? null,
         provider_model_id: payload.provider_model_id ?? null,
         quota_limit: payload.quota_limit ?? null,
@@ -2571,6 +2602,7 @@ export async function verifyProviderRoute(
         openrouter_provider: payload.openrouter_provider ?? null,
         openrouter_sort: payload.openrouter_sort ?? null,
         base_url: payload.base_url,
+        deployment_type: payload.deployment_type,
         api_key_id: payload.api_key_id ?? null,
         provider_model_id: payload.provider_model_id ?? null,
         quota_limit: payload.quota_limit ?? null,
@@ -2614,6 +2646,37 @@ export async function updateProviderRouteCandidate(
   return jsonOrThrow<ProviderRoute>(resp);
 }
 
+/** Set one route's capabilities; they hold until reset and survive restarts. */
+export async function updateProviderRouteCapabilities(
+  modelId: string,
+  routeId: string,
+  capabilities: RuntimeModelCapabilities,
+): Promise<ProviderRoute> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    `/admin/routing/provider-route-capabilities/${encodeURIComponent(modelId)}/${encodeURIComponent(routeId)}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(capabilities),
+    },
+  );
+  return jsonOrThrow<ProviderRoute>(resp);
+}
+
+/** Return one route to the capabilities it has from models.yaml or its creation. */
+export async function resetProviderRouteCapabilities(
+  modelId: string,
+  routeId: string,
+): Promise<ProviderRoute> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    `/admin/routing/provider-route-capabilities/${encodeURIComponent(modelId)}/${encodeURIComponent(routeId)}`,
+    { method: 'DELETE' },
+  );
+  return jsonOrThrow<ProviderRoute>(resp);
+}
+
 export async function verifyProviderRouteCandidate(
   modelId: string,
   payload: CreateProviderRoutePayload,
@@ -2642,6 +2705,54 @@ export async function deleteProviderRoute(
     },
   );
   return jsonOrThrow<ProviderRoute>(resp);
+}
+
+function providerRoutePath(prefix: string, modelId: string, routeId: string) {
+  return `/admin/routing/${prefix}/${encodeURIComponent(modelId)}/${encodeURIComponent(routeId)}`;
+}
+
+/** Disable or enable a route of either source; its config and weights are kept. */
+export async function updateProviderRouteState(
+  modelId: string,
+  routeId: string,
+  payload: { disabled: boolean },
+): Promise<ProviderRoute> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    providerRoutePath('provider-route-states', modelId, routeId),
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+  );
+  return jsonOrThrow<ProviderRoute>(resp);
+}
+
+/** Delete a config (models.yaml) route from this deployment; it can be restored. */
+export async function removeProviderRoute(
+  modelId: string,
+  routeId: string,
+): Promise<ListProviderRoutesResponse> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    providerRoutePath('provider-route-removals', modelId, routeId),
+    { method: 'POST' },
+  );
+  return jsonOrThrow<ListProviderRoutesResponse>(resp);
+}
+
+/** Restore a deleted config route, with the edits and weight it had. */
+export async function restoreProviderRoute(
+  modelId: string,
+  routeId: string,
+): Promise<ListProviderRoutesResponse> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    providerRoutePath('provider-route-removals', modelId, routeId),
+    { method: 'DELETE' },
+  );
+  return jsonOrThrow<ListProviderRoutesResponse>(resp);
 }
 
 export async function deleteProviderRouteCandidate(

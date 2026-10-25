@@ -18,7 +18,7 @@ range may be a live callable and is re-derived on every refresh.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from routing.backends_contract import _adapters_in_router, _resolve_endpoint_scope
 from routing.backends_tree import TreeBackend
@@ -120,10 +120,6 @@ class LocalBackend(TreeBackend):
         if not self.owns_model(obs.model_id):
             return False
         return self._observation_scope.includes_endpoint(obs.endpoint_id)
-
-    def adapter_in_scope(self, adapter: Any) -> bool:
-        """Return whether ``adapter`` is inside the declared local range."""
-        return self._observation_scope.includes_adapter(adapter)
 
     def dispatch_scope(self, model_id: str) -> frozenset[str] | None:
         """Return the declared local endpoints, or None when none were declared.
@@ -351,10 +347,6 @@ class FixedCloudBackend(CloudBackend):
         if not self.serves(obs.model_id):
             return False
         return self._observation_scope.includes_endpoint(obs.endpoint_id)
-
-    def adapter_in_scope(self, adapter: Any) -> bool:
-        """Return whether ``adapter`` is inside the declared cloud range."""
-        return self._observation_scope.includes_adapter(adapter)
 
     def refresh_route_table(self) -> None:
         """Forward the refresh and re-derive the range it may have changed.

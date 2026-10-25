@@ -30,6 +30,17 @@ re-exports them, so every existing import keeps resolving:
 ``backends_routewise``
     :class:`RouteWiseCloudBackend`.
 
+Architecture status is deliberate:
+
+- ``RoutingBackend``, ``LeafBackend`` and ``TreeBackend`` are the intended
+  execution-boundary contract (leaf versus routing subtree).
+- ``LocalBackend``, ``CloudBackend`` and ``FixedCloudBackend`` are intended
+  deployment-role implementations of that tree boundary, not temporary
+  compatibility shims.
+- ``RouteWiseCloudBackend`` is the optional scoped compatibility wrapper for
+  the concrete hybrid composition. It is not RouteWise's architectural home;
+  a ``router: routewise`` model retains its peer router and full candidate pool.
+
 Candidate ranges are explicit construction inputs. A cloud backend built over a
 table that also contains local endpoints binds a
 :class:`routing.route_scope.RouteScopeView` so primaries, fallbacks and the
