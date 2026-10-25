@@ -16,6 +16,7 @@ import pytest
 
 from serving.servers.routers.completions_logging import (
     _LOG_QUEUE_MAXSIZE,
+    _LOG_WORKERS,
     CompletionsLogger,
 )
 
@@ -58,24 +59,26 @@ async def test_stalled_db_bounds_queued_payloads():
         if i % 64 == 0:
             await asyncio.sleep(0)
 
-    # Exactly one long-lived worker instead of one task per write, and the
-    # queued payload count is capped; everything beyond the cap was dropped
-    # loudly, not silently piled up.
+    # A fixed worker pool instead of one task per write, and the queued
+    # payload count remains capped; everything beyond the survivors was
+    # dropped loudly, not silently piled up.
     assert cl._queue.qsize() <= _LOG_QUEUE_MAXSIZE
-    assert len(cl._background_tasks) == 1
-    # req-0 was pulled by the worker (in-flight) before the queue filled.
-    assert cl._dropped_count == total - _LOG_QUEUE_MAXSIZE - 1
+    assert len(cl._background_tasks) == _LOG_WORKERS
+    # The queue plus the workers' in-flight rows hold at most the bound; no
+    # per-request tasks exist.
+    admitted = store.log_request.await_count + cl._queue.qsize()
+    assert total - admitted == cl._dropped_count
 
     hang.set()
     await cl.stop()
-    # Draining writes the surviving payloads; the drop count is final.
-    assert store.log_request.await_count == _LOG_QUEUE_MAXSIZE + 1
-    assert cl._dropped_count == total - _LOG_QUEUE_MAXSIZE - 1
+    # Draining writes exactly the admitted survivors; drops are unchanged.
+    assert store.log_request.await_count == admitted
+    assert cl._dropped_count == total - admitted
 
 
 @pytest.mark.asyncio
 async def test_stop_drains_queued_rows_before_returning():
-    """Graceful shutdown flushes every queued row, in order."""
+    """Graceful shutdown flushes every queued row exactly once."""
     cl = CompletionsLogger(log_store=_store())
     for i in range(50):
         cl.schedule_log(f"req-{i}", {"request_id": f"req-{i}", "n": i})
@@ -83,7 +86,9 @@ async def test_stop_drains_queued_rows_before_returning():
     assert cl._log_store.log_request.await_count == 50
     assert cl._queue.qsize() == 0
     ids = [call.kwargs["request_id"] for call in cl._log_store.log_request.await_args_list]
-    assert ids == [f"req-{i}" for i in range(50)]
+    assert sorted(ids, key=lambda value: int(value.split("-")[1])) == [
+        f"req-{i}" for i in range(50)
+    ]
 
 
 @pytest.mark.asyncio
@@ -92,7 +97,7 @@ async def test_stop_is_idempotent_and_stops_the_worker():
     cl.schedule_log("req-1", {"request_id": "req-1"})
     await cl.stop()
     await cl.stop()
-    assert cl._worker is None
+    assert cl._workers is None
 
 
 @pytest.mark.asyncio
@@ -107,8 +112,8 @@ async def test_stop_timeout_discards_leftovers_and_logs(caplog):
         await cl.stop(timeout=0.05)
 
     assert "timed out" in caplog.text
-    # At most the in-flight row was started; the rest were reported discarded.
-    assert store.log_request.await_count <= 1
+    # At most the fixed pool's writes were started; all are aborted with stop.
+    assert store.log_request.await_count <= _LOG_WORKERS
     hang.set()
     await asyncio.sleep(0)
 
@@ -223,10 +228,11 @@ async def test_worker_unexpected_exit_preserves_pending_logs(caplog):
 
     cl.schedule_log("req-1", {"request_id": "req-1"})
     await _wait_for_first_write(store)
-    assert cl._worker is not None
-    cl._worker.cancel()
+    assert cl._workers
+    dead_worker = cl._workers[0]
+    dead_worker.cancel()
     with contextlib_suppress():
-        await cl._worker
+        await dead_worker
     pending_before = cl._queue.qsize()
 
     # The dead worker must be detected on the next admission, pending rows
@@ -243,7 +249,7 @@ async def test_worker_unexpected_exit_preserves_pending_logs(caplog):
     assert "req-1" in ids and "req-2" in ids and "req-3" in ids
     # Exactly one consumer remained throughout: the restarted worker ended
     # with stop(); nothing is left running.
-    assert cl._worker is None
+    assert cl._workers is None
 
 
 @pytest.mark.asyncio
@@ -259,9 +265,11 @@ async def test_worker_death_on_dead_loop_preserves_pending_and_refuses(caplog):
     dead_loop = cl._queue_loop
     assert dead_loop is not None and dead_loop is asyncio.get_running_loop()
 
-    cl._worker.cancel()
-    with contextlib_suppress():
-        await cl._worker
+    assert cl._workers
+    for worker in cl._workers:
+        worker.cancel()
+        with contextlib_suppress():
+            await worker
     # Simulate the queue belonging to a now-dead loop.
     cl._queue_loop = asyncio.new_event_loop()
 
@@ -296,6 +304,54 @@ async def test_stop_then_restart_is_not_possible_but_refusal_is_loud(caplog):
 
     assert "request_log_admission_refused" in caplog.text
     assert cl._log_store.log_request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fixed_pool_drains_concurrent_rows_faster_than_one_writer():
+    """Multiple database writes overlap; one row no longer gates the queue."""
+    store = MagicMock()
+    active = 0
+    max_active = 0
+
+    async def _write(**kwargs: object) -> None:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+
+    store.log_request = AsyncMock(side_effect=_write)
+    cl = CompletionsLogger(log_store=store)
+    count = 12
+    started = asyncio.get_running_loop().time()
+    for i in range(count):
+        cl.schedule_log(f"req-{i}", {"request_id": f"req-{i}"})
+    await cl.stop()
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert store.log_request.await_count == count
+    assert max_active > 1
+    # A single writer needs 12 * 20ms = 240ms. Four workers should finish in
+    # about 60ms; the bound leaves room for scheduler noise without accepting
+    # the original serialization.
+    assert elapsed < 0.15, elapsed
+
+
+@pytest.mark.asyncio
+async def test_pool_size_never_grows_with_queue_pressure():
+    """Worker count is fixed by policy even when the queue is full."""
+    hang = asyncio.Event()
+    store = _store(hang)
+    cl = CompletionsLogger(log_store=store)
+    for i in range(_LOG_QUEUE_MAXSIZE * 2):
+        cl.schedule_log(f"req-{i}", {"request_id": f"req-{i}"})
+        if i % 64 == 0:
+            await asyncio.sleep(0)
+
+    assert len(cl._background_tasks) == _LOG_WORKERS
+    assert cl._queue.qsize() <= _LOG_QUEUE_MAXSIZE
+    hang.set()
+    await cl.stop()
 
 
 @pytest.mark.asyncio
@@ -358,10 +414,10 @@ async def test_messages_surface_uses_bounded_queue_and_shutdown_drain(monkeypatc
         error=None,
         request_payload=None,
     )
-    # The only worker was created by CompletionsLogger, not by the Messages
-    # helper's legacy compatibility branch.
-    assert len(created) == 1
-    assert created[0].get_name() == "request_log_worker"
+    # Every task was a fixed-pool request-log worker; the Messages helper's
+    # legacy one-off task branch created none.
+    assert 1 <= len(created) <= _LOG_WORKERS
+    assert all(task.get_name().startswith("request_log_worker") for task in created)
 
 
 @pytest.mark.asyncio
