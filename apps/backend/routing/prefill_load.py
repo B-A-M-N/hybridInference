@@ -112,17 +112,17 @@ INTERVENE_TOKENS: int = 50_000
 # locality was considered.
 LOCALITY_MIN_SAVING_TOKENS: int = 4_096
 
-# Share of the drawn candidate's weight a warmer candidate must also carry
-# before locality may move the request to it.
+# Minimum symmetric weight ratio between the drawn and warmer candidate before
+# locality may move the request.
 #
 # The saving threshold says *how much* prefill a move must avoid; this says how
 # strong a preference it may overturn. Weights are not only a load split: for a
 # remote provider they encode cost, and for an operator they encode a deliberate
 # choice, so a cache hit -- which saves one prefill -- must not silently turn
 # weighted routing into "always the warmest endpoint". At half, a 60/40 pair may
-# follow the prefix in either direction, while 90/10 stays on the 90 and a
-# first turn with no prefix at all is unaffected. A zero-weight candidate never
-# wins, and an unweighted pool is unaffected.
+# follow the prefix in either direction, while 90/10 stays on the 90 in both
+# directions and a first turn with no prefix at all is unaffected. Both weights
+# must be positive; an unweighted pool is unaffected.
 LOCALITY_MIN_WEIGHT_SHARE: float = 0.5
 
 # Session affinity is a cache-locality optimization, not a correctness
@@ -1177,9 +1177,11 @@ class PrefillLoadTracker:
           ``avoid`` filters have already run);
         - it must save at least :data:`LOCALITY_MIN_SAVING_TOKENS` against the
           drawn candidate;
-        - it must carry at least :data:`LOCALITY_MIN_WEIGHT_SHARE` of that
-          candidate's weight, so locality refines a choice between comparable
-          candidates instead of overriding a cost or operator preference;
+        - its weight must be comparable to the drawn candidate's, measured
+          symmetrically as ``min(w_i, w_chosen) / max(w_i, w_chosen) >=
+          :data:`LOCALITY_MIN_WEIGHT_SHARE``, so locality refines a choice
+          between comparable candidates instead of overriding a cost or
+          operator preference in either direction;
         - it must not be carrying a foreign backlog past
           :data:`AFFINITY_BACKLOG_CEILING` -- past that the queue costs more
           than the prefill it saves, which is the same judgement
@@ -1196,16 +1198,19 @@ class PrefillLoadTracker:
         # would miss a second cache-warm candidate that clears both gates when
         # the cheapest one fails one -- a model with three or more ordinary
         # candidates would keep sending warm conversations cold.
-        min_weight = chosen_weight * LOCALITY_MIN_WEIGHT_SHARE
         with self._lock:
             backlogs = {i: self._backlog.get(keys[i], 0) for i in eligible if i != chosen}
         best, best_cost = chosen, chosen_cost
         for i in eligible:
             if i == chosen:
                 continue
-            if weights[i] < min_weight:
-                # The draw's candidate is the operator's preference by more than
-                # a prefix-cache hit is worth. Leave the decision with the weights.
+            candidate_weight = max(weights[i], 0.0)
+            if candidate_weight <= 0.0:
+                continue
+            larger_weight = max(candidate_weight, chosen_weight)
+            if min(candidate_weight, chosen_weight) / larger_weight < LOCALITY_MIN_WEIGHT_SHARE:
+                # Either candidate is the operator's preference by more than a
+                # prefix-cache hit is worth. Leave the decision with the weights.
                 continue
             if backlogs[i] > AFFINITY_BACKLOG_CEILING:
                 # Past that the queue costs more than the prefill it saves,

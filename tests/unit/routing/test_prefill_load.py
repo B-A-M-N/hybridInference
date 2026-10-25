@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -477,6 +478,58 @@ def test_select_may_move_between_comparable_weights():
         ["drawn", "warm"], [0.6, 0.4], 10_000, _fixed_rand(0.0), "caller", fingerprint="conv-a"
     )
     assert chosen == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("weights", [(0.5, 0.5), (0.65, 0.35), (0.7, 0.3), (0.9, 0.1)])
+def test_locality_preserves_configured_traffic_ratios(weights):
+    """A cache-warm endpoint must not become absorbing at an asymmetric ratio.
+
+    Each conversation keeps its own remembered prefix and reuses the tracker's
+    routing path across ten turns. The configured ratios are intentionally
+    coarse integration-like bounds: with only 4 000 samples, a binomial 70/30
+    split has a 95% interval of roughly +/-1.4 percentage points, while the
+    pre-fix behavior sends only about 5% to the light endpoint.
+    """
+    rng = random.Random(1_636)
+    counts = [0, 0]
+    endpoints = ("light", "heavy")
+    for conversation in range(400):
+        affinity_key = f"caller-{conversation}"
+        fingerprint = f"conversation-{conversation}"
+        warm_index: int | None = None
+        tracker = PrefillLoadTracker()
+        for _turn in range(10):
+            if warm_index is not None:
+                _remember(tracker, endpoints[warm_index], 5_000, fingerprint=fingerprint)
+            chosen = tracker.select_index(
+                endpoints,
+                weights,
+                10_000,
+                rng.random,
+                affinity_key,
+                fingerprint=fingerprint,
+            )
+            counts[chosen] += 1
+            warm_index = chosen
+    observed_light = counts[0] / sum(counts)
+    assert observed_light == pytest.approx(weights[0], abs=0.02)
+
+
+@pytest.mark.unit
+def test_select_does_not_move_from_light_to_strong_heavy_preference():
+    """The weight gate is symmetric: a heavy draw is protected like a light one."""
+    t = PrefillLoadTracker()
+    _remember(t, "warm", 5_000, fingerprint="conv-a")
+    chosen = t.select_index(
+        ["light", "warm"],
+        [0.1, 0.9],
+        10_000,
+        _fixed_rand(0.0),
+        "caller",
+        fingerprint="conv-a",
+    )
+    assert chosen == 0
 
 
 @pytest.mark.unit

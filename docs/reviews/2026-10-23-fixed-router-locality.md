@@ -28,10 +28,12 @@ candidates; it may not overturn a strong operator preference. Concretely, in
 2. Ordinary routing admissibility is unchanged: `avoid`, elephant saturation,
    health, fallback and explicit pins all apply before and around locality.
 3. A locality alternative must pass, in order:
-   - a **weight gate** — at least `LOCALITY_MIN_WEIGHT_SHARE` (0.5) of the
-     drawn candidate's weight. A 90/10 split stays on the 90; a 40/60 pair may
-     follow the prefix. This is the operator-weight contract: locality never
-     overrules a preference stronger than a cache hit is worth.
+   - a **weight gate** — the symmetric ratio
+     `min(w_i, w_chosen) / max(w_i, w_chosen)` must be at least
+     `LOCALITY_MIN_WEIGHT_SHARE` (0.5), with both weights positive. A 90/10
+     split stays on the 90 in either direction; a 40/60 pair may follow the
+     prefix. This is the operator-weight contract: locality never overrules a
+     preference stronger than a cache hit is worth.
    - a **backlog gate** — no foreign backlog past `AFFINITY_BACKLOG_CEILING`
      (150 000 tokens), the same judgement `should_keep_affinity` makes for a
      sticky pin: past that the queue costs more than the prefill it saves.
@@ -62,8 +64,8 @@ so unlike a load estimate it does not self-correct. It therefore requires:
   no copy), which is what distinguishes a continuation from a fork or retry
   sharing only the opening;
 - zero weights are handled: `select_index` never divides by a zero weight and
-  a zero-weight candidate cannot pass the relative-weight gate in either
-  direction.
+  a zero-weight candidate cannot pass the symmetric relative-weight gate in
+  either direction.
 
 The hybrid composition (`router_params.hybrid_composition: true`) carries the
 same conversation evidence through `FixedPolicy.select_backend`, so the
@@ -72,8 +74,10 @@ composition's global draw cannot reintroduce a cache-blind choice.
 ## Test map (this branch)
 
 `tests/unit/routing/test_prefill_load.py` — tracker level: warm-prefix
-preference, weight-preference non-override (90/10), comparable-weight
-movement, unrelated conversation on one key, fork/anchor mismatch, no
+preference, weight-preference non-override in both directions (90/10 and
+10/90), symmetric configured-ratio preservation across 50/50, 65/35, 70/30
+and 90/10, comparable-weight movement, unrelated conversation on one key,
+fork/anchor mismatch, no
 fingerprint, no caller, zero weights, immaterial saving, backlogged cached
 endpoint, cheapest-fails-weight-gate three-endpoint, cheapest-backlogged
 three-endpoint, all-candidates-disqualified draw-lock.
@@ -92,3 +96,12 @@ locks required behavior rather than discriminating.
 On this branch (independent, based on `9b48afd9`): `tests/unit/routing`
 passes; `make lint` clean. Combined-stack qualification on the integrating
 branch: 6 857 passed, 0 failed across `tests/unit tests/api`.
+
+After the symmetric-gate correction on `1cb618d`, a focused run of
+`test_prefill_load.py`, `test_session_affinity.py` and
+`test_hybrid_composition.py` passed (193 passed, 1 skipped). A four-thousand
+turn simulation of 400 ten-turn conversations produced light-endpoint shares
+of 53.25%/66.50%/69.83%/89.53% for configured 50/50, 65/35, 70/30 and 90/10
+ratios respectively (pre-fix: 53.25%/66.50%/95.25%/98.73%). The first two
+remain slightly above target because comparable candidates legitimately follow
+the prefix; asymmetric ratios beyond the 0.5 symmetric gate no longer do.
