@@ -2078,6 +2078,9 @@ async def test_post_provider_route_candidate_adds_direct_minimax_route(admin_cli
     runtime_adapter = route_executor.routes["minimax-fast"].raw_adapters[-1][0]
     assert runtime_adapter.config.provider == "minimax"
     assert runtime_adapter.config.provider_profile == "minimax"
+    # The openrouter template explicitly lacks stream usage, while the MiniMax
+    # protocol supports it. A runtime-created route takes the target default.
+    assert runtime_adapter.config.include_usage_in_stream is True
     assert runtime_adapter.config.route_metadata["runtime_candidate"] is True
     assert runtime_adapter.config.route_metadata["route_provider"] == "minimax"
     assert runtime_adapter.config.route_metadata["upstream_provider"] == "minimax"
