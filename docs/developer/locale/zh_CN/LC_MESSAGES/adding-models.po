@@ -1550,7 +1550,7 @@ msgid ""
 "remains authoritative. Unpriced local `sglang`, `vllm`, and `ollama` "
 "engine routes can retain the `free` default when their local endpoint is "
 "identifiable from configuration."
-msgstr "未填写 `required_role` 时，标记为 `admin_only: true` 的条目默认要求 `admin`。其他模型如果已知或无法确定 provider 成本，则默认要求 `pro`；这包括未标价的 LAN 或集群 DNS 路由、加载时无法分类的环境变量端点，以及即使 base URL 是本地地址的 `openai_compat` 路由。面向用户的价格为零，并不能证明上游 provider 不收费。若要将此类模型保持在 free 等级，请添加 `required_role: free`；路由应对其他等级开放时也请显式设置 `required_role`，显式值始终优先。未标价的本地 `sglang`、`vllm` 和 `ollama` 引擎路由，如果能从配置确认其本地端点，则仍可默认要求 `free`。"
+msgstr "未填写 `required_role` 时，标记为 `admin_only: true` 的条目默认要求 `admin`。其他模型如果已知或无法确定 provider 成本，则默认要求 `pro`；这包括未标价的 LAN 或集群 DNS 路由、加载时无法分类的环境变量端点，以及即使 base URL 是本地地址的 `openai_compat` 路由。面向用户的价格为零，并不能证明上游 provider 不收费。若要将此类模型保持在 free 等级，请添加 `required_role: free`；路由应对其他等级开放时也请显式设置该值，显式值始终优先。未标价的本地 `sglang`、`vllm` 和 `ollama` 引擎路由，如果能从配置确认其本地端点，则仍可默认要求 `free`。"
 
 #: ../developer/adding-models.md
 msgid "Automatic DeepSeek prices"
