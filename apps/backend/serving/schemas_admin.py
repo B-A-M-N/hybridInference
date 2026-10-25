@@ -663,7 +663,8 @@ class AdminTtftScatterPoint(BaseModel):
 
     prompt_tokens: int
     ttft_ms: int
-    cache_hit: bool
+    #: True = measured hit; False = measured miss; null = provider did not say.
+    cache_hit: bool | None
     timestamp: datetime
 
 

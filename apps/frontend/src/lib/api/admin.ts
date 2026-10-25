@@ -538,7 +538,7 @@ export async function getPerformanceMetrics({
 export interface AdminTtftScatterPoint {
   prompt_tokens: number;
   ttft_ms: number;
-  cache_hit: boolean;
+  cache_hit: boolean | null;
   timestamp: string;
 }
 

@@ -127,8 +127,9 @@ function ScatterDot(props: { cx?: number; cy?: number; fill?: string; fillOpacit
 
 function TtftScatterCard({ model }: { model: AdminTtftScatterModel }) {
   const safePoints = model.points.filter((p) => p.prompt_tokens > 0);
-  const cached = safePoints.filter((p) => p.cache_hit);
-  const uncached = safePoints.filter((p) => !p.cache_hit);
+  const cached = safePoints.filter((p) => p.cache_hit === true);
+  const uncached = safePoints.filter((p) => p.cache_hit === false);
+  const unknownCache = safePoints.filter((p) => p.cache_hit === null);
   const heading = `${model.model_id} · ${model.provider}`;
 
   const [xDomain, setXDomain] = useState<AxisDomain>(['auto', 'auto']);
@@ -270,7 +271,7 @@ function TtftScatterCard({ model }: { model: AdminTtftScatterModel }) {
     const header = 'timestamp,prompt_tokens,ttft_ms,cache_hit\n';
     const body = safePoints
       .map(
-        (p) => `${p.timestamp},${p.prompt_tokens},${p.ttft_ms},${p.cache_hit ? 'true' : 'false'}`,
+        (p) => `${p.timestamp},${p.prompt_tokens},${p.ttft_ms},${p.cache_hit === null ? 'unknown' : p.cache_hit ? 'true' : 'false'}`,
       )
       .join('\n');
     const blob = new Blob([`${header}${body}\n`], { type: 'text/csv;charset=utf-8' });
@@ -406,10 +407,17 @@ function TtftScatterCard({ model }: { model: AdminTtftScatterModel }) {
               shape={<ScatterDot />}
             />
             <Scatter
-              name="No cache"
+              name="Measured miss"
               data={uncached}
               fill="#64748b"
               fillOpacity={0.6}
+              shape={<ScatterDot />}
+            />
+            <Scatter
+              name="Unknown"
+              data={unknownCache}
+              fill="#f59e0b"
+              fillOpacity={0.5}
               shape={<ScatterDot />}
             />
             {showDragArea ? (

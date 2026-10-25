@@ -660,13 +660,15 @@ async def _load_ttft_scatter(db_logger) -> AdminTtftScatterResponse:
     """Return TTFT vs input length scatter data per (model, provider).
 
     For each (model_id, provider) pair, returns up to the last 1000 successful
-    streaming requests *per measured cache-hit class* (so up to 1000 cached
-    and 1000 measured misses) with a recorded TTFT and a non-empty prompt.
-    Requests without a cache measurement are excluded from this comparison.
-    Partitioning by cache class keeps the rarer uncached series well-populated
-    instead of being crowded out by cache hits. The query is bounded to the
-    last 90 days so the `ROW_NUMBER()` scan stays bounded as `api_logs` grows.
-    `cache_hit` is true iff `cache_read_tokens > 0`.
+    streaming requests *per cache class* (cached, measured miss, and unknown)
+    with a recorded TTFT and a non-empty prompt. Unknown rows remain visible:
+    a provider that never reports cache usage is still part of TTFT behavior,
+    and hiding it made its chart disappear. Partitioning by class keeps the
+    rarer uncached/unknown series well-populated instead of being crowded out
+    by cache hits. The query is bounded to the last 90 days so the
+    `ROW_NUMBER()` scan stays bounded as `api_logs` grows. `cache_hit` is
+    true iff `cache_read_tokens > 0`, false iff it is a measured zero, and
+    null when the provider did not report cache usage.
     """
     async with db_logger.pool.acquire() as conn:
         rows = await conn.fetch(
@@ -681,7 +683,12 @@ async def _load_ttft_scatter(db_logger) -> AdminTtftScatterResponse:
                     timestamp,
                     ROW_NUMBER() OVER (
                         PARTITION BY
-                            model_id, provider, (cache_read_tokens > 0)
+                            model_id, provider,
+                            CASE
+                                WHEN cache_read_tokens IS NULL THEN 'unknown'
+                                WHEN cache_read_tokens > 0 THEN 'hit'
+                                ELSE 'miss'
+                            END
                         ORDER BY timestamp DESC
                     ) AS rn
                 FROM api_logs
@@ -689,7 +696,6 @@ async def _load_ttft_scatter(db_logger) -> AdminTtftScatterResponse:
                   AND ttft_ms IS NOT NULL
                   AND prompt_tokens IS NOT NULL
                   AND prompt_tokens > 0
-                  AND cache_read_tokens IS NOT NULL
                   AND status_code BETWEEN 200 AND 399
                   AND stream = TRUE
             )
@@ -708,7 +714,7 @@ async def _load_ttft_scatter(db_logger) -> AdminTtftScatterResponse:
         point = AdminTtftScatterPoint(
             prompt_tokens=int(row["prompt_tokens"]),
             ttft_ms=int(row["ttft_ms"]),
-            cache_hit=cache_read is not None and cache_read > 0,
+            cache_hit=None if cache_read is None else cache_read > 0,
             timestamp=row["timestamp"],
         )
         by_pair.setdefault(key, []).append(point)

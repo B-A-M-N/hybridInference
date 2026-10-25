@@ -251,7 +251,7 @@ async def test_anthropic_logging_persists_unknown_and_measured_zero(pool):
 
 
 @pytest.mark.asyncio
-async def test_ttft_scatter_excludes_unknown_cache_rows(pool):
+async def test_ttft_scatter_keeps_unknown_cache_rows_distinct(pool):
     """Unknown cache rows do not appear in either measured cache class."""
     pool, prefix = pool
     timestamp = datetime.now(timezone.utc)
@@ -269,5 +269,5 @@ async def test_ttft_scatter_excludes_unknown_cache_rows(pool):
     response = await _ttft_scatter(pool)
     model = next(row for row in response["models"] if row["model_id"] == _MODEL)
     points = model["points"]
-    assert len(points) == 2
-    assert {point["cache_hit"] for point in points} == {False, True}
+    assert len(points) == 3
+    assert {point["cache_hit"] for point in points} == {None, False, True}
