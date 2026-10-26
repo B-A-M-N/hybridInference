@@ -479,3 +479,54 @@ class TestExplicitCacheReportedFlag:
         read, write = extract_cache_tokens(usage)
         assert read is None
         assert write == 12
+
+
+class TestUnknownFlagDropsALeftoverFlatCounter:
+    """A flat counter copied in from the source must not survive UNKNOWN.
+
+    ``normalize_usage`` copies the original usage dict, so a flat
+    ``cache_read_tokens: 0`` that the producer serialized alongside
+    ``cache_read_reported: false`` would otherwise be published as a
+    measured miss — the schema placeholder read as a real measurement.
+    """
+
+    def test_flat_zero_does_not_survive_an_unknown_flag(self):
+        usage = {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "total_tokens": 105,
+            "cache_read_tokens": 0,
+            "cache_read_reported": False,
+        }
+        normalized = normalize_usage(usage)
+        assert normalized is not None
+        assert "cache_read_tokens" not in normalized
+        assert normalized.get("cache_read_reported") is False
+
+    def test_nested_zero_does_not_survive_an_unknown_flag(self):
+        usage = {
+            "prompt_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 0},
+            "cache_read_reported": False,
+        }
+        normalized = normalize_usage(usage)
+        assert normalized is not None
+        assert "cache_read_tokens" not in normalized
+
+    def test_a_measured_miss_keeps_its_zero(self):
+        """The fix must not erase a real measurement."""
+        usage = {
+            "prompt_tokens": 100,
+            "cache_read_tokens": 0,
+            "cache_read_reported": True,
+        }
+        normalized = normalize_usage(usage)
+        assert normalized is not None
+        assert normalized.get("cache_read_tokens") == 0
+        assert normalized.get("cache_read_reported") is True
+
+    def test_without_the_flag_a_flat_zero_is_still_a_measured_miss(self):
+        usage = {"prompt_tokens": 100, "cache_read_tokens": 0}
+        normalized = normalize_usage(usage)
+        assert normalized is not None
+        assert normalized.get("cache_read_tokens") == 0

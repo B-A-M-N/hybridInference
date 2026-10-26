@@ -337,6 +337,13 @@ def normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
 
     # Extract cache tokens from nested locations
     cache_read, cache_write = extract_cache_tokens(usage)
+    # An explicit producer flag is authoritative about whether a measurement
+    # exists at all; extract_cache_tokens already honors it, and the
+    # normalized dict must honor it too.
+    cache_read_reported = usage.get("cache_read_reported")
+    cache_read_reported = (
+        cache_read_reported if isinstance(cache_read_reported, bool) else None
+    )
 
     # Create normalized usage dict
     normalized = dict(usage)  # Copy to avoid modifying original
@@ -348,6 +355,13 @@ def normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
     # Add cache tokens at top level if found
     if cache_read is not None:
         normalized["cache_read_tokens"] = cache_read
+    elif cache_read_reported is False:
+        # The producer asserted that no cache measurement was made. A flat
+        # ``cache_read_tokens: 0`` copied in from the original dict is the
+        # serializer's schema placeholder, not a measurement, so it must not
+        # survive as a published count: a consumer reading
+        # ``cache_read_tokens`` would score a miss that was never measured.
+        normalized.pop("cache_read_tokens", None)
     if cache_write is not None:
         normalized["cache_write_tokens"] = cache_write
 

@@ -1,13 +1,15 @@
 """End-to-end three-state cache evidence: UNKNOWN / MISS / HIT.
 
-One test walks the whole chain a request takes, and asserts each of the
-three cache-evidence states survives it intact:
+One test walks the whole chain a request takes and asserts each of the
+three cache-evidence states survives it intact, using the real
+production functions at every hop — not re-implementations of them:
 
     provider usage
-      -> normalize_usage (serving/utils/token_utils.py)
-      -> Responses translator (serving/responses_translator.py)
-      -> the usage payload the client / FI Gateway receives
-      -> the cache count RouteWise is handed as a routing observation
+      -> normalize_usage                (serving/utils/token_utils.py)
+      -> the Responses translator        (serving/responses_translator.py)
+      -> the usage payload the client (and the FI Gateway) receives
+      -> RoutingObservation.cached_tokens (routing/routers.py, built by
+         serving/servers/routers/completions_logging.py)
 
 The defect this pins: an unreported measurement (UNKNOWN) was serialized
 as a literal 0, so every consumer scored a miss that was never measured.
@@ -21,6 +23,7 @@ import json
 
 import pytest
 
+from routing.routers import RoutingObservation
 from serving.responses_translator import chat_response_to_responses
 from serving.utils.token_utils import normalize_usage
 
@@ -58,11 +61,12 @@ def _responses_payload(usage: dict) -> dict:
     )
 
 
-def _routewise_cached_tokens(usage: dict) -> int | None:
+def _observed_cached_tokens(usage: dict) -> int | None:
     """The count the completions router hands RouteWise for one request.
 
-    Mirrors serving/servers/routers/completions.py: the normalized usage's
-    cache_read_tokens, or None when the provider reported nothing.
+    Uses the real shared extractor and the real routing-observation
+    contract — the same two steps serving/servers/routers/completions.py
+    performs before calling record_routing_observation.
     """
     ns_usage = normalize_usage(usage) or {}
     raw = ns_usage.get("cache_read_tokens")
@@ -73,6 +77,16 @@ def _routewise_cached_tokens(usage: dict) -> int | None:
     except (TypeError, ValueError):
         return None
     return value if value >= 0 else None
+
+
+class _RecordingRouter:
+    """Captures the RoutingObservation a router would have received."""
+
+    def __init__(self) -> None:
+        self.observations: list[RoutingObservation] = []
+
+    def record_observation(self, obs: RoutingObservation) -> None:
+        self.observations.append(obs)
 
 
 class TestThreeStatesSurviveEndToEnd:
@@ -104,9 +118,29 @@ class TestThreeStatesSurviveEndToEnd:
         assert wire["cache_read_reported"] is expected_reported
 
         # 3. RouteWise receives UNKNOWN as None (no observation), never 0.
-        assert _routewise_cached_tokens(usage) == expected_cached
+        observed = _observed_cached_tokens(usage)
+        assert observed == expected_cached
 
-        # 4. The effective cache ratio the gateway computes from the payload
+        # 4. The observation itself carries the count, and the router's
+        #    contract keeps None and 0 distinct.
+        router = _RecordingRouter()
+        router.record_observation(
+            RoutingObservation(
+                model_id="m",
+                endpoint_id="m:api",
+                ttft_ms=1.0,
+                total_latency_ms=2.0,
+                token_count=241842,
+                success=True,
+                prompt_tokens=241678,
+                completion_tokens=164,
+                cached_tokens=observed,
+            )
+        )
+        assert len(router.observations) == 1
+        assert router.observations[0].cached_tokens == expected_cached
+
+        # 5. The effective cache ratio the gateway computes from the payload
         #    is -1 (unobservable) for UNKNOWN and the true ratio otherwise.
         cached = wire["input_tokens_details"]["cached_tokens"]
         if expected_cached is None:
@@ -129,7 +163,7 @@ class TestThreeStatesSurviveEndToEnd:
         assert emitted["cache_read_reported"] is False
 
         # RouteWise
-        assert _routewise_cached_tokens(UNKNOWN_USAGE) is None
+        assert _observed_cached_tokens(UNKNOWN_USAGE) is None
 
     def test_a_provider_without_the_flag_keeps_the_legacy_inference(self):
         """A provider that reports a nested 0 and no flag is a measured miss.
@@ -142,7 +176,7 @@ class TestThreeStatesSurviveEndToEnd:
             "completion_tokens": 5,
             "input_tokens_details": {"cached_tokens": 0},
         }
-        assert _routewise_cached_tokens(usage) == 0
+        assert _observed_cached_tokens(usage) == 0
 
     def test_billing_does_not_discount_an_unreported_measurement(self):
         """UNKNOWN must not imply a cache discount.
