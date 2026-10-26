@@ -200,7 +200,7 @@ async def test_late_write_during_drain_is_refused(caplog):
     assert "req-late" not in [
         call.kwargs.get("request_id") for call in store.log_request.await_args_list
     ]
-    assert "request_log_admission_refused" in caplog.text
+    assert "Request-log admission refused" in caplog.text
     # The early row was still drained.
     assert store.log_request.await_count == 1
 
@@ -242,7 +242,10 @@ async def test_worker_unexpected_exit_preserves_pending_logs(caplog):
         cl.schedule_log("req-3", {"request_id": "req-3"})
         await cl.stop()
 
-    assert "request_log_worker_faulted" in caplog.text
+    assert (
+        "Request-log worker terminated unexpectedly" in caplog.text
+        or "Request-log workers died" in caplog.text
+    )
     assert cl._queue is not None and cl._queue.qsize() == 0  # restarted consumer drained it
     assert pending_before >= 0
     ids = [call.kwargs["request_id"] for call in store.log_request.await_args_list]
@@ -302,7 +305,7 @@ async def test_stop_then_restart_is_not_possible_but_refusal_is_loud(caplog):
     with caplog.at_level(logging.ERROR, logger="serving.servers.routers.completions_logging"):
         cl.schedule_log("req-2", {"request_id": "req-2"})
 
-    assert "request_log_admission_refused" in caplog.text
+    assert "Request-log admission refused" in caplog.text
     assert cl._log_store.log_request.await_count == 1
 
 
