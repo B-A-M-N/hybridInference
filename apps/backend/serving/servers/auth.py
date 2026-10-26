@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import secrets
 from base64 import urlsafe_b64encode
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from cryptography.fernet import Fernet
@@ -29,19 +29,59 @@ from serving.observability.rejection_log import (
     rejection_logging_enabled,
     release_cached_body,
 )
+from serving.observability.tracked_tasks import tracked_task
 from serving.servers.deps import (
     auth_database_detail,
-    get_db_logger,
     get_log_store,
     get_operational_store,
 )
+from serving.storage.base import OperationalStore
 from serving.utils import context as req_ctx
 from serving.utils.auth_failure_blocklist import is_ip_blocked, record_auth_failure
 from serving.utils.logging import get_logger
 from serving.utils.phone_auth import phone_identity_unverified
-from serving.utils.request_ip import get_client_ip, get_client_ip_info
+from serving.utils.request_ip import get_client_ip_info
 
 logger = get_logger(__name__)
+
+# What the daily cost quota gate assumes the request about to run will cost: a
+# caller is refused once today's spend leaves less than this under the quota.
+_ESTIMATED_REQUEST_COST_USD = 0.01
+# Quota of a key whose ``quota_daily_cost_usd`` is NULL (rows from before the
+# column existed).
+_DEFAULT_DAILY_QUOTA_USD = 1000.0
+
+
+class StoredKeyRejected(Exception):
+    """A stored API key no longer authenticates its owner.
+
+    Raised by :func:`authenticate_stored_key`. ``reason`` says why, in words fit
+    for the owner: the key was revoked or has expired, the account is not
+    active or not verified, or the work was stored without a key and user
+    authentication is now on.
+    """
+
+    def __init__(self, reason: str) -> None:
+        """Record why the key was refused."""
+        super().__init__(reason)
+        self.reason = reason
+
+
+class StoredKeyQuotaExceeded(Exception):
+    """The owner of a stored API key has spent today's cost quota.
+
+    Raised by :func:`authenticate_stored_key`; ``reset_at`` is when the quota
+    renews (the next UTC midnight).
+    """
+
+    def __init__(self, *, quota_usd: float, spent_usd: float, reset_at: datetime) -> None:
+        """Record the quota, today's spend and when the quota renews."""
+        super().__init__(
+            f"daily cost quota exceeded (quota_usd={quota_usd:.4f} spent_usd={spent_usd:.4f})"
+        )
+        self.quota_usd = quota_usd
+        self.spent_usd = spent_usd
+        self.reset_at = reset_at
 
 
 def _quota_contact() -> str:
@@ -99,11 +139,6 @@ def decrypt_api_key(encrypted_key: str | None) -> str | None:
     if not encrypted_key:
         return None
     return _api_key_cipher().decrypt(encrypted_key.encode()).decode()
-
-
-def constant_time_compare(a: str, b: str) -> bool:
-    """Constant-time string comparison to prevent timing attacks."""
-    return hmac.compare_digest(a, b)
 
 
 def _extract_api_key(authorization: str | None, x_api_key: str | None) -> str | None:
@@ -220,19 +255,139 @@ async def _identify_rejected_caller(
     }
 
 
+async def _auth_context_with_spend(
+    op_store: Any, key_hash: str, *, want_spend: bool
+) -> tuple[dict[str, Any] | None, float | None]:
+    """Resolve the caller's auth context, and today's spend with it when asked.
+
+    Real stores implement :meth:`OperationalStore.get_auth_context_with_spend`
+    (issue #185): the key-identity join and the ``user_daily_cost`` read the
+    quota gate needs travel in a single query. With ``want_spend=False`` the
+    identity-only lookup runs instead — the shape the impersonation path wants,
+    where the caller's spend is not the identity the gate reads. Test doubles
+    and any store predating the merged lookup keep the two-query path, which
+    answers the same. ``spend`` is ``None`` when it was not fetched.
+    """
+    if isinstance(op_store, OperationalStore):
+        if want_spend:
+            row = await op_store.get_auth_context_with_spend(key_hash)
+            if row is None:
+                return None, 0.0
+            return row, float(row.get("cost_usd") or 0.0)
+        row = await op_store.get_auth_context_by_key_hash(key_hash)
+        return row, (None if row is not None else 0.0)
+    user = await op_store.get_auth_context_by_key_hash(key_hash)
+    if user is None:
+        return None, 0.0
+    if want_spend and op_store:
+        return user, float(await op_store.get_user_cost_today(user["user_id"]))
+    return user, None
+
+
+async def _verification_pending(user: dict[str, Any]) -> bool:
+    """Whether the account behind an auth-context row must still verify itself.
+
+    An email account must have verified its address while the
+    ``signup_require_email_verification`` runtime setting is on (the
+    environment value stands in when the runtime settings cannot be read); a
+    phone-only account must have verified its phone whatever that setting says.
+    """
+    require_verification = get_settings().signup_require_email_verification
+    try:
+        from serving.config.runtime_settings import get_runtime_settings_instance
+
+        rs = get_runtime_settings_instance()
+        require_verification = await rs.get_bool("signup_require_email_verification")
+    except Exception as exc:
+        logger.warning(
+            "RuntimeSettings lookup for signup_require_email_verification failed; "
+            f"falling back to env: {exc}"
+        )
+    return bool(
+        (require_verification and user.get("email") and not user.get("email_verified"))
+        or phone_identity_unverified(user)
+    )
+
+
+def _daily_quota_usd(identity: dict[str, Any]) -> float:
+    """Return the identity's daily cost quota, the default when the row has none."""
+    quota = identity.get("quota_daily_cost_usd")
+    return _DEFAULT_DAILY_QUOTA_USD if quota is None else float(quota)
+
+
+def _over_daily_quota(spent_usd: float, quota_usd: float) -> bool:
+    """Whether a request may no longer run against *quota_usd* after *spent_usd* today."""
+    return spent_usd + _ESTIMATED_REQUEST_COST_USD > quota_usd
+
+
+def _anonymous_context() -> dict[str, Any]:
+    """Return the user context of every caller while user auth is disabled.
+
+    The admin role opens the API, but ``authenticated`` stays False on purpose:
+    the synthetic-probe trust check (serving/utils/synthetic_probe.py) requires
+    a *presented, resolved* key, so on an auth-disabled deployment no caller's
+    X-Probe marker is honoured.
+    """
+    return {
+        "user_id": "anonymous",
+        "role": "admin",
+        "authenticated": False,
+        "is_admin": True,
+    }
+
+
+def _user_context(
+    identity: dict[str, Any],
+    *,
+    key_hash: str,
+    quota_daily_cost_usd: float,
+    spent_today_usd: float,
+) -> dict[str, Any]:
+    """Return the user context an authenticated API key resolves to.
+
+    One builder for every path that authenticates an ``hyi-`` key, so they all
+    hand the handlers the same shape. ``identity`` is the auth-context row the
+    request is attributed to (or the impersonated user's equivalent, see
+    :func:`_resolve_effective_identity`); ``key_hash`` is the key that
+    authenticated, which stays the presented one under impersonation.
+    """
+    user_role = identity.get("role") or "free"
+    return {
+        "user_id": identity["user_id"],
+        "user_name": identity.get("user_name"),
+        "role": user_role,
+        "authenticated": True,
+        "quota_daily_cost_usd": quota_daily_cost_usd,
+        "spent_today_usd": spent_today_usd,
+        "quota_remaining_cost_usd": quota_daily_cost_usd - spent_today_usd,
+        "is_admin": user_role == "admin",
+        "disabled_models": get_disabled_models_from_preferences(identity.get("preferences")),
+        "max_concurrent_requests": identity.get("max_concurrent_requests"),
+        # key_hash identifies the specific hyi-xxx key in use (a user may
+        # have multiple). Used as the affinity key for multi-key API rotation;
+        # stays the presented key even when acting on behalf of another user.
+        "auth_key_hash": key_hash,
+    }
+
+
 async def _authenticate_by_api_key(
     request: Request,
     authorization: str | None,
     x_api_key: str | None,
     op_store: Any,
-) -> tuple[dict[str, Any], str]:
+    *,
+    want_spend: bool = False,
+) -> tuple[dict[str, Any], str, float | None]:
     """Resolve and validate the caller's API key against the database.
 
     Shared by :func:`verify_api_key` and :func:`verify_api_key_for_balance` --
     both need the same identity/email-verification checks, but only
     ``verify_api_key`` additionally enforces the daily cost quota gate.
 
-    Returns ``(user_row, key_hash)``. Raises ``HTTPException(401)`` for a
+    Returns ``(user_row, key_hash, spend_today)``. ``spend_today`` is the
+    caller's daily spend when ``want_spend`` was set (the quota gate reads it
+    when the attributed identity is the caller) and ``None`` otherwise. Raises
+    ``HTTPException(401)`` for a
     missing/invalid key and ``HTTPException(403)`` for an unverified email.
     """
     # Refuse sources already blocked for repeated auth failures. The *decision*
@@ -344,7 +499,7 @@ async def _authenticate_by_api_key(
 
     key_hash = hash_api_key(api_key)
 
-    user = await op_store.get_auth_context_by_key_hash(key_hash)
+    user, spend_today = await _auth_context_with_spend(op_store, key_hash, want_spend=want_spend)
 
     if not user:
         # Resolve who the key belongs to, through the same bounded lookup the
@@ -413,26 +568,13 @@ async def _authenticate_by_api_key(
             detail="Invalid or expired API key",
         )
 
-    require_verification = get_settings().signup_require_email_verification
-    try:
-        from serving.config.runtime_settings import get_runtime_settings_instance
-
-        rs = get_runtime_settings_instance()
-        require_verification = await rs.get_bool("signup_require_email_verification")
-    except Exception as exc:
-        logger.warning(
-            "RuntimeSettings lookup for signup_require_email_verification failed; "
-            f"falling back to env: {exc}"
-        )
-    if (
-        require_verification and user.get("email") and not user.get("email_verified")
-    ) or phone_identity_unverified(user):
+    if await _verification_pending(user):
         raise HTTPException(
             status_code=403,
             detail="Email not verified. Please verify your email to continue.",
         )
 
-    return user, key_hash
+    return user, key_hash, spend_today
 
 
 def _impersonation_service_key_hashes() -> frozenset[str]:
@@ -547,14 +689,16 @@ def _is_inference_path(request: Request) -> bool:
     return request.url.path.rstrip("/") in _AGENT_TOKEN_PATHS
 
 
-def _publish_caller_role(user_ctx: dict[str, Any]) -> dict[str, Any]:
+def publish_caller_role(user_ctx: dict[str, Any]) -> dict[str, Any]:
     """Expose the authenticated caller's role on the request context.
 
     The multi-key pool reads it to skip upstream provider keys reserved for a
     higher tier (see ``serving.adapters.key_pool``). Published here rather than
     per-router so every authenticated inference surface — chat completions,
-    ``/v1/messages``, responses, embeddings — is covered by one hop. Returns
-    *user_ctx* unchanged so call sites can wrap their ``return``.
+    ``/v1/messages``, responses, embeddings — is covered by one hop; work run
+    outside an HTTP request on a user's behalf (the batch worker) publishes it
+    through here too. Returns *user_ctx* unchanged so call sites can wrap their
+    ``return``.
     """
     req_ctx.update({req_ctx.USER_ROLE: user_ctx.get("role") or "free"})
     return user_ctx
@@ -605,7 +749,7 @@ async def verify_api_key(
             if grants.looks_like_grant_token(presented_key):
                 # The grant path meters against the account's daily quota,
                 # which the legacy branch below this return never reached.
-                return _publish_caller_role(
+                return publish_caller_role(
                     await authenticate_grant_model_call(presented_key, op_store=op_store)
                 )
         except AgentQuotaExceeded as exc:
@@ -625,21 +769,12 @@ async def verify_api_key(
 
     # Check if auth is enabled
     if not is_user_auth_enabled():
-        # Auth disabled - allow all, mark as anonymous. The admin role here
-        # opens the API, but ``authenticated`` stays False on purpose: the
-        # synthetic-probe trust check (serving/utils/synthetic_probe.py)
-        # requires a *presented, resolved* key, so on an auth-disabled
-        # deployment no caller's X-Probe marker is honoured.
-        return _publish_caller_role(
-            {
-                "user_id": "anonymous",
-                "role": "admin",
-                "authenticated": False,
-                "is_admin": True,
-            }
-        )
+        # Auth disabled - allow all, mark as anonymous.
+        return publish_caller_role(_anonymous_context())
 
-    caller, key_hash = await _authenticate_by_api_key(request, authorization, x_api_key, op_store)
+    caller, key_hash, caller_spend = await _authenticate_by_api_key(
+        request, authorization, x_api_key, op_store, want_spend=not x_on_behalf_of
+    )
     # The presented key is always the one whose last_used we touch, even when the
     # request is attributed to another user via X-On-Behalf-Of.
     caller_key_id = caller["id"]
@@ -651,20 +786,21 @@ async def verify_api_key(
     identity = await _resolve_effective_identity(caller, key_hash, x_on_behalf_of, op_store)
     effective_user_id = identity["user_id"]
 
-    # Pre-check daily cost quota via operational store counter table
+    # Pre-check daily cost quota via operational store counter table. On the
+    # common path (no X-On-Behalf-Of) the spend arrived with the auth lookup in
+    # one round-trip (issue #185); an impersonated identity reads its own
+    # counter, since the key lookup joined the caller's spend.
     cost_spent = 0.0
     if op_store:
-        cost_spent = await op_store.get_user_cost_today(effective_user_id)
+        if caller_spend is not None:
+            cost_spent = caller_spend
+        else:
+            cost_spent = await op_store.get_user_cost_today(effective_user_id)
 
-    # Estimate cost for this request
-    estimated_cost = 0.01
-
-    # Get quota with fallback for NULL (old rows from migration)
-    quota_daily_cost_usd = identity.get("quota_daily_cost_usd")
-    quota_daily_cost_usd = 1000.0 if quota_daily_cost_usd is None else float(quota_daily_cost_usd)
+    quota_daily_cost_usd = _daily_quota_usd(identity)
 
     # Check cost quota
-    if cost_spent + estimated_cost > quota_daily_cost_usd:
+    if _over_daily_quota(cost_spent, quota_daily_cost_usd):
         seconds_until_midnight_utc = _seconds_until_utc_midnight()
         quota_reset_at = _next_utc_midnight()
         asyncio.create_task(  # noqa: RUF006 — fire-and-forget rejection log
@@ -706,28 +842,85 @@ async def verify_api_key(
             },
         )
 
-    # Update last_used timestamp (fire and forget) on the presented key.
-    await op_store.update_key_last_used(caller_key_id)
+    # Update last_used timestamp on the presented key — fire-and-forget
+    # (issue #185): telemetry, not a gate, so the response no longer waits on
+    # the write. Failures surface through the tracked-task alert rule.
+    tracked_task(op_store.update_key_last_used(caller_key_id), name="key_last_used")
 
     # Return user context for the attributed identity.
-    user_role = identity.get("role") or "free"
-    return _publish_caller_role(
-        {
-            "user_id": effective_user_id,
-            "user_name": identity.get("user_name"),
-            "role": user_role,
-            "authenticated": True,
-            "quota_daily_cost_usd": quota_daily_cost_usd,
-            "spent_today_usd": cost_spent,
-            "quota_remaining_cost_usd": quota_daily_cost_usd - cost_spent,
-            "is_admin": user_role == "admin",
-            "disabled_models": get_disabled_models_from_preferences(identity.get("preferences")),
-            "max_concurrent_requests": identity.get("max_concurrent_requests"),
-            # key_hash identifies the specific hyi-xxx key in use (a user may
-            # have multiple). Used as the affinity key for multi-key API rotation;
-            # stays the presented key even when acting on behalf of another user.
-            "auth_key_hash": key_hash,
-        }
+    return publish_caller_role(
+        _user_context(
+            identity,
+            key_hash=key_hash,
+            quota_daily_cost_usd=quota_daily_cost_usd,
+            spent_today_usd=cost_spent,
+        )
+    )
+
+
+async def authenticate_stored_key(key_hash: str | None, op_store: Any) -> dict[str, Any]:
+    """Authenticate, as of now, the owner of work stored under an API key.
+
+    For work that runs after the request that stored it has gone -- a batch
+    item -- and has to stop wherever a live request presenting the same key
+    would be refused. Applies what :func:`verify_api_key` applies to an
+    ``hyi-`` key: key status and expiry, account status, email/phone
+    verification and the daily cost quota, read uncached
+    (:func:`_auth_context_with_spend`), and returns the same user context --
+    role, disabled models, per-user concurrency override -- from the same
+    builder.
+
+    It is not a request, so none of the request side effects happen: no
+    ``last_used_at`` write, no IP block consulted or recorded, no rejection
+    logged, and the caller role is not published. Whoever opens a request scope
+    for the work publishes it there (:func:`publish_caller_role`).
+
+    Args:
+        key_hash: ``api_keys.key_hash`` of the key the work was stored under,
+            or ``None`` when it was stored while user auth was disabled.
+        op_store: The operational store.
+
+    Returns:
+        The user context :func:`verify_api_key` would return for the key now.
+        While user auth is disabled that is its anonymous context, whatever the
+        key, as it is for a live request.
+
+    Raises:
+        StoredKeyRejected: The key no longer authenticates its owner.
+        StoredKeyQuotaExceeded: The owner has spent today's cost quota.
+        Exception: Whatever the store raised, unchanged: the answer is unknown,
+            not no. Also raised without an operational store to ask.
+    """
+    if not is_user_auth_enabled():
+        return _anonymous_context()
+    if key_hash is None:
+        raise StoredKeyRejected(
+            "user authentication is now enabled and the work was stored without an API key"
+        )
+    if not op_store:
+        raise RuntimeError(auth_database_detail())
+
+    user, spend_today = await _auth_context_with_spend(op_store, key_hash, want_spend=True)
+    if not user:
+        raise StoredKeyRejected(
+            "the API key was revoked or has expired, or the account is inactive"
+        )
+    if await _verification_pending(user):
+        raise StoredKeyRejected("the account's email or phone is not verified")
+
+    quota_daily_cost_usd = _daily_quota_usd(user)
+    cost_spent = spend_today or 0.0
+    if _over_daily_quota(cost_spent, quota_daily_cost_usd):
+        raise StoredKeyQuotaExceeded(
+            quota_usd=quota_daily_cost_usd,
+            spent_usd=cost_spent,
+            reset_at=_next_utc_midnight(),
+        )
+    return _user_context(
+        user,
+        key_hash=key_hash,
+        quota_daily_cost_usd=quota_daily_cost_usd,
+        spent_today_usd=cost_spent,
     )
 
 
@@ -746,14 +939,11 @@ async def verify_api_key_for_balance(
     if not is_user_auth_enabled():
         return {"user_id": "anonymous", "authenticated": False}
 
-    user, _key_hash = await _authenticate_by_api_key(request, authorization, x_api_key, op_store)
+    user, _key_hash, cost_spent = await _authenticate_by_api_key(
+        request, authorization, x_api_key, op_store, want_spend=True
+    )
 
-    cost_spent = 0.0
-    if op_store:
-        cost_spent = await op_store.get_user_cost_today(user["user_id"])
-
-    quota_daily_cost_usd = user.get("quota_daily_cost_usd")
-    quota_daily_cost_usd = 1000.0 if quota_daily_cost_usd is None else float(quota_daily_cost_usd)
+    quota_daily_cost_usd = _daily_quota_usd(user)
 
     return {
         "user_id": user["user_id"],
@@ -843,52 +1033,13 @@ async def optional_verify_api_key(
 
 def _seconds_until_utc_midnight() -> int:
     """Calculate seconds until next UTC midnight."""
-    return int((_next_utc_midnight() - datetime.now(timezone.utc)).total_seconds())
+    return int((_next_utc_midnight() - datetime.now(UTC)).total_seconds())
 
 
 def _next_utc_midnight() -> datetime:
     """Return the next UTC midnight timestamp."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-
-
-async def verify_admin_token(
-    request: Request,
-    authorization: str | None = Header(None),
-    db_logger=Depends(get_db_logger),
-) -> str:
-    """Verify admin token from Authorization header.
-
-    Returns admin IP address for audit logging.
-    Raises HTTPException(401) if invalid or missing token.
-
-    All /admin/* routes should use this dependency to protect access.
-    """
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="Missing admin token. Use 'Authorization: Bearer {ADMIN_TOKEN}' header.",
-        )
-
-    token = authorization[7:]
-    admin_token = get_settings().admin_token
-
-    if not admin_token:
-        raise HTTPException(
-            status_code=500,
-            detail="Server misconfiguration: ADMIN_TOKEN environment variable not set",
-        )
-
-    # Constant-time comparison to prevent timing attacks
-    if not constant_time_compare(token, admin_token):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid admin token",
-        )
-
-    # Extract admin IP for audit logging
-    admin_ip = get_client_ip(request)
-    return admin_ip
 
 
 async def log_admin_action(
