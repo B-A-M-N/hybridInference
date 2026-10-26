@@ -199,6 +199,31 @@ def extract_cache_tokens(
     if not usage or not isinstance(usage, dict):
         return None, None
 
+    # An explicit state flag from the producer is authoritative over field
+    # presence. The Responses surface emits ``cache_read_reported: false``
+    # when the provider reported no cache measurement at all, while still
+    # serializing ``input_tokens_details.cached_tokens: 0`` for SDK
+    # compatibility. Without this short-circuit the nested 0 would be read as
+    # a measured miss, and every consumer downstream — RouteWise locality
+    # learning, billing, the api_logs cache columns — would score a
+    # measurement that was never made.
+    explicit = usage.get("cache_read_reported")
+    if isinstance(explicit, bool) and not explicit:
+        # The producer asserts nothing was measured. Cache write accounting is
+        # a separate measurement and is unaffected.
+        cache_write = None
+        for field in ("cache_creation_input_tokens", "cache_write_tokens"):
+            val = usage.get(field)
+            if val is not None:
+                try:
+                    val = int(val)
+                    if val >= 0:
+                        cache_write = val
+                        break
+                except (TypeError, ValueError):
+                    pass
+        return None, cache_write
+
     # --- cache read tokens ---
     cache_read: int | None = None
 
