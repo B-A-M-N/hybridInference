@@ -209,6 +209,31 @@ class TestDefaultRequiredRoleForModel:
         assert model_cost_is_unknown_remote(engine) is False
         assert default_required_role_for_model(engine) == "free"
 
+    @pytest.mark.parametrize("routes", [None, []])
+    def test_an_empty_route_list_is_classified_like_an_omitted_one(self, routes):
+        # The registry reads ``m.get("route") or [synthesized]``: ``route: []``
+        # and ``route: null`` synthesize the same single route from the
+        # model-level provider / base_url as an omitted list. An empty list
+        # must not read as "no routes, so nothing can cost".
+        remote = {"id": "m", "provider": "openai_compat", "base_url": "https://api.example.test/v1"}
+        engine = {"id": "m", "provider": "sglang", "base_url": "http://localhost:12003/v1"}
+        for base, unknown, role in ((remote, True, "pro"), (engine, False, "free")):
+            model = {**base, "route": routes}
+            assert model_cost_is_unknown_remote(model) is unknown, model
+            assert default_required_role_for_model(model) == role, model
+
+    def test_an_empty_route_list_keeps_explicit_role_and_paid_pricing(self):
+        remote = {
+            "id": "m",
+            "provider": "openai_compat",
+            "base_url": "https://api.example.test/v1",
+            "route": [],
+        }
+        assert default_required_role_for_model({**remote, "required_role": "free"}) == "free"
+        paid = {**remote, "pricing": {"prompt": "1.0"}}
+        assert model_cost_is_unknown_remote(paid) is False
+        assert default_required_role_for_model(paid) == "pro"
+
     def test_an_unparseable_top_level_base_url_defaults_closed(self):
         # A single-route model without a route list falls back to the
         # top-level base_url; if it cannot be parsed as local, default closed.
@@ -255,6 +280,17 @@ class TestDefaultRequiredRoleForModel:
     def test_an_explicit_role_always_wins(self):
         model = {"id": "sponsored", "required_role": "free", "pricing": {"prompt": "2.0"}}
         assert default_required_role_for_model(model) == "free"
+
+    def test_admin_only_beside_an_explicit_free_role_stays_admin(self):
+        # The legacy precedence register_route has always applied: the
+        # contradictory pair must not open an admin-only model to free users.
+        model = {"id": "legacy", "admin_only": True, "required_role": "free"}
+        assert default_required_role_for_model(model) == "admin"
+
+    @pytest.mark.parametrize("role", ["pro", "internal", "admin"])
+    def test_any_other_explicit_role_replaces_admin_only(self, role):
+        model = {"id": "legacy", "admin_only": True, "required_role": role}
+        assert default_required_role_for_model(model) == role
 
     def test_an_invalid_explicit_role_is_returned_untouched(self):
         # The registry validates and fails closed to admin; the default

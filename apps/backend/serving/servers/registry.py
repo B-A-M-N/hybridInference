@@ -427,19 +427,13 @@ def _parse_role_gate(model: dict[str, Any], model_id: str) -> tuple[bool, str]:
     unknown-cost models publish as ``pro``; provably free ones as ``free``),
     an invalid ``required_role`` fails closed to ``admin`` (a typo must gate
     the model, not open it), and ``admin_only: true`` stays the older
-    spelling of ``required_role: admin``.
+    spelling of ``required_role: admin``. ``admin_only`` is kept as written:
+    beside an explicit ``free`` it still means admin (the legacy precedence
+    ``register_route`` applies too), beside any other explicit role that
+    role is the gate.
     """
     admin_only = bool(model.get("admin_only", False))
-    if "required_role" in model:
-        # An explicit value always wins, even an invalid one: the VALID_ROLES
-        # check below fails it closed. Only the omission reads as the
-        # cost-derived default.
-        admin_only = False
-        required_role = str(model["required_role"])
-    elif admin_only:
-        required_role = "admin"
-    else:
-        required_role = default_required_role_for_model(model)
+    required_role = default_required_role_for_model(model)
     # Validate required_role to prevent fail-open on typos
     from serving.config.settings import VALID_ROLES
 

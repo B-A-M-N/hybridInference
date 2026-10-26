@@ -115,19 +115,69 @@ def test_embedding_admin_only_without_role_defaults_to_admin(tmp_path):
     assert gate.required_role == "admin"
 
 
-@pytest.mark.unit
-def test_embedding_explicit_role_overrides_admin_only_compatibility(tmp_path):
-    body = _embedding_yaml(role="free").replace(
+def _admin_only_embedding_yaml(role: str) -> str:
+    return _embedding_yaml(role=role).replace(
         "    model_type: embedding\n", "    model_type: embedding\n    admin_only: true\n"
     )
-    p = _write_models_yaml(tmp_path, body)
+
+
+@pytest.mark.unit
+def test_embedding_admin_only_with_explicit_free_role_stays_admin(tmp_path):
+    """The legacy contradictory pair stays admin-only, as on the chat surface."""
+    p = _write_models_yaml(tmp_path, _admin_only_embedding_yaml("free"))
 
     exe = FixedRouter()
     register_from_models_yaml(exe, p, {})
 
     gate = exe.embedding_routes["emb-x"]
-    assert gate.required_role == "free"
-    assert gate.admin_only is False
+    assert gate.required_role == "admin"
+    assert gate.admin_only is True
+
+
+@pytest.mark.unit
+def test_embedding_admin_only_with_explicit_pro_role_is_pro(tmp_path):
+    p = _write_models_yaml(tmp_path, _admin_only_embedding_yaml("pro"))
+
+    exe = FixedRouter()
+    register_from_models_yaml(exe, p, {})
+
+    gate = exe.embedding_routes["emb-x"]
+    assert gate.required_role == "pro"
+    assert gate.admin_only is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("provider", "base_url", "expected"),
+    [
+        ("openai_compat", "https://gateway.example/api/v2/", "pro"),
+        ("sglang", "http://localhost:12003/v1", "free"),
+    ],
+)
+def test_embedding_with_an_empty_route_list_defaults_like_an_omitted_one(
+    tmp_path, provider, base_url, expected
+):
+    # route: [] synthesizes the model-level route in the registry, so the
+    # cost default must classify that route: an unpriced remote endpoint is
+    # unknown-cost (pro), a local engine stays free.
+    body = f"""
+models:
+  - id: emb-x
+    name: Embedding X
+    provider: {provider}
+    base_url: {base_url}
+    model_type: embedding
+    route: []
+"""
+    p = _write_models_yaml(tmp_path, body)
+
+    exe = FixedRouter()
+    adapters: dict = {}
+    count, _infos = register_from_models_yaml(exe, p, adapters)
+
+    assert count == 1
+    assert "emb-x" in adapters
+    assert exe.embedding_routes["emb-x"].required_role == expected
 
 
 @pytest.mark.unit
@@ -344,6 +394,35 @@ async def test_admin_only_gate_denies_free_caller():
     resp = await _post(app, "emb-pro")
 
     assert resp.status_code == 404
+
+
+@pytest.mark.parametrize(("user_role", "status"), [("free", 404), ("pro", 404), ("admin", 200)])
+@pytest.mark.asyncio
+async def test_yaml_admin_only_with_free_role_is_served_to_admins_only(tmp_path, user_role, status):
+    """admin_only: true + required_role: free, registered from YAML, stays admin-only."""
+
+    class _CountingAdapter(_FakeAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config.id = "emb-x"
+            self.calls = 0
+
+        async def embeddings(self, input_data, **params):
+            self.calls += 1
+            return await super().embeddings(input_data, **params)
+
+    p = _write_models_yaml(tmp_path, _admin_only_embedding_yaml("free"))
+    exe = FixedRouter()
+    register_from_models_yaml(exe, p, {})
+    adapter = _CountingAdapter()
+    app = _build_app(exe, _CapturingLogger(), user_role=user_role)
+    # Dispatch goes to a local fake; the gate is the one the YAML registered.
+    app.dependency_overrides[get_embedding_adapters] = lambda: {"emb-x": adapter}
+
+    resp = await _post(app, "emb-x")
+
+    assert resp.status_code == status
+    assert adapter.calls == (1 if status == 200 else 0)
 
 
 @pytest.mark.asyncio

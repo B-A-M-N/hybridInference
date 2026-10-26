@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from routing.routers import FixedRouter
+from serving.model_access import baseline_required_role
 from serving.servers import registry
 
 
@@ -1257,7 +1258,6 @@ def test_explicit_required_role_still_wins_over_the_pricing_default(tmp_path):
         "  - id: sponsored-pro\n"
         "    name: Sponsored Pro\n"
         "    provider: openai_compat\n"
-        "    admin_only: true\n"
         "    required_role: free\n"
         "    pricing:\n"
         '      prompt: "2.00"\n'
@@ -1275,6 +1275,110 @@ def test_explicit_required_role_still_wins_over_the_pricing_default(tmp_path):
 
     assert exe.routes["sponsored-pro"].admin_only is False
     assert exe.routes["sponsored-pro"].required_role == "free"
+
+
+def _admin_only_with_role_yaml(role: str) -> str:
+    return (
+        "models:\n"
+        "  - id: legacy-admin\n"
+        "    name: Legacy Admin\n"
+        "    provider: openai_compat\n"
+        "    admin_only: true\n"
+        f"    required_role: {role}\n"
+        "    route:\n"
+        "      - kind: openai_compat\n"
+        "        weight: 1.0\n"
+        "        base_url: https://legacy.example.test/v1\n"
+    )
+
+
+@pytest.mark.unit
+def test_admin_only_with_explicit_free_role_stays_admin(tmp_path):
+    """The legacy contradictory pair keeps the model admin-only.
+
+    ``register_route`` has always read ``admin_only: true`` beside
+    ``required_role: free`` as admin; the parser must not drop ``admin_only``
+    and publish the model free-tier.
+    """
+    p = tmp_path / "models.yaml"
+    p.write_text(_admin_only_with_role_yaml("free"))
+
+    exe = FixedRouter()
+    registry.register_from_models_yaml(exe, Path(p))
+
+    route = exe.routes["legacy-admin"]
+    assert route.admin_only is True
+    assert route.required_role == "admin"
+    assert baseline_required_role(route) == "admin"
+
+
+@pytest.mark.unit
+def test_admin_only_with_explicit_pro_role_is_pro(tmp_path):
+    """Any other explicit role is the gate, as on dev: admin_only + pro is pro."""
+    p = tmp_path / "models.yaml"
+    p.write_text(_admin_only_with_role_yaml("pro"))
+
+    exe = FixedRouter()
+    registry.register_from_models_yaml(exe, Path(p))
+
+    route = exe.routes["legacy-admin"]
+    assert route.admin_only is True
+    assert route.required_role == "pro"
+    assert baseline_required_role(route) == "pro"
+
+
+def _empty_route_list_yaml(*, provider: str, base_url: str, extra: str = "") -> str:
+    return (
+        "models:\n"
+        "  - id: empty-routes\n"
+        "    name: Empty Routes\n"
+        f"    provider: {provider}\n"
+        f"    base_url: {base_url}\n"
+        f"{extra}"
+        "    route: []\n"
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("provider", "base_url", "extra", "expected"),
+    [
+        # route: [] synthesizes the model-level route exactly like an omitted
+        # list, so an unpriced remote endpoint is unknown-cost.
+        ("openai_compat", "https://remote.example.test/v1", "", "pro"),
+        # The provably local engine control keeps the free default.
+        ("sglang", "http://localhost:12003/v1", "", "free"),
+        # An explicit role stays authoritative.
+        ("openai_compat", "https://remote.example.test/v1", "    required_role: free\n", "free"),
+        # Paid pricing still defaults to pro.
+        (
+            "openai_compat",
+            "https://remote.example.test/v1",
+            '    pricing:\n      prompt: "1.00"\n      completion: "2.00"\n',
+            "pro",
+        ),
+    ],
+)
+def test_empty_route_list_defaults_like_an_omitted_one(
+    tmp_path, provider, base_url, extra, expected
+):
+    p = tmp_path / "models.yaml"
+    p.write_text(_empty_route_list_yaml(provider=provider, base_url=base_url, extra=extra))
+
+    exe = FixedRouter()
+    registry.register_from_models_yaml(exe, Path(p))
+
+    route = exe.routes["empty-routes"]
+    # The registry did synthesize the model-level route.
+    assert [adapter.config.base_url for adapter, _ in route.adapters] == [base_url]
+    assert route.required_role == expected
+
+    # And an omitted route list lands on the same tier.
+    omitted = tmp_path / "omitted.yaml"
+    omitted.write_text(p.read_text().replace("    route: []\n", ""))
+    exe_omitted = FixedRouter()
+    registry.register_from_models_yaml(exe_omitted, Path(omitted))
+    assert exe_omitted.routes["empty-routes"].required_role == expected
 
 
 @pytest.mark.unit

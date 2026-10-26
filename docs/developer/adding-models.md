@@ -207,6 +207,11 @@ different tier, and that value remains authoritative. Unpriced local
 `sglang`, `vllm`, and `ollama` engine routes can retain the `free` default
 when their local endpoint is identifiable from configuration.
 
+An explicit `required_role` also takes the place of `admin_only: true`, with
+one exception kept from earlier releases: `admin_only: true` together with
+`required_role: free` stays admin-only. To open such a model to the free tier,
+remove `admin_only`.
+
 ### Automatic DeepSeek prices
 
 To follow DeepSeek prices automatically, configure the official API model id as a pricing source. The source is independent of the inference endpoint, so a self-hosted route can use these reference prices too. PostgreSQL stores the last validated snapshot; no API key is sent to the pricing or calendar sources.

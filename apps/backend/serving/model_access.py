@@ -127,12 +127,13 @@ def model_cost_is_unknown_remote(model: Mapping[str, Any]) -> bool:
     provider_kind = model.get("provider")
     model_base_url = model.get("base_url")
     routes = model.get("route")
-    if not isinstance(routes, list):
-        # A single-route model without a route list: the registry synthesizes
-        # one route from the top-level base_url and the model's provider
-        # field. Built-in remote providers can use their own endpoint and
+    if not routes or not isinstance(routes, list):
+        # No usable route list — omitted, null or empty: the registry
+        # (``m.get("route") or [...]``) synthesizes one route from the model's
+        # provider field and top-level base_url, so classify exactly that
+        # route. Built-in remote providers can use their own endpoint and
         # still incur upstream cost even without a configured base_url.
-        return _route_cost_is_unknown(model, provider_kind)
+        return _route_cost_is_unknown({"kind": provider_kind, "base_url": model_base_url})
     return any(
         isinstance(route, Mapping) and _route_cost_is_unknown(route, provider_kind, model_base_url)
         for route in routes
@@ -145,8 +146,11 @@ def default_required_role_for_model(model: Mapping[str, Any]) -> str:
     Issue #1576: an omitted ``required_role`` used to publish every such model
     free-tier — including paid-upstream compatibility routes. Known paid
     models default to ``pro``; unknown remote costs do too unless the route is
-    provably local. ``admin_only`` defaults to ``admin`` when no role is
-    explicit. An explicit value always wins, even an invalid one (callers fail
+    provably local. ``admin_only: true`` reads as ``admin`` when no role is
+    explicit, and also when the explicit role is ``free``: that is the legacy
+    precedence the router has always applied (``register_route``), so the
+    contradictory pair stays admin-only rather than opening the model. Any
+    other explicit value wins as written, even an invalid one (callers fail
     that closed themselves).
 
     The unknown-cost half of the gap: a model with no pricing metadata whose
@@ -158,7 +162,10 @@ def default_required_role_for_model(model: Mapping[str, Any]) -> str:
     Explicit ``required_role`` remains authoritative.
     """
     if "required_role" in model:
-        return str(model["required_role"])
+        required_role = str(model["required_role"])
+        if model.get("admin_only") and required_role == "free":
+            return "admin"
+        return required_role
     if model.get("admin_only"):
         return "admin"
     if model_pricing_indicates_paid(model):

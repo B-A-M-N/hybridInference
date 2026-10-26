@@ -1552,6 +1552,14 @@ msgid ""
 "identifiable from configuration."
 msgstr "未填写 `required_role` 时，标记为 `admin_only: true` 的条目默认要求 `admin`。其他模型如果已知或无法确定 provider 成本，则默认要求 `pro`；这包括未标价的 LAN 或集群 DNS 路由、加载时无法分类的环境变量端点，以及即使 base URL 是本地地址的 `openai_compat` 路由。面向用户的价格为零，并不能证明上游 provider 不收费。若要将此类模型保持在 free 等级，请添加 `required_role: free`；路由应对其他等级开放时也请显式设置该值，显式值始终优先。未标价的本地 `sglang`、`vllm` 和 `ollama` 引擎路由，如果能从配置确认其本地端点，则仍可默认要求 `free`。"
 
+#: ../developer/adding-models.md:210
+msgid ""
+"An explicit `required_role` also takes the place of `admin_only: true`, "
+"with one exception kept from earlier releases: `admin_only: true` "
+"together with `required_role: free` stays admin-only. To open such a "
+"model to the free tier, remove `admin_only`."
+msgstr "显式的 `required_role` 同样会取代 `admin_only: true`，但保留了早期版本的一个例外：`admin_only: true` 与 `required_role: free` 同时出现时，模型仍仅限管理员使用。若要向 free 等级开放此类模型，请删除 `admin_only`。"
+
 #: ../developer/adding-models.md
 msgid "Automatic DeepSeek prices"
 msgstr "自动同步 DeepSeek 价格"
