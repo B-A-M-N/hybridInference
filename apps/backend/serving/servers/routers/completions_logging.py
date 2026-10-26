@@ -288,7 +288,7 @@ class CompletionsLogger:
                 # join them here. Just make sure they are not left running.
                 for worker in workers:
                     worker.cancel()
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(
                 f"Request-log drain timed out after {timeout}s; "
                 f"{queue.qsize()} queued payloads discarded"
