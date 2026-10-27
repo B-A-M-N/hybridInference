@@ -96,4 +96,6 @@ async def test_cached_store_forwards_explicit_stale_claim_resume():
         reason="operator confirmed workers stopped",
         email="alice@example.com",
         recover_stale_claim=True,
+        # The merged resume_user signature also forwards dev's audit actor.
+        actor=None,
     )
