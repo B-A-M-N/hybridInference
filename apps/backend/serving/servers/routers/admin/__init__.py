@@ -11,6 +11,7 @@ exported at this level. Callers use
 from fastapi import APIRouter
 
 from serving.servers.routers.admin import (
+    alert_history,
     alerts,
     analytics,
     api_keys,
@@ -18,6 +19,7 @@ from serving.servers.routers.admin import (
     batch,
     broadcast,
     config,
+    config_backup,
     export,
     login_events,
     metrics,
@@ -48,6 +50,7 @@ except ImportError:  # RouteWise absent from a partial install
 from serving.servers.routers.admin.metrics import _decode_throughput_tps
 
 router = APIRouter()
+router.include_router(alert_history.router)
 router.include_router(alerts.router)
 router.include_router(analytics.router)
 router.include_router(api_keys.router)
@@ -55,6 +58,7 @@ router.include_router(auth_blocks.router)
 router.include_router(batch.router)
 router.include_router(broadcast.router)
 router.include_router(config.router)
+router.include_router(config_backup.router)
 router.include_router(export.router)
 router.include_router(login_events.router)
 router.include_router(metrics.router)

@@ -12,6 +12,7 @@ from cryptography.fernet import Fernet
 from fastapi import Depends, Header, HTTPException, Request
 
 from serving import grants, quota
+from serving.audit import AuditActor, AuditTarget, audit_columns
 from serving.config.app_config import config_value
 from serving.config.settings import get_settings
 from serving.config.site_identity import get_site_identity
@@ -704,6 +705,57 @@ def publish_caller_role(user_ctx: dict[str, Any]) -> dict[str, Any]:
     return user_ctx
 
 
+def _quota_exceeded(
+    request: Request,
+    *,
+    user_id: str,
+    role: str,
+    quota_usd: float,
+    spent_usd: float,
+) -> HTTPException:
+    """Log the quota rejection and return the 429 every quota-gated route answers."""
+    seconds_until_midnight_utc = _seconds_until_utc_midnight()
+    quota_reset_at = _next_utc_midnight()
+    asyncio.create_task(  # noqa: RUF006 — fire-and-forget rejection log
+        log_rejection(
+            request=request,
+            status_code=429,
+            error_code="quota_exceeded",
+            reason=(f"quota_usd={quota_usd:.4f} spent_usd={spent_usd:.4f}"),
+            user={
+                "user_id": user_id,
+                "role": role,
+                # The caller passed key auth to reach the quota gate, so
+                # the rejection log's probe-trust check sees a real key.
+                "authenticated": True,
+            },
+        )
+    )
+    return HTTPException(
+        status_code=429,
+        detail={
+            "error": "Daily cost quota exceeded",
+            "quota_usd": quota_usd,
+            "spent_usd": spent_usd,
+            "remaining_usd": max(0, quota_usd - spent_usd),
+            "reset_at": quota_reset_at.isoformat(),
+            "contact_email": _quota_contact(),
+            "message": (
+                f"Need more quota? Email {_quota_contact()} and explain your use case."
+                if _quota_contact()
+                else "Daily quota exhausted. Contact the operator of this deployment."
+            ),
+            "retry_after": seconds_until_midnight_utc,
+        },
+        headers={
+            "Retry-After": str(seconds_until_midnight_utc),
+            "X-RateLimit-Limit-Cost": str(quota_usd),
+            "X-RateLimit-Remaining-Cost": str(max(0, quota_usd - spent_usd)),
+            "X-RateLimit-Reset": str(int(quota_reset_at.timestamp())),
+        },
+    )
+
+
 async def verify_api_key(
     request: Request,
     authorization: str | None = Header(None),
@@ -801,45 +853,12 @@ async def verify_api_key(
 
     # Check cost quota
     if _over_daily_quota(cost_spent, quota_daily_cost_usd):
-        seconds_until_midnight_utc = _seconds_until_utc_midnight()
-        quota_reset_at = _next_utc_midnight()
-        asyncio.create_task(  # noqa: RUF006 — fire-and-forget rejection log
-            log_rejection(
-                request=request,
-                status_code=429,
-                error_code="quota_exceeded",
-                reason=(f"quota_usd={quota_daily_cost_usd:.4f} spent_usd={cost_spent:.4f}"),
-                user={
-                    "user_id": effective_user_id,
-                    "role": identity.get("role") or "free",
-                    # The caller passed key auth to reach the quota gate, so
-                    # the rejection log's probe-trust check sees a real key.
-                    "authenticated": True,
-                },
-            )
-        )
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error": "Daily cost quota exceeded",
-                "quota_usd": quota_daily_cost_usd,
-                "spent_usd": cost_spent,
-                "remaining_usd": max(0, quota_daily_cost_usd - cost_spent),
-                "reset_at": quota_reset_at.isoformat(),
-                "contact_email": _quota_contact(),
-                "message": (
-                    f"Need more quota? Email {_quota_contact()} and explain your use case."
-                    if _quota_contact()
-                    else "Daily quota exhausted. Contact the operator of this deployment."
-                ),
-                "retry_after": seconds_until_midnight_utc,
-            },
-            headers={
-                "Retry-After": str(seconds_until_midnight_utc),
-                "X-RateLimit-Limit-Cost": str(quota_daily_cost_usd),
-                "X-RateLimit-Remaining-Cost": str(max(0, quota_daily_cost_usd - cost_spent)),
-                "X-RateLimit-Reset": str(int(quota_reset_at.timestamp())),
-            },
+        raise _quota_exceeded(
+            request,
+            user_id=effective_user_id,
+            role=identity.get("role") or "free",
+            quota_usd=quota_daily_cost_usd,
+            spent_usd=cost_spent,
         )
 
     # Update last_used timestamp on the presented key — fire-and-forget
@@ -858,7 +877,9 @@ async def verify_api_key(
     )
 
 
-async def authenticate_stored_key(key_hash: str | None, op_store: Any) -> dict[str, Any]:
+async def authenticate_stored_key(
+    key_hash: str | None, op_store: Any, *, check_quota: bool = True
+) -> dict[str, Any]:
     """Authenticate, as of now, the owner of work stored under an API key.
 
     For work that runs after the request that stored it has gone -- a batch
@@ -890,6 +911,9 @@ async def authenticate_stored_key(key_hash: str | None, op_store: Any) -> dict[s
         StoredKeyQuotaExceeded: The owner has spent today's cost quota.
         Exception: Whatever the store raised, unchanged: the answer is unknown,
             not no. Also raised without an operational store to ask.
+
+    ``check_quota`` False skips the daily cost quota, for work that spends
+    nothing (validating a batch's input).
     """
     if not is_user_auth_enabled():
         return _anonymous_context()
@@ -910,7 +934,7 @@ async def authenticate_stored_key(key_hash: str | None, op_store: Any) -> dict[s
 
     quota_daily_cost_usd = _daily_quota_usd(user)
     cost_spent = spend_today or 0.0
-    if _over_daily_quota(cost_spent, quota_daily_cost_usd):
+    if check_quota and _over_daily_quota(cost_spent, quota_daily_cost_usd):
         raise StoredKeyQuotaExceeded(
             quota_usd=quota_daily_cost_usd,
             spent_usd=cost_spent,
@@ -921,6 +945,77 @@ async def authenticate_stored_key(key_hash: str | None, op_store: Any) -> dict[s
         key_hash=key_hash,
         quota_daily_cost_usd=quota_daily_cost_usd,
         spent_today_usd=cost_spent,
+    )
+
+
+async def verify_batch_management_identity(
+    request: Request,
+    authorization: str | None = Header(None),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    x_on_behalf_of: str | None = Header(None, alias="X-On-Behalf-Of"),
+    op_store=Depends(get_operational_store),
+) -> dict[str, Any]:
+    """Authenticate a caller managing batches and files, without the daily quota gate.
+
+    Everything :func:`verify_api_key` checks about the key and the account
+    still applies -- a revoked or expired key, a suspended, deleted or
+    unverified account, a blocked IP -- and the same user context comes back,
+    role and admin flag included. Only the daily cost quota is left out:
+    listing, reading, downloading, cancelling and deleting what one already
+    submitted spends nothing, and must keep working exactly when the quota is
+    spent. The context carries ``quota_exceeded`` so a route that does create
+    work enforces the quota itself (:func:`enforce_daily_quota`), after its
+    idempotency check.
+
+    Agent-sandbox grant tokens and ``X-On-Behalf-Of`` are refused: batch work
+    runs later under the key that created it, which neither of those is.
+    """
+    presented_key = _extract_api_key(authorization, x_api_key)
+    if grants.looks_like_grant_token(presented_key):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "type": "insufficient_scope",
+                    "message": "This credential may only be used for model inference.",
+                }
+            },
+        )
+    if x_on_behalf_of:
+        raise HTTPException(
+            400,
+            "X-On-Behalf-Of is not supported for batches: a batch belongs to the key that "
+            "creates it",
+        )
+    if not is_user_auth_enabled():
+        return publish_caller_role({**_anonymous_context(), "quota_exceeded": False})
+
+    user, key_hash, spend_today = await _authenticate_by_api_key(
+        request, authorization, x_api_key, op_store, want_spend=True
+    )
+    tracked_task(op_store.update_key_last_used(user["id"]), name="key_last_used")
+    quota_daily_cost_usd = _daily_quota_usd(user)
+    cost_spent = spend_today or 0.0
+    context = _user_context(
+        user,
+        key_hash=key_hash,
+        quota_daily_cost_usd=quota_daily_cost_usd,
+        spent_today_usd=cost_spent,
+    )
+    context["quota_exceeded"] = _over_daily_quota(cost_spent, quota_daily_cost_usd)
+    return publish_caller_role(context)
+
+
+def enforce_daily_quota(request: Request, user_ctx: dict[str, Any]) -> None:
+    """Refuse with the quota 429 when a management identity has spent today's quota."""
+    if not user_ctx.get("quota_exceeded"):
+        return
+    raise _quota_exceeded(
+        request,
+        user_id=user_ctx.get("user_id") or "anonymous",
+        role=user_ctx.get("role") or "free",
+        quota_usd=float(user_ctx.get("quota_daily_cost_usd") or 0.0),
+        spent_usd=float(user_ctx.get("spent_today_usd") or 0.0),
     )
 
 
@@ -1044,26 +1139,39 @@ def _next_utc_midnight() -> datetime:
 
 async def log_admin_action(
     db_logger,
-    admin_ip: str,
-    action: str,
+    admin_ip: str | None = None,
+    action: str | None = None,
     target_user_id: str | None = None,
     details: dict[str, Any] | None = None,
     success: bool = True,
+    *,
+    actor: AuditActor | None = None,
+    target: AuditTarget | None = None,
 ) -> None:
-    """Log admin action to audit trail.
+    """Log an action to the audit trail.
 
     Accepts either an OperationalStore or a legacy DatabaseLogger. Callers
     are migrating to pass the store directly; during transition both are
-    supported.
+    supported, and both write the same row (``serving.storage.audit_schema``).
+
+    New writers pass *actor* and *target* (see :mod:`serving.audit`) and no
+    *admin_ip* / *target_user_id*: the row's source address comes from the
+    actor, and ``target_user_id`` is set only for a user target. The
+    positional legacy form still works and writes a row whose actor is "not
+    recorded".
 
     Args:
         db_logger: OperationalStore or DatabaseLogger instance
-        admin_ip: IP address of admin performing the action
+        admin_ip: Legacy: the value to store raw in ``admin_ip``
         action: Action type (e.g., 'create_key', 'revoke_key')
-        target_user_id: User ID affected by the action (if applicable)
+        target_user_id: Legacy: the value to store raw in ``target_user_id``
         details: Additional context (will be stored as JSONB)
         success: Whether the action succeeded
+        actor: Who acted
+        target: What was acted on
     """
+    if not action:
+        raise ValueError("log_admin_action needs an action")
     if not db_logger:
         return  # Silently skip if logging not configured
 
@@ -1075,6 +1183,8 @@ async def log_admin_action(
             target_user_id=target_user_id,
             details=details,
             success=success,
+            actor=actor,
+            target=target,
         )
         return
 
@@ -1082,17 +1192,12 @@ async def log_admin_action(
     if not getattr(db_logger, "pool", None):
         return
 
-    import json
+    from serving.storage.audit_schema import insert_audit_row
 
+    columns = audit_columns(
+        admin_ip=admin_ip, target_user_id=target_user_id, actor=actor, target=target
+    )
     async with db_logger.pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO admin_audit_log (admin_ip, action, target_user_id, details, success)
-            VALUES ($1, $2, $3, $4::jsonb, $5)
-            """,
-            admin_ip,
-            action,
-            target_user_id,
-            json.dumps(details) if details else None,
-            success,
+        await insert_audit_row(
+            conn, columns=columns, action=action, details=details, success=success
         )

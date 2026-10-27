@@ -54,6 +54,16 @@ class Category:
     id: str
     label: str
     description: str
+    #: Whether its settings can take effect in this deployment; the console
+    #: offers none of them while it returns false. ``None`` is always.
+    in_effect: Callable[[], bool] | None = None
+
+
+def _sms_provider_registered() -> bool:
+    # Phone sign-in needs a provider an extension registers; "none" is always listed.
+    from serving.utils.delivery import sms_provider_names
+
+    return len(sms_provider_names()) > 1
 
 
 CATEGORIES: tuple[Category, ...] = (
@@ -73,7 +83,12 @@ CATEGORIES: tuple[Category, ...] = (
         "Email",
         "Outgoing mail for verification, password reset and notifications.",
     ),
-    Category("phone", "Phone authentication", "Optional phone sign-in and SMS delivery."),
+    Category(
+        "phone",
+        "Phone authentication",
+        "Optional phone sign-in and SMS delivery.",
+        in_effect=_sms_provider_registered,
+    ),
     Category(
         "providers",
         "Providers",
@@ -104,6 +119,7 @@ CATEGORIES: tuple[Category, ...] = (
 )
 
 CATEGORY_IDS: frozenset[str] = frozenset(category.id for category in CATEGORIES)
+_CATEGORY_BY_ID: dict[str, Category] = {category.id: category for category in CATEGORIES}
 
 
 @dataclass(frozen=True)
@@ -953,7 +969,7 @@ _STATIC_ENTRIES: tuple[ConfigEntry, ...] = (
         "Batch Concurrency; this is only the default. 0 pauses batch work on every "
         "model without a cap.",
         type="int",
-        default="4",
+        default="64",
         minimum=0,
     ),
     ConfigEntry(
@@ -1003,10 +1019,124 @@ _STATIC_ENTRIES: tuple[ConfigEntry, ...] = (
     ConfigEntry(
         "BATCH_RETENTION_DAYS",
         "batch",
-        "Days a finished batch and its results are kept before they are deleted.",
+        "Days a finished batch and its results are kept before they are deleted. A "
+        "change applies to batches created afterwards.",
         type="int",
         default="7",
         minimum=1,
+    ),
+    ConfigEntry(
+        "BATCH_EXPANSION_ENABLED",
+        "batch",
+        "Allow creating the newer batch kinds: Anthropic Message Batches, file batches "
+        "with the Files upload, and Embeddings and Responses requests. Turn on only once "
+        "every gateway process runs a version that supports them. Off, batches already "
+        "accepted still run and can still be read, downloaded, cancelled and deleted.",
+        type="bool",
+        default="0",
+        flag=True,
+    ),
+    ConfigEntry(
+        "BATCH_SHARED_INTERACTIVE_LOAD",
+        "batch",
+        "Count the interactive requests in flight on every gateway process, not only "
+        "this one, when batch work yields to interactive traffic. If that shared count "
+        "cannot be read, no new batch request starts until it can.",
+        type="bool",
+        default="1",
+        flag=True,
+    ),
+    ConfigEntry(
+        "BATCH_MAX_QUEUED_REQUESTS_PER_USER",
+        "batch",
+        "Unfinished batch requests one user may have across all their batches. A batch "
+        "that would go past it is refused, however it is split.",
+        type="int",
+        default="100000",
+        minimum=1,
+    ),
+    *(
+        ConfigEntry(
+            f"BATCH_ROLE_CONCURRENCY_{role.upper()}",
+            "batch",
+            f"Batch requests one {role} user may have running at once, across every "
+            "model (counted per gateway process). Separate from the role's interactive concurrency limit: batch work "
+            "neither waits on nor takes the slots of the user's own interactive requests. "
+            "0 removes this cap (the per-model batch limits still apply).",
+            type="int",
+            default=str(default),
+            minimum=0,
+        )
+        for role, default in (("free", 8), ("pro", 16), ("internal", 64), ("admin", 64))
+    ),
+    ConfigEntry(
+        "BATCH_INTERACTIVE_RESERVE",
+        "batch",
+        "Slots of every model's batch cap always left free for interactive requests, on "
+        "top of those interactive requests already in flight take (while batch work "
+        "yields to interactive traffic). 0 keeps no extra room.",
+        type="int",
+        default="0",
+        minimum=0,
+    ),
+    ConfigEntry(
+        "BATCH_MAX_LINE_KB",
+        "batch",
+        "Largest line of an uploaded batch input file, in KiB.",
+        type="int",
+        default="4096",
+        minimum=1,
+    ),
+    ConfigEntry(
+        "BATCH_MAX_RESULT_KB",
+        "batch",
+        "Largest response one batch request may store, in KiB. A larger response fails "
+        "the request with result_too_large.",
+        type="int",
+        default="4096",
+        minimum=1,
+    ),
+    ConfigEntry(
+        "BATCH_FILES_MAX_TOTAL_MB_PER_USER",
+        "batch",
+        "Uploaded batch input files one user may keep at once, in MiB.",
+        type="int",
+        default="512",
+        minimum=1,
+    ),
+    ConfigEntry(
+        "BATCH_FILE_UPLOADS_PER_HOUR",
+        "batch",
+        "Batch input files one user may upload per hour.",
+        type="int",
+        default="60",
+        minimum=1,
+    ),
+    ConfigEntry(
+        "BATCH_FILE_RETENTION_DAYS",
+        "batch",
+        "Days an uploaded batch input file is kept before it is deleted.",
+        type="int",
+        default="30",
+        minimum=1,
+    ),
+    ConfigEntry(
+        "BATCH_ANTHROPIC_VERSIONS",
+        "batch",
+        "Comma-separated anthropic-version values a Message Batch may be created under. "
+        "Known versions: 2023-06-01, 2026-10-21. A request with any other version is "
+        "refused.",
+        default="2023-06-01,2026-10-21",
+    ),
+    ConfigEntry(
+        "BATCH_WEBHOOK_ALLOW_PRIVATE_TARGETS",
+        "batch",
+        "Let batch webhooks reach private, loopback and link-local addresses. For "
+        "isolated test deployments only: on, a user can make the gateway send requests "
+        "into its own network. Cloud metadata addresses stay refused.",
+        type="bool",
+        default="0",
+        flag=True,
     ),
     # --- network -----------------------------------------------------------
     _setting(
@@ -1135,6 +1265,39 @@ _STATIC_ENTRIES: tuple[ConfigEntry, ...] = (
         "ENVIRONMENT",
         "alerts",
         "Older name of DEPLOYMENT_ENV, used while DEPLOYMENT_ENV is empty.",
+    ),
+    ConfigEntry(
+        "ALERT_HISTORY_ENABLED",
+        "alerts",
+        "Keep a history of every backend alert, suppression and delivery result in the "
+        "database, and accept history from configured sources. Off by default.",
+        type="bool",
+        default="false",
+        restart_required=True,
+    ),
+    ConfigEntry(
+        "ALERT_HISTORY_DEPLOYMENT_ID",
+        "alerts",
+        "Deployment id written on this gateway's alert history and matched by reader "
+        "credentials. Empty is 'default'.",
+        restart_required=True,
+    ),
+    ConfigEntry(
+        "ALERT_HISTORY_READ_CREDENTIALS",
+        "alerts",
+        "JSON list of read-only alert-history credentials: SHA-256 of each token, the "
+        "deployments and environments it may read, and its expiry. Tokens themselves are "
+        "never stored.",
+        type="text",
+        secret=True,
+    ),
+    ConfigEntry(
+        "ALERT_HISTORY_WRITER_CREDENTIALS",
+        "alerts",
+        "JSON list of alert-history source credentials: SHA-256 of each token and the "
+        "source, namespace, deployment and environments it may write, and its expiry.",
+        type="text",
+        secret=True,
     ),
     # --- integrations ------------------------------------------------------
     ConfigEntry(
@@ -1463,6 +1626,20 @@ def static_entry(key: str) -> ConfigEntry | None:
 @lru_cache(maxsize=1)
 def _static_by_key() -> dict[str, ConfigEntry]:
     return {entry.key: entry for entry in static_entries()}
+
+
+def is_offered(entry: ConfigEntry) -> bool:
+    """Return whether the admin console offers *entry* for editing.
+
+    It offers neither a setting with a single accepted value, which leaves
+    nothing to choose, nor the settings of a category that cannot take effect
+    here: the phone settings do nothing until an extension registers an SMS
+    provider.
+    """
+    if len(entry.choices) == 1:
+        return False
+    category = _CATEGORY_BY_ID.get(entry.category)
+    return category is None or category.in_effect is None or category.in_effect()
 
 
 def is_environment_only(key: str) -> bool:

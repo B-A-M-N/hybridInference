@@ -19,16 +19,20 @@ from .middleware.timeout import TimeoutMiddleware
 from .routers import (
     admin,
     agent_grants,
+    alert_history_ingest,
     anthropic_messages,
     auth_routes,
+    batch_console,
     batches,
     compat,
     completions,
     embeddings,
+    files,
     health,
     identity,
     internal,
     internal_lookups,
+    message_batches,
     models,
     playground,
     public_stats,
@@ -54,7 +58,15 @@ async def lifespan(app: FastAPI):
 
     # Loads dotenv and the database-backed configuration, then refuses to start
     # without the authentication secrets, before it opens stores or starts tasks.
-    services: AppServices = await bootstrap.initialize()
+    try:
+        services: AppServices = await bootstrap.initialize()
+    except BaseException:
+        # Alert history starts before the producers; a startup that fails
+        # after that point must not leave its writer running.
+        from ..observability.alert_history.runtime import stop_runtime
+
+        await stop_runtime()
+        raise
     app.state.services = services  # type: ignore[attr-defined]
     # The batch worker runs each request through this app's handlers, so it
     # starts only once the services are reachable from the app.
@@ -114,6 +126,9 @@ def create_app() -> FastAPI:
     app.include_router(completions.router)
     app.include_router(embeddings.router)
     app.include_router(batches.router)
+    app.include_router(message_batches.router)
+    app.include_router(files.router)
+    app.include_router(batch_console.router)
     app.include_router(rag.router)
     app.include_router(responses.router)
     app.include_router(anthropic_messages.router)
@@ -131,6 +146,7 @@ def create_app() -> FastAPI:
     app.include_router(identity.router)
     app.include_router(agent_grants.router)
     app.include_router(internal_lookups.router)
+    app.include_router(alert_history_ingest.router)
 
     # Override HTTPException handler to emit Anthropic-format errors on
     # /v1/messages and /anthropic/... paths (must register after install_error_handlers).
