@@ -1271,12 +1271,55 @@ msgstr "[批量推理](batches.md)"
 
 #: ../developer/architecture.md
 #, python-brace-format
-msgid "`POST /v1/batches`, `GET /v1/batches`, `GET` and `DELETE /v1/batches/{id}`, `POST /v1/batches/{id}/cancel`, `GET /v1/batches/{id}/results`"
-msgstr "`POST /v1/batches`、`GET /v1/batches`、`GET` 和 `DELETE /v1/batches/{id}`、`POST /v1/batches/{id}/cancel`、`GET /v1/batches/{id}/results`"
+msgid "`POST` and `GET /v1/batches`, `GET` and `DELETE /v1/batches/{id}`, `POST /v1/batches/{id}/cancel`, `GET /v1/batches/{id}/results`, `GET /v1/batches/{id}/output.jsonl` (JSONL export)"
+msgstr "`POST` 和 `GET /v1/batches`、`GET` 和 `DELETE /v1/batches/{id}`、`POST /v1/batches/{id}/cancel`、`GET /v1/batches/{id}/results`、`GET /v1/batches/{id}/output.jsonl`（JSONL 导出）"
 
 #: ../developer/architecture.md
 msgid "API key; creating a batch needs the `BATCH_MIN_ROLE` role, `internal` by default"
 msgstr "API key；创建批次需要 `BATCH_MIN_ROLE` 角色，默认为 `internal`"
+
+#: ../developer/architecture.md
+msgid "[Batch files](batches.md#batches-from-a-file)"
+msgstr "[批次文件](batches.md#batches-from-a-file)"
+
+#: ../developer/architecture.md
+#, python-brace-format
+msgid "`POST` and `GET /v1/files`, `GET` and `DELETE /v1/files/{id}`, `GET /v1/files/{id}/content`"
+msgstr "`POST` 和 `GET /v1/files`、`GET` 和 `DELETE /v1/files/{id}`、`GET /v1/files/{id}/content`"
+
+#: ../developer/architecture.md
+msgid "[Message Batches](batches.md#anthropic-message-batches)"
+msgstr "[Message Batches](batches.md#anthropic-message-batches)"
+
+#: ../developer/architecture.md
+#, python-brace-format
+msgid "`POST` and `GET /v1/messages/batches`, `GET` and `DELETE …/{id}`, `POST …/{id}/cancel`, `GET …/{id}/results`; the same under `/anthropic`"
+msgstr "`POST` 和 `GET /v1/messages/batches`、`GET` 和 `DELETE …/{id}`、`POST …/{id}/cancel`、`GET …/{id}/results`；`/anthropic` 下同样提供"
+
+#: ../developer/architecture.md
+msgid "[Batch webhooks](batches.md#webhooks)"
+msgstr "[批次 webhook](batches.md#webhooks)"
+
+#: ../developer/architecture.md
+msgid "`GET`, `PUT` and `DELETE /v1/batch_webhook`, `GET /v1/batch_webhook/events`"
+msgstr "`GET`、`PUT` 和 `DELETE /v1/batch_webhook`、`GET /v1/batch_webhook/events`"
+
+#: ../developer/architecture.md:490
+msgid "`BATCH_ENABLED` controls all batch, file and webhook routes together; when it is off, even management and result routes answer `404`, and no queued request starts. With it on, all batch kinds are available. `BATCH_MIN_ROLE` controls creating batches, uploading files and setting up or changing a webhook. An owner whose role is lowered can still manage existing batches and files, read or delete their webhook, and receive its deliveries."
+msgstr "`BATCH_ENABLED` 统一控制所有批次、文件和 webhook 路由；关闭时，管理和结果路由也会返回 `404`，排队中的请求不会开始执行。开启时，所有批次类型都可用。`BATCH_MIN_ROLE` 控制创建批次、上传文件以及设置或修改 webhook 的权限。所有者的角色降低后，仍可管理已有批次和文件，读取或删除自己的 webhook，并接收其事件投递。"
+
+#: ../developer/architecture.md:466
+msgid ""
+"**Alert history** (on with a database; `ALERT_HISTORY_ENABLED=false` turns "
+"it off). The same alert path records what it did "
+"— breaches, recoveries, suppression decisions, deliveries and their results "
+"— into PostgreSQL through a bounded buffer and one writer per process "
+"(`serving/observability/alert_history/`). It never changes what is sent. See"
+" [Alert history](alert-history.md)."
+msgstr ""
+"**告警历史**（有数据库时开启；`ALERT_HISTORY_ENABLED=false` 可关闭）。同一条告警路径会把自己做过的事——越限、恢复、抑制决定、投递及其结果——通过一个有上限的缓冲区和每个进程一个写入器记录到 "
+"PostgreSQL 中（`serving/observability/alert_history/`）。它从不改变发送的内容。参见 "
+"[告警历史](alert-history.md)。"
 
 #~ msgid ""
 #~ "`FixedRouter.chat_completion` / `stream_chat_completion`"
@@ -1730,3 +1773,15 @@ msgstr "API key；创建批次需要 `BATCH_MIN_ROLE` 角色，默认为 `intern
 #~ "There is no Prometheus exporter; it "
 #~ "was removed. The supported surfaces are:"
 #~ msgstr "没有 Prometheus exporter，它已经被移除。受支持的观测面是："
+
+#: ../developer/architecture.md:0
+msgid "API key; uploading a file needs `BATCH_MIN_ROLE`"
+msgstr "API 密钥；上传文件需要达到 `BATCH_MIN_ROLE`"
+
+#: ../developer/architecture.md:0
+msgid "API key; creating a batch needs `BATCH_MIN_ROLE`"
+msgstr "API 密钥；创建批次需要达到 `BATCH_MIN_ROLE`"
+
+#: ../developer/architecture.md:0
+msgid "API key; setting up or changing a webhook needs `BATCH_MIN_ROLE`"
+msgstr "API 密钥；设置或修改 webhook 需要达到 `BATCH_MIN_ROLE`"

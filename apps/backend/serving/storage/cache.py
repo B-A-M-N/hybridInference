@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     from decimal import Decimal
     from typing import Literal
 
+    from serving.audit import AuditActor, AuditTarget
+
 
 # ---------------------------------------------------------------------------
 # Cached wrapper
@@ -299,11 +301,12 @@ class CachedOperationalStore(OperationalStore):
         self,
         user_id: str,
         *,
-        admin_ip: str,
-        admin_id: str,
+        admin_ip: str | None = None,
+        admin_id: str | None = None,
         reason: str | None = None,
         email: str | None = None,
         self_service: bool = False,
+        actor: AuditActor | None = None,
     ) -> None:
         """Delegate then invalidate user + auth caches."""
         await self._store.delete_user(
@@ -313,6 +316,7 @@ class CachedOperationalStore(OperationalStore):
             reason=reason,
             email=email,
             self_service=self_service,
+            actor=actor,
         )
         await self._cache.delete(self._user_key(user_id))
         # Also purge any auth entries referencing this user's keys
@@ -394,11 +398,12 @@ class CachedOperationalStore(OperationalStore):
         self,
         user_id: str,
         *,
-        admin_ip: str,
-        admin_id: str,
+        admin_ip: str | None = None,
+        admin_id: str | None = None,
         reason: str | None = None,
         email: str | None = None,
         recover_stale_claim: bool = False,
+        actor: AuditActor | None = None,
     ) -> None:
         """Delegate then invalidate user + auth caches."""
         await self._store.resume_user(
@@ -408,6 +413,7 @@ class CachedOperationalStore(OperationalStore):
             reason=reason,
             email=email,
             recover_stale_claim=recover_stale_claim,
+            actor=actor,
         )
         await self._cache.delete(self._user_key(user_id))
         await self.invalidate_auth_caches()
@@ -417,10 +423,11 @@ class CachedOperationalStore(OperationalStore):
         user_id: str,
         *,
         claim_token: str,
-        admin_ip: str,
-        admin_id: str,
+        admin_ip: str | None = None,
+        admin_id: str | None = None,
         reason: str | None = None,
         email: str | None = None,
+        actor: AuditActor | None = None,
     ) -> dict[str, int]:
         """Delegate then invalidate user + auth caches."""
         counts = await self._store.hard_delete_user(
@@ -430,6 +437,7 @@ class CachedOperationalStore(OperationalStore):
             admin_id=admin_id,
             reason=reason,
             email=email,
+            actor=actor,
         )
         await self._cache.delete(self._user_key(user_id))
         await self.invalidate_auth_caches()
@@ -561,7 +569,8 @@ class CachedOperationalStore(OperationalStore):
         marker_key: str,
         marker_value: str,
         code_key: str,
-        admin_ip: str,
+        admin_ip: str | None = None,
+        actor: AuditActor | None = None,
     ) -> bool:
         """Delegate to wrapped store (a new user id has nothing cached)."""
         return await self._store.create_first_admin(
@@ -573,6 +582,7 @@ class CachedOperationalStore(OperationalStore):
             marker_value=marker_value,
             code_key=code_key,
             admin_ip=admin_ip,
+            actor=actor,
         )
 
     async def get_user_counts_by_status(self) -> dict[str, int]:
@@ -1017,11 +1027,13 @@ class CachedOperationalStore(OperationalStore):
     async def log_admin_action(
         self,
         *,
-        admin_ip: str,
+        admin_ip: str | None = None,
         action: str,
         target_user_id: str | None = None,
         details: dict[str, Any] | None = None,
         success: bool = True,
+        actor: AuditActor | None = None,
+        target: AuditTarget | None = None,
     ) -> None:
         """Delegate to wrapped store."""
         return await self._store.log_admin_action(
@@ -1030,6 +1042,8 @@ class CachedOperationalStore(OperationalStore):
             target_user_id=target_user_id,
             details=details,
             success=success,
+            actor=actor,
+            target=target,
         )
 
     async def list_audit_log(
@@ -1693,6 +1707,14 @@ class CachedOperationalStore(OperationalStore):
     ) -> list[tuple[str, str, str]]:
         """Delegate to wrapped store."""
         return await self._store.list_provider_env_key_reservations(provider)
+
+    async def list_all_disabled_provider_env_keys(self) -> list[tuple[str, str, str]]:
+        """Delegate to wrapped store."""
+        return await self._store.list_all_disabled_provider_env_keys()
+
+    async def list_all_provider_env_key_reservations(self) -> list[tuple[str, str, str, str]]:
+        """Delegate to wrapped store."""
+        return await self._store.list_all_provider_env_key_reservations()
 
 
 __all__ = [
