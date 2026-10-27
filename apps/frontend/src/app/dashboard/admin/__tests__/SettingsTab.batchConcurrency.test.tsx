@@ -75,14 +75,10 @@ describe('SettingsTab batch concurrency', () => {
     expect(labels.indexOf('Batch Concurrency')).toBe(labels.indexOf('Model Concurrency') + 1);
 
     expect(await screen.findByText('glm-4.7')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Edit Batch Concurrency' }));
     fireEvent.change(screen.getByLabelText('Max concurrent batch requests for glm-4.7'), {
       target: { value: '2' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Save changes to Batch Concurrency' }));
-    fireEvent.click(
-      within(screen.getByRole('dialog')).getByRole('button', { name: 'Confirm save' }),
-    );
 
     await waitFor(() => {
       expect(api.updateBatchModelLimit).toHaveBeenCalledWith('glm-4.7', 2);

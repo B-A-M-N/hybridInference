@@ -32,8 +32,7 @@ import {
   ROW_ACTION_DANGER,
   TABLE_HEAD_CELL,
 } from '@/components/features/admin/adminStyles';
-import { ChangeList, plural } from '@/components/features/admin/confirm/ChangeList';
-import { EditBar, EditButton } from '@/components/features/admin/confirm/EditBar';
+import { EditBar } from '@/components/features/admin/confirm/EditBar';
 import { useConfirmAction } from '@/components/features/admin/confirm/useConfirmAction';
 import { writeEach } from '@/components/features/admin/confirm/writeEach';
 import { getErrorMessage } from '@/lib/utils/errors';
@@ -46,6 +45,9 @@ import { UsageInsightsSettingsSection } from './UsageInsightsSettingsSection';
 import { ModelVisibilitySection } from './ModelVisibilitySection';
 import { ModelConcurrencySection } from './ModelConcurrencySection';
 import { BatchConcurrencySection } from './BatchConcurrencySection';
+
+/** The write key of Add domain, so only its button reads "Adding…". */
+const ADD_DOMAIN = 'add domain';
 
 /** The page's sections, in order, for its section index. */
 const SECTIONS = [
@@ -98,8 +100,6 @@ function validateNumeric(setting: RuntimeSettingItem, draft: string) {
   });
 }
 
-const flagText = (value: unknown) => (value ? 'On' : 'Off');
-
 /** A changed runtime setting: what is saved, and the value the save would write. */
 interface SettingChange {
   setting: RuntimeSettingItem;
@@ -107,9 +107,9 @@ interface SettingChange {
 }
 
 /**
- * A group of runtime settings of one type (feature flags or numbers), shown
- * read-only until Edit. The edited values are drafts until the administrator
- * confirms the list of changes; each changed setting is one request.
+ * A group of runtime settings of one type (feature flags or numbers), edited in
+ * place. The edited values are drafts until Save; each changed setting is one
+ * request.
  */
 function RuntimeSettingsSection({
   id,
@@ -136,16 +136,29 @@ function RuntimeSettingsSection({
   /** Called once after a save that wrote at least one setting, even partly. */
   onAfterWrite: () => void;
   onToast: (msg: string) => void;
-  /** Read-only actions for a row, such as applying a quota to existing users. */
-  renderExtra?: (setting: RuntimeSettingItem) => React.ReactNode;
+  /**
+   * Actions on a row's saved value, such as applying a quota to existing users.
+   * `unsaved` while the row has a draft, which the action would not act on.
+   */
+  renderExtra?: (setting: RuntimeSettingItem, unsaved: boolean) => React.ReactNode;
 }) {
-  const confirmation = useConfirmAction();
-  const [editing, setEditing] = useState(false);
+  const writes = useConfirmAction();
   const [drafts, setDrafts] = useState<Record<string, string | boolean>>({});
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  const draftOf = (setting: RuntimeSettingItem) =>
-    drafts[setting.key] ?? (kind === 'flag' ? !!setting.value : String(setting.value ?? ''));
+  const savedDraft = (setting: RuntimeSettingItem) =>
+    kind === 'flag' ? !!setting.value : String(setting.value ?? '');
+  const draftOf = (setting: RuntimeSettingItem) => drafts[setting.key] ?? savedDraft(setting);
+
+  // A value set back to what is saved is no draft, so a later refresh of the
+  // saved value shows through instead of being masked by a stale copy.
+  const changeDraft = (setting: RuntimeSettingItem, value: string | boolean) =>
+    setDrafts((prev) => {
+      const next = { ...prev };
+      if (value === savedDraft(setting)) delete next[setting.key];
+      else next[setting.key] = value;
+      return next;
+    });
 
   // A setting is changed when its draft is valid and differs from what is saved.
   const changes = settings.flatMap((setting): SettingChange[] => {
@@ -165,46 +178,31 @@ function RuntimeSettingsSection({
             setting.key in drafts && !validateNumeric(setting, String(drafts[setting.key])).ok,
         )
       : [];
+  // An invalid draft is unsaved too: it keeps the bar up, with Save held back.
+  const unsavedKeys = new Set([
+    ...changes.map(({ setting }) => setting.key),
+    ...invalid.map((setting) => setting.key),
+  ]);
+  const blocked =
+    invalid.length > 0
+      ? `Correct ${invalid.map((setting) => setting.key).join(', ')} before saving.`
+      : null;
 
   const cancel = () => {
-    if (confirmation.busy) return;
+    if (writes.busy) return;
     setDrafts({});
     setSaveError(null);
-    setEditing(false);
   };
 
-  const save = () => {
-    if (invalid.length > 0) {
-      setSaveError(`Correct ${invalid.map((setting) => setting.key).join(', ')} before saving.`);
-      return;
-    }
-    if (changes.length === 0) return;
+  const save = async () => {
+    // Enter in a field reaches here too; the bar already says what to correct.
+    if (blocked || changes.length === 0) return;
     setSaveError(null);
     const pending = changes;
-    const format = (value: unknown) => (kind === 'flag' ? flagText(value) : String(value));
-    confirmation.request({
-      title: `Save ${plural(pending.length, 'change')} to ${title}?`,
-      confirmLabel: 'Confirm save',
-      busyLabel: 'Saving…',
-      cancelLabel: 'Back to editing',
-      body: (
-        <>
-          <ChangeList
-            changes={pending.map(({ setting, value }) => ({
-              label: settingLabel(setting.key),
-              before: format(setting.value),
-              after: format(value),
-            }))}
-          />
-          {pending.length === 1 && pending[0].setting.description ? (
-            <p>{pending[0].setting.description}</p>
-          ) : null}
-          <p>This takes effect immediately.</p>
-        </>
-      ),
+    const failure = await writes.perform({
       run: async () => {
         let wrote = false;
-        const failure = await writeEach(
+        await writeEach(
           pending,
           ({ setting }) => setting.key,
           async ({ setting, value }) => {
@@ -220,9 +218,6 @@ function RuntimeSettingsSection({
         ).finally(() => {
           if (wrote) onAfterWrite();
         });
-        setSaveError(failure);
-        if (failure) return;
-        setEditing(false);
         onToast(
           pending.length === 1
             ? kind === 'flag'
@@ -232,26 +227,18 @@ function RuntimeSettingsSection({
         );
       },
     });
+    setSaveError(failure);
   };
 
   return (
-    <AdminSection
-      id={id}
-      title={title}
-      description={description}
-      actions={
-        !editing && !loading && settings.length > 0 ? (
-          <EditButton target={title} onClick={() => setEditing(true)} />
-        ) : null
-      }
-    >
+    <AdminSection id={id} title={title} description={description}>
       {loading ? (
         <AdminLoading size="sm" />
       ) : settings.length === 0 ? (
         <AdminEmptyState title={emptyText} />
       ) : (
         <ul
-          className={`${PANEL} divide-y divide-gray-100 ${editing ? 'border-gray-400 shadow-sm' : ''}`}
+          className={`${PANEL} divide-y divide-gray-100 ${unsavedKeys.size > 0 ? 'border-gray-400 shadow-sm' : ''}`}
         >
           {settings.map((setting) => {
             const isDefault = setting.value === setting.default_value;
@@ -285,27 +272,21 @@ function RuntimeSettingsSection({
                       </span>
                     ) : null}
                   </p>
-                  {editing && validated && !validated.ok && String(draft) !== '' && (
+                  {setting.key in drafts && validated && !validated.ok && String(draft) !== '' && (
                     <p className="mt-0.5 text-[11px] text-red-600" role="alert">
                       {validated.error}
                     </p>
                   )}
                 </div>
                 <div className="flex shrink-0 flex-wrap items-center gap-2">
-                  {!editing ? (
-                    <output aria-label={name} className="text-[13px] font-medium text-gray-900">
-                      {kind === 'flag' ? flagText(setting.value) : String(setting.value ?? '')}
-                    </output>
-                  ) : kind === 'flag' ? (
+                  {kind === 'flag' ? (
                     <button
                       type="button"
                       role="switch"
                       aria-checked={draft === true}
                       aria-label={name}
-                      disabled={confirmation.busy}
-                      onClick={() =>
-                        setDrafts((prev) => ({ ...prev, [setting.key]: !(draft === true) }))
-                      }
+                      disabled={writes.busy}
+                      onClick={() => changeDraft(setting, !(draft === true))}
                       className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-gray-400 focus:ring-offset-2 disabled:opacity-40 ${
                         draft === true ? 'bg-gray-900' : 'bg-gray-200'
                       }`}
@@ -323,21 +304,19 @@ function RuntimeSettingsSection({
                       min={setting.min ?? undefined}
                       max={setting.max ?? undefined}
                       value={String(draft)}
-                      disabled={confirmation.busy}
-                      onChange={(e) =>
-                        setDrafts((prev) => ({ ...prev, [setting.key]: e.target.value }))
-                      }
+                      disabled={writes.busy}
+                      onChange={(e) => changeDraft(setting, e.target.value)}
                       onKeyDown={(e) => {
                         if (e.key === 'Enter') {
                           e.preventDefault();
-                          save();
+                          void save();
                         }
                       }}
                       aria-label={name}
                       className={`${CONTROL} w-24 text-right`}
                     />
                   )}
-                  {!editing && renderExtra ? renderExtra(setting) : null}
+                  {renderExtra ? renderExtra(setting, unsavedKeys.has(setting.key)) : null}
                 </div>
               </li>
             );
@@ -345,17 +324,16 @@ function RuntimeSettingsSection({
         </ul>
       )}
 
-      {editing ? (
-        <EditBar
-          target={title}
-          changeCount={changes.length}
-          onCancel={cancel}
-          onSave={save}
-          busy={confirmation.busy}
-          error={saveError}
-        />
-      ) : null}
-      {confirmation.dialog}
+      <EditBar
+        target={title}
+        changeCount={unsavedKeys.size}
+        onCancel={cancel}
+        onSave={() => void save()}
+        busy={writes.busy}
+        error={saveError}
+        blocked={blocked}
+        inPlace
+      />
     </AdminSection>
   );
 }
@@ -363,6 +341,7 @@ function RuntimeSettingsSection({
 export function SettingsTab() {
   const router = useRouter();
   const confirmation = useConfirmAction();
+  const addingNow = confirmation.savingKey === ADD_DOMAIN;
   const [domains, setDomains] = useState<SignupAllowedDomain[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -447,26 +426,16 @@ export function SettingsTab() {
   const replaceSetting = (setList: typeof setFeatureFlags) => (updated: RuntimeSettingItem) =>
     setList((prev) => prev.map((s) => (s.key === updated.key ? updated : s)));
 
-  const onAddDomain = () => {
+  // A domain the administrator typed is added at once; a failure stays under the input.
+  const onAddDomain = async () => {
     setInputError(null);
     const validated = validateSignupDomainInput(input);
     if (!validated.ok) {
       setInputError(validated.error);
       return;
     }
-    const shownDomain = validated.isWildcard ? `*.${validated.domain}` : validated.domain;
-    confirmation.request({
-      title: `Add ${shownDomain} to the signup allowlist?`,
-      confirmLabel: 'Add domain',
-      busyLabel: 'Adding…',
-      cancelLabel: 'Back to editing',
-      body: (
-        <p className="[overflow-wrap:anywhere]">
-          Future signups from <code className="rounded bg-gray-100 px-1">{shownDomain}</code>{' '}
-          {validated.isWildcard ? '(any subdomain, not the bare suffix) ' : ''}are approved
-          automatically.
-        </p>
-      ),
+    const failure = await confirmation.perform({
+      key: ADD_DOMAIN,
       run: async () => {
         await addSignupAllowedDomain(input.trim());
         setInput('');
@@ -479,10 +448,13 @@ export function SettingsTab() {
         await loadDomains();
       },
     });
+    if (failure) setInputError(failure);
   };
 
   const onRemove = (row: SignupAllowedDomain) => {
     const shownDomain = row.is_wildcard ? `*.${row.domain}` : row.domain;
+    // The last domain empties the list, and an empty list approves every signup.
+    const last = domains.length === 1;
     confirmation.request({
       title: `Remove ${shownDomain} from the signup allowlist?`,
       confirmLabel: 'Remove',
@@ -490,8 +462,18 @@ export function SettingsTab() {
       tone: 'danger',
       body: (
         <p className="[overflow-wrap:anywhere]">
-          Future signups from <code className="rounded bg-gray-100 px-1">{shownDomain}</code> will
-          require admin approval. Existing users keep their current status.
+          {last ? (
+            <>
+              It is the last allowed domain. With the list empty, every signup is approved
+              automatically.
+            </>
+          ) : (
+            <>
+              Future signups from <code className="rounded bg-gray-100 px-1">{shownDomain}</code>{' '}
+              will require admin approval.
+            </>
+          )}{' '}
+          Existing users keep their current status.
         </p>
       ),
       run: async () => {
@@ -590,14 +572,16 @@ export function SettingsTab() {
             onSaved={replaceSetting(setNumericSettings)}
             onAfterWrite={refreshSiteConfig}
             onToast={flashToast}
-            renderExtra={(setting) =>
+            renderExtra={(setting, unsaved) =>
               setting.key.startsWith(QUOTA_KEY_PREFIX) ? (
                 <button
                   type="button"
                   onClick={() =>
                     void onClickApply(setting.key.slice(QUOTA_KEY_PREFIX.length) as Role)
                   }
-                  disabled={quotaLoadingRole !== null || confirmation.busy}
+                  // It applies the saved quota, not the one being typed.
+                  disabled={unsaved || quotaLoadingRole !== null || confirmation.busy}
+                  title={unsaved ? 'Save or discard the new quota first' : undefined}
                   className={BUTTON_SECONDARY}
                 >
                   {quotaLoadingRole === setting.key.slice(QUOTA_KEY_PREFIX.length)
@@ -648,13 +632,13 @@ export function SettingsTab() {
               )
             }
           >
-            {/* Add form: opened explicitly, reviewed before anything is written. */}
+            {/* Add form: opened explicitly; its Add domain writes the domain. */}
             {addingDomain ? (
               <form
                 className="mb-4 flex max-w-xl flex-col gap-1.5"
                 onSubmit={(e) => {
                   e.preventDefault();
-                  if (!confirmation.busy) onAddDomain();
+                  if (!confirmation.busy) void onAddDomain();
                 }}
               >
                 <div className="flex flex-wrap items-center gap-2">
@@ -686,9 +670,10 @@ export function SettingsTab() {
                   <button
                     type="submit"
                     disabled={confirmation.busy || !input.trim()}
+                    aria-busy={addingNow || undefined}
                     className={BUTTON_PRIMARY}
                   >
-                    Review and add
+                    {addingNow ? 'Adding…' : 'Add domain'}
                   </button>
                 </div>
                 <p className="text-[11px] text-gray-400">

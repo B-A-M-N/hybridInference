@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import enum
 from typing import Any
 
@@ -95,7 +96,7 @@ class CompletionsLogger:
         """
         self._log_store = log_store
         self._background_tasks: set[asyncio.Task[Any]] = set()
-        self._queue: asyncio.Queue[tuple[str, dict[str, Any]]] | None = None
+        self._queue: asyncio.Queue[tuple[str, dict[str, Any], contextvars.Context]] | None = None
         self._queue_loop: asyncio.AbstractEventLoop | None = None
         self._workers: tuple[asyncio.Task[None], ...] | None = None
         self._dropped_count = 0
@@ -178,7 +179,9 @@ class CompletionsLogger:
             self._queue_loop = loop
             self._workers = self._start_workers()
 
-        item = (request_id, log_data)
+        # The producer's context, as a per-request task would have copied it:
+        # the write and its log lines are attributed to this row's request.
+        item = (request_id, log_data, contextvars.copy_context())
         try:
             self._queue.put_nowait(item)
         except asyncio.QueueFull:
@@ -201,14 +204,24 @@ class CompletionsLogger:
 
     def _start_workers(self) -> tuple[asyncio.Task[None], ...]:
         """Start the fixed worker pool on the current loop."""
-        workers = tuple(
-            asyncio.create_task(self._drain_loop(), name=f"request_log_worker_{index}")
-            for index in range(_LOG_WORKERS)
+        return tuple(self._spawn_worker(index) for index in range(_LOG_WORKERS))
+
+    def _spawn_worker(self, index: int) -> asyncio.Task[None]:
+        """Start one worker in an empty context.
+
+        A worker outlives the request whose ``schedule_log`` happened to start
+        it. Copying that request's context would stamp its request id, model
+        and provider on every later row's log lines, and keep it alive for the
+        life of the pool; each row's own context is restored per write instead.
+        """
+        worker = asyncio.create_task(
+            self._drain_loop(),
+            name=f"request_log_worker_{index}",
+            context=contextvars.Context(),
         )
-        self._background_tasks.update(workers)
-        for worker in workers:
-            worker.add_done_callback(self._background_tasks.discard)
-        return workers
+        self._background_tasks.add(worker)
+        worker.add_done_callback(self._background_tasks.discard)
+        return worker
 
     def _replace_dead_workers(
         self, workers: tuple[asyncio.Task[None], ...]
@@ -218,12 +231,7 @@ class CompletionsLogger:
         for index, worker in enumerate(replaced):
             if not worker.done():
                 continue
-            replacement = asyncio.create_task(
-                self._drain_loop(), name=f"request_log_worker_{index}"
-            )
-            self._background_tasks.add(replacement)
-            replacement.add_done_callback(self._background_tasks.discard)
-            replaced[index] = replacement
+            replaced[index] = self._spawn_worker(index)
         return tuple(replaced)
 
     async def _drain_loop(self) -> None:
@@ -239,9 +247,16 @@ class CompletionsLogger:
         if queue is None:  # pragma: no cover - schedule_log always creates it first
             return
         while True:
-            request_id, log_data = await queue.get()
+            request_id, log_data, context = await queue.get()
             try:
-                await tracked_task(self._log_to_db(request_id, log_data), name="request_log")
+                # Created inside the row's context, the write task runs in a
+                # copy of it: its log lines and ``tracked_task_completed``
+                # event carry this row's request, and nothing it sets reaches
+                # the producer or the next row.
+                write = context.run(
+                    tracked_task, self._log_to_db(request_id, log_data), name="request_log"
+                )
+                await write
             finally:
                 queue.task_done()
 
@@ -339,7 +354,16 @@ class CompletionsLogger:
         provider (``None`` = unknown). It MUST NOT be synthesized: if the
         provider did not report usage, leave it as ``None``.
         """
+        provider, endpoint_id, strategy_metadata = _extract_observation_keys(routing)
+        terminal_key = endpoint_id or provider or "unknown"
         failed_attempts = _extract_failed_attempts(routing)
+        if not success and failed_attempts:
+            last_provider, last_endpoint = _extract_failed_attempt_keys(failed_attempts[-1])
+            if (last_endpoint or last_provider or "unknown") == terminal_key:
+                # The router lists the final attempt among the failed ones as
+                # well as naming it the endpoint: it is the terminal failure
+                # below, and reported twice it would count as two.
+                failed_attempts = failed_attempts[:-1]
         seen_failed_attempts: set[tuple[str, str | None, str | None]] = set()
         for attempt in failed_attempts:
             failed_provider, failed_endpoint = _extract_failed_attempt_keys(attempt)
@@ -369,10 +393,9 @@ class CompletionsLogger:
                 )
             )
 
-        provider, endpoint_id, strategy_metadata = _extract_observation_keys(routing)
         obs = RoutingObservation(
             model_id=model_id,
-            endpoint_id=endpoint_id or provider or "unknown",
+            endpoint_id=terminal_key,
             ttft_ms=ttft_ms,
             total_latency_ms=total_latency_ms,
             token_count=prompt_tokens + completion_tokens,

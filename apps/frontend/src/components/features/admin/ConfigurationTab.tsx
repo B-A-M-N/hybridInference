@@ -11,7 +11,6 @@ import {
 import { ChangeList } from '@/components/features/admin/confirm/ChangeList';
 import { useConfirmAction } from '@/components/features/admin/confirm/useConfirmAction';
 import { withoutSecret } from '@/components/features/admin/confirm/withoutSecret';
-import { ConfirmDialog } from '@/components/features/configuration/ConfirmDialog';
 import {
   AdminEmptyState,
   AdminLoading,
@@ -65,10 +64,13 @@ import {
   type ConfigGroup,
 } from '@/components/features/configuration/configDrafts';
 import {
+  exportConfigBackup,
   getConfig,
   patchConfig,
   resetConfigKey,
+  restoreConfigBackup,
   testAlertNotification,
+  type ConfigBackupPayload,
   type ConfigEntry,
   type ConfigResponse,
   type ConfigScalar,
@@ -80,44 +82,33 @@ function plural(count: number, one: string, many = `${one}s`): string {
   return `${count} ${count === 1 ? one : many}`;
 }
 
-/** A category's validated changes, waiting for the administrator to confirm them. */
-interface PendingSave {
+function downloadBackupJson(payload: ConfigBackupPayload): void {
+  const datePart = (payload.exported_at ?? new Date().toISOString()).slice(0, 10);
+  const filename = `hybrid-inference-config-backup-${datePart}.json`;
+  const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], {
+    type: 'application/json',
+  });
+  if (typeof URL.createObjectURL !== 'function') return;
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  if (typeof URL.revokeObjectURL === 'function') {
+    URL.revokeObjectURL(url);
+  }
+}
+
+/** A category's validated changes, as its save sends them. */
+interface CategorySave {
   group: ConfigGroup;
   values: Record<string, ConfigScalar>;
   /** Keys the save marks secret, in the same PATCH as `values`. */
   secrets: string[];
   /** Keys whose stored row the save removes, one DELETE each after the PATCH. */
   resets: string[];
-}
-
-function shownValue(
-  entry: ConfigEntry | undefined,
-  value: ConfigScalar | null | undefined,
-): string {
-  if (value === null || value === undefined || value === '') return '(empty)';
-  if (entry?.type === 'bool') return value === true ? 'On' : 'Off';
-  return String(value);
-}
-
-/** One line of the confirmation: what the save does to `key`. Never a secret's value. */
-function describeChange(
-  entry: ConfigEntry | undefined,
-  key: string,
-  { values, secrets, resets }: PendingSave,
-): string[] {
-  const lines: string[] = [];
-  if (resets.includes(key)) {
-    if (entry?.custom) lines.push('Delete the variable');
-    else if (entry?.secret) lines.push('Reset to the environment or default');
-    else lines.push(`${shownValue(entry, entry?.value)} → environment or default`);
-  }
-  if (key in values) {
-    const value = values[key];
-    if (entry?.secret) lines.push(value === '' ? 'Clear' : 'Replace');
-    else lines.push(`${shownValue(entry, entry?.value)} → ${shownValue(entry, value)}`);
-  }
-  if (secrets.includes(key)) lines.push('Mark as secret');
-  return lines;
 }
 
 /** Keys of `record` that belong to `group`. */
@@ -128,11 +119,12 @@ function groupKeys(group: ConfigGroup, record: Readonly<Record<string, unknown>>
 /**
  * Admin → Configuration: every database-backed setting, grouped by category.
  *
- * Each category saves its own changes as one batch (the backend validates a
- * batch together, so related settings can change in one save). After any
- * write the page asks the server components to re-render, which re-reads the
- * public site configuration and so updates the "required settings are
- * missing" banner.
+ * Settings are edited in place, and several categories can hold unsaved
+ * changes at once. Each category's Save writes its own changes as one batch
+ * (the backend validates a batch together, so related settings can change in
+ * one save). After any write the page asks the server
+ * components to re-render, which re-reads the public site configuration and
+ * so updates the "required settings are missing" banner.
  */
 export function ConfigurationTab({ initialMissingOnly = false }: { initialMissingOnly?: boolean }) {
   const toast = useAccountToast();
@@ -147,9 +139,7 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
   const [savingGroup, setSavingGroup] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [missingOnly, setMissingOnly] = useState(initialMissingOnly);
-  // One category is edited at a time; every other one shows its saved values.
-  const [editingGroup, setEditingGroup] = useState<string | null>(null);
-  // Staged like drafts: nothing is written until the category's save is confirmed.
+  // Staged like drafts: nothing is written until the category is saved.
   const [pendingResets, setPendingResets] = useState<Record<string, true>>({});
   const [pendingSecrets, setPendingSecrets] = useState<Record<string, true>>({});
   const [adding, setAdding] = useState(false);
@@ -157,8 +147,9 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
   const [testingAlert, setTestingAlert] = useState(false);
   const alertTestInFlight = useRef(false);
   const [alertTestResult, setAlertTestResult] = useState<AlertTestResult | null>(null);
-  const testConfirmation = useConfirmAction();
-  const [pendingSave, setPendingSave] = useState<PendingSave | null>(null);
+  // Restoring a backup overwrites everything, so it is confirmed; a download is not.
+  const backupConfirmation = useConfirmAction();
+  const restoreInputRef = useRef<HTMLInputElement | null>(null);
   const saveInFlight = useRef(false);
 
   const load = useCallback(async () => {
@@ -222,47 +213,30 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
     setAlertTestResult(null);
   };
 
-  // A test send posts a real message, so it is confirmed like any other action.
-  // Its outcome is shown beside the button, never in the dialog: only the
-  // console's own sanitized message may describe a webhook failure.
-  const sendAlertTest = () => {
+  // A test send posts a message but changes no setting, so it goes on the
+  // click. Its outcome is shown beside the button: only the console's own
+  // sanitized message may describe a webhook failure.
+  const sendAlertTest = async () => {
     if (!webhookEntries || alertChannel === 'none' || alertTestInFlight.current) return;
     const entry = selectedWebhookEntry(webhookEntries, alertChannel);
     if (!entry || alertWebhookError(entry, drafts)) return;
     const draft = drafts[entry.key];
     const channel = alertChannel;
-    const name = channel === 'wecom' ? 'WeCom' : 'Slack';
-    testConfirmation.request({
-      title: `Send a test notification to ${name}?`,
-      confirmLabel: 'Send test',
-      busyLabel: 'Sending…',
-      body: (
-        <p>
-          A test message is posted to the {name} channel{' '}
-          {draft?.kind === 'replace'
-            ? 'behind the webhook URL you typed. That URL is not saved.'
-            : 'behind the saved webhook.'}{' '}
-          Settings are not changed.
-        </p>
-      ),
-      run: async () => {
-        alertTestInFlight.current = true;
-        setTestingAlert(true);
-        setAlertTestResult(null);
-        try {
-          const result = await testAlertNotification({
-            channel,
-            ...(draft?.kind === 'replace' ? { webhook_url: draft.value.trim() } : {}),
-          });
-          setAlertTestResult({ sent: true, testId: result.test_id });
-        } catch (e) {
-          setAlertTestResult({ sent: false, message: alertTestFailureMessage(e) });
-        } finally {
-          alertTestInFlight.current = false;
-          setTestingAlert(false);
-        }
-      },
-    });
+    alertTestInFlight.current = true;
+    setTestingAlert(true);
+    setAlertTestResult(null);
+    try {
+      const result = await testAlertNotification({
+        channel,
+        ...(draft?.kind === 'replace' ? { webhook_url: draft.value.trim() } : {}),
+      });
+      setAlertTestResult({ sent: true, testId: result.test_id });
+    } catch (e) {
+      setAlertTestResult({ sent: false, message: alertTestFailureMessage(e) });
+    } finally {
+      alertTestInFlight.current = false;
+      setTestingAlert(false);
+    }
   };
 
   const groups = useMemo(
@@ -270,25 +244,55 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
     [config],
   );
 
+  /**
+   * Unsaved changes in a whole category, including entries a filter hides.
+   * Each variable counts once, however many things the save does to it; the
+   * alert channel choice counts as one.
+   */
+  const dirtyCount = useCallback(
+    (group: ConfigGroup) => {
+      const channelEntries = alertWebhookEntries(group.entries);
+      const selectedEntry = channelEntries
+        ? selectedWebhookEntry(channelEntries, alertChannel)
+        : null;
+      const changedKeys = new Set([
+        ...group.entries
+          .filter(
+            (entry) =>
+              (!channelEntries || !isAlertWebhook(entry.key)) && isDirty(entry, drafts[entry.key]),
+          )
+          .map((entry) => entry.key),
+        ...groupKeys(group, pendingResets),
+        ...groupKeys(group, pendingSecrets),
+      ]);
+      const channelDirty =
+        channelEntries !== null &&
+        (alertChannelDraft !== null ||
+          Boolean(selectedEntry && isDirty(selectedEntry, drafts[selectedEntry.key])));
+      return changedKeys.size + Number(channelDirty);
+    },
+    [drafts, pendingResets, pendingSecrets, alertChannel, alertChannelDraft],
+  );
+
   const visibleGroups = useMemo(
     () =>
-      groups
-        .map((group) => ({
-          ...group,
-          entries: group.entries.filter(
-            (entry) =>
-              (!missingOnly || entry.missing) &&
-              (matchesQuery(entry, query, group.label) ||
-                (isAlertWebhook(entry.key) &&
-                  'notification channel'.includes(query.trim().toLowerCase()))),
-          ),
-        }))
-        // The edited category stays, so its Cancel and Save stay reachable.
-        .filter((group) => group.entries.length > 0 || group.id === editingGroup),
-    [groups, missingOnly, query, editingGroup],
+      groups.flatMap((group) => {
+        const entries = group.entries.filter(
+          (entry) =>
+            (!missingOnly || entry.missing) &&
+            (matchesQuery(entry, query, group.label) ||
+              (isAlertWebhook(entry.key) &&
+                'notification channel'.includes(query.trim().toLowerCase()))),
+        );
+        // A category with unsaved changes stays, so its Discard and Save stay reachable.
+        return entries.length > 0 || dirtyCount(group) > 0 ? [{ ...group, entries }] : [];
+      }),
+    [groups, missingOnly, query, dirtyCount],
   );
 
   const saveGroup = (group: ConfigGroup) => {
+    // One save at a time: a Save while another category's is in flight does nothing.
+    if (saveInFlight.current) return;
     // The whole category, including entries a filter is hiding: a change the
     // administrator made stays part of the save it was made for.
     const channelEntries = alertWebhookEntries(group.entries);
@@ -320,11 +324,10 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
     for (const key of resets) delete values[key];
     const secrets = groupKeys(group, pendingSecrets);
     if (Object.keys(values).length + secrets.length + resets.length === 0) return;
-    // Nothing is written until the administrator confirms the list of changes.
-    setPendingSave({ group, values, secrets, resets });
+    void commitSave({ group, values, secrets, resets });
   };
 
-  const commitSave = async ({ group, values, secrets, resets }: PendingSave) => {
+  const commitSave = async ({ group, values, secrets, resets }: CategorySave) => {
     if (saveInFlight.current) return;
     saveInFlight.current = true;
     const channelEntries = alertWebhookEntries(group.entries);
@@ -380,8 +383,6 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
         setAlertTestResult(null);
       }
       const count = new Set([...keys, ...secrets, ...resets]).size;
-      setPendingSave(null);
-      setEditingGroup(null);
       toast.success(
         count === 1 ? `Saved ${group.label}.` : `Saved ${count} changes to ${group.label}.`,
       );
@@ -404,21 +405,14 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
         } not reset: resets are sent after the value changes, one request each. If this change needs a reset, save the reset on its own first.`;
       }
       setGroupErrors((prev) => ({ ...prev, [group.id]: message }));
-      setPendingSave(null);
     } finally {
       saveInFlight.current = false;
       setSavingGroup(null);
     }
   };
 
-  const startEditing = (group: ConfigGroup) => {
-    if (editingGroup !== null) return;
-    setGroupErrors((prev) => withoutKeys(prev, [group.id]));
-    setEditingGroup(group.id);
-  };
-
-  /** Cancel: every draft and staged action of the category goes, and it is read-only again. */
-  const cancelEditing = (group: ConfigGroup) => {
+  /** Discard: every draft and staged action of the category goes, and its saved values are back. */
+  const discardGroup = (group: ConfigGroup) => {
     if (saveInFlight.current) return;
     if (alertWebhookEntries(group.entries)) {
       if (alertTestInFlight.current) return;
@@ -431,7 +425,6 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
     setPendingResets((prev) => withoutKeys(prev, keys));
     setPendingSecrets((prev) => withoutKeys(prev, keys));
     setGroupErrors((prev) => withoutKeys(prev, [group.id]));
-    setEditingGroup(null);
   };
 
   const toggleReset = (target: ConfigEntry) => {
@@ -451,6 +444,105 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
   const toggleMarkSecret = (target: ConfigEntry) => {
     const { key } = target;
     setPendingSecrets((prev) => (prev[key] ? withoutKeys(prev, [key]) : { ...prev, [key]: true }));
+  };
+
+  // A download changes nothing, so it goes on the click. The file holds every
+  // secret in plain text: the button's title says so before, the toast after.
+  const downloadBackup = async () => {
+    const failure = await backupConfirmation.perform({
+      run: async () => {
+        downloadBackupJson(await exportConfigBackup());
+        toast.success(
+          'Downloaded configuration backup. It holds API keys and secrets in plain text: store it securely.',
+        );
+      },
+    });
+    if (failure) toast.error(`The backup could not be downloaded: ${failure}`);
+  };
+
+  const onRestoreFileSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+
+    let parsed: ConfigBackupPayload;
+    try {
+      const text = await file.text();
+      const raw: unknown = JSON.parse(text);
+      if (
+        !raw ||
+        typeof raw !== 'object' ||
+        Array.isArray(raw) ||
+        typeof (raw as { schema_version?: unknown }).schema_version !== 'number'
+      ) {
+        toast.error('The selected file is not a valid configuration backup JSON.');
+        return;
+      }
+      parsed = raw as ConfigBackupPayload;
+    } catch {
+      toast.error('The selected file is not a valid configuration backup JSON.');
+      return;
+    }
+
+    const appConfigCount = Array.isArray(parsed.app_config) ? parsed.app_config.length : 0;
+    const siteSettingsCount = Array.isArray(parsed.site_settings) ? parsed.site_settings.length : 0;
+    const providerCount = Array.isArray(parsed.provider_definitions)
+      ? parsed.provider_definitions.length
+      : 0;
+    const keyCount = Array.isArray(parsed.provider_keys) ? parsed.provider_keys.length : 0;
+    const routeCount =
+      (Array.isArray(parsed.provider_route_candidates)
+        ? parsed.provider_route_candidates.length
+        : 0) +
+      (Array.isArray(parsed.provider_route_configs) ? parsed.provider_route_configs.length : 0);
+
+    backupConfirmation.request({
+      title: 'Restore configuration from backup?',
+      confirmLabel: 'Restore configuration',
+      busyLabel: 'Restoring…',
+      tone: 'danger',
+      body: (
+        <div className="space-y-2">
+          <ChangeList
+            changes={[
+              { label: 'Backup file', after: file.name },
+              ...(parsed.exported_at ? [{ label: 'Exported at', after: parsed.exported_at }] : []),
+              { label: 'Application settings', after: plural(appConfigCount, 'stored row') },
+              { label: 'Runtime & model settings', after: plural(siteSettingsCount, 'setting') },
+              {
+                label: 'Custom providers & keys',
+                after: `${plural(providerCount, 'provider')}, ${plural(keyCount, 'API key')}`,
+              },
+              { label: 'Routes & overrides', after: plural(routeCount, 'route') },
+            ]}
+          />
+          <p className="font-medium text-red-800">
+            Restoring replaces the current configuration, providers, API keys, routes, and runtime
+            settings with the contents of this backup. Existing user API key encryption secrets are
+            automatically preserved when user API keys already exist.
+          </p>
+        </div>
+      ),
+      run: async () => {
+        const res = await restoreConfigBackup(parsed);
+        setConfig(res.config);
+        setDrafts({});
+        setEntryErrors({});
+        setGroupErrors({});
+        setPendingResets({});
+        setPendingSecrets({});
+        setAlertChannelDraft(null);
+        setAlertTestResult(null);
+        router.refresh();
+        if (res.immutable_keys_preserved.length > 0) {
+          toast.success(
+            `Restored configuration (preserved existing ${res.immutable_keys_preserved.join(', ')}).`,
+          );
+        } else {
+          toast.success('Restored configuration from backup.');
+        }
+      },
+    });
   };
 
   if (loading && !config) {
@@ -481,32 +573,6 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
   const existingKeys = new Set(config.entries.map((entry) => entry.key));
   const resetKeys = new Set(Object.keys(pendingResets));
 
-  /**
-   * Unsaved changes in a whole category, including entries a filter hides.
-   * Each variable counts once, however many things the save does to it, as the
-   * confirmation counts them; the alert channel choice counts as one.
-   */
-  const dirtyCount = (group: ConfigGroup) => {
-    const channelEntries = alertWebhookEntries(group.entries);
-    const selectedEntry = channelEntries
-      ? selectedWebhookEntry(channelEntries, alertChannel)
-      : null;
-    const changedKeys = new Set([
-      ...group.entries
-        .filter(
-          (entry) =>
-            (!channelEntries || !isAlertWebhook(entry.key)) && isDirty(entry, drafts[entry.key]),
-        )
-        .map((entry) => entry.key),
-      ...groupKeys(group, pendingResets),
-      ...groupKeys(group, pendingSecrets),
-    ]);
-    const channelDirty =
-      channelEntries !== null &&
-      (alertChannelDraft !== null ||
-        Boolean(selectedEntry && isDirty(selectedEntry, drafts[selectedEntry.key])));
-    return changedKeys.size + Number(channelDirty);
-  };
   const fullGroup = (visible: ConfigGroup) =>
     groups.find((candidate) => candidate.id === visible.id) ?? visible;
   const sectionAnchor = (group: ConfigGroup) => `config-${group.id.replace(/[^\w-]/g, '-')}`;
@@ -625,6 +691,31 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
         >
           Add variable
         </button>
+        <button
+          type="button"
+          onClick={() => void downloadBackup()}
+          disabled={backupConfirmation.busy}
+          title="Downloads every setting and provider key as JSON, with secrets in plain text"
+          className={BUTTON_SECONDARY}
+        >
+          Backup
+        </button>
+        <button
+          type="button"
+          onClick={() => restoreInputRef.current?.click()}
+          disabled={backupConfirmation.busy}
+          className={BUTTON_SECONDARY}
+        >
+          Restore
+        </button>
+        <input
+          ref={restoreInputRef}
+          type="file"
+          accept=".json,application/json"
+          aria-label="Select configuration backup file"
+          onChange={(event) => void onRestoreFileSelected(event)}
+          className="sr-only"
+        />
       </div>
 
       {adding ? (
@@ -656,12 +747,14 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
           <div className="min-w-0 space-y-8">
             {visibleGroups.map((visible) => {
               const group = fullGroup(visible);
-              const editing = editingGroup === group.id;
               const channelEntries = alertWebhookEntries(group.entries);
               const dirty = dirtyCount(group);
               const hidden = group.entries.length - visible.entries.length;
               const saving = savingGroup === group.id;
               const busy = saving || Boolean(channelEntries && testingAlert);
+              // One save at a time: while any category saves, every bar waits.
+              const barHeld = busy || savingGroup !== null;
+              const groupError = groupErrors[group.id];
               const headingId = `${searchId}-${group.id}`;
               return (
                 <section
@@ -670,40 +763,15 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
                   aria-labelledby={headingId}
                   className="scroll-mt-4 focus:outline-none"
                 >
-                  <div className="mb-3 flex flex-wrap items-end justify-between gap-x-4 gap-y-2">
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <h2 id={headingId} className="text-[14px] font-semibold text-gray-900">
-                          {group.label}
-                        </h2>
-                        {editing ? (
-                          <span className="rounded bg-gray-900 px-1.5 py-0.5 text-[10px] font-medium text-white">
-                            Editing
-                          </span>
-                        ) : null}
-                      </div>
-                      {group.description ? (
-                        <p className="mt-0.5 max-w-3xl text-[12px] text-gray-500">
-                          {group.description}
-                        </p>
-                      ) : null}
-                    </div>
-                    {editing ? null : (
-                      <button
-                        type="button"
-                        onClick={() => startEditing(group)}
-                        disabled={editingGroup !== null}
-                        title={
-                          editingGroup !== null
-                            ? 'Save or cancel the category you are editing first.'
-                            : undefined
-                        }
-                        aria-label={`Edit ${group.label}`}
-                        className={BUTTON_SECONDARY}
-                      >
-                        Edit
-                      </button>
-                    )}
+                  <div className="mb-3">
+                    <h2 id={headingId} className="text-[14px] font-semibold text-gray-900">
+                      {group.label}
+                    </h2>
+                    {group.description ? (
+                      <p className="mt-0.5 max-w-3xl text-[12px] text-gray-500">
+                        {group.description}
+                      </p>
+                    ) : null}
                   </div>
 
                   {/* A form, so Enter saves the category, and one browsers do not
@@ -714,10 +782,10 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
                     noValidate
                     onSubmit={(event) => {
                       event.preventDefault();
-                      if (editing && !busy && dirty > 0) saveGroup(group);
+                      if (!barHeld && dirty > 0) saveGroup(group);
                     }}
                   >
-                    {editing && hidden > 0 ? (
+                    {dirty > 0 && hidden > 0 ? (
                       <p className="mb-3 rounded-lg bg-gray-50 px-3 py-2 text-[12px] text-gray-600">
                         {hidden === group.entries.length
                           ? 'Every setting in this category is hidden by the current filter.'
@@ -725,7 +793,7 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
                         Unsaved changes to them are kept and saved with the rest.
                       </p>
                     ) : null}
-                    <div className={`${PANEL} ${editing ? 'border-gray-400 shadow-sm' : ''}`}>
+                    <div className={`${PANEL} ${dirty > 0 ? 'border-gray-400 shadow-sm' : ''}`}>
                       <div className="divide-y divide-gray-100 px-4">
                         {channelEntries &&
                         visible.entries.some((entry) => isAlertWebhook(entry.key)) ? (
@@ -739,9 +807,8 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
                             disabled={busy}
                             testing={testingAlert}
                             testResult={alertTestResult}
-                            onTest={sendAlertTest}
+                            onTest={() => void sendAlertTest()}
                             onReset={toggleReset}
-                            readOnly={!editing}
                             pendingResets={resetKeys}
                           />
                         ) : null}
@@ -757,7 +824,6 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
                               onReset={toggleReset}
                               onMarkSecret={toggleMarkSecret}
                               layout="split"
-                              readOnly={!editing}
                               resetPending={Boolean(pendingResets[entry.key])}
                               markSecretPending={Boolean(pendingSecrets[entry.key])}
                               disabled={busy}
@@ -765,12 +831,16 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
                           ))}
                       </div>
 
-                      {editing ? (
-                        // Sticky, so Cancel and Save stay in reach anywhere in a long category.
-                        <div className="sticky bottom-0 z-10 rounded-b-lg border-t border-gray-200 bg-white/95 px-4 py-3 backdrop-blur">
-                          {groupErrors[group.id] ? (
+                      {/* Appears with the first change, or a reason to show, and stays
+                          at the bottom of the window while its category is on screen.
+                          Not the shared EditBar, whose busy state reads "Saving…": a
+                          test notification also holds the Alerts category, and saves
+                          nothing. */}
+                      {dirty > 0 || groupError || saving ? (
+                        <div className="animate-admin-reveal sticky bottom-0 z-10 rounded-b-lg border-t border-gray-200 bg-white/95 px-4 py-3 backdrop-blur">
+                          {groupError ? (
                             <div className="mb-2">
-                              <AdminNotice role="alert">{groupErrors[group.id]}</AdminNotice>
+                              <AdminNotice role="alert">{groupError}</AdminNotice>
                             </div>
                           ) : null}
                           <div className="flex flex-wrap items-center justify-end gap-2">
@@ -782,16 +852,16 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
                             </span>
                             <button
                               type="button"
-                              onClick={() => cancelEditing(group)}
-                              disabled={busy}
-                              aria-label={`Cancel editing ${group.label}`}
+                              onClick={() => discardGroup(group)}
+                              disabled={barHeld}
+                              aria-label={`Discard changes to ${group.label}`}
                               className={BUTTON_GHOST}
                             >
-                              Cancel
+                              Discard
                             </button>
                             <button
                               type="submit"
-                              disabled={busy || dirty === 0}
+                              disabled={barHeld || dirty === 0}
                               aria-busy={saving || undefined}
                               aria-label={`Save changes to ${group.label}`}
                               className={BUTTON_PRIMARY}
@@ -810,76 +880,7 @@ export function ConfigurationTab({ initialMissingOnly = false }: { initialMissin
         </div>
       ) : null}
 
-      {testConfirmation.dialog}
-
-      {pendingSave ? (
-        <ConfirmDialog
-          title={`Save ${plural(
-            new Set([
-              ...Object.keys(pendingSave.values),
-              ...pendingSave.secrets,
-              ...pendingSave.resets,
-            ]).size,
-            'change',
-          )} to ${pendingSave.group.label}?`}
-          confirmLabel="Confirm save"
-          cancelLabel="Back to editing"
-          busyLabel="Saving…"
-          busy={savingGroup === pendingSave.group.id}
-          onConfirm={() => void commitSave(pendingSave)}
-          onCancel={() => setPendingSave(null)}
-        >
-          <ul className="space-y-1.5">
-            {pendingSave.group.entries
-              .filter(
-                (entry) =>
-                  entry.key in pendingSave.values ||
-                  pendingSave.secrets.includes(entry.key) ||
-                  pendingSave.resets.includes(entry.key),
-              )
-              .map((entry) => (
-                <li key={entry.key} className="break-all">
-                  <span className="font-mono font-medium text-gray-900">{entry.key}</span>
-                  {describeChange(entry, entry.key, pendingSave).map((line) => (
-                    <span key={line} className="block font-mono text-[12px]">
-                      {line}
-                    </span>
-                  ))}
-                </li>
-              ))}
-          </ul>
-          {pendingSave.resets.length > 0 ? (
-            <p>
-              A reset removes the stored value: the setting falls back to the environment, then to
-              its default. A custom variable is deleted.
-            </p>
-          ) : null}
-          {/* Each request is validated alone (PATCH, then one DELETE per reset). */}
-          {pendingSave.resets.length > 0 &&
-          (pendingSave.resets.length > 1 ||
-            Object.keys(pendingSave.values).length + pendingSave.secrets.length > 0) ? (
-            <p>
-              {Object.keys(pendingSave.values).length + pendingSave.secrets.length > 0
-                ? 'The value changes are sent first, in one request; then each reset, on its own.'
-                : 'Each reset is sent on its own, in the order listed.'}{' '}
-              The backend checks each request by itself, so a change that is valid only together
-              with one of these resets can be refused; if so, save that reset on its own first.
-            </p>
-          ) : null}
-          {pendingSave.secrets.length > 0 ? (
-            <p className="font-medium text-gray-800">
-              Marking a variable secret cannot be undone from the console.
-            </p>
-          ) : null}
-          {[...Object.keys(pendingSave.values), ...pendingSave.secrets, ...pendingSave.resets].some(
-            (key) =>
-              pendingSave.group.entries.find((candidate) => candidate.key === key)
-                ?.restart_required,
-          ) ? (
-            <p>Some of these apply only after the backend restarts.</p>
-          ) : null}
-        </ConfirmDialog>
-      ) : null}
+      {backupConfirmation.dialog}
     </div>
   );
 }
@@ -902,12 +903,12 @@ function AddVariableForm({
   // is the administrator's choice.
   const [secretChoice, setSecretChoice] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const confirmation = useConfirmAction();
-  const saving = confirmation.busy;
+  const writes = useConfirmAction();
+  const saving = writes.busy;
   const secretByName = looksSecret(name);
   const secret = secretByName || secretChoice;
 
-  const submit = (event: React.FormEvent) => {
+  const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     const key = name.trim();
     if (!CUSTOM_KEY_PATTERN.test(key)) {
@@ -921,30 +922,8 @@ function AddVariableForm({
       return;
     }
     setError(null);
-    // A new variable is reviewed before it is written; a secret's value is never shown.
-    confirmation.request({
-      title: `Add ${key}?`,
-      confirmLabel: 'Add variable',
-      busyLabel: 'Adding…',
-      cancelLabel: 'Back to editing',
-      body: (
-        <>
-          <ChangeList
-            changes={[
-              {
-                label: key,
-                after: secret ? (value ? 'Set (hidden)' : '(empty)') : value || '(empty)',
-              },
-              { label: 'Secret', after: secret ? 'Yes, write-only from now on' : 'No' },
-            ]}
-          />
-          <p>
-            It is stored in the database, where a{' '}
-            <code className="rounded bg-gray-100 px-1">{`$\{${key}}`}</code> reference in a
-            configuration file can read it.
-          </p>
-        </>
-      ),
+    // A refusal that echoes a secret's value shows it masked; the form keeps what was typed.
+    const failure = await writes.perform({
       run: async () => {
         const next = await patchConfig({
           values: { [key]: value },
@@ -955,6 +934,7 @@ function AddVariableForm({
         onAdded(next, key);
       },
     });
+    if (failure) setError(failure);
   };
 
   return (
@@ -982,6 +962,7 @@ function AddVariableForm({
             id={`${baseId}-name`}
             value={name}
             onChange={(event) => setName(event.target.value.toUpperCase())}
+            disabled={saving}
             placeholder="MY_PROVIDER_API_KEY"
             spellCheck={false}
             autoComplete="off"
@@ -999,6 +980,7 @@ function AddVariableForm({
             type={secret ? 'password' : 'text'}
             value={value}
             onChange={(event) => setValue(event.target.value)}
+            disabled={saving}
             spellCheck={false}
             autoComplete={secret ? 'new-password' : 'off'}
             {...NOT_A_LOGIN_FIELD}
@@ -1010,7 +992,7 @@ function AddVariableForm({
         <input
           type="checkbox"
           checked={secret}
-          disabled={secretByName}
+          disabled={secretByName || saving}
           aria-describedby={secretByName ? `${baseId}-secret-note` : undefined}
           onChange={(event) => setSecretChoice(event.target.checked)}
           className={CHECKBOX}
@@ -1037,10 +1019,9 @@ function AddVariableForm({
           aria-busy={saving || undefined}
           className={BUTTON_PRIMARY}
         >
-          {saving ? 'Adding…' : 'Review and add'}
+          {saving ? 'Adding…' : 'Add variable'}
         </button>
       </div>
-      {confirmation.dialog}
     </form>
   );
 }

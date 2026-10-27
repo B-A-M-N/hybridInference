@@ -11,7 +11,7 @@ For distribution manifests, branding, UI modules and backend extensions, see
 
 ## Email and SMS delivery providers
 
-`EMAIL_PROVIDER` defaults to `smtp`; `SMS_PROVIDER` defaults to `none`. Every other provider is an optional module that a deployment loads explicitly. A gateway that does not load a provider neither offers it nor lists its settings in **Admin > Configuration**. Selecting an unavailable provider is a configuration error; delivery never silently falls back to another provider.
+`EMAIL_PROVIDER` defaults to `smtp`; `SMS_PROVIDER` defaults to `none`. Every other provider is an optional module that a deployment loads explicitly. A gateway that does not load a provider neither offers it nor lists its settings in **Admin > Configuration**. Without a provider beyond the built-in one, it does not list `EMAIL_PROVIDER` or `SMS_PROVIDER` either, which would have only one value to choose, and without an SMS provider it lists none of the phone settings. Selecting an unavailable provider is a configuration error; delivery never silently falls back to another provider.
 
 Each distribution can add the providers its own inference hub needs, such as a regional email or SMS service. A trusted module selected through `BACKEND_EXTENSIONS` registers its email or SMS transport and configuration entries before database-backed settings load. The shared interfaces are `register_email_provider` and `register_sms_provider` in `serving.utils.delivery`, and `register_config_entries` in `serving.config.app_config_registry`. Extension settings keep the normal database → environment → registered default precedence, validation, secret masking and worker refresh. The extension reads them through `config_value()` instead of adding vendor fields to shared `Settings`.
 
@@ -391,7 +391,7 @@ several gateway processes sees it in the others after their next restart.
 |---|---|---|---|
 | Change who can see a model | **Model Visibility** | `PATCH /admin/models/{model_id}/visibility` sets or clears a `required_role` override; `GET /admin/models/visibility` lists baseline, override and effective values | `model_visibility_overrides` |
 | Exempt a model from the per-user concurrency limit | **Model Concurrency Limit** | `PATCH /admin/models/{model_id}/concurrency` | `model_concurrency_exemptions` |
-| Cap how many batch requests a model runs at once | **Batch Concurrency** | `PATCH /admin/batch/models/{model_id}` sets or clears a model's cap; `GET /admin/batch/models` lists the caps with each model's running and queued batch requests | `batch_model_limits` |
+| Cap how many batch requests a model runs at once | **Batch Concurrency** | `PATCH /admin/batch/models/{model_id}` sets or clears a model's cap; `GET /admin/batch/models` lists the caps with each model's running and queued batch requests. The other batch settings are in [Running batch inference](batches.md#running-batch-inference) | `batch_model_limits` |
 
 ### How the two layers combine
 
@@ -498,6 +498,13 @@ its value comes from. Besides every setting the gateway reads itself, it lists:
   not end the list, and a key entered twice counts once;
 - variables added with **Add variable**, for a `${VAR}` reference the gateway
   cannot see yet, such as one in a registry you are about to switch to.
+
+It leaves out the settings that offer nothing to choose: one with a single
+accepted value, such as `EMAIL_PROVIDER` while SMTP is the only transport, and
+the phone settings while no SMS provider is registered, since they do nothing
+without one. Such a setting still appears while it needs attention — required
+and empty, stored with a value that cannot apply, or waiting for a restart —
+and `python -m serving.config.manage list` always shows it.
 
 Secrets are write-only: the tab shows whether one is set, never its value, and
 the admin audit log records only that it changed. Besides the settings the
@@ -661,7 +668,7 @@ output as sensitive.
 
 ## Optional phone authentication
 
-Phone signup, login and binding are disabled by default. Install a distribution-owned SMS provider, configure its delivery settings, then enable `SMS_AUTH_ENABLED` and select that registered provider through `SMS_PROVIDER` in **Admin > Configuration**. The gateway advertises `features.phone_auth` through `/site-config`; the shared forms show the phone option only when it is available. Existing email and first-run administrator logins continue to work.
+Phone signup, login and binding are disabled by default. Install a distribution-owned SMS provider, configure its delivery settings, then enable `SMS_AUTH_ENABLED` and select that registered provider through `SMS_PROVIDER` in **Admin > Configuration**, where the phone settings appear once a provider is registered. The gateway advertises `features.phone_auth` through `/site-config`; the shared forms show the phone option only when it is available. Existing email and first-run administrator logins continue to work.
 
 Account identifiers use international format, such as `+12025550123`. `SMS_DEFAULT_COUNTRY_CODE` optionally supplies a calling code for local input; leave it empty to require international input. `SMS_ALLOWED_PREFIXES` optionally restricts destinations using comma-separated prefixes. The distribution chooses a number policy supported by its delivery provider; account storage and verification-code policy remain shared.
 
