@@ -44,7 +44,7 @@ from routing.prefill_load import (
 )
 from routing.route_table import EffectiveRoute, RouteTableSnapshot
 from routing.streaming import has_non_empty_content
-from routing.telemetry import failed_attempt, routing_chunk
+from routing.telemetry import adapter_pricing_snapshot, failed_attempt, routing_chunk
 from serving.adapters.upstream_limiter import EngineHold
 from serving.config.app_config import config_value, on_change
 from serving.exceptions import operator_safe_error
@@ -991,7 +991,12 @@ class FixedRouter:
         prompt over the offload route's max input does not get it at all, not
         even last.
         """
-        route = self.routes[model_id]
+        route = self.routes.get(model_id)
+        if route is None:
+            # Removed while this request was upstream (an admin deleted the
+            # model's last route): nothing to fall back to, so the primary's
+            # own error is the one the request ends with.
+            return FallbackOrder([], None), None
         candidates = self._dispatch_range(
             model_id,
             route,
@@ -1776,6 +1781,7 @@ class FixedRouter:
         preferred_endpoint_id: str | None = None,
         endpoint_scope: frozenset[str] | None = None,
         require_target: bool = False,
+        fingerprint: str | None = None,
     ) -> BaseAdapter | None:
         """Select an adapter using weighted random selection with optional affinity.
 
@@ -1807,6 +1813,8 @@ class FixedRouter:
                 admissible raises :class:`TargetUnavailableError` instead of
                 being replaced by the ordinary draw, so a caller that planned one
                 candidate per attempt is told which candidate it lost.
+            fingerprint: This request's conversation, so the prefill-aware draw
+                judges a mega-prefill the way the dispatch's lease will count it.
 
         Returns:
             Selected adapter or None if no route configured / no match.
@@ -1949,6 +1957,7 @@ class FixedRouter:
                         prefill_tokens=prefill_tokens,
                         affinity_key=affinity_key,
                         avoid_endpoint_id=None,
+                        fingerprint=fingerprint,
                     ),
                     affinity_key,
                 )
@@ -1966,6 +1975,7 @@ class FixedRouter:
             prefill_tokens=prefill_tokens,
             affinity_key=affinity_key,
             avoid_endpoint_id=avoid_endpoint_id,
+            fingerprint=fingerprint,
         )
         return self._record_affinity_and_return(model_id, chosen, affinity_key)
 
@@ -1995,6 +2005,7 @@ class FixedRouter:
         prefill_tokens: int,
         affinity_key: str | None,
         avoid_endpoint_id: str | None,
+        fingerprint: str | None = None,
     ) -> BaseAdapter:
         """Draw one adapter from ``allowed`` by weight, prefill-aware.
 
@@ -2025,6 +2036,7 @@ class FixedRouter:
                 random.random,
                 affinity_key,
                 avoid_endpoint_id,
+                fingerprint=fingerprint,
             )
         except Exception:
             logger.error(
@@ -2060,6 +2072,7 @@ class FixedRouter:
         preferred_endpoint_id: str | None = None,
         endpoint_scope: frozenset[str] | None = None,
         require_target: bool = False,
+        fingerprint: str | None = None,
     ) -> tuple[BaseAdapter | None, DispatchClaim | None]:
         """Select an adapter and claim the dispatch slot for its endpoint.
 
@@ -2100,6 +2113,7 @@ class FixedRouter:
                     required_modalities=required_modalities,
                     prefill_tokens=prefill_tokens,
                     endpoint_scope=endpoint_scope,
+                    fingerprint=fingerprint,
                 ),
                 None,
             )
@@ -2124,6 +2138,7 @@ class FixedRouter:
                 preferred_endpoint_id=preferred_endpoint_id,
                 endpoint_scope=endpoint_scope,
                 require_target=require_target,
+                fingerprint=fingerprint,
             )
             if preferred is not None:
                 preferred_endpoint = endpoint_id_for_adapter(preferred)
@@ -2149,6 +2164,7 @@ class FixedRouter:
                 prefill_tokens=prefill_tokens,
                 exclude=exclude,
                 endpoint_scope=endpoint_scope,
+                fingerprint=fingerprint,
             )
             if adapter is None:
                 return None, None
@@ -2217,15 +2233,16 @@ class FixedRouter:
         actual prefill -- as an elephant and have the upstream schedule it last
         and preempt it, which is the opposite of what its cost deserves.
 
-        Priority does NOT agree with routing by construction. Three callers read
-        ``uncached_estimate`` at three strictnesses, deliberately: this method
-        passes ``fingerprint`` *and* ``messages``, so a fork that shares only the
-        opening fails the anchor check; ``acquire`` passes ``fingerprint`` alone,
-        enough to keep one caller's unrelated conversations from inheriting each
-        other's prefix on the admission gate; ``select_index`` passes neither,
-        because a mis-estimated *load* skews one draw and self-corrects. So
-        priority and the elephant count can still disagree about a fork or a
-        retry, and selection can disagree with both.
+        Priority does NOT agree with routing by construction. ``uncached_estimate``
+        is read at three strictnesses, deliberately: this method passes
+        ``fingerprint`` *and* ``messages``, so a fork that shares only the
+        opening fails the anchor check; the elephant verdict -- ``acquire``'s
+        count and the ``select_index`` gate that has to predict it -- passes
+        ``fingerprint`` alone, enough to keep one caller's unrelated
+        conversations from inheriting each other's prefix on admission; the load
+        ``acquire`` charges passes neither, because a mis-estimated *load* skews
+        one draw and self-corrects. So priority and the elephant count can still
+        disagree about a fork or a retry.
 
         Per endpoint, because the discount is: a prefix resident on the replica
         the caller has been talking to is not resident on a fallback that has
@@ -2303,6 +2320,7 @@ class FixedRouter:
                     preferred_endpoint_id=preferred_endpoint_id,
                     endpoint_scope=endpoint_scope,
                     require_target=require_target,
+                    fingerprint=fingerprint,
                 )
                 if primary is not None:
                     lease = self._prefill_load.acquire(
@@ -2378,6 +2396,8 @@ class FixedRouter:
                 }
             # Always inject endpoint_id so observation keys match latency profiles.
             resp["_routing"].setdefault("endpoint_id", endpoint_id_for_adapter(primary))
+            if "pricing" not in resp["_routing"]:
+                resp["_routing"]["pricing"] = adapter_pricing_snapshot(execution)
             if primary_plan.reason is not None:
                 resp["_routing"].setdefault("offload", primary_plan.reason)
             return resp
@@ -2515,6 +2535,8 @@ class FixedRouter:
                             "fallback": True,
                         }
                     resp["_routing"].setdefault("endpoint_id", endpoint_id_for_adapter(adapter))
+                    if "pricing" not in resp["_routing"]:
+                        resp["_routing"]["pricing"] = adapter_pricing_snapshot(execution)
                     resp["_routing"].setdefault("failed_attempts", failed_attempts)
                     if offload_reason is not None:
                         resp["_routing"].setdefault("offload", offload_reason)
@@ -2608,6 +2630,7 @@ class FixedRouter:
                     preferred_endpoint_id=preferred_endpoint_id,
                     endpoint_scope=endpoint_scope,
                     require_target=require_target,
+                    fingerprint=fingerprint,
                 )
                 if primary is not None:
                     lease = self._prefill_load.acquire(

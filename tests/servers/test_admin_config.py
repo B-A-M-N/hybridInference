@@ -10,12 +10,18 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from serving.audit import AuditTarget
 from serving.config import app_config
 from serving.config.settings import get_settings
 from serving.servers import restart
 from serving.servers.deps import AppServices
 from serving.servers.routers import admin as admin_router
-from serving.servers.routers.admin import config as config_routes, system as system_routes
+from serving.servers.routers.admin import (
+    config as config_routes,
+    config_backup as config_backup_routes,
+    system as system_routes,
+)
+from serving.storage.base import ProviderDefinitionRow, ProviderKeyRow
 from tests.fixtures.app_config_store import FakeAppConfigStore, row
 
 AUTH = {"Authorization": "Bearer test-admin"}
@@ -45,6 +51,7 @@ async def config_client(monkeypatch, tmp_path):
 
     audit = AsyncMock()
     monkeypatch.setattr(config_routes, "log_admin_action", audit)
+    monkeypatch.setattr(config_backup_routes, "log_admin_action", audit)
     monkeypatch.setattr(system_routes, "log_admin_action", audit)
 
     app = FastAPI()
@@ -136,6 +143,20 @@ async def test_get_reports_a_variable_a_model_needs(config_client) -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_leaves_out_settings_with_nothing_to_choose(config_client) -> None:
+    client, _store, _audit = config_client
+
+    body = (await client.get("/admin/config", headers=AUTH)).json()
+
+    # No delivery extension is loaded: email has SMTP alone, and phone sign-in
+    # has no SMS provider for its settings to tune.
+    keys = set(_entries(body))
+    assert "EMAIL_PROVIDER" not in keys
+    assert not any(key.startswith("SMS_") for key in keys)
+    assert {"SMTP_HOST", "SMTP_PASSWORD"} <= keys
+
+
+@pytest.mark.asyncio
 async def test_patch_stores_and_returns_the_full_configuration(config_client) -> None:
     client, store, audit = config_client
 
@@ -161,10 +182,13 @@ async def test_patch_stores_and_returns_the_full_configuration(config_client) ->
         "SMTP_PORT",
         "CHAT_UPSTREAM_KEY",
     }
-    details = [call.args[4] for call in audit.await_args_list]
+    details = [call.kwargs["details"] for call in audit.await_args_list]
     assert {"key": "CHAT_UPSTREAM_KEY", "changed": True} in details
     assert {"key": "SITE_NAME", "old_value": None, "new_value": "Acme Gateway"} in details
-    assert all(call.args[2] == "config.update" for call in audit.await_args_list)
+    assert all(call.kwargs["action"] == "config.update" for call in audit.await_args_list)
+    # Each change targets its own configuration key, typed, never a user.
+    for call in audit.await_args_list:
+        assert call.kwargs["target"] == AuditTarget("config", call.kwargs["details"]["key"])
     assert '"k"' not in repr(details)
 
 
@@ -231,7 +255,10 @@ async def test_delete_falls_back_and_custom_variables_disappear(config_client) -
     response = await client.delete("/admin/config/BOX_REGION", headers=AUTH)
     assert response.status_code == 200
     assert "BOX_REGION" not in _entries(response.json())
-    assert [call.args[2] for call in audit.await_args_list] == ["config.reset", "config.reset"]
+    assert [call.kwargs["action"] for call in audit.await_args_list] == [
+        "config.reset",
+        "config.reset",
+    ]
 
 
 @pytest.mark.asyncio
@@ -301,7 +328,7 @@ async def test_patch_marks_a_stored_variable_secret_without_a_value(config_clien
     assert store.rows["BOX_REGION"].secret
     assert store.rows["BOX_REGION"].value == "east"
     assert len(store.writes) == writes  # the value was not rewritten
-    assert [call.args[4] for call in audit.await_args_list] == [
+    assert [call.kwargs["details"] for call in audit.await_args_list] == [
         {"key": "BOX_REGION", "marked_secret": True}
     ]
     assert '"east"' not in response.text
@@ -404,4 +431,346 @@ async def test_restart_answers_202_then_signals(config_client, monkeypatch) -> N
     assert restart.restart_requested()
     assert exits == []  # the watchdog has not fired
     audit.assert_awaited_once()
-    assert audit.await_args.args[2] == "system.restart"
+    assert audit.await_args.kwargs["action"] == "system.restart"
+    assert audit.await_args.kwargs["actor"].type == "admin_token"
+
+
+@pytest.mark.asyncio
+async def test_backup_requires_an_administrator(config_client) -> None:
+    client, _store, _audit = config_client
+
+    assert (await client.get("/admin/config/backup")).status_code == 401
+    assert (
+        await client.post("/admin/config/restore", json={"schema_version": 1})
+    ).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_backup_exports_plaintext_secrets_and_excludes_setup_markers(config_client) -> None:
+    client, _store, audit = config_client
+    await client.patch(
+        "/admin/config",
+        headers=AUTH,
+        json={"values": {"SITE_NAME": "Backup Lab", "CHAT_UPSTREAM_KEY": "sk-chat-secret"}},
+    )
+    audit.reset_mock()
+
+    op_store = client._transport.app.state.services.operational_store
+    op_store.list_settings = AsyncMock(
+        return_value=[
+            {"key": "setup_completed_at", "value": "2026-10-01T00:00:00Z", "value_type": "str"},
+            {"key": "setup_code", "value": "secret-setup-code", "value_type": "str"},
+            {"key": "signup_enabled", "value": "true", "value_type": "bool"},
+        ]
+    )
+    op_store.list_provider_definitions = AsyncMock(
+        return_value=[
+            ProviderDefinitionRow(
+                provider="acme",
+                display_name="Acme AI",
+                adapter_kind="openai_compat",
+                default_base_url="https://api.acme.test/v1",
+                status="active",
+                created_at=None,
+                updated_at=None,
+            )
+        ]
+    )
+    op_store.list_provider_keys = AsyncMock(
+        return_value=[
+            ProviderKeyRow(
+                id="key-1",
+                provider="acme",
+                key_prefix="sk-acme...",
+                label="primary",
+                status="active",
+                created_at=None,
+                min_role="pro",
+            )
+        ]
+    )
+    op_store.list_provider_key_values = AsyncMock(return_value={"key-1": "sk-acme-plaintext-1234"})
+
+    response = await client.get("/admin/config/backup", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.headers.get("cache-control") == "no-store"
+    body = response.json()
+    assert body["schema_version"] == 1
+    app_rows = {r["key"]: r for r in body["app_config"]}
+    assert app_rows["SITE_NAME"]["value"] == "Backup Lab"
+    assert app_rows["CHAT_UPSTREAM_KEY"]["value"] == "sk-chat-secret"
+    assert app_rows["CHAT_UPSTREAM_KEY"]["secret"] is True
+    assert app_rows["SMTP_PASSWORD"]["value"] == "env-smtp-password"
+
+    setting_keys = [s["key"] for s in body["site_settings"]]
+    assert setting_keys == ["signup_enabled"]
+    assert "setup_completed_at" not in setting_keys
+    assert "setup_code" not in setting_keys
+
+    assert body["provider_definitions"] == [
+        {
+            "provider": "acme",
+            "display_name": "Acme AI",
+            "adapter_kind": "openai_compat",
+            "default_base_url": "https://api.acme.test/v1",
+            "status": "active",
+        }
+    ]
+    assert body["provider_keys"] == [
+        {
+            "id": "key-1",
+            "provider": "acme",
+            "api_key": "sk-acme-plaintext-1234",
+            "label": "primary",
+            "status": "active",
+            "min_role": "pro",
+        }
+    ]
+    audit.assert_awaited_once()
+    assert audit.await_args.kwargs["action"] == "config.backup"
+    assert audit.await_args.kwargs["actor"].type == "admin_token"
+    assert audit.await_args.kwargs["actor"].id is None
+    assert audit.await_args.kwargs["target"] == AuditTarget("config", "backup")
+
+
+@pytest.mark.asyncio
+async def test_backup_exports_the_signup_domain_allowlist(config_client) -> None:
+    client, _store, _audit = config_client
+    op_store = client._transport.app.state.services.operational_store
+    op_store.list_signup_allowed_domains = AsyncMock(
+        return_value=[
+            {"domain": "mit.edu", "is_wildcard": True, "created_by": None},
+            {"domain": "harvard.edu", "is_wildcard": False, "created_by": None},
+        ]
+    )
+
+    response = await client.get("/admin/config/backup", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json()["signup_allowed_domains"] == [
+        {"domain": "harvard.edu", "is_wildcard": False},
+        {"domain": "mit.edu", "is_wildcard": True},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_restore_replaces_the_signup_domain_allowlist_and_refreshes_resolvers(
+    config_client,
+) -> None:
+    """An empty allowlist approves every signup, so a restore must not drop it."""
+    client, _store, _audit = config_client
+    services = client._transport.app.state.services
+    op_store = services.operational_store
+    op_store.list_signup_allowed_domains = AsyncMock(
+        return_value=[
+            {"domain": "harvard.edu", "is_wildcard": False},
+            {"domain": "old.org", "is_wildcard": False},
+        ]
+    )
+    op_store.add_signup_allowed_domain = AsyncMock()
+    op_store.remove_signup_allowed_domain = AsyncMock()
+    services.model_visibility_resolver = MagicMock(spec=["invalidate_cache"])
+    services.model_concurrency_resolver = MagicMock(spec=["invalidate_cache"])
+
+    response = await client.post(
+        "/admin/config/restore",
+        headers=AUTH,
+        json={
+            "schema_version": 1,
+            "signup_allowed_domains": [
+                {"domain": "harvard.edu", "is_wildcard": False},
+                {"domain": "mit.edu", "is_wildcard": True},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    op_store.remove_signup_allowed_domain.assert_awaited_once_with(
+        domain="old.org", is_wildcard=False
+    )
+    # An ADMIN_TOKEN caller has no account to attribute the row to.
+    op_store.add_signup_allowed_domain.assert_awaited_once_with(
+        domain="mit.edu", is_wildcard=True, created_by=None
+    )
+    services.model_visibility_resolver.invalidate_cache.assert_called_once_with()
+    services.model_concurrency_resolver.invalidate_cache.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_restore_accepts_a_paused_batch_model_its_backup_exported(config_client) -> None:
+    """A cap of 0 pauses a model's batch work; a backup taken meanwhile holds it."""
+    client, _store, _audit = config_client
+    services = client._transport.app.state.services
+    services.batch_store = MagicMock()
+    services.batch_store.list_model_limits = AsyncMock(return_value={})
+    services.batch_store.set_model_limit = AsyncMock()
+
+    response = await client.post(
+        "/admin/config/restore",
+        headers=AUTH,
+        json={"schema_version": 1, "batch_model_limits": {"glm-4.6": 0}},
+    )
+
+    assert response.status_code == 200
+    services.batch_store.set_model_limit.assert_awaited_once_with(
+        "glm-4.6", 0, updated_by="admin-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_restore_applies_backup_and_preserves_locked_api_key_secret(config_client) -> None:
+    client, store, audit = config_client
+    store.has_api_keys = True
+    original_api_key_secret = store.rows["API_KEY_SECRET"].value
+
+    op_store = client._transport.app.state.services.operational_store
+    op_store.list_settings = AsyncMock(
+        return_value=[
+            {"key": "setup_completed_at", "value": "2026-10-01T00:00:00Z", "value_type": "str"},
+            {"key": "old_setting", "value": "stale", "value_type": "str"},
+        ]
+    )
+    op_store.delete_setting = AsyncMock()
+    op_store.set_setting = AsyncMock()
+
+    backup_payload = {
+        "schema_version": 1,
+        "app_config": [
+            {"key": "SITE_NAME", "value": "Restored Gateway", "secret": False, "source": "admin"},
+            {
+                "key": "API_KEY_SECRET",
+                "value": "different-backup-secret-that-must-not-break-keys",
+                "secret": True,
+                "source": "generated",
+            },
+            {
+                "key": "CHAT_UPSTREAM_KEY",
+                "value": "sk-restored-upstream",
+                "secret": True,
+                "source": "admin",
+            },
+        ],
+        "site_settings": [
+            {"key": "signup_enabled", "value": "true", "value_type": "bool"},
+        ],
+    }
+
+    response = await client.post("/admin/config/restore", headers=AUTH, json=backup_payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["immutable_keys_preserved"] == ["API_KEY_SECRET"]
+    assert store.rows["API_KEY_SECRET"].value == original_api_key_secret
+    assert store.rows["SITE_NAME"].value == "Restored Gateway"
+    assert store.rows["CHAT_UPSTREAM_KEY"].value == "sk-restored-upstream"
+
+    entries = _entries(body["config"])
+    assert entries["SITE_NAME"]["value"] == "Restored Gateway"
+    assert entries["CHAT_UPSTREAM_KEY"]["value"] is None
+    assert entries["CHAT_UPSTREAM_KEY"]["is_set"] is True
+
+    op_store.delete_setting.assert_awaited_once_with("old_setting")
+    op_store.set_setting.assert_awaited_once_with("signup_enabled", "true", "bool", "admin-token")
+    audit.assert_awaited_once()
+    assert audit.await_args.kwargs["action"] == "config.restore"
+    assert audit.await_args.kwargs["actor"].type == "admin_token"
+    assert audit.await_args.kwargs["actor"].id is None
+    assert audit.await_args.kwargs["target"] == AuditTarget("config", "backup")
+
+
+@pytest.mark.asyncio
+async def test_backup_leaves_out_the_retired_routewise_latency_threshold(config_client) -> None:
+    # routewise_latency_min_samples was removed; its rows may still be stored,
+    # and a backup taken while it existed must still restore.
+    client, _store, _audit = config_client
+    retired = [
+        {"key": "routewise_latency_min_samples", "value": "10", "value_type": "int"},
+        {
+            "key": "model_routewise_setting:routewise_latency_min_samples:chat",
+            "value": "4",
+            "value_type": "int",
+        },
+    ]
+    op_store = client._transport.app.state.services.operational_store
+    op_store.list_settings = AsyncMock(
+        return_value=[*retired, {"key": "signup_enabled", "value": "true", "value_type": "bool"}]
+    )
+    op_store.delete_setting = AsyncMock()
+    op_store.set_setting = AsyncMock()
+
+    exported = (await client.get("/admin/config/backup", headers=AUTH)).json()
+    assert [s["key"] for s in exported["site_settings"]] == ["signup_enabled"]
+
+    response = await client.post(
+        "/admin/config/restore",
+        headers=AUTH,
+        json={
+            "schema_version": 1,
+            "site_settings": [
+                *retired,
+                {"key": "signup_enabled", "value": "true", "value_type": "bool"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    op_store.set_setting.assert_awaited_once_with("signup_enabled", "true", "bool", "admin-token")
+    # The rows left behind are cleared rather than kept.
+    assert {call.args[0] for call in op_store.delete_setting.await_args_list} == {
+        row["key"] for row in retired
+    }
+
+
+@pytest.mark.asyncio
+async def test_restore_overwrites_generated_api_key_secret_when_no_user_keys_exist(
+    config_client,
+    monkeypatch,
+) -> None:
+    client, store, _audit = config_client
+    monkeypatch.delenv("API_KEY_SECRET", raising=False)
+    store.has_api_keys = False
+    store.rows["API_KEY_SECRET"] = row(
+        "API_KEY_SECRET",
+        "fresh-auto-generated-secret-00000000",
+        secret=True,
+        source="generated",
+    )
+
+    backup_payload = {
+        "schema_version": 1,
+        "app_config": [
+            {
+                "key": "API_KEY_SECRET",
+                "value": "migrated-api-key-secret-from-backup-12345",
+                "secret": True,
+                "source": "generated",
+            },
+        ],
+    }
+
+    response = await client.post("/admin/config/restore", headers=AUTH, json=backup_payload)
+
+    assert response.status_code == 200
+    assert response.json()["immutable_keys_preserved"] == []
+    assert store.rows["API_KEY_SECRET"].value == "migrated-api-key-secret-from-backup-12345"
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_invalid_payload_without_changing_store(config_client) -> None:
+    client, store, audit = config_client
+    before = dict(store.rows)
+
+    bad_payload = {
+        "schema_version": 1,
+        "app_config": [
+            {"key": "SMTP_PORT", "value": "not-an-int", "secret": False, "source": "admin"},
+        ],
+    }
+
+    response = await client.post("/admin/config/restore", headers=AUTH, json=bad_payload)
+
+    assert response.status_code == 400
+    assert "SMTP_PORT" in response.json()["detail"]
+    assert store.rows == before
+    audit.assert_not_awaited()
