@@ -1856,10 +1856,14 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             # never clear a claim after another operation has changed the
             # account state, and never turn an active account into a pending
             # hard-delete candidate.
+            # Clear the ownership timestamp too: a rolling-deploy replica
+            # that re-claims the released claim must not inherit a stale
+            # claimed_at and skip the recovery grace period.
             await conn.execute(
                 """
                 UPDATE users
-                SET hard_delete_pending = FALSE, hard_delete_claim_token = NULL
+                SET hard_delete_pending = FALSE, hard_delete_claim_token = NULL,
+                    hard_delete_claimed_at = NULL
                 WHERE id = $1
                   AND status = 'deleted'
                   AND hard_delete_pending = TRUE

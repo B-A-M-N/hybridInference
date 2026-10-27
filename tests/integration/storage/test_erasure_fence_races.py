@@ -1037,6 +1037,16 @@ async def test_failed_hard_delete_claim_can_be_released(fence_store):
     assert row["hard_delete_pending"] is False
     assert row["hard_delete_claim_token"] is None
 
+    # The release also clears the ownership timestamp: a rolling-deploy
+    # replica re-claiming after this point must serve the full recovery
+    # grace period, not inherit a stale claimed_at.
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT hard_delete_claimed_at FROM users WHERE id = $1",
+            _OWNER,
+        )
+    assert row["hard_delete_claimed_at"] is None
+
     # The guarded release must not clear a claim after the account changes
     # state. This keeps an active account out of the hard-delete state machine.
     async with pool.acquire() as conn:
