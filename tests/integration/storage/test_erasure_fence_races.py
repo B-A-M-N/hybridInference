@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 import pytest
 import pytest_asyncio
 
+from serving.audit import AuditActor
 from serving.exceptions import (
     HardDeleteRecoveryAvailable,
     HardDeleteStateChanged,
@@ -834,7 +835,6 @@ async def test_resume_endpoint_delete_wins_after_preflight_returns_conflict(
     from types import SimpleNamespace
 
     from fastapi import HTTPException
-    from starlette.requests import Request
 
     import serving.servers.routers.admin.users as admin_users
     from serving.schemas_admin import HardDeleteUserRequest, ResumeUserRequest
@@ -864,19 +864,14 @@ async def test_resume_endpoint_delete_wins_after_preflight_returns_conflict(
         "get_settings",
         lambda: SimpleNamespace(erasure_fence_protocol_ready=True),
     )
-    request_scope = {
-        "type": "http",
-        "headers": [],
-        "client": ("127.0.0.1", 12345),
-        "server": ("test", 80),
-        "scheme": "http",
-    }
     resume = asyncio.create_task(
         admin_users.resume_user(
-            Request(request_scope),
             _OWNER,
             ResumeUserRequest(reason="raced with hard delete"),
+            # The merged route carries the client IP through the audit actor
+            # (verify_admin_access records it from the request).
             admin_id="admin",
+            actor=AuditActor.admin("admin", "127.0.0.1"),
             op_store=PausingResumeStore(),
             log_store=log_store,
         )
@@ -887,10 +882,10 @@ async def test_resume_endpoint_delete_wins_after_preflight_returns_conflict(
         assert await log_store.account_has_erasure_fence(_OWNER) is False
 
         await admin_users.hard_delete_user(
-            Request(request_scope),
             _OWNER,
             HardDeleteUserRequest(confirm=True),
             admin_id="delete-admin",
+            actor=AuditActor.admin("delete-admin", "127.0.0.1"),
             op_store=op_store,
             log_store=log_store,
             response_store=ResponseStore(),
@@ -1452,8 +1447,6 @@ async def test_hard_delete_route_stops_after_claim_recovery_between_stages(
     """An old worker cannot enter Responses or operational deletion after takeover."""
     from types import SimpleNamespace
 
-    from starlette.requests import Request
-
     import serving.servers.routers.admin.users as admin_users
     from serving.schemas_admin import HardDeleteUserRequest
 
@@ -1490,21 +1483,12 @@ async def test_hard_delete_route_stops_after_claim_recovery_between_stages(
         "get_settings",
         lambda: SimpleNamespace(erasure_fence_protocol_ready=True),
     )
-    request = Request(
-        {
-            "type": "http",
-            "headers": [],
-            "client": ("127.0.0.1", 12345),
-            "server": ("test", 80),
-            "scheme": "http",
-        }
-    )
     original_worker = asyncio.create_task(
         admin_users.hard_delete_user(
-            request,
             _OWNER,
             HardDeleteUserRequest(confirm=True),
             admin_id="old-worker",
+            actor=AuditActor.admin("old-worker", "127.0.0.1"),
             op_store=op_store,
             log_store=PausingLogStore(),
             response_store=ResponseStore(),
@@ -1560,8 +1544,6 @@ async def test_hard_delete_route_cancellation_stops_before_the_next_stage(
     """Cancellation at any destructive boundary cannot enter the next store."""
     from types import SimpleNamespace
 
-    from starlette.requests import Request
-
     import serving.servers.routers.admin.users as admin_users
     from serving.schemas_admin import HardDeleteUserRequest
 
@@ -1611,21 +1593,12 @@ async def test_hard_delete_route_cancellation_stops_before_the_next_stage(
         "get_settings",
         lambda: SimpleNamespace(erasure_fence_protocol_ready=True),
     )
-    request = Request(
-        {
-            "type": "http",
-            "headers": [],
-            "client": ("127.0.0.1", 12345),
-            "server": ("test", 80),
-            "scheme": "http",
-        }
-    )
     worker = asyncio.create_task(
         admin_users.hard_delete_user(
-            request,
             _OWNER,
             HardDeleteUserRequest(confirm=True),
             admin_id="cancelled-worker",
+            actor=AuditActor.admin("cancelled-worker", "127.0.0.1"),
             op_store=op_store,
             log_store=PausingLogStore(),
             response_store=ResponseStore(),
@@ -1666,8 +1639,6 @@ async def test_log_store_error_after_fence_commit_retains_claim_and_stops(fence_
     """A post-commit error is ambiguous, so the route retains its claim."""
     from types import SimpleNamespace
 
-    from starlette.requests import Request
-
     import serving.servers.routers.admin.users as admin_users
     from serving.schemas_admin import HardDeleteUserRequest
 
@@ -1699,22 +1670,13 @@ async def test_log_store_error_after_fence_commit_retains_claim_and_stops(fence_
         "get_settings",
         lambda: SimpleNamespace(erasure_fence_protocol_ready=True),
     )
-    request = Request(
-        {
-            "type": "http",
-            "headers": [],
-            "client": ("127.0.0.1", 12345),
-            "server": ("test", 80),
-            "scheme": "http",
-        }
-    )
 
     with pytest.raises(RuntimeError, match="after the LogStore commit"):
         await admin_users.hard_delete_user(
-            request,
             _OWNER,
             HardDeleteUserRequest(confirm=True),
             admin_id="ambiguous-worker",
+            actor=AuditActor.admin("ambiguous-worker", "127.0.0.1"),
             op_store=op_store,
             log_store=CommitThenFailLogStore(),
             response_store=ResponseStore(),
@@ -1739,7 +1701,6 @@ async def test_status_reactivation_after_admin_read_blocks_hard_delete(fence_sto
     from types import SimpleNamespace
 
     from fastapi import HTTPException
-    from starlette.requests import Request
 
     import serving.servers.routers.admin.users as admin_users
     from serving.schemas_admin import HardDeleteUserRequest
@@ -1786,21 +1747,12 @@ async def test_status_reactivation_after_admin_read_blocks_hard_delete(fence_sto
         "get_settings",
         lambda: SimpleNamespace(erasure_fence_protocol_ready=True),
     )
-    request = Request(
-        {
-            "type": "http",
-            "headers": [],
-            "client": ("127.0.0.1", 12345),
-            "server": ("test", 80),
-            "scheme": "http",
-        }
-    )
     hard_delete = asyncio.create_task(
         admin_users.hard_delete_user(
-            request,
             _OWNER,
             HardDeleteUserRequest(confirm=True),
             admin_id="admin",
+            actor=AuditActor.admin("admin", "127.0.0.1"),
             op_store=PausingOperationalStore(),
             log_store=CountingLogStore(),
             response_store=ResponseStore(),
