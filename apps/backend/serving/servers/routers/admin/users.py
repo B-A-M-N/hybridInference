@@ -86,8 +86,12 @@ if TYPE_CHECKING:
 # The claim recovery grace period is one hour. Renew substantially sooner so
 # a slow destructive store operation cannot outlive its ownership lease.
 _HARD_DELETE_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 300.0
+# A transient database failure (failover, pool exhaustion on another writer)
+# must not abort a long purge: renew until the claim is close to losing its
+# lease, not for a fixed handful of attempts. The margin keeps the last
+# renewal's own latency safely inside the one-hour recovery grace.
+_HARD_DELETE_CLAIM_RENEW_UNTIL_SECONDS = 60.0 * 45.0
 _HARD_DELETE_CLAIM_HEARTBEAT_RETRY_SECONDS = 1.0
-_HARD_DELETE_CLAIM_HEARTBEAT_MAX_RETRIES = 3
 
 
 async def _run_hard_delete_stage_with_heartbeat(
@@ -103,12 +107,26 @@ async def _run_hard_delete_stage_with_heartbeat(
     the claim transaction. The heartbeat keeps recovery from treating a slow,
     healthy worker as abandoned. If ownership is superseded, cancel the stage
     before surfacing the fencing error.
+
+    Known assumption (not fully closable client-side): a stage that pauses for
+    longer than the one-hour recovery grace *between* its renewals -- a VM
+    pause or SIGSTOP of the whole process -- can still commit its LogStore
+    purge and fence afterwards, because only the renewal boundaries observe
+    the fence. The resume path's operator attestation is what guards this:
+    an operator confirming a stale-claim resume asserts the worker is really
+    gone, not merely past its lease.
     """
 
     async def _heartbeat() -> None:
         while True:
             await asyncio.sleep(_HARD_DELETE_CLAIM_HEARTBEAT_INTERVAL_SECONDS)
-            for attempt in range(_HARD_DELETE_CLAIM_HEARTBEAT_MAX_RETRIES + 1):
+            # Retry a transient renewal failure until the claim is close to
+            # losing its lease, not for a fixed handful of attempts: a purge
+            # aborted just after a database failover leaves the claim stuck
+            # for the whole one-hour recovery grace plus an operator action.
+            # An authoritative mismatch is never retried.
+            give_up_at = asyncio.get_running_loop().time() + _HARD_DELETE_CLAIM_RENEW_UNTIL_SECONDS
+            while True:
                 try:
                     await op_store.renew_hard_delete_user_claim(user_id, claim_token)
                 except HardDeleteStateChanged:
@@ -117,9 +135,9 @@ async def _run_hard_delete_stage_with_heartbeat(
                     # destructive boundary.
                     raise
                 except Exception as exc:
-                    if attempt >= _HARD_DELETE_CLAIM_HEARTBEAT_MAX_RETRIES:
+                    if asyncio.get_running_loop().time() >= give_up_at:
                         raise RuntimeError(
-                            "hard-delete claim renewal failed after bounded retries"
+                            "hard-delete claim renewal failed until within the lease margin"
                         ) from exc
                     await asyncio.sleep(_HARD_DELETE_CLAIM_HEARTBEAT_RETRY_SECONDS)
                 else:

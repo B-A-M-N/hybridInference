@@ -1736,6 +1736,70 @@ async def test_heartbeat_retries_transient_claim_renewal_errors(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_retries_until_the_lease_margin_not_a_fixed_count(monkeypatch):
+    """A purge must survive a long transient outage, not 3 one-second retries.
+
+    Renewal keeps trying until the claim is within the lease margin of losing
+    its one-hour recovery grace, then gives up loudly. A short outage (here,
+    the first two attempts) repairs invisibly; an outage longer than the
+    margin ends the stage with a Runtime error instead of silently losing the
+    lease.
+    """
+    attempts = 0
+    renewed = asyncio.Event()
+
+    class Store:
+        async def renew_hard_delete_user_claim(self, _user_id, _claim_token):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 100:
+                raise OSError("database is failovering")
+            renewed.set()
+
+    async def stage():
+        await renewed.wait()
+        return "committed"
+
+    monkeypatch.setattr(admin_users, "_HARD_DELETE_CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(admin_users, "_HARD_DELETE_CLAIM_HEARTBEAT_RETRY_SECONDS", 0)
+    result = await admin_users._run_hard_delete_stage_with_heartbeat(
+        stage(),
+        op_store=Store(),
+        user_id="u1",
+        claim_token="claim",
+    )
+
+    assert result == "committed"
+    assert attempts == 100
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_gives_up_at_the_lease_margin_with_a_loud_error(monkeypatch):
+    attempts = 0
+
+    class Store:
+        async def renew_hard_delete_user_claim(self, _user_id, _claim_token):
+            nonlocal attempts
+            attempts += 1
+            raise OSError("database is failovering")
+
+    async def stage():
+        await asyncio.Event().wait()  # never finishes
+
+    monkeypatch.setattr(admin_users, "_HARD_DELETE_CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(admin_users, "_HARD_DELETE_CLAIM_HEARTBEAT_RETRY_SECONDS", 0)
+    monkeypatch.setattr(admin_users, "_HARD_DELETE_CLAIM_RENEW_UNTIL_SECONDS", 0.05)
+    with pytest.raises(RuntimeError, match="lease margin"):
+        await admin_users._run_hard_delete_stage_with_heartbeat(
+            stage(),
+            op_store=Store(),
+            user_id="u1",
+            claim_token="claim",
+        )
+    assert attempts >= 2
+
+
+@pytest.mark.asyncio
 async def test_committed_stage_result_wins_over_simultaneous_heartbeat_error(monkeypatch):
     heartbeat_started = asyncio.Event()
     stage_finished = asyncio.Event()
