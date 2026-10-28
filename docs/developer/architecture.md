@@ -234,10 +234,6 @@ known strategies. Each strategy declares a Pydantic params model with
 `extra="forbid"`, so a typo in `router_params:` fails at boot instead of
 silently falling back to a default.
 
-`apps/backend/routing/executor.py` is a backward-compatibility shim that
-re-exports `FixedRouter` under its old name `RouteExecutor`. Edit
-`apps/backend/routing/routers.py` instead.
-
 ### Two layers of "strategy"
 
 Two different things are called a strategy:
@@ -459,13 +455,20 @@ The gateway reports through these; it has no Prometheus exporter:
   `/health/deep` adds per-endpoint availability and circuit state, and reports
   `degraded` when any endpoint is.
 - **Alerting.** `alert_slack()` and `alert_on_transition()` in
-  `apps/backend/serving/observability/alerts.py` post to a Slack webhook
-  (`SLACK_ALERTS_WEBHOOK_URL`). Thresholds come
+  `apps/backend/serving/observability/alerts.py` post through an `AlertSink` to
+  one Slack or WeCom webhook, selected in Admin Configuration. Channel changes
+  take effect after a restart. Thresholds come
   from the alert config resolved by the same `resolve_config_path()` chain; with
   no alert file present the built-in thresholds apply. The circuit breaker pages
   on `circuit_open` transitions and on upstream-credential rejections, with
   per-endpoint cooldowns so a persistent fault re-pages on a fixed cadence
   instead of flooding.
+- **Alert history** (on with a database; `ALERT_HISTORY_ENABLED=false` turns
+  it off). The same alert path records what it did
+  — breaches, recoveries, suppression decisions, deliveries and their results —
+  into PostgreSQL through a bounded buffer and one writer per process
+  (`serving/observability/alert_history/`). It never changes what is sent. See
+  [Alert history](alert-history.md).
 
 ## HTTP surface
 
@@ -475,11 +478,22 @@ Client-facing groups, all served by the same app:
 | --- | --- | --- |
 | OpenAI-compatible inference | `POST /v1/chat/completions`, `POST /v1/completions`, `POST /completion`, `POST /v1/embeddings`, `POST /v1/responses` | API key |
 | Anthropic-compatible inference | `POST /v1/messages`, `POST /anthropic/v1/messages`, `…/count_tokens` | API key |
+| [Batch inference](batches.md) | `POST` and `GET /v1/batches`, `GET` and `DELETE /v1/batches/{id}`, `POST /v1/batches/{id}/cancel`, `GET /v1/batches/{id}/results`, `GET /v1/batches/{id}/output.jsonl` (JSONL export) | API key; creating a batch needs the `BATCH_MIN_ROLE` role, `internal` by default |
+| [Batch files](batches.md#batches-from-a-file) | `POST` and `GET /v1/files`, `GET` and `DELETE /v1/files/{id}`, `GET /v1/files/{id}/content` | API key; uploading a file needs `BATCH_MIN_ROLE` |
+| [Message Batches](batches.md#anthropic-message-batches) | `POST` and `GET /v1/messages/batches`, `GET` and `DELETE …/{id}`, `POST …/{id}/cancel`, `GET …/{id}/results`; the same under `/anthropic` | API key; creating a batch needs `BATCH_MIN_ROLE` |
+| [Batch webhooks](batches.md#webhooks) | `GET`, `PUT` and `DELETE /v1/batch_webhook`, `GET /v1/batch_webhook/events` | API key; setting up or changing a webhook needs `BATCH_MIN_ROLE` |
 | Model catalog | `GET /v1/models`, `GET /models`, `GET /openrouter/models`, `GET /anthropic/v1/models` | Optional — a key only widens what is listed |
 | Health | `GET /health`, `/health/ready`, `/health/deep` | None |
 | Public routing disclosure | `GET /routing` | None |
 | Admin | `GET /admin/routing`, `GET /admin/stats` and the rest of `/admin/*` | Admin |
 | Accounts and console APIs | `/auth/*`, `/user/*`, `/site-config` | Mixed |
+
+`BATCH_ENABLED` controls all batch, file and webhook routes together; when it
+is off, even management and result routes answer `404`, and no queued request
+starts. With it on, all batch kinds are available. `BATCH_MIN_ROLE` controls
+creating batches, uploading files and setting up or changing a webhook. An
+owner whose role is lowered can still manage existing batches and files, read
+or delete their webhook, and receive its deliveries.
 
 ```{warning}
 `GET /routing` requires no authentication and returns each published route's

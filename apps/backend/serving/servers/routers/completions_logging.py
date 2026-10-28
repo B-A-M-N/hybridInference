@@ -35,24 +35,15 @@ class CompletionsLogger:
     cancel them mid-flight.
     """
 
-    def __init__(self, *, log_store: Any, model_router_registry: Any | None = None) -> None:
+    def __init__(self, *, log_store: Any) -> None:
         """Create a logger.
 
         Args:
             log_store: ``LogStore`` instance (Postgres).
                 ``None``-tolerant: ``schedule_log`` no-ops when this is
                 ``None``, so callers do not need to pre-gate.
-            model_router_registry: Accepted for backward-compat with
-                bootstrap; currently unused. ``build_db_params`` resolves
-                adapter configs via the ``get_adapter_config_for_provider``
-                closure passed in by the handler scope rather than via this
-                registry.
         """
         self._log_store = log_store
-        # NOTE: ``model_router_registry`` is intentionally not stored — the
-        # field was unused and ``build_db_params`` takes the lookup as an
-        # argument. Constructor still accepts the kwarg for API stability.
-        del model_router_registry
         self._background_tasks: set[asyncio.Task[Any]] = set()
 
     # -- DB log scheduling ---------------------------------------------------
@@ -121,7 +112,16 @@ class CompletionsLogger:
         provider (``None`` = unknown). It MUST NOT be synthesized: if the
         provider did not report usage, leave it as ``None``.
         """
+        provider, endpoint_id, strategy_metadata = _extract_observation_keys(routing)
+        terminal_key = endpoint_id or provider or "unknown"
         failed_attempts = _extract_failed_attempts(routing)
+        if not success and failed_attempts:
+            last_provider, last_endpoint = _extract_failed_attempt_keys(failed_attempts[-1])
+            if (last_endpoint or last_provider or "unknown") == terminal_key:
+                # The router lists the final attempt among the failed ones as
+                # well as naming it the endpoint: it is the terminal failure
+                # below, and reported twice it would count as two.
+                failed_attempts = failed_attempts[:-1]
         seen_failed_attempts: set[tuple[str, str | None, str | None]] = set()
         for attempt in failed_attempts:
             failed_provider, failed_endpoint = _extract_failed_attempt_keys(attempt)
@@ -151,10 +151,9 @@ class CompletionsLogger:
                 )
             )
 
-        provider, endpoint_id, strategy_metadata = _extract_observation_keys(routing)
         obs = RoutingObservation(
             model_id=model_id,
-            endpoint_id=endpoint_id or provider or "unknown",
+            endpoint_id=terminal_key,
             ttft_ms=ttft_ms,
             total_latency_ms=total_latency_ms,
             token_count=prompt_tokens + completion_tokens,

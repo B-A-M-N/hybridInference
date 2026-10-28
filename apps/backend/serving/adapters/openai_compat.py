@@ -6,7 +6,6 @@ import asyncio
 import json
 import time
 import uuid
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -217,7 +216,7 @@ async def _iter_with_idle_timeout(
             item = await asyncio.wait_for(source.__anext__(), idle_timeout)
         except StopAsyncIteration:
             return
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise UpstreamStreamIdleError(
                 idle_timeout, endpoint_id=endpoint_id, frames=frames
             ) from exc
@@ -717,11 +716,7 @@ class OpenAICompatAdapter(BaseAdapter):
         first_byte_timeout = get_stream_first_byte_timeout_seconds(self._usage_profile)
         if first_byte_timeout is None:
             return None
-        try:
-            return aiohttp.ClientTimeout(total=None, sock_read=first_byte_timeout)
-        except TypeError:
-            # Test doubles may expose a simplified ClientTimeout(total=...) shim.
-            return SimpleNamespace(total=None, sock_read=first_byte_timeout)
+        return aiohttp.ClientTimeout(total=None, sock_read=first_byte_timeout)
 
     def _format_passthrough_chunk(self, processed_chunk: dict[str, Any]) -> str:
         """Forward an upstream delta while normalizing model/role fields."""
@@ -790,8 +785,9 @@ class OpenAICompatAdapter(BaseAdapter):
 
         Buckets are per (provider label, key), so a pooled adapter must pass the
         key it just leased rather than the route's configured one — sibling keys
-        are usually separate accounts with separate allowances. Local inference
-        servers get an inert slot (see ``upstream_limiter.is_local_endpoint``).
+        are usually separate accounts with separate allowances. Self-hosted
+        engines instead use engine admission when a router requests a hold
+        (see ``upstream_limiter.is_local_endpoint``).
 
         Raises:
             UpstreamSaturated: no slot came free within the acquire timeout.
@@ -800,6 +796,7 @@ class OpenAICompatAdapter(BaseAdapter):
             self._key_pool_provider_label,
             api_key,
             base_url=self.config.base_url,
+            deployment_type=self.config.deployment_type,
         )
 
     async def _post_with_pool(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -845,7 +842,7 @@ class OpenAICompatAdapter(BaseAdapter):
                     timeout=aiohttp.ClientTimeout(total=_COMPLETION_TIMEOUT_S),
                     retries=1,
                 )
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            except (TimeoutError, aiohttp.ClientError) as e:
                 slot.release(
                     status_code=e.status if isinstance(e, aiohttp.ClientResponseError) else 0
                 )
@@ -920,7 +917,7 @@ class OpenAICompatAdapter(BaseAdapter):
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=_COMPLETION_TIMEOUT_S),
                 )
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            except (TimeoutError, aiohttp.ClientError) as e:
                 status = e.status if isinstance(e, aiohttp.ClientResponseError) else 0
                 slot.release(status_code=status)
                 outcome = self._key_pool.release(lease, status_code=status, tried=tried)
@@ -1137,7 +1134,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 )
                 last_error = e
                 continue
-            except (aiohttp.ClientError, asyncio.TimeoutError):
+            except (TimeoutError, aiohttp.ClientError):
                 # A non-status I/O failure may have arrived after the upstream
                 # returned 2xx and began streaming the body. ``http.stream_post``
                 # deliberately scopes its retry to the connect phase and lets
@@ -1557,8 +1554,17 @@ class OpenAICompatAdapter(BaseAdapter):
                         # than letting the loop fall out and report the missing
                         # terminator. Guarded on empty choices because a normal
                         # content chunk may legitimately carry a null `error`.
-                        if isinstance(data, dict) and data.get("error") and not raw_choices:
-                            error = data["error"]
+                        # OpenRouter's mid-stream error keeps its choices and
+                        # marks them ``finish_reason: "error"``: a failure, never
+                        # a finish, with or without the error object beside it.
+                        errored = isinstance(raw_choices, list) and any(
+                            isinstance(choice, dict) and choice.get("finish_reason") == "error"
+                            for choice in raw_choices
+                        )
+                        if isinstance(data, dict) and (
+                            (data.get("error") and not raw_choices) or errored
+                        ):
+                            error = data.get("error")
                             raise UpstreamStreamError(
                                 _stream_error_message(error),
                                 _stream_error_status(error),
@@ -1610,7 +1616,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 },
             )
             raise
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             # A socket-level read timeout, i.e. the optional first-byte budget.
             # It used to be swallowed here and the stream capped with a normal
             # flush + [DONE], which handed the caller a truncated answer dressed
@@ -1650,8 +1656,9 @@ class OpenAICompatAdapter(BaseAdapter):
             if abandoned:
                 slot_status = release_status = None
             elif stream_error:
-                slot_status = 0
-                release_status = stream_error_status if stream_error_status else 0
+                # An error frame's own status, so a 429 one shrinks the AIMD
+                # limit as a 429 response would; 0 for everything statusless.
+                slot_status = release_status = stream_error_status if stream_error_status else 0
             else:
                 slot_status = release_status = 200
             if active_slot is not None:

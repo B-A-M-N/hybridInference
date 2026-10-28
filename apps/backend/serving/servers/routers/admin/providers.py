@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from routing.endpoints import endpoint_id_for_adapter
 from serving.admin.provider_quotas import gather_all
+from serving.audit import AuditActor, AuditTarget
 from serving.config.provider_labels import resolve_display_names
 from serving.schemas_admin import (
     AdminProviderQuotasResponse,
@@ -31,6 +32,7 @@ from serving.schemas_admin import (
 )
 from serving.servers.auth import log_admin_action
 from serving.servers.deps import (
+    get_admin_audit_actor,
     get_db_logger,
     get_operational_store,
     get_services,
@@ -38,7 +40,6 @@ from serving.servers.deps import (
 )
 from serving.servers.routers.admin._common import _require_aware_utc, _truncate_hour
 from serving.servers.routewise_rebuild import rebuild_routewise_routers
-from serving.utils.request_ip import get_client_ip
 
 router = APIRouter(prefix="/admin")
 
@@ -140,7 +141,7 @@ async def admin_provider_quotas(
     for provider in providers:
         provider.disabled = provider.name in disabled
     return AdminProviderQuotasResponse(
-        generated_at=datetime.now(timezone.utc),
+        generated_at=datetime.now(UTC),
         providers=providers,
     )
 
@@ -178,10 +179,10 @@ async def admin_list_routable_providers(
     response_model=SetProviderDisabledResponse,
 )
 async def admin_set_provider_disabled(
-    request: Request,
     provider: str,
     payload: SetProviderDisabledRequest,
     admin_id: str = Depends(verify_admin_access),
+    actor: AuditActor = Depends(get_admin_audit_actor),
     op_store=Depends(get_operational_store),
     services=Depends(get_services),
 ) -> SetProviderDisabledResponse:
@@ -210,12 +211,13 @@ async def admin_set_provider_disabled(
 
     rebuild_routewise_routers(services)
 
+    # The provider is the target; it is not a user, so target_user_id stays NULL.
     await log_admin_action(
         op_store,
-        get_client_ip(request),
-        "providers.disabled.update",
-        provider,
-        {"provider": provider, "disabled": payload.disabled},
+        action="providers.disabled.update",
+        details={"provider": provider, "disabled": payload.disabled},
+        actor=actor,
+        target=AuditTarget.provider(provider),
     )
 
     return SetProviderDisabledResponse(
@@ -254,7 +256,7 @@ async def admin_provider_stats(
     if not db_logger or not db_logger.pool:
         raise HTTPException(status_code=503, detail="database unavailable")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if to is not None:
         to = _require_aware_utc(to, "to")
     if from_ is not None:
@@ -386,7 +388,7 @@ async def admin_provider_observability(
     if not _is_reportable_performance_provider(provider):
         raise HTTPException(status_code=400, detail="provider must be an upstream provider")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if to is not None:
         to = _require_aware_utc(to, "to")
     if from_ is not None:
@@ -565,7 +567,7 @@ async def admin_provider_observability(
 
 
 # ============================================================
-# Token Usage tab — per (provider, model_id) totals over a fixed-window
+# Analytics → Overview: token totals per (provider, model_id) over a fixed-window
 # selector (1h | 24h | 7d | 30d). Reads pre-aggregated rows from
 # provider_hourly_stats; no scan of api_logs.
 # ============================================================
@@ -598,7 +600,7 @@ async def admin_provider_token_usage(
     # hour HH has not been written yet. Subtract one hour from `end` in
     # that window so we don't undercount and so `refreshed_at` reflects
     # the most recent bucket guaranteed to exist.
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     end = _truncate_hour(now)
     if now.minute < _ROLLUP_MINUTE_OFFSET:
         end = end - timedelta(hours=1)

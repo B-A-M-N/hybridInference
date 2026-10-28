@@ -49,6 +49,7 @@ from serving.auto_mode import (
     session_key,
     strip_foreign_thinking,
 )
+from serving.batch.attempts import batch_log_attribution, note_request_id, observe_billing
 from serving.config.app_config import config_value, on_change
 from serving.exceptions import (
     conceal_served_model,
@@ -58,7 +59,7 @@ from serving.exceptions import (
     scrub_error_for_user,
 )
 from serving.grant_auth import ledger_attribution
-from serving.model_access import model_access_denial
+from serving.model_access import model_access_denial, route_canonical_model_id
 from serving.observability.rejection_log import log_rejection
 from serving.observability.tracked_tasks import tracked_task
 from serving.pricing import effective_pricing, require_source_pricing
@@ -67,7 +68,7 @@ from serving.servers.auth import (
     verify_api_key,
     verify_api_key_for_balance,
 )
-from serving.servers.concurrency import enforce_user_concurrency
+from serving.servers.concurrency import enforce_user_concurrency, retarget_interactive_load
 from serving.servers.deps import (
     get_log_store,
     get_model_visibility_resolver,
@@ -350,6 +351,37 @@ def _validation_field_paths(errors: list[Any] | None) -> list[str]:
     return paths
 
 
+#: The validation error the request was raised with, when ``exc.errors()`` is
+#: what fails. FastAPI keeps it in ``_errors``; naming the attribute keeps this
+#: out of text rendering, which is where the submitted values are.
+_RAW_ERRORS_ATTR = "_errors"
+
+
+def _unrenderable_validation_detail(exc: RequestValidationError, failure: str | None) -> str:
+    """Describe a validation error whose ``errors()`` could not be rendered.
+
+    The log used to say only "Invalid request" in this case, and before the
+    redaction it said ``str(exc)`` — which carried the caller's payload. This
+    keeps the diagnostic value without that: the exception type that broke the
+    rendering and, when they can still be read, the ``loc`` paths of the
+    entries. ``_validation_field_paths`` reads only ``loc``, so no submitted
+    value can reach this string.
+    """
+    if failure is None:
+        return "Invalid request"
+    detail = f"Invalid request (validation errors unrenderable: {failure})"
+    try:
+        raw = getattr(exc, _RAW_ERRORS_ATTR, None)
+        fields = _validation_field_paths(raw if isinstance(raw, list) else None)
+    except Exception:
+        # Reading them can fail the same way rendering them did. The exception
+        # type is already in the line; that is enough.
+        fields = []
+    if fields:
+        detail += f"; fields: {', '.join(fields)}"
+    return detail
+
+
 async def anthropic_aware_validation_exception_handler(
     request: Request, exc: RequestValidationError
 ):
@@ -378,8 +410,9 @@ async def anthropic_aware_validation_exception_handler(
     The status is unchanged at 422 -- same as FastAPI's default -- and the
     correlation id still rides on the ``X-Request-ID`` response header, so a
     client that reports "I got a 422, here is the id" is still supportable. The
-    full validation detail, ``input`` included, goes to the log except on
-    phone-auth routes, where submitted OTPs and phone numbers are omitted.
+    validation type, field path and message reach the log, without submitted
+    ``input`` or validator ``ctx`` on any route. Credentials may occur in a
+    valid field of an otherwise invalid body, including a missing-field error.
 
     Registered on the Anthropic-aware pair in ``create_app`` alongside the
     HTTPException handler, so the Anthropic surfaces keep their own envelope
@@ -388,28 +421,32 @@ async def anthropic_aware_validation_exception_handler(
     rides in ``message`` rather than in a sibling key: ``ErrorDetail`` drops
     unknown fields and the Anthropic envelope has nowhere to put one.
     """
+    errors: list[Any] | None
+    errors_failure: str | None = None
     try:
-        errors: list[Any] | None = exc.errors()
-    except Exception:
+        errors = exc.errors()
+    except Exception as render_exc:
         # .errors() can itself raise on exotic payloads (a ctx value pydantic
         # cannot render). Answering the request matters more than the log line,
-        # and a body with no field list is still a correct 422.
+        # and a body with no field list is still a correct 422. The log must not
+        # become empty, though: record the exception *type* and the field paths
+        # the exception itself carries, never its text, because the text (and
+        # the payload it was rendered from) can hold submitted values.
         errors = None
-    if request.url.path.startswith("/auth/phone/"):
-        # A missing signup field carries the whole body in ``input``, including
-        # a valid OTP. Keep diagnostics without retaining that credential.
-        detail = (
-            str(
-                [
-                    {key: error[key] for key in ("type", "loc", "msg") if key in error}
-                    for error in errors
-                ]
-            )
-            if errors is not None
-            else "Invalid phone authentication request"
+        errors_failure = type(render_exc).__name__
+    # Missing-field errors contain the entire body in ``input``. Do not rely
+    # on route names to identify credentials: mounts and future endpoints
+    # must receive the same protection. ``ctx`` can carry submitted values too.
+    detail = (
+        str(
+            [
+                {key: error[key] for key in ("type", "loc", "msg") if key in error}
+                for error in errors
+            ]
         )
-    else:
-        detail = str(errors) if errors is not None else str(exc)
+        if errors is not None
+        else _unrenderable_validation_detail(exc, errors_failure)
+    )
     logger.warning(
         "request_validation_error",
         extra={
@@ -509,6 +546,21 @@ def _pick_dispatch_adapter(
     prompt over its max input may not be sent (``eligible_adapters``).
     """
     eligible = router_exec.eligible_adapters(canonical, size_prompt=size_prompt)
+    requirement = req_ctx.get().get(req_ctx.BATCH_EXECUTION)
+    if requirement is not None and eligible:
+        # A batch item may only go to an adapter that serves it as written
+        # (serving/batch/targets.py): never one that would drop a parameter.
+        eligible = [entry for entry in eligible if requirement.problem(entry[0]) is None]
+        if not eligible:
+            route = router_exec.routes.get(canonical)
+            capable = route is not None and any(
+                requirement.problem(entry[0]) is None for entry in route.adapters
+            )
+            if not capable:
+                raise HTTPException(
+                    400, f"Model '{model_id}' cannot serve this batch request as written"
+                )
+            raise HTTPException(503, f"No provider is currently available for model '{model_id}'")
     if not eligible:
         # Every provider for this model is admin-disabled, has an open circuit,
         # or is already being probed. Same disposition the chat path gives
@@ -728,6 +780,9 @@ async def _maybe_reroute_small_reasoning_call(
     Any failure to resolve the target leaves everything unchanged.
     """
     max_tokens = body.get("max_tokens")
+    if req_ctx.get().get(req_ctx.BATCH_EXECUTION) is not None:
+        # A batch item runs on the model it was admitted for, never another.
+        return canonical, route, adapter
     # Cheap, in-memory gates first (so ordinary traffic never reads the toggle):
     # only tiny budgets, aimed at a reasoning model, that are NOT tool-safety
     # checks. Safety verdicts are always left on the caller's chosen model.
@@ -1045,6 +1100,13 @@ def _schedule_log_store_task(
     # billed, matching the chat/embedding paths.
     if status_code == 200:
         _schedule_messages_cost_increment(op_store, user_id, usage_for_cost, pricing)
+        # What this request is charged, for a batch attempt watching it; the
+        # same inputs as the increment above. Unpriced reads as unknown.
+        observe_billing(
+            cost_usd=calculate_cost(usage_for_cost, pricing) if pricing else None,
+            usage=usage_for_cost,
+            request_id=request_id,
+        )
 
 
 # --- Endpoint health recording ---------------------------------------------
@@ -1420,7 +1482,10 @@ def _parse_sse_chunk(buffer: bytes, raw: bytes) -> tuple[list[tuple[str, str]], 
             continue
         event_type = ""
         data_lines: list[str] = []
-        for line in block.splitlines():
+        # LF, not ``str.splitlines``: that also breaks on U+2028, U+2029 and
+        # U+0085, which JSON carries raw inside strings. A CRLF line keeps its
+        # CR here, and the strip below removes it.
+        for line in block.split("\n"):
             if line.startswith("event:"):
                 event_type = line[len("event:") :].strip()
             elif line.startswith("data:"):
@@ -1431,6 +1496,27 @@ def _parse_sse_chunk(buffer: bytes, raw: bytes) -> tuple[list[tuple[str, str]], 
     if len(leftover) > _SSE_LEFTOVER_CAP:
         leftover = b""
     return events, leftover
+
+
+def _shape_error(body: dict[str, Any]) -> str | None:
+    """Name a field whose JSON type the dispatch cannot take, or return None.
+
+    Preparing the dispatch reads ``messages`` as a list of objects and
+    ``metadata`` as an object, after the endpoint's dispatch claim is taken.
+    Anything else raised ``AttributeError`` there: a 500 for the client's
+    mistake, and on a half-open endpoint a probe claim held until it timed out.
+    Checked with the required fields instead, so it is a 400 before any claim.
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return "Invalid field: messages must be an array"
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            return f"Invalid field: messages[{index}] must be an object"
+    metadata = body.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return "Invalid field: metadata must be an object"
+    return None
 
 
 # --- Route handler ---------------------------------------------------------
@@ -1450,6 +1536,8 @@ async def anthropic_messages(
     """Handle Anthropic Messages API requests (non-streaming)."""
     request_id = f"amsg_{int(time.time() * 1_000_000)}"
     start = time.time()
+    # The log row's id, for a batch attempt running this request.
+    note_request_id(request_id)
 
     # Per-caller identity for multi-key rotation, published before any dispatch.
     # Pinned to the specific hyi-xxx key in use (not user_id — a user may hold
@@ -1475,14 +1563,19 @@ async def anthropic_messages(
         body = await request.json()
     except Exception:
         return _anthropic_error(400, "Invalid JSON in request body")
+    if not isinstance(body, dict):
+        return _anthropic_error(400, "Request body must be a JSON object")
 
     model_id = body.get("model")
     if not model_id:
         return _anthropic_error(400, "Missing required field: model")
     if "messages" not in body:
         return _anthropic_error(400, "Missing required field: messages")
-    if "max_tokens" not in body:
+    if body.get("max_tokens") is None:
         return _anthropic_error(400, "Missing required field: max_tokens")
+    shape_error = _shape_error(body)
+    if shape_error is not None:
+        return _anthropic_error(400, shape_error)
 
     # Before dispatch, so this covers the native passthrough as well as the
     # translated path. A native Anthropic upstream is forwarded this body
@@ -1640,6 +1733,11 @@ async def anthropic_messages(
     if auto_selection is not None and reroute_info is not None:
         # The reroute's target serves the request now; keep it from the caller too.
         hide_served_model(auto_selection, *(entry[0].config for entry in _route.adapters))
+
+    # Auto selection (and the small-budget reroute above) happen after the
+    # concurrency dependency admitted the virtual model. Count the request on
+    # the final concrete canonical model for the remainder of its lifetime.
+    retarget_interactive_load(request, route_canonical_model_id(_route, canonical))
 
     forwarded_headers = _extract_forwarded_headers(request)
 
@@ -1808,6 +1906,8 @@ async def anthropic_messages(
     # spend unattributed — and the per-job budget reads this same ledger.
     if user_ctx.get("agent_job_id"):
         metadata["agent_job_id"] = user_ctx["agent_job_id"]
+    # Batch attribution (serving/batch/dispatch.py); nothing for other traffic.
+    metadata.update(batch_log_attribution(user_ctx))
     # The usage window query needs the grant itself and the real start time;
     # ``ledger_attribution`` says why the insert timestamp is not enough.
     metadata.update(ledger_attribution(user_ctx, started_at=start))
@@ -1933,7 +2033,7 @@ async def anthropic_messages(
                             item = await asyncio.wait_for(
                                 chunk_queue.get(), timeout=_KEEPALIVE_INTERVAL
                             )
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             idle_seconds += _KEEPALIVE_INTERVAL
                             # Prefill before the first frame, decode after it.
                             idle_ceiling = (
@@ -2081,8 +2181,9 @@ async def anthropic_messages(
                 stream_error_message = scrub_error_for_user(None, request_id, 429)
                 stream_error_operator = operator_safe_error(exc)
                 logger.warning(f"[{request_id}] Streaming dispatch failed: key pool exhausted")
-                # Carries no HTTP status, so it is never exempt: every key for
-                # this endpoint is muted and nothing it is sent can succeed.
+                # The registry filters this pre-dispatch refusal out of the
+                # breaker and emits key_pool_exhausted_skip_breaker; nothing was
+                # sent upstream.
                 _record_dispatch_failure(
                     dispatch_endpoint_id,
                     reason="messages_stream_exception",
@@ -2237,7 +2338,7 @@ async def anthropic_messages(
         # ``exc=`` throughout: HTTPException/ClientResponseError carry a status,
         # and the registry drops 4xx client errors on that basis so one caller's
         # malformed request cannot open the circuit for everyone. The
-        # status-less failures below (key pool, timeout) are never exempt.
+        # status-less key-pool refusals below are breaker-exempt; timeouts are not.
         _record_dispatch_failure(
             dispatch_endpoint_id,
             reason="messages_exception",
@@ -2351,7 +2452,7 @@ async def anthropic_messages(
             operator_error=operator_safe_error(exc),
         )
         return _anthropic_error(429, error_message, headers={"retry-after": "1"})
-    except (TimeoutError, asyncio.TimeoutError) as exc:
+    except TimeoutError as exc:
         # Upstream exceeded the (generous) completion timeout. Surface a 504
         # gateway-timeout rather than a generic 502 "Internal server error" so
         # the client can tell a slow upstream from a real server fault.
@@ -2479,6 +2580,8 @@ async def anthropic_count_tokens(
         body = await request.json()
     except Exception:
         return _anthropic_error(400, "Invalid JSON in request body")
+    if not isinstance(body, dict):
+        return _anthropic_error(400, "Request body must be a JSON object")
 
     model_id = body.get("model")
     if not model_id:

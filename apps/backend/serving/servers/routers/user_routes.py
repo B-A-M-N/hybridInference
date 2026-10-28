@@ -3,7 +3,7 @@
 import json
 import time
 from collections import OrderedDict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
+from serving.audit import AuditTarget
 from serving.exceptions import (
     UserNotFoundError,
     generic_message_for_status,
@@ -59,6 +60,7 @@ from serving.servers.deps import (
     get_model_visibility_resolver,
     get_operational_store,
     get_router,
+    user_audit_actor,
 )
 from serving.servers.routers.models import _build_model_list_async
 from serving.servers.routers.reauth import confirm_account_owner
@@ -67,7 +69,6 @@ from serving.utils import password as password_utils
 from serving.utils.email import is_email_enabled, send_password_changed_email
 from serving.utils.logging import get_logger
 from serving.utils.phone_auth import phone_identity_unverified
-from serving.utils.request_ip import get_client_ip
 
 router = APIRouter(prefix="/user", tags=["User Dashboard"])
 logger = get_logger(__name__)
@@ -154,7 +155,7 @@ async def _get_cached_user_request_count(conn: Any, user_id: str, model_id: str 
 
 def _get_daily_quota_reset_at() -> datetime:
     """Return the next daily quota reset timestamp."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
@@ -204,8 +205,8 @@ def _extract_locale_preference(preferences: dict[str, Any]) -> LocalePreference 
 def _as_utc(moment: datetime) -> datetime:
     """Return *moment* as an aware UTC datetime; a naive one is taken as UTC."""
     if moment.tzinfo is None:
-        return moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc)
+        return moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC)
 
 
 def _iso_utc(moment: datetime) -> str:
@@ -406,7 +407,7 @@ async def update_locale_preference(
         raise HTTPException(status_code=500, detail="Database not available")
 
     user_id = current_user["user_id"]
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     chosen_at = now if body.chosen_at is None else min(_as_utc(body.chosen_at), now)
     choice = LocalePreference(value=body.locale, chosen_at=chosen_at)
     value = {"value": choice.value, "chosen_at": _iso_utc(chosen_at)}
@@ -489,20 +490,20 @@ async def create_api_key(
     logger.info(f"API key created for user: {current_user['user_id']}")
     await log_admin_action(
         db_logger,
-        get_client_ip(request),
-        "create_key",
-        current_user["user_id"],
-        {
+        action="create_key",
+        details={
             "actor": "user",
             "key_prefix": key_prefix,
         },
+        actor=user_audit_actor(request, current_user),
+        target=AuditTarget.user(current_user["user_id"]),
     )
 
     return APIKeyResponse(
         api_key=api_key,
         key_prefix=key_prefix,
         warning="Save this API key now. It will not be shown again.",
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
     )
 
 
@@ -657,10 +658,10 @@ async def delete_api_key(
     if response and audit_action:
         await log_admin_action(
             db_logger,
-            get_client_ip(request),
-            audit_action,
-            current_user["user_id"],
-            audit_details,
+            action=audit_action,
+            details=audit_details,
+            actor=user_audit_actor(request, current_user),
+            target=AuditTarget.user(current_user["user_id"]),
         )
         # Both branches write api_keys directly, bypassing
         # CachedOperationalStore, so the auth cache is evicted here rather than
@@ -722,14 +723,14 @@ async def regenerate_api_key(
     logger.info(f"API key regenerated for user: {current_user['user_id']}")
     await log_admin_action(
         db_logger,
-        get_client_ip(request),
-        "regenerate_key",
-        current_user["user_id"],
-        {
+        action="regenerate_key",
+        details={
             "actor": "user",
             "old_key_prefix": old_key_row["key_prefix"],
             "new_key_prefix": key_prefix,
         },
+        actor=user_audit_actor(request, current_user),
+        target=AuditTarget.user(current_user["user_id"]),
     )
 
     return APIKeyRegenerateResponse(
@@ -756,15 +757,20 @@ async def get_usage(
         raise HTTPException(status_code=500, detail="Database not available")
 
     # Resolve per-user concurrency cap (applies regardless of API-key state).
-    try:
-        rt = get_runtime_settings_instance()
-    except RuntimeError:
-        rt = None
-    max_concurrency = await get_user_concurrency_for_role(
-        current_user.get("role") or "free",
-        rt,
-        is_admin=bool(current_user.get("is_admin", False)),
-    )
+    # A per-user override wins over the role's cap, as in
+    # ``UserConcurrencyLimiter.try_acquire``, so the dashboard shows the cap
+    # the limiter enforces.
+    max_concurrency = current_user.get("max_concurrent_requests")
+    if max_concurrency is None:
+        try:
+            rt = get_runtime_settings_instance()
+        except RuntimeError:
+            rt = None
+        max_concurrency = await get_user_concurrency_for_role(
+            current_user.get("role") or "free",
+            rt,
+            is_admin=bool(current_user.get("is_admin", False)),
+        )
 
     # Get user's quota
     key_row = await op_store.get_active_key_by_account(current_user["user_id"])
@@ -953,6 +959,8 @@ async def change_password(
     revoked = await op_store.revoke_user_sessions(
         current_user["user_id"], except_sid=current_user.get("sid")
     )
+    # So does an outstanding reset link: another way back in.
+    await op_store.delete_user_reset_tokens(current_user["user_id"])
 
     if user_row.get("email") and user_row.get("email_verified") and is_email_enabled():
         background_tasks.add_task(

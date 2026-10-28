@@ -26,7 +26,7 @@ from routing.policies import FixedPolicy
 from routing.prefill_load import PrefillLoadTracker
 from routing.protocols import RoutingRequestOptions
 from routing.routers import AllCircuitsOpenError, FixedRouter
-from serving.adapters.base import BaseAdapter, ModelConfig
+from serving.adapters.base import BaseAdapter, DeploymentType, ModelConfig
 from serving.config.offload_routes import AppliedOffloadPolicies
 from serving.servers.hybrid_composition import HybridFixedRouterFactory, local_endpoint_scope
 
@@ -94,6 +94,7 @@ def _adapter(
     *,
     provider: str,
     base_url: str,
+    deployment_type: DeploymentType = "auto",
     chat_error: BaseException | None = None,
     stream_chunks: tuple[str, ...] = (),
     stream_error: BaseException | None = None,
@@ -103,6 +104,7 @@ def _adapter(
         name=_MODEL_ID,
         provider=provider,
         base_url=base_url,
+        deployment_type=deployment_type,
         endpoint_id=endpoint_id,
         pricing={"prompt": "1", "completion": "1"},
         input_modalities=["text"],
@@ -156,6 +158,33 @@ def test_local_endpoint_scope_uses_the_gateway_locality_predicate() -> None:
 
 
 @pytest.mark.unit
+def test_explicit_deployment_defines_scope_without_changing_endpoint_ids() -> None:
+    engine = _adapter(
+        "compose-model:engine-api",
+        provider="openai_compat",
+        base_url="http://inference.svc:8000/v1",
+        deployment_type="self_hosted",
+    )
+    proxy = _adapter(
+        "compose-model:local-9000",
+        provider="openai_compat",
+        base_url="http://localhost:9000/v1",
+        deployment_type="provider_api",
+    )
+    shared = _shared_router(engine, proxy)
+    assert local_endpoint_scope(shared, _MODEL_ID) == frozenset({"compose-model:engine-api"})
+
+    router = _registry(shared).get_router(_MODEL_ID)
+    assert isinstance(router, HybridRouter)
+    backends = {name: router.backend(name) for name in ("local", "cloud")}
+    assert backends["local"].endpoint_scope == frozenset({"compose-model:engine-api"})
+    assert backends["cloud"].endpoint_scope == frozenset({"compose-model:local-9000"})
+
+    # An explicitly supplied deployment resolver still owns the composition split.
+    assert local_endpoint_scope(shared, _MODEL_ID, is_local=lambda _cfg, _id: False) == frozenset()
+
+
+@pytest.mark.unit
 def test_registry_builds_a_hybrid_router_for_a_mixed_model() -> None:
     local = _adapter(_LOCAL_ENDPOINT, provider="local", base_url=_LOCAL_URL)
     remote = _adapter(_CLOUD_ENDPOINT, provider="zai", base_url="https://api.zai.example/v1")
@@ -164,7 +193,7 @@ def test_registry_builds_a_hybrid_router_for_a_mixed_model() -> None:
 
     assert isinstance(router, HybridRouter)
     assert isinstance(router.policy, FixedPolicy)
-    backends = {backend.name: backend for backend in router.backends()}
+    backends = {name: router.backend(name) for name in ("local", "cloud")}
     assert isinstance(backends["local"], LocalBackend)
     assert isinstance(backends["cloud"], FixedCloudBackend)
     assert backends["local"].endpoint_scope == frozenset({_LOCAL_ENDPOINT})

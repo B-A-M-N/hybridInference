@@ -2,8 +2,15 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { useConfirmAction } from '@/components/features/admin/confirm/useConfirmAction';
 import { AlertSnoozeStatus, clearAlertSnooze, getAlertSnooze, snoozeAlerts } from '@/lib/api/admin';
 import { getErrorMessage } from '@/lib/utils/errors';
+import {
+  AdminLoading,
+  AdminNotice,
+  AdminSection,
+} from '@/components/features/admin/AdminPrimitives';
+import { BUTTON_PRIMARY, BUTTON_SECONDARY, PANEL } from '@/components/features/admin/adminStyles';
 
 const DURATIONS: { label: string; seconds: number }[] = [
   { label: '30m', seconds: 30 * 60 },
@@ -39,7 +46,8 @@ export function AlertSnoozeSection({ onToast }: AlertSnoozeSectionProps) {
   const [status, setStatus] = useState<AlertSnoozeStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const writes = useConfirmAction();
+  const busy = writes.busy;
 
   // A reload in flight when this section goes away — a tab switch, or a test
   // environment tearing down — would otherwise land its setState on an
@@ -86,55 +94,42 @@ export function AlertSnoozeSection({ onToast }: AlertSnoozeSectionProps) {
     return () => clearInterval(id);
   }, [status?.snoozed, status?.snooze_until, load]);
 
-  const onSnooze = async (seconds: number, label: string) => {
-    setBusy(true);
-    try {
-      setStatus(await snoozeAlerts(seconds));
-      onToast(`Slack alerts snoozed for ${label}`);
-    } catch (e) {
-      onToast(`Failed to snooze alerts: ${getErrorMessage(e)}`);
-    } finally {
-      setBusy(false);
-    }
+  // Both act on the click, as each undoes the other; a failure shows above the controls.
+  const apply = async (run: () => Promise<void>) => {
+    setError(null);
+    const failure = await writes.perform({ run });
+    if (failure) setError(failure);
   };
 
-  const onResume = async () => {
-    setBusy(true);
-    try {
+  const onSnooze = (seconds: number, label: string) =>
+    void apply(async () => {
+      setStatus(await snoozeAlerts(seconds));
+      onToast(`Alert notifications snoozed for ${label}`);
+    });
+
+  const onResume = () =>
+    void apply(async () => {
       setStatus(await clearAlertSnooze());
-      onToast('Slack alerts resumed');
-    } catch (e) {
-      onToast(`Failed to resume alerts: ${getErrorMessage(e)}`);
-    } finally {
-      setBusy(false);
-    }
-  };
+      onToast('Alert notifications resumed');
+    });
 
   const snoozed = !!status?.snoozed;
 
   return (
-    <div className="rounded-xl border border-gray-200 bg-white p-5">
-      <div className="mb-3">
-        <h2 className="text-[14px] font-semibold text-gray-900">Slack Alerts</h2>
-        <p className="mt-1 text-[12px] text-gray-500">
-          Temporarily mute all outgoing Slack alerts (e.g. during maintenance or a known incident).
-          Alerting resumes automatically when the snooze elapses.
-        </p>
-      </div>
-
+    <AdminSection
+      title="Alert Notifications"
+      description="Temporarily mute all outgoing backend alert notifications (e.g. during maintenance or a known incident). Alerting resumes automatically when the snooze elapses."
+    >
       {error && (
-        <div className="mb-3 rounded-lg bg-red-50 px-3 py-2 text-[12px] text-red-600">
-          {error}{' '}
-          <button onClick={() => setError(null)} className="ml-2 font-bold">
-            &times;
-          </button>
+        <div className="mb-3">
+          <AdminNotice onDismiss={() => setError(null)}>{error}</AdminNotice>
         </div>
       )}
 
       {loading ? (
-        <div className="py-8 text-center text-[13px] text-gray-400">Loading...</div>
+        <AdminLoading size="sm" />
       ) : (
-        <div className="space-y-4">
+        <div className={`${PANEL} space-y-3 px-4 py-3`}>
           <div className="flex items-center gap-2">
             <span
               className={`inline-block h-2.5 w-2.5 rounded-full ${
@@ -161,24 +156,19 @@ export function AlertSnoozeSection({ onToast }: AlertSnoozeSectionProps) {
                 type="button"
                 disabled={busy}
                 onClick={() => onSnooze(d.seconds, d.label)}
-                className="rounded-md border border-gray-300 bg-white px-3 py-1 text-[12px] font-medium text-gray-700 transition hover:bg-gray-50 disabled:opacity-40"
+                className={BUTTON_SECONDARY}
               >
                 {d.label}
               </button>
             ))}
             {snoozed && (
-              <button
-                type="button"
-                disabled={busy}
-                onClick={onResume}
-                className="rounded-md bg-gray-900 px-3 py-1 text-[12px] font-medium text-white transition hover:bg-gray-700 disabled:opacity-40"
-              >
+              <button type="button" disabled={busy} onClick={onResume} className={BUTTON_PRIMARY}>
                 Resume now
               </button>
             )}
           </div>
         </div>
       )}
-    </div>
+    </AdminSection>
   );
 }

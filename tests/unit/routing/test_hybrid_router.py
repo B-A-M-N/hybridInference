@@ -292,7 +292,8 @@ def test_hybrid_router_rejects_an_empty_backend_name() -> None:
 
 
 @pytest.mark.unit
-def test_hybrid_router_rejects_a_policy_naming_an_uninjected_backend() -> None:
+@pytest.mark.asyncio
+async def test_hybrid_router_rejects_a_policy_naming_an_uninjected_backend() -> None:
     router = _hybrid(
         policy=_ForceBackend("greedy"),
         local=_local_backend(_adapter(_LOCAL_ENDPOINT)),
@@ -300,7 +301,7 @@ def test_hybrid_router_rejects_a_policy_naming_an_uninjected_backend() -> None:
     )
 
     with pytest.raises(HybridRoutingError, match="unknown backend 'greedy'"):
-        router.backend_for_request(_MODEL_ID, _MESSAGES)
+        await router.chat_completion(_MODEL_ID, _MESSAGES)
 
 
 @pytest.mark.unit
@@ -454,6 +455,27 @@ async def test_streaming_does_not_run_the_backend_before_the_first_read() -> Non
     assert '"content":"one"' in await anext(stream)
     assert local.stream_calls == 1
     await stream.aclose()  # type: ignore[attr-defined]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_selection_error_surfaces_on_the_first_read_of_the_stream() -> None:
+    """As FixedRouter's does: the stream is created first and read inside the session.
+
+    The serving layer maps an error raised while the stream is read to its status
+    (every circuit open is a 503). Raised by the call itself, it escaped that
+    handling and answered 500.
+    """
+    router = _hybrid(
+        policy=_ForceBackend("greedy"),
+        local=_local_backend(_adapter(_LOCAL_ENDPOINT)),
+        cloud=_cloud_backend(_adapter(_CLOUD_ENDPOINT)),
+    )
+
+    stream = router.stream_chat_completion(_MODEL_ID, _MESSAGES, request_id="stream-unknown")
+
+    with pytest.raises(HybridRoutingError, match="unknown backend 'greedy'"):
+        await anext(stream)
 
 
 class _ClosingBackend:
@@ -711,10 +733,6 @@ def test_provider_status_is_merged_across_backends() -> None:
         "local": {"circuit_state": "closed"},
         "cloud": {"circuit_state": "closed"},
     }
-    assert router.backend_status() == {
-        "local": {"local": {"circuit_state": "closed"}},
-        "cloud": {"cloud": {"circuit_state": "closed"}},
-    }
 
 
 @pytest.mark.unit
@@ -738,7 +756,8 @@ def test_hybrid_router_accepts_the_two_documented_domains() -> None:
 
     assert local.is_local is True and local.is_cloud is False
     assert cloud.is_cloud is True and cloud.is_local is False
-    assert [backend.name for backend in router.backends()] == ["local", "cloud"]
+    assert router.backend("local") is local
+    assert router.backend("cloud") is cloud
 
 
 @pytest.mark.unit

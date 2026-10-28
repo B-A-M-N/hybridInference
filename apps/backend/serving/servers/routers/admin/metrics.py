@@ -7,8 +7,8 @@ import hashlib
 import inspect
 import json
 import time
-from datetime import datetime, timezone
-from typing import Any, Generic, TypeVar
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -39,6 +39,7 @@ from serving.schemas_admin import (
 )
 from serving.servers.auth import log_admin_action
 from serving.servers.deps import (
+    get_admin_audit_actor,
     get_db_logger,
     get_log_store,
     get_operational_store,
@@ -56,7 +57,9 @@ from serving.servers.routers.admin._refreshing_cache import RefreshingResult
 from serving.storage import account_schema, admin_view_results, perf_metrics_index
 from serving.storage.utils import coerce_json_object
 from serving.utils.logging import get_logger
-from serving.utils.request_ip import get_client_ip
+
+if TYPE_CHECKING:
+    from serving.audit import AuditActor
 
 router = APIRouter(prefix="/admin")
 logger = get_logger(__name__)
@@ -404,7 +407,7 @@ async def admin_get_request_metrics(
         )
 
     return AdminRequestMetricsResponse(
-        generated_at=datetime.now(timezone.utc),
+        generated_at=datetime.now(UTC),
         windows=windows,
     )
 
@@ -570,7 +573,7 @@ async def _load_performance_metrics(db_logger) -> AdminPerformanceMetricsRespons
             windows.append(window)
 
     return AdminPerformanceMetricsResponse(
-        generated_at=datetime.now(timezone.utc),
+        generated_at=datetime.now(UTC),
         windows=windows,
     )
 
@@ -717,7 +720,7 @@ async def _load_ttft_scatter(db_logger) -> AdminTtftScatterResponse:
     ]
     models.sort(key=lambda m: len(m.points), reverse=True)
 
-    return AdminTtftScatterResponse(generated_at=datetime.now(timezone.utc), models=models)
+    return AdminTtftScatterResponse(generated_at=datetime.now(UTC), models=models)
 
 
 _ResponseT = TypeVar("_ResponseT", AdminPerformanceMetricsResponse, AdminTtftScatterResponse)
@@ -1215,7 +1218,7 @@ async def _load_request_perf_breakdown(
     ]
 
     return AdminRequestPerfBreakdownResponse(
-        generated_at=datetime.now(timezone.utc),
+        generated_at=datetime.now(UTC),
         days=days,
         groups=groups,
         truncated=truncated,
@@ -1409,7 +1412,7 @@ async def _load_request_offloads(
 
     ranked = sorted(folded.items(), key=lambda item: (-item[1]["request_count"], item[0]))
     return AdminRequestOffloadsResponse(
-        generated_at=datetime.now(timezone.utc),
+        generated_at=datetime.now(UTC),
         days=days,
         total_offloaded=sum(group["request_count"] for group in folded.values()),
         groups=[
@@ -1527,7 +1530,7 @@ def _trend_grid(now: datetime, days: int, bucket_minutes: int) -> list[datetime]
     width = bucket_minutes * 60
     end = int(now.timestamp()) // width * width
     start = end - (days * 86400 // width) * width
-    return [datetime.fromtimestamp(ts, tz=timezone.utc) for ts in range(start, end + width, width)]
+    return [datetime.fromtimestamp(ts, tz=UTC) for ts in range(start, end + width, width)]
 
 
 async def _load_request_perf_trend(
@@ -1651,7 +1654,7 @@ async def _load_request_perf_trend(
             *params,
         )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     grid = _trend_grid(now, days, bucket_minutes)
     # rn > cap means busier routes crowded this one out; drop it but say so.
     truncated = any(int(row["rn"]) > _PERF_TREND_MAX_SERIES for row in rows)
@@ -1835,9 +1838,8 @@ async def admin_get_recent_request_content(
 
 @router.post("/recent-requests/clear-errors", response_model=AdminClearErrorRequestsResponse)
 async def admin_clear_error_requests(
-    request: Request,
     hours: int = 1,
-    _admin_id: str = Depends(verify_admin_access),
+    actor: AuditActor = Depends(get_admin_audit_actor),
     log_store=Depends(get_log_store),
     op_store=Depends(get_operational_store),
 ) -> AdminClearErrorRequestsResponse:
@@ -1868,10 +1870,9 @@ async def admin_clear_error_requests(
     if op_store is not None:
         await log_admin_action(
             op_store,
-            get_client_ip(request),
-            "clear_error_requests",
-            None,
-            {"hours": hours, "deleted_count": deleted_count},
+            action="clear_error_requests",
+            details={"hours": hours, "deleted_count": deleted_count},
+            actor=actor,
         )
 
     _RECENT_REQUESTS_COUNT_CACHE.clear()

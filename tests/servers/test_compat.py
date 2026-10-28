@@ -6,7 +6,7 @@ import pytest
 from fastapi import FastAPI, status
 from httpx import ASGITransport, AsyncClient
 
-from routing.executor import RouteExecutor
+from routing.routers import FixedRouter
 from serving.adapters.base import BaseAdapter, ModelConfig
 from serving.servers.auth import verify_api_key
 from serving.servers.deps import AppServices
@@ -41,7 +41,7 @@ def _cfg(model_id: str) -> ModelConfig:
 @pytest.fixture
 async def compat_app(monkeypatch: pytest.MonkeyPatch) -> FastAPI:
     monkeypatch.setenv("USER_AUTH_ENABLED", "0")
-    router = RouteExecutor()
+    router = FixedRouter()
     t = _Adapter(_cfg("trk"))
     router.register_route("trk", [(t, 1.0)])
 
@@ -92,7 +92,7 @@ async def test_legacy_completions_prompt_conversion(compat_client: AsyncClient):
 @pytest.mark.asyncio
 async def test_legacy_completions_preserves_parameters(compat_app: FastAPI):
     # Extract the tracking adapter for assertions
-    router: RouteExecutor = compat_app.state.services.router  # type: ignore[attr-defined]
+    router: FixedRouter = compat_app.state.services.router  # type: ignore[attr-defined]
     adapter = router.routes["trk"].adapters[0][0]
 
     transport = ASGITransport(app=compat_app)
@@ -113,3 +113,28 @@ async def test_legacy_completions_preserves_parameters(compat_app: FastAPI):
         assert adapter.last_params["max_tokens"] == 100
         assert adapter.last_params["top_p"] == 0.9
         assert adapter.last_messages[0]["content"] == "hello"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/completion", {"model": "trk", "messages": [{"role": "user", "content": "hi"}]}),
+        ("/v1/completions", {"model": "trk", "prompt": "hi"}),
+    ],
+    ids=["completion", "v1-completions"],
+)
+async def test_compat_endpoints_read_the_runtime_settings(
+    compat_app: FastAPI, compat_client: AsyncClient, path: str, body: dict[str, Any]
+):
+    """The legacy surfaces are served by the chat handler and follow its runtime settings."""
+    from unittest.mock import AsyncMock
+
+    settings = AsyncMock()
+    settings.get_bool = AsyncMock(return_value=False)
+    compat_app.state.services.runtime_settings = settings
+
+    resp = await compat_client.post(path, json=body)
+
+    assert resp.status_code == status.HTTP_200_OK
+    settings.get_bool.assert_any_await("force_chat_completions_streaming")

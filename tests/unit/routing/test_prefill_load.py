@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import random
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -64,6 +66,46 @@ class _FailAdapter(BaseAdapter):
     ) -> AsyncGenerator[str, None]:
         raise RuntimeError("fail")
         yield  # pragma: no cover
+
+
+class _TransactionRecordingPrefillLoad(PrefillLoadTracker):
+    """Record whether each lease reservation is serialized with selection."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.transaction_depth = 0
+        self.acquire_depths: list[int] = []
+
+    @contextlib.contextmanager
+    def routing_transaction(self):
+        with super().routing_transaction():
+            self.transaction_depth += 1
+            try:
+                yield
+            finally:
+                self.transaction_depth -= 1
+
+    def acquire(self, *args: Any, **kwargs: Any):
+        self.acquire_depths.append(self.transaction_depth)
+        return super().acquire(*args, **kwargs)
+
+
+class _TransactionCheckingEchoAdapter(_EchoAdapter):
+    def __init__(self, config: ModelConfig, tracker: _TransactionRecordingPrefillLoad) -> None:
+        super().__init__(config)
+        self._tracker = tracker
+        self.dispatch_depths: list[int] = []
+
+    async def chat_completion(self, messages: list[dict[str, Any]], **params) -> dict[str, Any]:
+        self.dispatch_depths.append(self._tracker.transaction_depth)
+        return await super().chat_completion(messages, **params)
+
+    async def stream_chat_completion(
+        self, messages: list[dict[str, Any]], **params
+    ) -> AsyncGenerator[str, None]:
+        self.dispatch_depths.append(self._tracker.transaction_depth)
+        async for chunk in super().stream_chat_completion(messages, **params):
+            yield chunk
 
 
 def _fixed_rand(*values: float):
@@ -758,6 +800,36 @@ async def test_stream_fallback_releases_both_leases():
     assert r.prefill_load.backlog("GOOD") == 0
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.asyncio
+async def test_fixed_fallback_lease_is_acquired_inside_routing_transaction(stream: bool):
+    tracker = _TransactionRecordingPrefillLoad()
+    router = FixedRouter()
+    router._prefill_load = tracker
+    primary = _FailAdapter(_cfg("m", provider="BAD", base_url="http://BAD"))
+    fallback = _TransactionCheckingEchoAdapter(
+        _cfg("m", provider="GOOD", base_url="http://GOOD"), tracker
+    )
+    router.register_route("m", [(primary, 1.0), (fallback, 1.0)])
+    router._select_adapter = lambda *args, **kwargs: primary
+    messages = [{"role": "user", "content": "x" * 4000}]
+
+    if stream:
+        chunks = [chunk async for chunk in router.stream_chat_completion("m", messages)]
+        assert any("GOOD" in str(chunk) for chunk in chunks)
+    else:
+        response = await router.chat_completion("m", messages)
+        assert response["choices"][0]["message"]["content"] == "ok"
+
+    # The first reservation is the primary; the second is its fallback. Both
+    # serialize with selection, while upstream I/O remains outside the lock.
+    assert tracker.acquire_depths == [1, 1]
+    assert fallback.dispatch_depths == [0]
+    assert tracker.backlog("BAD") == 0
+    assert tracker.backlog("GOOD") == 0
+
+
 # ---------------------------------------------------------------------------
 # priority_for_prefill
 # ---------------------------------------------------------------------------
@@ -1039,6 +1111,54 @@ def test_elephant_gate_is_not_fooled_by_a_sibling_conversation():
     other = t.acquire("ep", 500_000, affinity_key="key1", fingerprint="conv-b")
     assert other.elephant is True
     assert t.elephants("ep") == 1
+
+
+def _sibling_conversation_setup(tracker: PrefillLoadTracker) -> None:
+    """Key K's conversation A left a warm prefix on A; a stranger's elephant fills A."""
+    tracker.release(
+        tracker.acquire("A", 300_000, affinity_key="K", fingerprint="conv-a"),
+        prefill_confirmed=True,
+    )
+    tracker.acquire("A", 400_000, affinity_key="stranger", fingerprint="x")
+    assert tracker.elephants("A") == 1  # A is at ELEPHANT_LIMIT
+
+
+@pytest.mark.unit
+def test_selection_keeps_a_sibling_conversations_elephant_off_a_saturated_endpoint():
+    """Selection must judge an elephant the way ``acquire`` then counts it.
+
+    Read on the loose caller-scoped discount, K's unrelated conversation B
+    looked warm on A and kept A eligible at its elephant limit; ``acquire``
+    then counted it as an elephant there, stacking two mega-prefills on A.
+    """
+    t = PrefillLoadTracker()
+    _sibling_conversation_setup(t)
+    rng = random.Random(1)
+
+    picks = {
+        t.select_index(["A", "B"], [0.5, 0.5], 300_000, rng.random, "K", fingerprint="conv-b")
+        for _ in range(500)
+    }
+
+    assert picks == {1}
+
+
+@pytest.mark.unit
+def test_router_selection_passes_the_conversation_fingerprint(monkeypatch):
+    r = FixedRouter()
+    a = _EchoAdapter(_cfg("m", provider="A", base_url="http://A"))
+    b = _EchoAdapter(_cfg("m", provider="B", base_url="http://B"))
+    r.register_route("m", [(a, 0.5), (b, 0.5)])
+    req_ctx.set({"affinity_key": "K"})
+    _sibling_conversation_setup(r.prefill_load)
+    # Both of the two draws land on A unless A is filtered out.
+    monkeypatch.setattr("routing.routers.random.random", lambda: 0.0)
+
+    chosen, claim = r._select_and_claim_adapter("m", prefill_tokens=300_000, fingerprint="conv-b")
+
+    assert chosen is b
+    if claim is not None:
+        r._health_registry.end_dispatch(claim)
 
 
 @pytest.mark.unit

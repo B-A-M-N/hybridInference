@@ -40,7 +40,7 @@ also show whether a backup request was sent and whether it won.
 
 ### Gateway with the Web and Admin Consoles
 
-Requires Git, Make, Python 3.10–3.13, and a running Docker daemon with Compose.
+Requires Git, Make, Python 3.11–3.13, and a running Docker daemon with Compose.
 The local example runs the gateway, Postgres, and both consoles with a
 simulated model provider. No GPU or provider API key is needed.
 
@@ -65,7 +65,7 @@ docker logs hybridinference-example-backend 2>&1 | grep 'setup code'
 Enter the code and create the administrator with a username and a demo-only
 password (at least eight characters, including uppercase, lowercase, and a
 number). From the dashboard, create an API key, open the API Playground,
-or enter the Admin Console, whose Configuration tab holds the gateway's
+or enter the Admin Console, whose Settings tab holds the gateway's
 settings. The example model returns the fixed reply `RUNNABLE_EXAMPLE_OK`.
 
 When you are done, stop the stack. Its database volume is kept for the next

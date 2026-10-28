@@ -8,7 +8,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from routing.executor import RouteExecutor
+from routing.routers import FixedRouter
 from serving.config.model_visibility import ModelVisibilityResolver
 from serving.servers.deps import AppServices
 from serving.servers.routers import admin as admin_router
@@ -26,7 +26,7 @@ async def admin_client(monkeypatch):
     op_store.set_model_visibility_override = AsyncMock()
     op_store.delete_model_visibility_override = AsyncMock()
 
-    router = RouteExecutor()
+    router = FixedRouter()
     adapter = MagicMock()
     adapter.config.id = "public-model"
     adapter.config.name = "Public Model"
@@ -63,6 +63,11 @@ async def admin_client(monkeypatch):
         "provider/model",
         [(provider_model_adapter, 1.0)],
         required_role="free",
+    )
+    embedding_adapter = MagicMock()
+    embedding_adapter.config.id = "public-embedding"
+    router.register_embedding_route(
+        "public-embedding", [(embedding_adapter, 1.0)], required_role="free"
     )
 
     app = FastAPI()
@@ -103,6 +108,7 @@ async def test_list_model_visibility_returns_baseline_and_effective_roles(admin_
     assert model["baseline_required_role"] == "free"
     assert model["override_required_role"] is None
     assert model["effective_required_role"] == "free"
+    assert _model_by_id(data["models"], "public-embedding")["baseline_required_role"] == "free"
 
 
 @pytest.mark.asyncio
@@ -118,6 +124,22 @@ async def test_patch_model_visibility_sets_override(admin_client):
     assert response.status_code == 200
     op_store.set_model_visibility_override.assert_awaited_once_with(
         "public-model", "admin", "admin-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_patch_model_visibility_supports_embedding_models(admin_client):
+    client, op_store = admin_client
+
+    response = await client.patch(
+        "/admin/models/public-embedding/visibility",
+        json={"required_role": "admin"},
+        headers={"Authorization": "Bearer test-admin"},
+    )
+
+    assert response.status_code == 200
+    op_store.set_model_visibility_override.assert_awaited_once_with(
+        "public-embedding", "admin", "admin-token"
     )
 
 

@@ -24,10 +24,11 @@ multi-worker deployment may need one call per worker.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends
 
+from serving.audit import AuditActor, AuditTarget
 from serving.config.settings import settings
 from serving.schemas_admin import (
     AuthBlockItem,
@@ -36,10 +37,10 @@ from serving.schemas_admin import (
     ListAuthBlocksResponse,
 )
 from serving.servers.auth import log_admin_action
-from serving.servers.deps import get_operational_store, verify_admin_access
+from serving.servers.deps import get_admin_audit_actor, get_operational_store, verify_admin_access
 from serving.utils.auth_failure_blocklist import clear_block, list_active_blocks
 from serving.utils.logging import get_logger
-from serving.utils.request_ip import get_client_ip, normalize_ip_bucket
+from serving.utils.request_ip import normalize_ip_bucket
 
 logger = get_logger(__name__)
 
@@ -61,7 +62,7 @@ async def list_auth_blocks(
         blocks=[
             AuthBlockItem(
                 ip_bucket=block.ip_bucket,
-                blocked_until=datetime.fromtimestamp(block.blocked_until, tz=timezone.utc),
+                blocked_until=datetime.fromtimestamp(block.blocked_until, tz=UTC),
                 retry_after_sec=block.retry_after_sec,
             )
             for block in blocks
@@ -73,9 +74,8 @@ async def list_auth_blocks(
 
 @router.post("/auth-blocks/clear", response_model=ClearAuthBlockResponse)
 async def clear_auth_block(
-    request: Request,
     payload: ClearAuthBlockRequest,
-    _admin_id: str = Depends(verify_admin_access),
+    actor: AuditActor = Depends(get_admin_audit_actor),
     op_store=Depends(get_operational_store),
 ) -> ClearAuthBlockResponse:
     """Lift one active block on this worker, and drop the bucket's counted history.
@@ -105,10 +105,10 @@ async def clear_auth_block(
     try:
         await log_admin_action(
             op_store,
-            get_client_ip(request),
-            "auth_blocks.clear",
-            None,
-            {"ip": payload.ip, "ip_bucket": ip_bucket, "cleared": cleared},
+            action="auth_blocks.clear",
+            details={"ip": payload.ip, "ip_bucket": ip_bucket, "cleared": cleared},
+            actor=actor,
+            target=AuditTarget("auth_block", ip_bucket) if ip_bucket else None,
         )
     except Exception:
         logger.exception(

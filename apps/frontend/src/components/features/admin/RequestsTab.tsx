@@ -25,6 +25,8 @@ import {
 import { getErrorMessage } from '@/lib/utils/errors';
 import { formatRouteWiseDecision } from '@/lib/utils/routewise';
 import { InlineErrorText } from '@/components/ui/InlineErrorText';
+import { Select } from '@/components/ui/Select';
+import { useConfirmAction } from './confirm/useConfirmAction';
 import { FoldedText } from './requestContent';
 import { OffloadedRequestsPanel } from './OffloadedRequestsPanel';
 import { RequestPerformancePanel } from './RequestPerformancePanel';
@@ -454,7 +456,7 @@ function RequestMetricsCard({ metric }: { metric: AdminRequestMetricsWindow }) {
                 isErrorHeavy ? 'bg-red-400' : 'bg-gray-900'
               }`}
               style={{ height: `${height}%` }}
-              title={`${new Date(bucket.start_time).toLocaleString()}: ${
+              title={`${new Date(bucket.start_time).toLocaleString('en-US')}: ${
                 bucket.request_count
               } requests, ${bucket.error_count} errors, ${bucketDisconnects} client disconnects`}
             />
@@ -525,7 +527,9 @@ export function RequestsTab() {
   const [exportEndDate, setExportEndDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [exportIncludeContent, setExportIncludeContent] = useState(false);
   const [exportLoading, setExportLoading] = useState(false);
-  const [clearingErrors, setClearingErrors] = useState(false);
+  const clearConfirmation = useConfirmAction();
+  const requestClearConfirmation = clearConfirmation.request;
+  const clearingErrors = clearConfirmation.busy;
 
   // Monotonic id for list fetches so an out-of-order response (e.g. a slow
   // request issued under an older filter) can't overwrite a newer one.
@@ -595,27 +599,34 @@ export function RequestsTab() {
     }
   }, [toast]);
 
-  const handleClearErrors = useCallback(async () => {
-    if (
-      !window.confirm(
-        'Permanently delete all error requests from the past hour? This cannot be undone.',
-      )
-    ) {
-      return;
-    }
-    setClearingErrors(true);
-    try {
-      const result = await clearErrorRequests(1);
-      toast.success(result.message);
-      loadRequests(reqUserFilter, reqModelFilter);
-      loadRequestMetrics();
-      setPerfRefreshKey((key) => key + 1);
-    } catch (e) {
-      toast.error(getErrorMessage(e));
-    } finally {
-      setClearingErrors(false);
-    }
-  }, [toast, loadRequests, reqUserFilter, reqModelFilter, loadRequestMetrics]);
+  const handleClearErrors = useCallback(() => {
+    requestClearConfirmation({
+      title: 'Delete the last hour of error requests?',
+      confirmLabel: 'Delete error requests',
+      busyLabel: 'Deleting…',
+      tone: 'danger',
+      body: (
+        <p>
+          Every request that ended in an error during the past hour is permanently removed from the
+          request log and its metrics. This cannot be undone.
+        </p>
+      ),
+      run: async () => {
+        const result = await clearErrorRequests(1);
+        toast.success(result.message);
+        loadRequests(reqUserFilter, reqModelFilter);
+        loadRequestMetrics();
+        setPerfRefreshKey((key) => key + 1);
+      },
+    });
+  }, [
+    requestClearConfirmation,
+    toast,
+    loadRequests,
+    reqUserFilter,
+    reqModelFilter,
+    loadRequestMetrics,
+  ]);
 
   useEffect(() => {
     loadRequests(debouncedUserFilter, debouncedModelFilter);
@@ -760,54 +771,57 @@ export function RequestsTab() {
         ) : null}
         <label className="flex select-none items-center gap-1.5 text-[13px] text-gray-600">
           Outcome
-          <select
+          <Select<RequestOutcome>
             value={reqOutcome}
-            onChange={(e) => {
-              setReqOutcome(e.target.value as RequestOutcome);
+            onValueChange={(next) => {
+              setReqOutcome(next);
               setReqOffset(0);
             }}
+            options={[
+              { value: 'all', label: 'All' },
+              { value: 'errors', label: 'Errors' },
+              { value: 'errors_excluding_disconnects', label: 'Errors, no disconnects' },
+              { value: 'client_disconnect', label: 'Client disconnects' },
+            ]}
             aria-label="Filter by outcome"
             title="A client disconnect is the caller hanging up mid-stream. It is logged with an error string, so “Errors” includes it — the other two options read those rows on their own, or hold them out of the way. An upstream that answers 499 stays an error."
-            className="rounded-lg border border-gray-200 bg-white py-1.5 pl-2 pr-7 text-[13px] text-gray-700 focus:border-gray-400 focus:outline-none focus:ring-2 focus:ring-gray-900/5"
-          >
-            <option value="all">All</option>
-            <option value="errors">Errors</option>
-            <option value="errors_excluding_disconnects">Errors, no disconnects</option>
-            <option value="client_disconnect">Client disconnects</option>
-          </select>
+            className="w-44"
+          />
         </label>
         <label className="flex select-none items-center gap-1.5 text-[13px] text-gray-600">
           Type
-          <select
+          <Select<'all' | 'chat' | 'embedding'>
             value={reqType}
-            onChange={(e) => {
-              setReqType(e.target.value as 'all' | 'chat' | 'embedding');
+            onValueChange={(next) => {
+              setReqType(next);
               setReqOffset(0);
             }}
+            options={[
+              { value: 'all', label: 'All' },
+              { value: 'chat', label: 'Chat' },
+              { value: 'embedding', label: 'Embedding' },
+            ]}
             aria-label="Filter by request type"
-            className="rounded-lg border border-gray-200 bg-white py-1.5 pl-2 pr-7 text-[13px] text-gray-700 focus:border-gray-400 focus:outline-none focus:ring-2 focus:ring-gray-900/5"
-          >
-            <option value="all">All</option>
-            <option value="chat">Chat</option>
-            <option value="embedding">Embedding</option>
-          </select>
+            className="w-32"
+          />
         </label>
         <label className="flex select-none items-center gap-1.5 text-[13px] text-gray-600">
           Last
-          <select
-            value={reqDays}
-            onChange={(e) => {
-              setReqDays(Number(e.target.value));
+          <Select
+            value={String(reqDays)}
+            onValueChange={(next) => {
+              setReqDays(Number(next));
               setReqOffset(0);
             }}
+            options={[
+              { value: '1', label: '24h' },
+              { value: '7', label: '7d' },
+              { value: '30', label: '30d' },
+              { value: '90', label: '90d' },
+            ]}
             aria-label="Lookback window"
-            className="rounded-lg border border-gray-200 bg-white py-1.5 pl-2 pr-7 text-[13px] text-gray-700 focus:border-gray-400 focus:outline-none focus:ring-2 focus:ring-gray-900/5"
-          >
-            <option value={1}>24h</option>
-            <option value={7}>7d</option>
-            <option value={30}>30d</option>
-            <option value={90}>90d</option>
-          </select>
+            className="w-24"
+          />
         </label>
         <span
           className="inline-flex items-center rounded-full bg-gray-100 px-2.5 py-1 text-[12px] font-medium tabular-nums text-gray-600"
@@ -828,6 +842,7 @@ export function RequestsTab() {
         >
           {clearingErrors ? 'Clearing…' : 'Clear last hour errors'}
         </button>
+        {clearConfirmation.dialog}
         <button
           type="button"
           onClick={() => setShowExportPanel((v) => !v)}
@@ -1231,7 +1246,7 @@ export function RequestsTab() {
                             : '—'}
                         </td>
                         <td className="whitespace-nowrap px-3 py-2.5 text-right text-[12px] text-gray-400 pr-4">
-                          <span title={new Date(req.timestamp).toLocaleString()}>
+                          <span title={new Date(req.timestamp).toLocaleString('en-US')}>
                             {relTime(req.timestamp)}
                           </span>
                         </td>

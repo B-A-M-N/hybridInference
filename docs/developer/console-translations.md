@@ -2,10 +2,11 @@
 
 The console can be read in English or Chinese. A reader who never chose a
 language gets the one their browser asks for. Signed-in readers choose Language
-from the account menu; signed-out readers use the header switcher. The language
-setting also remains available under Account Settings. The console keeps the
-most recent choice in this browser and, once they sign in, in their account,
-so it follows them to other browsers. The design record is
+from the account menu or under Account Settings. The header has no language
+control, so signed-out readers see the language their browser asks for, or the
+one last chosen in this browser. The console keeps the most recent choice in
+this browser and, once they sign in, in their account, so it follows them to
+other browsers. The design record is
 [2026-10-17 console language switching](https://github.com/HarvardMadSys/hybridInference/blob/dev/docs/agents/specs/2026-10-17-console-language-switching-design.zh.md).
 
 This page is for anyone who adds console text or translates it. Translating
@@ -45,8 +46,12 @@ const t = useT();
   catalog check can read them.
 
 Administration pages (`/dashboard/admin`) are for operators, not users, and stay
-in English: they do not go through `t()`, and their container is marked
-`lang="en"`. The rest of what stays in English is listed below.
+in English: their layout provides an English `LocaleProvider` without a
+translation catalog, and their container is marked `lang="en"`. This also keeps
+shared components using `t()` and React portals in English without changing the
+reader’s saved language. Admin date/time labels use an explicit `en-US` locale
+while preserving their existing time zone. The rest of what stays in English is
+listed below.
 
 ## The catalog
 
@@ -85,8 +90,8 @@ prune in the same change that edits the English.
 ## What stays in English
 
 - What only the people running the deployment see: administration
-  (`/dashboard/admin`), first-run setup (`/setup`), the Configuration tab, and
-  the API Playground, which only internal accounts can open.
+  (`/dashboard/admin`), first-run setup (`/setup`), and the API Playground,
+  which only internal accounts can open.
 - The last-resort error screens (`global-error` and the boundary around the
   whole application), which render outside the language provider.
 - Error messages from the gateway, model names, and Markdown written by
