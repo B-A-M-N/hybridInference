@@ -116,7 +116,9 @@ def _stream_body() -> dict[str, Any]:
     }
 
 
-def _openai_tool_chunk(arguments: str) -> str:
+def _openai_tool_chunk(
+    arguments: str, *, index: int = 0, call_id: str = "call_1", name: str = "lookup"
+) -> str:
     payload = {
         "id": "x",
         "object": "chat.completion.chunk",
@@ -127,10 +129,10 @@ def _openai_tool_chunk(arguments: str) -> str:
                 "delta": {
                     "tool_calls": [
                         {
-                            "index": 0,
-                            "id": "call_1",
+                            "index": index,
+                            "id": call_id,
                             "type": "function",
-                            "function": {"name": "lookup", "arguments": arguments},
+                            "function": {"name": name, "arguments": arguments},
                         }
                     ]
                 },
@@ -148,6 +150,17 @@ def _openai_text_chunk(content: str) -> str:
         "choices": [{"index": 0, "delta": {"content": content}}],
     }
     return f"data: {json.dumps(payload)}\n\n"
+
+
+def _sse_events(raw: bytes):
+    events = []
+    event_type = None
+    for line in raw.decode().splitlines():
+        if line.startswith("event: "):
+            event_type = line[len("event: ") :]
+        elif line.startswith("data: "):
+            events.append((event_type, json.loads(line[len("data: ") :])))
+    return events
 
 
 @pytest.mark.asyncio
@@ -169,6 +182,39 @@ async def test_stream_messages_upstream_error_flushes_received_content_without_t
     # Anthropic terminal event; the router must see the exception instead.
     assert b"event: message_stop" not in out
     assert b"event: message_delta" not in out
+
+
+@pytest.mark.asyncio
+async def test_stream_messages_upstream_error_preserves_pending_parallel_call():
+    """The abort path must not drop a complete call still pending behind another."""
+    a = _ScriptedOpenAIAdapter(
+        _cfg(),
+        [
+            _openai_tool_chunk('{"x":', index=0, call_id="call_0", name="first"),
+            _openai_tool_chunk('{"x":1}', index=1, call_id="call_1", name="second"),
+        ],
+        error=RuntimeError("upstream failed"),
+    )
+    out = b""
+    with pytest.raises(RuntimeError, match="upstream failed"):
+        async for chunk in a.stream_messages(_stream_body(), request_id="req_pending_err"):
+            out += chunk
+
+    events = _sse_events(out)
+    starts = [
+        (data["content_block"].get("id"), data["content_block"].get("name"))
+        for name, data in events
+        if name == "content_block_start" and data["content_block"]["type"] == "tool_use"
+    ]
+    assert starts == [("call_0", "first"), ("call_1", "second")]
+
+    args: dict[int, str] = {}
+    for name, data in events:
+        if name != "content_block_delta" or data["delta"].get("type") != "input_json_delta":
+            continue
+        args[data["index"]] = args.get(data["index"], "") + data["delta"]["partial_json"]
+    assert list(args.values()) == ['{"x":', '{"x":1}']
+    assert not any(name in ("message_delta", "message_stop") for name, _ in events)
 
 
 @pytest.mark.asyncio

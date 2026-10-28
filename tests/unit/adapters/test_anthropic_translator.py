@@ -1153,6 +1153,17 @@ def _tool_start_and_args(events):
     return starts, args
 
 
+def _block_starts(events):
+    """Ordered content-block identities: (type, tool id, tool name)."""
+    starts = []
+    for name, data in events:
+        if name != "content_block_start":
+            continue
+        block = data["content_block"]
+        starts.append((block["type"], block.get("id"), block.get("name")))
+    return starts
+
+
 def _tool_args_chunk(index: int, arguments: str):
     """One OpenAI tool-argument continuation for an already-started call."""
     return _openai_chunk({"tool_calls": [{"index": index, "function": {"arguments": arguments}}]})
@@ -1659,6 +1670,264 @@ def test_stream_back_to_back_parallel_tools_keep_all_args_without_overlap():
     assert [start[1:] for start in starts] == [("call_0", "first"), ("call_1", "second")]
     assert args[starts[0][0]] == '{"a":1}'
     assert args[starts[1][0]] == '{"b":2}'
+    _assert_anthropic_lifecycle(events)
+
+
+def _feed_two_call_prefix(t):
+    """tc0 incomplete, tc1 complete pending, then tc0 completes.
+
+    The completion of tc0 must release tc1 before anything later can overtake
+    it. Frames are returned for the full event stream assertions.
+    """
+    out = [
+        b"".join(
+            t.feed(
+                _openai_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_0",
+                                "type": "function",
+                                "function": {"name": "first", "arguments": '{"x":'},
+                            }
+                        ]
+                    }
+                )
+            )
+        ),
+        b"".join(
+            t.feed(
+                _openai_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 1,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "second", "arguments": '{"x":1}'},
+                            }
+                        ]
+                    }
+                )
+            )
+        ),
+        b"".join(t.feed(_tool_args_chunk(0, "0}"))),
+    ]
+    return out
+
+
+def test_stream_parallel_tool_markers_keep_first_seen_fifo_order():
+    """Trace 1: call_1 must not be overtaken by a later call_2."""
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    out = _feed_two_call_prefix(t)
+    out.append(
+        b"".join(
+            t.feed(
+                _openai_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 2,
+                                "id": "call_2",
+                                "type": "function",
+                                "function": {"name": "third", "arguments": '{"x":2}'},
+                            }
+                        ]
+                    }
+                )
+            )
+        )
+    )
+    out.append(b"".join(t.finalize()))
+    events = _events(out)
+
+    assert _block_starts(events) == [
+        ("tool_use", "call_0", "first"),
+        ("tool_use", "call_1", "second"),
+        ("tool_use", "call_2", "third"),
+    ]
+    starts, args = _tool_start_and_args(events)
+    by_id = {call_id: args[index] for index, call_id, _ in starts}
+    assert by_id == {
+        "call_0": '{"x":0}',
+        "call_1": '{"x":1}',
+        "call_2": '{"x":2}',
+    }
+    _assert_anthropic_lifecycle(events)
+
+
+def test_stream_text_after_pending_parallel_tool_stays_after_it():
+    """Trace 2: text after both tools must not jump ahead of call_1."""
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    out = _feed_two_call_prefix(t)
+    out.append(b"".join(t.feed(_openai_chunk({"content": "after both tools"}))))
+    out.append(b"".join(t.finalize()))
+    events = _events(out)
+
+    assert _block_starts(events) == [
+        ("tool_use", "call_0", "first"),
+        ("tool_use", "call_1", "second"),
+        ("text", None, None),
+    ]
+    text_values = [
+        data["delta"]["text"]
+        for name, data in events
+        if name == "content_block_delta" and data["delta"].get("type") == "text_delta"
+    ]
+    assert text_values == ["after both tools"]
+    _assert_anthropic_lifecycle(events)
+
+
+def test_stream_abort_preserves_complete_pending_parallel_tool():
+    """Trace 3: a pending complete call must not be dropped by abort()."""
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    out = _feed_two_call_prefix(t)
+    out.append(b"".join(t.abort()))
+    events = _events(out)
+
+    assert _block_starts(events) == [
+        ("tool_use", "call_0", "first"),
+        ("tool_use", "call_1", "second"),
+    ]
+    starts, args = _tool_start_and_args(events)
+    by_id = {call_id: args[index] for index, call_id, _ in starts}
+    assert by_id == {"call_0": '{"x":0}', "call_1": '{"x":1}'}
+    assert not any(name in ("message_delta", "message_stop") for name, _ in events)
+    _assert_anthropic_lifecycle(events)
+
+
+def test_stream_mixed_content_straddling_pending_tool_keeps_fifo_order():
+    """Text before a pending marker stays before it; text after stays after."""
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    out = [
+        b"".join(
+            t.feed(
+                _openai_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_0",
+                                "type": "function",
+                                "function": {"name": "first", "arguments": '{"a":'},
+                            }
+                        ]
+                    }
+                )
+            )
+        ),
+        b"".join(t.feed(_openai_chunk({"content": "before"}))),
+        b"".join(
+            t.feed(
+                _openai_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 1,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "second", "arguments": '{"b":1}'},
+                            }
+                        ]
+                    }
+                )
+            )
+        ),
+        b"".join(t.feed(_openai_chunk({"content": "after"}))),
+        b"".join(t.feed(_tool_args_chunk(0, "0}"))),
+    ]
+    out.append(b"".join(t.finalize()))
+    events = _events(out)
+
+    assert _block_starts(events) == [
+        ("tool_use", "call_0", "first"),
+        ("text", None, None),
+        ("tool_use", "call_1", "second"),
+        ("text", None, None),
+    ]
+    text_values = [
+        data["delta"]["text"]
+        for name, data in events
+        if name == "content_block_delta" and data["delta"].get("type") == "text_delta"
+    ]
+    assert text_values == ["before", "after"]
+    starts, args = _tool_start_and_args(events)
+    by_id = {call_id: args[index] for index, call_id, _ in starts}
+    assert by_id == {"call_0": '{"a":0}', "call_1": '{"b":1}'}
+    _assert_anthropic_lifecycle(events)
+
+
+def test_stream_three_parallel_tools_drain_in_marker_order_not_completion_order():
+    """All three calls keep first-seen order even when they complete out of order."""
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    out = [
+        b"".join(
+            t.feed(
+                _openai_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_0",
+                                "type": "function",
+                                "function": {"name": "first", "arguments": '{"a":'},
+                            }
+                        ]
+                    }
+                )
+            )
+        ),
+        b"".join(
+            t.feed(
+                _openai_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 1,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "second", "arguments": '{"b":'},
+                            }
+                        ]
+                    }
+                )
+            )
+        ),
+        b"".join(
+            t.feed(
+                _openai_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 2,
+                                "id": "call_2",
+                                "type": "function",
+                                "function": {"name": "third", "arguments": '{"c":2}'},
+                            }
+                        ]
+                    }
+                )
+            )
+        ),
+        b"".join(t.feed(_tool_args_chunk(1, "1}"))),
+        b"".join(t.feed(_tool_args_chunk(0, "0}"))),
+    ]
+    out.append(b"".join(t.finalize()))
+    events = _events(out)
+
+    assert _block_starts(events) == [
+        ("tool_use", "call_0", "first"),
+        ("tool_use", "call_1", "second"),
+        ("tool_use", "call_2", "third"),
+    ]
+    starts, args = _tool_start_and_args(events)
+    by_id = {call_id: args[index] for index, call_id, _ in starts}
+    assert by_id == {
+        "call_0": '{"a":0}',
+        "call_1": '{"b":1}',
+        "call_2": '{"c":2}',
+    }
     _assert_anthropic_lifecycle(events)
 
 
