@@ -1661,9 +1661,16 @@ def _fake_session_from_iter(iter_factory):
         def iter_any(self):
             return iter_factory()
 
+        async def iter_chunked(self, n):
+            # OpenAI-compatible streaming reads through iter_chunked;
+            # native Anthropic passthrough reads through iter_any.
+            async for chunk in iter_factory():
+                yield chunk
+
     class _FakeResp:
         status = 200
         content = _FakeContent()
+        headers: dict = {"Content-Type": "text/event-stream"}  # noqa: RUF012
 
         async def __aenter__(self):
             return self
@@ -1902,6 +1909,153 @@ async def test_silence_after_the_first_frame_aborts_at_the_mid_stream_ceiling(
             collected += raw
 
     assert b"event: error" in collected
+    assert captured.get("status_code") == 504
+
+
+@pytest.mark.asyncio
+async def test_translated_stream_after_complete_tool_keeps_idle_watchdog_fed(
+    anthropic_test_client, monkeypatch
+):
+    """Text after complete tool args must stream, not sit behind finalize.
+
+    The full route is exercised: OpenAI tool call -> translator -> Anthropic
+    SSE -> router queue. With the old per-type buffers every post-tool text
+    delta was withheld, so a 100ms frame-level idle ceiling killed a healthy
+    300ms generation and logged a 504.
+    """
+    import asyncio
+
+    from serving.servers.routers import anthropic_messages as amod
+
+    monkeypatch.setattr(amod, "_KEEPALIVE_INTERVAL", 0.1)
+    monkeypatch.setattr(amod, "_MAX_STREAM_IDLE", 0.1)
+
+    def _chunk(delta, finish_reason=None):
+        payload = {
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "model": OPENAI_MODEL,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
+    async def _iter():
+        yield _chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"x":1}'},
+                    }
+                ]
+            }
+        )
+        for i in range(30):
+            await asyncio.sleep(0.01)
+            yield _chunk({"content": f"fragment-{i} "})
+        yield _chunk({}, finish_reason="stop")
+
+    from serving.http import AsyncHTTPClient
+
+    monkeypatch.setattr(AsyncHTTPClient, "_ensure_session", _fake_session_from_iter(_iter))
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        amod, "_schedule_log_store_task", lambda log_store, **kw: captured.update(kw)
+    )
+
+    body = {
+        "model": OPENAI_MODEL,
+        "max_tokens": 50,
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    collected = b""
+    async with anthropic_test_client.stream(
+        "POST", "/v1/messages", json=body, headers=_auth()
+    ) as r:
+        assert r.status_code == 200
+        async for raw in r.aiter_bytes():
+            collected += raw
+
+    assert b"event: error" not in collected, collected[-2000:]
+    assert b"event: message_stop" in collected
+    for i in range(30):
+        assert f"fragment-{i} ".encode() in collected
+    assert captured.get("status_code") == 200
+    assert captured.get("error") is None
+
+
+@pytest.mark.asyncio
+async def test_translated_stream_incomplete_tool_then_silence_still_hits_idle_ceiling(
+    anthropic_test_client, monkeypatch
+):
+    """Activity comments are emitted only for received data, not on a timer.
+
+    A provider that sends an incomplete tool call plus one interleaved text
+    fragment and then wedges must still be aborted; the translator's
+    comment frame must not keep a genuinely stalled upstream alive.
+    """
+    import asyncio
+
+    from serving.servers.routers import anthropic_messages as amod
+
+    monkeypatch.setattr(amod, "_KEEPALIVE_INTERVAL", 0.1)
+    monkeypatch.setattr(amod, "_MAX_STREAM_IDLE", 0.1)
+    monkeypatch.setattr(amod, "_MAX_FIRST_FRAME_IDLE", 30)
+
+    def _chunk(delta):
+        payload = {
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "model": OPENAI_MODEL,
+            "choices": [{"index": 0, "delta": delta}],
+        }
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
+    async def _iter():
+        yield _chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"a":'},
+                    }
+                ]
+            }
+        )
+        yield _chunk({"content": "buffered-but-stalled"})
+        await asyncio.sleep(30)
+
+    from serving.http import AsyncHTTPClient
+
+    monkeypatch.setattr(AsyncHTTPClient, "_ensure_session", _fake_session_from_iter(_iter))
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        amod, "_schedule_log_store_task", lambda log_store, **kw: captured.update(kw)
+    )
+
+    body = {
+        "model": OPENAI_MODEL,
+        "max_tokens": 50,
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    collected = b""
+    async with anthropic_test_client.stream(
+        "POST", "/v1/messages", json=body, headers=_auth()
+    ) as r:
+        assert r.status_code == 200
+        async for raw in r.aiter_bytes():
+            collected += raw
+
+    assert b"event: error" in collected
+    assert b"event: message_stop" not in collected
     assert captured.get("status_code") == 504
 
 
