@@ -13,6 +13,7 @@ import pytest
 
 from serving.adapters.anthropic_translator import (
     OpenAIToAnthropicStreamTranslator,
+    _ToolArguments,
     anthropic_request_to_openai,
     extract_anthropic_usage_from_sse,
     normalize_inline_system,
@@ -1928,6 +1929,463 @@ def test_stream_three_parallel_tools_drain_in_marker_order_not_completion_order(
         "call_1": '{"b":1}',
         "call_2": '{"c":2}',
     }
+    _assert_anthropic_lifecycle(events)
+
+
+# -- incremental argument completeness --------------------------------------
+
+
+def _reference_arguments_complete(arguments: str) -> bool:
+    """The completeness definition the incremental tracker must reproduce."""
+    if not arguments.strip():
+        return False
+    try:
+        return isinstance(_json.loads(arguments), dict)
+    except ValueError:
+        return False
+
+
+_ARGUMENT_CORPUS = [
+    "",
+    "   \n\t",
+    "{}",
+    " {} \n",
+    '{"a":1}',
+    '{"a":1} x',
+    '{"a":1}}',
+    '{"a":1}{}',
+    '{"s":"}"}',
+    '{"s":"{"}',
+    '{"s":"a\\"}"}',
+    '{"s":"a\\\\"}',
+    '{"s":"\\\\\\""}',
+    '{"u":"\\u007d\\u0022"}',
+    '{"a":{"b":[1,{"c":"]"}],"d":[]}}',
+    '{"a":[}',
+    '{"a":]}',
+    "{]",
+    '{"a":}',
+    "{'a':1}",
+    '{"a":1,}',
+    '{"a":NaN}',
+    '{"a":"line\nbreak"}',
+    '{"a":"x',
+    '{"a":"x\\',
+    "[1,2]",
+    '"str"',
+    "123",
+    "null",
+    chr(0xA0) + "{}",  # Unicode, not JSON, whitespace
+    "{}" + chr(0xA0),
+    chr(0xFEFF) + "{}",  # a BOM json.loads refuses
+    '{"a":"é\U0001f600"}',
+]
+
+
+@pytest.mark.parametrize("arguments", _ARGUMENT_CORPUS)
+def test_tool_arguments_completeness_matches_json_on_every_split(arguments):
+    """Every prefix, under every two-way split, agrees with a full json.loads.
+
+    Covers quoted braces, escapes (including one split between fragments),
+    nesting, JSON-vs-Unicode whitespace, trailing data and non-objects.
+    """
+    for split in range(len(arguments) + 1):
+        tracked = _ToolArguments()
+        for fragment in (arguments[:split], arguments[split:]):
+            if fragment:
+                tracked.append(fragment)
+        assert tracked.text() == arguments
+        assert tracked.complete() is _reference_arguments_complete(arguments), (
+            arguments,
+            split,
+        )
+
+    # One character per fragment, checked after every one of them.
+    tracked = _ToolArguments()
+    for position, char in enumerate(arguments, start=1):
+        tracked.append(char)
+        assert tracked.complete() is _reference_arguments_complete(arguments[:position]), (
+            arguments,
+            position,
+        )
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_tool_arguments_completeness_matches_json_on_random_streams(seed):
+    """Random JSON-ish byte streams and random fragmenting: exact agreement."""
+    import random
+
+    rng = random.Random(seed)
+    alphabet = '{}[]":,\\ \nab1'
+    for _ in range(400):
+        tokens = ['{"k":', '"', "\\", "{", "}", "[", "]", ",", ":", " ", "1", "a", '"x"']
+        if rng.random() < 0.5:
+            arguments = "".join(rng.choice(tokens) for _ in range(rng.randint(0, 12)))
+        else:
+            arguments = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 12)))
+        if rng.random() < 0.3:
+            arguments = _json.dumps({"v": arguments, "n": [arguments]}) + rng.choice(
+                ["", " ", "\n", "x", "}"]
+            )
+        tracked = _ToolArguments()
+        received = ""
+        while len(received) < len(arguments):
+            fragment = arguments[len(received) : len(received) + rng.randint(1, 4)]
+            tracked.append(fragment)
+            received += fragment
+            assert tracked.complete() is _reference_arguments_complete(received), (
+                seed,
+                received,
+            )
+
+
+def test_stream_empty_initial_arguments_are_not_closed_by_later_events():
+    """A call that opened with no arguments yet must still receive them."""
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    out = [
+        b"".join(
+            t.feed(
+                _openai_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_0",
+                                "type": "function",
+                                "function": {"name": "first", "arguments": ""},
+                            }
+                        ]
+                    }
+                )
+            )
+        )
+    ]
+    text_out = b"".join(t.feed(_openai_chunk({"content": "after first"})))
+    assert b": keepalive" in text_out
+    assert b"text_delta" not in text_out
+    out.append(text_out)
+    out.append(
+        b"".join(
+            t.feed(
+                _openai_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 1,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "second", "arguments": ""},
+                            }
+                        ]
+                    }
+                )
+            )
+        )
+    )
+    # Whitespace alone is still not an arguments value.
+    out.append(b"".join(t.feed(_tool_args_chunk(0, " "))))
+    assert b"text_delta" not in out[-1]
+    out.append(b"".join(t.feed(_tool_args_chunk(0, '{"a":1}'))))
+    out.append(b"".join(t.feed(_tool_args_chunk(1, '{"b":2}'))))
+    out.append(b"".join(t.finalize()))
+    events = _events(out)
+
+    assert _block_starts(events) == [
+        ("tool_use", "call_0", "first"),
+        ("text", None, None),
+        ("tool_use", "call_1", "second"),
+    ]
+    starts, args = _tool_start_and_args(events)
+    by_id = {call_id: args[index] for index, call_id, _ in starts}
+    assert by_id == {"call_0": ' {"a":1}', "call_1": '{"b":2}'}
+    _assert_anthropic_lifecycle(events)
+
+
+@pytest.mark.parametrize(
+    ("fragments", "expected"),
+    [
+        # A brace inside a string, then an escaped quote split at a boundary.
+        (['{"s":"a}', "\\", '""}'], '{"s":"a}\\""}'),
+        # An escaped backslash ends exactly at a boundary: the next quote is real.
+        (['{"s":"a\\\\', '"', "}"], '{"s":"a\\\\"}'),
+        # Nested objects/arrays with brackets inside strings.
+        (['{"a":{"b":[1,', '{"c":"]}"}', "]}", "}"], '{"a":{"b":[1,{"c":"]}"}]}}'),
+    ],
+    ids=["quoted-brace-split-escape", "split-escaped-backslash", "nested"],
+)
+def test_stream_lexical_edges_hold_content_until_the_object_closes(fragments, expected):
+    """Content waits until exactly the fragment that closes the object."""
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    out = [
+        b"".join(
+            t.feed(
+                _openai_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_0",
+                                "type": "function",
+                                "function": {"name": "write", "arguments": fragments[0]},
+                            }
+                        ]
+                    }
+                )
+            )
+        )
+    ]
+    out.append(b"".join(t.feed(_openai_chunk({"content": "after"}))))
+    for position, fragment in enumerate(fragments[1:], start=2):
+        chunk = b"".join(t.feed(_tool_args_chunk(0, fragment)))
+        out.append(chunk)
+        released = any(
+            data["delta"].get("text") == "after"
+            for name, data in _events([chunk])
+            if name == "content_block_delta"
+        )
+        assert released is (position == len(fragments)), (position, fragment)
+    out.append(b"".join(t.finalize()))
+    events = _events(out)
+
+    starts, args = _tool_start_and_args(events)
+    assert [start[1:] for start in starts] == [("call_0", "write")]
+    assert list(args.values()) == [expected]
+    assert _json.loads(expected)
+    _assert_anthropic_lifecycle(events)
+
+
+@pytest.mark.parametrize(
+    "fragments",
+    [['{"a":', "}"], ["{'a'", ":1}"], ['{"a":[', "}"], ["[1,", "2]"]],
+    ids=["missing-value", "single-quotes", "mismatched-bracket", "array"],
+)
+def test_stream_malformed_arguments_keep_content_queued_until_finalize(fragments):
+    """A closing brace on malformed JSON is not completeness; bytes are kept."""
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    out = [
+        b"".join(
+            t.feed(
+                _openai_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_0",
+                                "type": "function",
+                                "function": {"name": "write", "arguments": fragments[0]},
+                            }
+                        ]
+                    }
+                )
+            )
+        )
+    ]
+    out.append(b"".join(t.feed(_openai_chunk({"content": "after"}))))
+    for fragment in fragments[1:]:
+        chunk = b"".join(t.feed(_tool_args_chunk(0, fragment)))
+        assert b"text_delta" not in chunk
+        out.append(chunk)
+    out.append(b"".join(t.finalize()))
+    events = _events(out)
+
+    starts, args = _tool_start_and_args(events)
+    assert len(starts) == 1
+    assert list(args.values()) == ["".join(fragments)]
+    assert _block_starts(events)[-1] == ("text", None, None)
+    _assert_anthropic_lifecycle(events)
+
+
+def _large_tool_stream(mode: str, fragment_count: int):
+    """A Write-like call growing by 128-byte fragments, optionally with a queue.
+
+    ``text`` queues a text fragment and ``parallel`` a second call behind the
+    open one, so every fragment makes the drain ask whether the open call is
+    complete -- the case that used to re-parse the whole prefix each time.
+    """
+    frames = [
+        _openai_chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "write", "arguments": '{"file":"'},
+                    }
+                ]
+            }
+        )
+    ]
+    if mode == "text":
+        frames.append(_openai_chunk({"content": "after"}))
+    elif mode == "parallel":
+        frames.append(
+            _openai_chunk(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 1,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{}"},
+                        }
+                    ]
+                }
+            )
+        )
+    body = 'x\\"{}[]\\n' * 12 + "y" * 20
+    assert len(body) == 128
+    frames.extend(_tool_args_chunk(0, body) for _ in range(fragment_count))
+    frames.append(_tool_args_chunk(0, '"}'))
+    return frames, 9 + 128 * fragment_count + 2
+
+
+@pytest.mark.parametrize("mode", ["none", "text", "parallel"])
+def test_stream_large_arguments_do_linear_parse_and_join_work(mode, monkeypatch):
+    """Deterministic work counters, not timing: each byte is parsed/joined O(1) times.
+
+    Counts every ``json.loads`` of tool-argument text (whatever helper calls
+    it) and every byte materialized by joining argument fragments. The old
+    path parsed the full prefix once per fragment while text or a second call
+    was queued, and copied the full prefix once per fragment on append.
+    """
+    real_loads = _json.loads
+    parsed = {"calls": 0, "bytes": 0}
+
+    def counting_loads(s, *args, **kwargs):
+        if isinstance(s, str) and s.startswith('{"file"'):
+            parsed["calls"] += 1
+            parsed["bytes"] += len(s)
+        return real_loads(s, *args, **kwargs)
+
+    real_text = _ToolArguments.text
+    joined = {"calls": 0, "bytes": 0}
+
+    def counting_text(self):
+        value = real_text(self)
+        joined["calls"] += 1
+        joined["bytes"] += len(value)
+        return value
+
+    def run(fragment_count):
+        parsed.update(calls=0, bytes=0)
+        joined.update(calls=0, bytes=0)
+        frames, total = _large_tool_stream(mode, fragment_count)
+        t = OpenAIToAnthropicStreamTranslator(model="m")
+        out = []
+        for position, frame in enumerate(frames):
+            chunk = b"".join(t.feed(frame))
+            out.append(chunk)
+            if position >= len(frames) - fragment_count - 1 and position < len(frames) - 1:
+                # The open call's deltas keep streaming as they arrive.
+                assert b"input_json_delta" in chunk
+        out.append(b"".join(t.finalize()))
+        return _events(out), total, dict(parsed), dict(joined)
+
+    monkeypatch.setattr(_json, "loads", counting_loads)
+    monkeypatch.setattr(_ToolArguments, "text", counting_text)
+    small = run(256)
+    large = run(1024)
+    monkeypatch.undo()
+
+    for events, total, parse_work, join_work in (small, large):
+        starts, args = _tool_start_and_args(events)
+        assert len(args[starts[0][0]]) == total
+        assert real_loads(args[starts[0][0]])["file"].startswith('x"{}[]\n')
+        assert parse_work["calls"] <= 1
+        assert parse_work["bytes"] <= total
+        # The open call is joined at most twice (first emission, validation).
+        assert join_work["calls"] <= 4
+        assert join_work["bytes"] <= 2 * total + 64
+        _assert_anthropic_lifecycle(events)
+        if mode == "text":
+            assert _block_starts(events)[-1] == ("text", None, None)
+        if mode == "parallel":
+            assert [start[1:] for start in starts] == [("call_0", "write"), ("call_1", "read")]
+
+    # Four times the input costs at most about four times the work.
+    assert large[2]["bytes"] <= 4 * small[2]["bytes"] + 64
+    assert large[3]["bytes"] <= 4 * small[3]["bytes"] + 64
+
+
+# -- tool-call index validation ----------------------------------------------
+
+
+def _tool_chunk_with_index(index, *, call_id="call_bad", arguments='{"a":1}'):
+    tc = {"id": call_id, "type": "function", "function": {"name": "bad", "arguments": arguments}}
+    tc["index"] = index
+    return _openai_chunk({"tool_calls": [tc]})
+
+
+@pytest.mark.parametrize(
+    "index",
+    [None, "0", "1", 0.0, 1.5, True, False, [0], {"i": 0}],
+    ids=["null", "str0", "str1", "float0", "float", "true", "false", "list", "dict"],
+)
+def test_stream_non_integer_tool_index_is_rejected_before_any_state(index):
+    """An explicit non-integer index is a protocol error, not call 0."""
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    started = b"".join(t.feed(_openai_chunk({"content": "before"})))
+    with pytest.raises(ValueError, match="tool call index must be an integer"):
+        list(t.feed(_tool_chunk_with_index(index)))
+    assert t._tool_calls == {}
+    assert all(kind != "tool" for kind, _ in t._pending_events)
+
+    events = _events([started, b"".join(t.abort())])
+    assert not any(
+        name == "content_block_start" and data["content_block"]["type"] == "tool_use"
+        for name, data in events
+    )
+    assert not any(name in ("message_delta", "message_stop") for name, _ in events)
+    assert list(t.finalize()) == []
+    _assert_anthropic_lifecycle(events)
+
+
+def test_stream_invalid_index_behind_open_tool_aborts_with_a_closed_lifecycle():
+    """Rejection mid-stream drains received content and closes every block."""
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    out = [
+        b"".join(t.feed(_tool_chunk_with_index(0, call_id="call_0", arguments='{"a":'))),
+        b"".join(t.feed(_openai_chunk({"content": "queued"}))),
+    ]
+    with pytest.raises(ValueError, match="tool call index must be an integer"):
+        list(t.feed(_tool_chunk_with_index(None)))
+    out.append(b"".join(t.abort()))
+    events = _events(out)
+
+    assert _block_starts(events) == [("tool_use", "call_0", "bad"), ("text", None, None)]
+    _, args = _tool_start_and_args(events)
+    assert list(args.values()) == ['{"a":']
+    assert not any(name in ("message_delta", "message_stop") for name, _ in events)
+    _assert_anthropic_lifecycle(events)
+
+
+def test_stream_missing_tool_index_still_means_call_zero():
+    """Compatibility: providers that omit the index stream a single call."""
+    t = OpenAIToAnthropicStreamTranslator(model="m")
+    out = [
+        b"".join(
+            t.feed(
+                _openai_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "call_0",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": '{"a":'},
+                            }
+                        ]
+                    }
+                )
+            )
+        ),
+        b"".join(t.feed(_openai_chunk({"tool_calls": [{"function": {"arguments": "1}"}}]}))),
+        b"".join(t.finalize()),
+    ]
+    events = _events(out)
+    starts, args = _tool_start_and_args(events)
+    assert [start[1:] for start in starts] == [("call_0", "lookup")]
+    assert list(args.values()) == ['{"a":1}']
     _assert_anthropic_lifecycle(events)
 
 

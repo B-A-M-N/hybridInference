@@ -218,6 +218,40 @@ async def test_stream_messages_upstream_error_preserves_pending_parallel_call():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("index", [None, "1", True], ids=["null", "str", "bool"])
+async def test_stream_messages_invalid_tool_index_raises_after_closing_blocks(index):
+    """A non-integer index takes the abort path: closed blocks, no terminal."""
+    a = _ScriptedOpenAIAdapter(
+        _cfg(),
+        [
+            _openai_tool_chunk('{"a":', call_id="call_0"),
+            _openai_text_chunk("queued"),
+            _openai_tool_chunk('{"b":1}', index=index, call_id="call_bad"),
+            _openai_text_chunk("never"),
+        ],
+    )
+    out = b""
+    with pytest.raises(ValueError, match="tool call index must be an integer"):
+        async for chunk in a.stream_messages(_stream_body(), request_id="req_bad_index"):
+            out += chunk
+
+    events = _sse_events(out)
+    starts = [
+        (data["content_block"]["type"], data["content_block"].get("id"))
+        for name, data in events
+        if name == "content_block_start"
+    ]
+    assert starts == [("tool_use", "call_0"), ("text", None)]
+    stops = [data["index"] for name, data in events if name == "content_block_stop"]
+    assert sorted(stops) == [0, 1]
+    assert b"call_bad" not in out
+    assert b"never" not in out
+    assert not any(name in ("message_delta", "message_stop") for name, _ in events)
+    # The owned upstream generator is closed on the error path too.
+    assert a.upstream_closed
+
+
+@pytest.mark.asyncio
 async def test_stream_messages_cancellation_does_not_emit_terminal_or_flush_buffers():
     """A cancelled client is not an upstream finish; do not dress it as one."""
     a = _ScriptedOpenAIAdapter(

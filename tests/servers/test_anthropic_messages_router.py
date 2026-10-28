@@ -2058,6 +2058,106 @@ async def test_translated_stream_incomplete_tool_then_silence_still_hits_idle_ce
     assert captured.get("status_code") == 504
 
 
+@pytest.mark.asyncio
+async def test_translated_stream_null_tool_index_is_an_error_not_a_200(
+    anthropic_test_client, monkeypatch
+):
+    """An explicit null tool-call index fails the stream through the error path.
+
+    Normalizing it to call 0 (or giving it its own state) would end with a
+    logged 200 and a message_stop around a call the client cannot attribute.
+    The blocks already on the wire must still be closed exactly once.
+    """
+    from serving.servers.routers import anthropic_messages as amod
+
+    def _chunk(delta, finish_reason=None):
+        payload = {
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "model": OPENAI_MODEL,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
+    def _tool(index, call_id, arguments):
+        return {
+            "index": index,
+            "id": call_id,
+            "type": "function",
+            "function": {"name": "lookup", "arguments": arguments},
+        }
+
+    async def _iter():
+        yield _chunk({"tool_calls": [_tool(0, "call_0", '{"a":')]})
+        yield _chunk({"content": "queued-before-error"})
+        yield _chunk({"tool_calls": [_tool(None, "call_null", '{"b":1}')]})
+        yield _chunk({"content": "after-error"})
+        # A well-formed ending: without the index check this stream would be
+        # a successful, logged 200.
+        yield _chunk({}, finish_reason="tool_calls")
+        yield b"data: [DONE]\n\n"
+
+    from serving.http import AsyncHTTPClient
+
+    monkeypatch.setattr(AsyncHTTPClient, "_ensure_session", _fake_session_from_iter(_iter))
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        amod, "_schedule_log_store_task", lambda log_store, **kw: captured.update(kw)
+    )
+
+    body = {
+        "model": OPENAI_MODEL,
+        "max_tokens": 50,
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    collected = b""
+    async with anthropic_test_client.stream(
+        "POST", "/v1/messages", json=body, headers=_auth()
+    ) as r:
+        assert r.status_code == 200
+        async for raw in r.aiter_bytes():
+            collected += raw
+
+    events = []
+    event_type = None
+    for line in collected.decode().splitlines():
+        if line.startswith("event: "):
+            event_type = line[len("event: ") :]
+        elif line.startswith("data: "):
+            events.append((event_type, json.loads(line[len("data: ") :])))
+
+    names = [name for name, _ in events]
+    assert names[-1] == "error"
+    assert "message_stop" not in names
+    assert "message_delta" not in names
+    assert b"call_null" not in collected
+    assert b"after-error" not in collected
+    assert b"queued-before-error" in collected
+
+    open_blocks: set[int] = set()
+    started: list[tuple] = []
+    for name, data in events:
+        if name == "content_block_start":
+            assert not open_blocks, (open_blocks, data)
+            open_blocks.add(data["index"])
+            block = data["content_block"]
+            started.append((block["type"], block.get("id")))
+        elif name == "content_block_delta":
+            assert data["index"] in open_blocks, data
+        elif name == "content_block_stop":
+            assert data["index"] in open_blocks, data
+            open_blocks.discard(data["index"])
+    assert not open_blocks
+    assert started == [("tool_use", "call_0"), ("text", None)]
+
+    assert captured.get("status_code") == 502
+    assert captured.get("error")
+    # The client sees a scrubbed message; the operator record names the cause.
+    assert "tool call index must be an integer" in (captured.get("operator_error") or "")
+
+
 # ---------------------------------------------------------------------------
 # Error-mapping + count_tokens correctness fixes
 # ---------------------------------------------------------------------------

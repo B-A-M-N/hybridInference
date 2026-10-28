@@ -10,6 +10,7 @@ Pure functions plus one stateful streaming translator. No I/O, no logging.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections import deque
 from typing import TYPE_CHECKING, Any
@@ -561,6 +562,130 @@ def openai_response_to_anthropic(resp: dict[str, Any], *, model: str) -> dict[st
 # is ignored by clients and by the router's accounting.
 _ACTIVITY_FRAME = b": keepalive\n\n"
 
+# Lexical states of a streamed tool-arguments value; see _ToolArguments.
+_ARGS_EMPTY = 0  # only JSON whitespace so far
+_ARGS_OBJECT = 1  # inside the top-level object
+_ARGS_CLOSED = 2  # the top-level object's closing brace was seen
+_ARGS_INVALID = 3  # can never become a complete JSON object
+
+# JSON's own whitespace set. ``str.strip()`` removes other Unicode spaces too,
+# which ``json.loads`` rejects.
+_JSON_NON_WHITESPACE = re.compile(r"[^ \t\n\r]")
+_JSON_STRUCTURAL = re.compile(r'["{}\[\]]')
+# The rest of a string body: stops at its closing quote, at the end of the
+# fragment, or at a backslash that is the fragment's last character (an escape
+# split across fragments).
+_JSON_STRING_BODY = re.compile(r'[^"\\]*(?:\\[\s\S][^"\\]*)*')
+
+
+def _is_json_object(text: str) -> bool:
+    """Whether ``text`` is exactly one JSON object, with optional whitespace.
+
+    Anthropic tool input is an object. Requiring one also stops a scalar
+    prefix (``1`` on the way to ``123``) from looking complete.
+    """
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return isinstance(parsed, dict)
+
+
+class _ToolArguments:
+    """The argument bytes of one streamed tool call, and their completeness.
+
+    Fragments are kept as a list and joined only when the whole value is
+    needed: once to emit a pending call's backlog when its block opens, and at
+    most once to validate it. Appending to one string instead copies
+    everything received so far on every fragment.
+
+    Completeness means the bytes are exactly one JSON object, as
+    ``json.loads`` would decide. Re-parsing the growing prefix on every
+    fragment is quadratic, so each fragment is scanned once instead, tracking
+    strings (escapes may split across fragments) and bracket depth. Only when
+    the top-level object's closing brace has been seen is the value parsed,
+    once, and the result kept. That is exact rather than heuristic: in valid
+    JSON the lexical close is where the object ends, so if the bytes up to it
+    are not a valid object no extension is, and any later non-whitespace is
+    trailing data that ``json.loads`` rejects. Whitespace may follow.
+    """
+
+    __slots__ = ("_chunks", "_depth", "_escaped", "_in_string", "_size", "_state", "_valid")
+
+    def __init__(self) -> None:
+        self._chunks: list[str] = []
+        self._size = 0
+        self._state = _ARGS_EMPTY
+        self._depth = 0
+        self._in_string = False
+        self._escaped = False
+        self._valid: bool | None = None
+
+    def __bool__(self) -> bool:
+        return self._size > 0
+
+    def append(self, fragment: str) -> None:
+        self._chunks.append(fragment)
+        self._size += len(fragment)
+        self._scan(fragment)
+
+    def text(self) -> str:
+        """Return every byte received so far, joined once and kept joined."""
+        if len(self._chunks) > 1:
+            self._chunks[:] = ["".join(self._chunks)]
+        return self._chunks[0] if self._chunks else ""
+
+    def complete(self) -> bool:
+        """Whether the bytes so far form exactly one JSON object."""
+        if self._state != _ARGS_CLOSED:
+            return False
+        if self._valid is None:
+            self._valid = _is_json_object(self.text())
+        return self._valid
+
+    def _scan(self, fragment: str) -> None:
+        pos, end = 0, len(fragment)
+        while pos < end:
+            if self._state == _ARGS_INVALID:
+                return
+            if self._state != _ARGS_OBJECT:
+                # Outside the object only whitespace may appear, and the
+                # object may begin only if nothing else came first.
+                match = _JSON_NON_WHITESPACE.search(fragment, pos)
+                if match is None:
+                    return
+                if self._state == _ARGS_EMPTY and match.group() == "{":
+                    self._state, self._depth, pos = _ARGS_OBJECT, 1, match.end()
+                    continue
+                self._state = _ARGS_INVALID
+                return
+            if self._in_string:
+                if self._escaped:
+                    self._escaped = False
+                    pos += 1
+                    continue
+                pos = _JSON_STRING_BODY.match(fragment, pos).end()
+                if pos < end:
+                    if fragment[pos] == '"':
+                        self._in_string = False
+                    else:
+                        self._escaped = True
+                    pos += 1
+                continue
+            match = _JSON_STRUCTURAL.search(fragment, pos)
+            if match is None:
+                return
+            pos = match.end()
+            char = match.group()
+            if char == '"':
+                self._in_string = True
+            elif char in "{[":
+                self._depth += 1
+            else:
+                self._depth -= 1
+                if self._depth == 0:
+                    self._state = _ARGS_CLOSED
+
 
 class OpenAIToAnthropicStreamTranslator:
     """Stateful translator: feed OpenAI SSE chunks, emit Anthropic SSE bytes.
@@ -942,41 +1067,20 @@ class OpenAIToAnthropicStreamTranslator:
             else:
                 yield from self._emit_text(payload)
 
-    @staticmethod
-    def _arguments_complete(arguments: str) -> bool:
-        """Whether the accumulated tool arguments form a complete JSON object.
+    def _call_arguments_complete(self, call: dict[str, Any]) -> bool:
+        """Whether an in-flight call's arguments form a complete JSON object.
 
         This is a *local* completeness check, not proof that the upstream has
         finished the call: OpenAI has no per-tool end marker. It is used only
         to decide whether content that follows can be streamed without closing
         a block that a later argument fragment would have to reopen. Empty or
-        whitespace-only arguments are not complete, and trailing non-whitespace
-        makes ``json.loads`` fail rather than looking complete.
+        whitespace-only arguments are not complete -- the call may still
+        receive its arguments -- and trailing non-whitespace is not either.
+        The drain asks on every queued event, so the answer is tracked
+        incrementally rather than by re-parsing the prefix (see
+        :class:`_ToolArguments`).
         """
-        if not arguments or not arguments.strip():
-            return False
-        try:
-            parsed = json.loads(arguments)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return False
-        # Anthropic tool input is an object. Requiring an object also stops a
-        # scalar prefix (for example "1" on the way to "123") from looking
-        # complete while the upstream is still appending to it.
-        return isinstance(parsed, dict)
-
-    def _call_arguments_complete(self, call: dict[str, Any]) -> bool:
-        """Cached form of :meth:`_arguments_complete` for an in-flight call.
-
-        Parallel calls can deliver many argument deltas for a pending tool
-        while an earlier tool is still open. Re-parsing the earlier call's
-        whole accumulated JSON on every one of those deltas would be
-        quadratic, so remember the result until the next appended byte.
-        """
-        arguments = call["arguments"]
-        if call["complete_checked_len"] != len(arguments):
-            call["arguments_complete"] = self._arguments_complete(arguments)
-            call["complete_checked_len"] = len(arguments)
-        return call["arguments_complete"]
+        return call["arguments"].complete()
 
     def _tool_call_state(self, idx: int, tc: dict[str, Any], fn: dict[str, Any]) -> dict[str, Any]:
         """Return this index's state, recording id/name without overwriting them.
@@ -991,9 +1095,7 @@ class OpenAIToAnthropicStreamTranslator:
                 "anthropic_index": None,
                 "id": "",
                 "name": "",
-                "arguments": "",
-                "arguments_complete": False,
-                "complete_checked_len": 0,
+                "arguments": _ToolArguments(),
                 "opened": False,
                 "closed": False,
             }
@@ -1051,7 +1153,8 @@ class OpenAIToAnthropicStreamTranslator:
                 },
             },
         )
-        if call["arguments"]:
+        backlog = call["arguments"].text()
+        if backlog:
             yield self._sse(
                 "content_block_delta",
                 {
@@ -1059,7 +1162,7 @@ class OpenAIToAnthropicStreamTranslator:
                     "index": anthropic_index,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": call["arguments"],
+                        "partial_json": backlog,
                     },
                 },
             )
@@ -1076,7 +1179,17 @@ class OpenAIToAnthropicStreamTranslator:
         self._open_tool = None
 
     def _emit_tool_call_delta(self, tc: dict[str, Any]) -> Iterator[bytes]:
+        # A missing index means a single call, as before. Anything else must be
+        # an integer: it is the only key tying a later argument fragment to its
+        # call, so an explicit null or a string cannot be mapped to one without
+        # guessing. Fail like any other upstream protocol error, before any state
+        # or block exists for it. bool is an int subclass, not an index.
         idx = tc.get("index", 0)
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            raise ValueError(
+                f"tool call index must be an integer, got {type(idx).__name__}; "
+                "argument fragments cannot be attributed to a call"
+            )
         fn = tc.get("function") or {}
         call = self._tool_call_state(idx, tc, fn)
         partial = self._normalize_partial_arguments(tc)
@@ -1096,7 +1209,7 @@ class OpenAIToAnthropicStreamTranslator:
             return
 
         if partial:
-            call["arguments"] += partial
+            call["arguments"].append(partial)
 
         if call["opened"]:
             if partial:
