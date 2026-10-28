@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from serving.config.settings import has_role
+from serving.observability.alert_history import hooks as alert_history
 from serving.observability.alerts import AlertSeverity, alert_on_transition
 from serving.observability.state_alert_policy import db_disconnect_policy
 from serving.servers import restart
@@ -173,6 +174,24 @@ async def _test_store_health(op_store: Any, log_store: Any) -> dict[str, Any]:
                 kind="state",
             )
         )
+    if not db_policy.enabled:
+        # Not reported, by policy; alert history still records the breach
+        # with the reason it went unannounced. Nothing for a healthy store.
+        for store, status, kind in (
+            (op_store, op_status, op_status.get("backend", "operational")),
+            (log_store, log_status, f"{log_status.get('backend', 'log')}_log"),
+        ):
+            if store and status["status"] == "ok":
+                alert_history.observed_healthy(f"db_disconnect:{kind}")
+            elif store and status["status"] == "error":
+                alert_history.external_decision(
+                    f"db_disconnect:{kind}",
+                    reason="policy_disabled",
+                    severity=AlertSeverity.CRITICAL,
+                    title="Database disconnected",
+                    kind="state",
+                    context={"store": "operational_store" if store is op_store else "log_store"},
+                )
     if log_store and db_policy.enabled:
         _report_in_background(
             alert_on_transition(
@@ -388,6 +407,21 @@ async def deep_health(
         router_exec.get_route_exclusions() if hasattr(router_exec, "get_route_exclusions") else []
     )
 
+    # Live configuration groups, alerting first among them. Like the route
+    # exclusions, deliberately not part of `overall`: a group that failed to
+    # apply keeps its previous state, and alerting is degradable -- its own
+    # state says so, without taking inference out of a load balancer.
+    from serving.config import live
+
+    config_groups = {
+        name: {
+            "state": group.status.state,
+            "reconciled_revision": group.status.reconciled_revision,
+            "error_code": group.status.error_code,
+        }
+        for name, group in live.COORDINATOR.groups.items()
+    }
+
     return {
         "status": overall,
         "routes_configured": routes_count,
@@ -398,6 +432,7 @@ async def deep_health(
         },
         "providers": provider_status,
         "route_exclusions": route_exclusions,
+        "config_groups": config_groups,
     }
 
 
