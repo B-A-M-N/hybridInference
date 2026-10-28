@@ -331,7 +331,11 @@ function TtftScatterCard({ model }: { model: AdminTtftScatterModel }) {
         </span>
         <span className="inline-flex items-center gap-1.5">
           <span className="h-2 w-2 rounded-full bg-slate-500 opacity-60" aria-hidden="true" />
-          No cache ({uncached.length.toLocaleString()})
+          Measured miss ({uncached.length.toLocaleString()})
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="h-2 w-2 rounded-full bg-amber-500 opacity-50" aria-hidden="true" />
+          Unknown ({unknownCache.length.toLocaleString()})
         </span>
         <span className="text-gray-400">· drag to zoom</span>
         <ScaleToggle label="X" value={xScale} onChange={setXScale} />
