@@ -251,7 +251,17 @@ async def test_basic_text_response(responses_client):
 
 
 @pytest.mark.asyncio
-async def test_responses_non_stream_copies_trusted_identity_headers(responses_client):
+@pytest.mark.parametrize(
+    "identity_headers",
+    [
+        {"x-probe": "synthetic"},
+        {"x-fi-served-identity": "include"},
+    ],
+    ids=["trusted-probe", "authorized-opt-in"],
+)
+async def test_responses_non_stream_copies_trusted_identity_headers(
+    responses_client, identity_headers
+):
     app = responses_client._transport.app
     adapter = app.state.services.router.routes[TEXT_MODEL].adapters[0][0]
     adapter.config.provider = "zai"
@@ -261,7 +271,7 @@ async def test_responses_non_stream_copies_trusted_identity_headers(responses_cl
     response = await responses_client.post(
         "/v1/responses",
         json={"model": TEXT_MODEL, "input": "hello"},
-        headers={**_auth(), "x-probe": "synthetic"},
+        headers={**_auth(), **identity_headers},
     )
 
     assert response.status_code == 200
@@ -467,7 +477,15 @@ async def test_streaming_text_events(responses_client):
 
 
 @pytest.mark.asyncio
-async def test_responses_stream_copies_trusted_identity_headers(responses_client):
+@pytest.mark.parametrize(
+    "identity_headers",
+    [
+        {"x-probe": "synthetic"},
+        {"x-fi-served-identity": "include"},
+    ],
+    ids=["trusted-probe", "authorized-opt-in"],
+)
+async def test_responses_stream_copies_trusted_identity_headers(responses_client, identity_headers):
     app = responses_client._transport.app
     adapter = app.state.services.router.routes[TEXT_MODEL].adapters[0][0]
     adapter.config.provider = "zai"
@@ -478,7 +496,7 @@ async def test_responses_stream_copies_trusted_identity_headers(responses_client
         "POST",
         "/v1/responses",
         json={"model": TEXT_MODEL, "input": "hello", "stream": True},
-        headers={**_auth(), "x-probe": "synthetic"},
+        headers={**_auth(), **identity_headers},
     ) as response:
         assert response.status_code == 200
         assert response.headers["x-fi-requested-model"] == TEXT_MODEL

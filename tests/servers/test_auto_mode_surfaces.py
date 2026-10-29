@@ -379,9 +379,18 @@ async def test_bare_auto_is_the_default_tier(gateway):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("path", "body"), _SURFACES[:2])
-async def test_auto_does_not_expose_identity_headers_to_ordinary_callers(gateway, path, body):
+@pytest.mark.parametrize(
+    "headers",
+    [
+        SESSION | {"x-fi-served-identity": "include"},
+        SESSION | {"x-fi-served-identity": "include", "x-probe": "synthetic"},
+    ],
+)
+async def test_auto_does_not_expose_identity_headers_to_ordinary_callers(
+    gateway, path, body, headers
+):
     """Served-identity headers are limited to trusted diagnostic callers."""
-    response = await gateway.post(path, body("auto-balance"), SESSION)
+    response = await gateway.post(path, body("auto-balance"), headers)
 
     assert response.status_code == 200
     assert not any(name.lower().startswith("x-fi-") for name in response.headers)

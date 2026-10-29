@@ -27,10 +27,17 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from serving.utils.synthetic_probe import (
+    is_trusted_probe_caller,
+    is_trusted_probe_headers,
+)
+
 REQUESTED_MODEL_HEADER = "X-FI-Requested-Model"
 SERVED_MODEL_HEADER = "X-FI-Served-Model"
 SERVED_ENDPOINT_HEADER = "X-FI-Served-Endpoint"
 SERVED_PROVIDER_HEADER = "X-FI-Served-Provider"
+SERVED_IDENTITY_OPT_IN_HEADER = "X-FI-Served-Identity"
+SERVED_IDENTITY_OPT_IN_VALUE = "include"
 SERVED_IDENTITY_HEADER_NAMES = frozenset(
     (REQUESTED_MODEL_HEADER, SERVED_MODEL_HEADER, SERVED_ENDPOINT_HEADER, SERVED_PROVIDER_HEADER)
 )
@@ -39,6 +46,24 @@ SERVED_IDENTITY_HEADER_NAMES = frozenset(
 # registry publishability bit is the authority for whether a location may be
 # disclosed at all.
 _SAFE_LOCATION_RE = re.compile(r"^(?:local(?:-\d+)?|[a-z][a-z0-9]*-api)$")
+
+
+def should_include_served_identity_headers(headers: Any, user_ctx: Any) -> bool:
+    """Authorize identity headers for a trusted probe or opted-in diagnostic call.
+
+    The caller entitlement is derived only from the authenticated server-side
+    context: the existing internal/admin trust tier, excluding agent grants.
+    A request header can express per-call intent, but cannot grant that
+    entitlement. Synthetic probes retain their existing marker and policy.
+    """
+    if is_trusted_probe_headers(headers, user_ctx):
+        return True
+    if not is_trusted_probe_caller(user_ctx):
+        return False
+    return (
+        headers.get(SERVED_IDENTITY_OPT_IN_HEADER, "").strip().lower()
+        == SERVED_IDENTITY_OPT_IN_VALUE
+    )
 
 
 def header_endpoint_id(

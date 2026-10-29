@@ -149,8 +149,16 @@ def _patch_anthropic_upstream(monkeypatch, model: str = "claude-opus-4-7"):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity_headers",
+    [
+        {"x-probe": "synthetic"},
+        {"x-fi-served-identity": "include"},
+    ],
+    ids=["trusted-probe", "authorized-opt-in"],
+)
 async def test_messages_response_carries_served_identity_headers(
-    anthropic_client, anthropic_test_app, monkeypatch
+    anthropic_client, anthropic_test_app, monkeypatch, identity_headers
 ):
     _patch_anthropic_upstream(monkeypatch)
     adapter = anthropic_test_app.state.services.router.routes[NATIVE_MODEL].adapters[0][0]
@@ -162,7 +170,7 @@ async def test_messages_response_carries_served_identity_headers(
     r = await anthropic_client.post(
         "/v1/messages",
         json=_anthropic_body(),
-        headers={**_anthropic_auth(), "x-probe": "synthetic"},
+        headers={**_anthropic_auth(), **identity_headers},
     )
     assert r.status_code == 200
     assert r.headers["x-fi-requested-model"] == NATIVE_MODEL
@@ -196,8 +204,16 @@ async def test_messages_with_non_latin_model_id_does_not_fail_or_leak_headers(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity_headers",
+    [
+        {"x-probe": "synthetic"},
+        {"x-fi-served-identity": "include"},
+    ],
+    ids=["trusted-probe", "authorized-opt-in"],
+)
 async def test_messages_stream_carries_the_same_served_identity_headers(
-    anthropic_client, anthropic_test_app, monkeypatch
+    anthropic_client, anthropic_test_app, monkeypatch, identity_headers
 ):
     """Streaming and non-streaming expose the same identity (issue #1504)."""
 
@@ -246,7 +262,7 @@ async def test_messages_stream_carries_the_same_served_identity_headers(
         "POST",
         "/v1/messages",
         json=_anthropic_body(stream=True),
-        headers={**_anthropic_auth(), "x-probe": "synthetic"},
+        headers={**_anthropic_auth(), **identity_headers},
     ) as r:
         assert r.status_code == 200
         assert r.headers["x-fi-requested-model"] == NATIVE_MODEL
@@ -279,6 +295,23 @@ async def test_chat_completions_response_carries_served_identity_headers(chat_cl
 
 
 @pytest.mark.asyncio
+async def test_authorized_opt_in_discloses_chat_identity_without_marking_probe(chat_client):
+    app = chat_client._transport.app
+    _enable_trusted_probe(app)
+    response = await chat_client.post(
+        "/v1/chat/completions",
+        json={"model": CHAT_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
+        headers={"x-fi-served-identity": "include"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-fi-served-model"] == CHAT_MODEL
+    assert response.headers["x-fi-served-endpoint"] == f"{CHAT_MODEL}:zai-api"
+    # Opt-in is disclosure only; it does not turn an ordinary request into a probe.
+    assert chat_client._transport.app.state.services.log_store is not None
+
+
+@pytest.mark.asyncio
 async def test_alias_request_publishes_canonical_model_and_endpoint(chat_client):
     """An alias remains the requested spelling; identity uses the canonical id."""
     chat_client._transport.app.state.services.router.register_route(
@@ -291,7 +324,7 @@ async def test_alias_request_publishes_canonical_model_and_endpoint(chat_client)
     response = await chat_client.post(
         "/v1/chat/completions",
         json={"model": "glm-latest", "messages": [{"role": "user", "content": "Hi"}]},
-        headers={"x-probe": "synthetic"},
+        headers={"x-fi-served-identity": "include"},
     )
 
     assert response.status_code == 200
@@ -307,6 +340,18 @@ async def test_untrusted_customer_does_not_receive_served_identity_headers(chat_
         "/v1/chat/completions",
         json={"model": CHAT_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
     )
+    assert response.status_code == 200
+    assert not any(name.lower().startswith("x-fi-") for name in response.headers)
+
+
+@pytest.mark.asyncio
+async def test_opt_in_header_does_not_grant_identity_disclosure(chat_client):
+    response = await chat_client.post(
+        "/v1/chat/completions",
+        json={"model": CHAT_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
+        headers={"x-fi-served-identity": "include", "x-probe": "synthetic"},
+    )
+
     assert response.status_code == 200
     assert not any(name.lower().startswith("x-fi-") for name in response.headers)
 
@@ -346,7 +391,15 @@ async def test_non_latin_model_id_does_not_fail_chat_or_stream(chat_client):
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_stream_carries_requested_identity(chat_client):
+@pytest.mark.parametrize(
+    "identity_headers",
+    [
+        {"x-probe": "synthetic"},
+        {"x-fi-served-identity": "include"},
+    ],
+    ids=["trusted-probe", "authorized-opt-in"],
+)
+async def test_chat_completions_stream_carries_requested_identity(chat_client, identity_headers):
     """A trusted diagnostic stream carries the selected route identity."""
     _enable_trusted_probe(chat_client._transport.app)
     r = await chat_client.post(
@@ -356,7 +409,7 @@ async def test_chat_completions_stream_carries_requested_identity(chat_client):
             "messages": [{"role": "user", "content": "Hi"}],
             "stream": True,
         },
-        headers={"x-probe": "synthetic"},
+        headers=identity_headers,
     )
     assert r.status_code == 200
     assert r.headers["x-fi-requested-model"] == CHAT_MODEL

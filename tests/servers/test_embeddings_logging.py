@@ -452,6 +452,29 @@ async def test_trusted_embedding_probe_receives_registered_identity_headers():
 
 
 @pytest.mark.asyncio
+async def test_authorized_embedding_opt_in_keeps_request_logging_and_billing():
+    adapter = _FakeAdapter(response=_OK_RESPONSE, pricing=_PAID_PRICING)
+    adapter.config.provider = "zai"
+    adapter.config.endpoint_id = "emb-model:zai-api"
+    adapter.config.endpoint_identity_publishable = True
+    logger = _CapturingLogger()
+    op_store = _CapturingOpStore()
+    app = _build_app(adapter, logger, op_store)
+
+    response = await _post(
+        app,
+        {"model": "emb-model", "input": "hello"},
+        headers={"x-fi-served-identity": "include"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-fi-served-model"] == "emb-model"
+    assert response.headers["x-fi-served-endpoint"] == "emb-model:zai-api"
+    assert len(logger.calls) == 1
+    assert op_store.increments
+
+
+@pytest.mark.asyncio
 async def test_synthetic_probe_logged_when_enabled_and_billed():
     """When log_synthetic_probes is on, the probe is logged and tagged, and is
     billed like any other request.
