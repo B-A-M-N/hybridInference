@@ -147,10 +147,7 @@ class TestThreeStatesSurviveEndToEnd:
         # 5. The effective cache ratio the gateway computes from the payload
         #    is -1 (unobservable) for UNKNOWN and the true ratio otherwise.
         cached = wire["input_tokens_details"]["cached_tokens"]
-        if expected_cached is None:
-            ratio = -1.0
-        else:
-            ratio = cached / wire["input_tokens"]
+        ratio = -1.0 if expected_cached is None else cached / wire["input_tokens"]
         assert ratio == pytest.approx(expected_ratio, abs=1e-9)
 
     def test_unknown_is_not_a_miss_anywhere_in_the_chain(self):
