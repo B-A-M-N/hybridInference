@@ -6,8 +6,13 @@ For: the maintainers/agent owning #1630 (edit route capabilities at runtime),
 on route edit). Written by the routing-side cache-locality work; none of your
 branches are edited here.
 
-## Classification: pre-existing runtime-route mechanism, first observable
-through PR A's new field
+Status: the create, restore, and kind-repoint inheritance gap described below
+was fixed by PR #1635 (`_config_to_dict(..., strip_route_capabilities=True)`);
+same-endpoint edits retain the existing route value. Tests now cover create,
+same-endpoint edit, repoint, and restore. This note records the original
+finding and its resolution.
+
+## Original classification (as of 2026-10-23; superseded below)
 
 The mechanism is **not** introduced by PR A
 (`bamn/serving/route-usage-capability`, `fac7ffc0` equivalent): the template
@@ -67,7 +72,7 @@ Root cause in one sentence: the runtime paths copy *resolved* config values
 where the loader's contract is *declared* values win, kind defaults only on
 absence — and nothing records which one a route is carrying.
 
-## Minimal correct design (recommended)
+## Minimal design proposed at the time
 
 Keep the flag kind-derived by default and persist only explicit declarations:
 
@@ -90,14 +95,12 @@ exposing the flag in the console later. All of it lives in
 `provider_routes.py` / `schemas_admin.py` / storage — the files #1630-#1632
 are actively reshaping — hence this handoff rather than a competing patch.
 
-## Impact on PR A's readiness
+## Resolution in PR #1635
 
-None blocking. PR A is correct for every models.yaml-declared route (the only
-surface that can set the flag today), self-consistent for runtime routes
-(inherited value is deterministic at create, edit, and restore given an
-unchanged template), and its regression tests cover the loader and outbound
-request behavior. The gap narrows to "runtime-created routes cannot declare
-the flag independently of the template, and kind-repointing edits do not
-re-derive it" — pre-existing mechanism, admin-invoked, bounded blast radius
-(one stream field on one repointed route), owned by the #1630-#1632 family
-with the recommendation above.
+The create and restore paths strip the template's resolved value before the
+target adapter is built, so its own kind default applies. An edit strips the
+value only when provider or URL changes; an edit to the same endpoint retains
+the route's current value. The setting remains explicit in YAML for routes
+that declare it. OpenRouter's adapter always requests usage, and the native
+Anthropic, Claude, and Gemini adapters do not consume this flag; the developer
+guide now documents those exceptions.
