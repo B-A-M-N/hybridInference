@@ -383,6 +383,7 @@ async def test_bare_auto_is_the_default_tier(gateway):
     "headers",
     [
         SESSION | {"x-fi-served-identity": "include"},
+        SESSION | {"x-probe": "synthetic"},
         SESSION | {"x-fi-served-identity": "include", "x-probe": "synthetic"},
     ],
 )
@@ -488,8 +489,16 @@ async def test_a_model_the_caller_may_not_use_is_never_chosen(gateway):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["chat", "messages"])
 @pytest.mark.parametrize("stream", [False, True])
-async def test_trusted_probe_auto_selection_still_conceals_served_identity(
-    mock_db_logger, mock_log_store, surface, stream
+@pytest.mark.parametrize(
+    "identity_headers",
+    [
+        {"x-probe": "synthetic"},
+        {"x-fi-served-identity": "include"},
+    ],
+    ids=["trusted-probe", "authorized-opt-in"],
+)
+async def test_auto_selection_conceals_served_identity_for_diagnostic_access(
+    mock_db_logger, mock_log_store, surface, stream, identity_headers
 ):
     gateway = _Gateway(
         mock_db_logger,
@@ -506,7 +515,7 @@ async def test_trusted_probe_auto_selection_still_conceals_served_identity(
     response = await gateway.post(
         path,
         body,
-        headers={"x-probe": "synthetic"},
+        headers=identity_headers,
     )
 
     assert response.status_code == 200

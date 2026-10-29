@@ -345,11 +345,20 @@ async def test_untrusted_customer_does_not_receive_served_identity_headers(chat_
 
 
 @pytest.mark.asyncio
-async def test_opt_in_header_does_not_grant_identity_disclosure(chat_client):
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"x-fi-served-identity": "include"},
+        {"x-probe": "synthetic"},
+        {"x-fi-served-identity": "include", "x-probe": "synthetic"},
+    ],
+    ids=["opt-in-only", "probe-only", "both-spoofed"],
+)
+async def test_opt_in_header_does_not_grant_identity_disclosure(chat_client, headers):
     response = await chat_client.post(
         "/v1/chat/completions",
         json={"model": CHAT_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
-        headers={"x-fi-served-identity": "include", "x-probe": "synthetic"},
+        headers=headers,
     )
 
     assert response.status_code == 200
@@ -451,8 +460,16 @@ async def test_forced_streaming_branch_carries_the_headers(chat_app):
 
 
 @pytest.mark.asyncio
-async def test_multi_backend_streaming_uses_observed_route_identity(chat_app):
-    """Trusted probes receive identity observed from the selected stream route."""
+@pytest.mark.parametrize(
+    "identity_headers",
+    [
+        {"x-probe": "synthetic"},
+        {"x-fi-served-identity": "include"},
+    ],
+    ids=["trusted-probe", "authorized-opt-in"],
+)
+async def test_multi_backend_streaming_uses_observed_route_identity(chat_app, identity_headers):
+    """Authorized diagnostic paths receive the selected stream route identity."""
 
     class _SecondAdapter(DummyAdapter):
         pass
@@ -478,7 +495,7 @@ async def test_multi_backend_streaming_uses_observed_route_identity(chat_app):
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True,
             },
-            headers={"x-probe": "synthetic"},
+            headers=identity_headers,
         )
     assert r.status_code == 200
     assert r.headers["x-fi-requested-model"] == CHAT_MODEL
@@ -491,7 +508,17 @@ async def test_multi_backend_streaming_uses_observed_route_identity(chat_app):
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_chat_fallback_reports_the_route_that_served(chat_app):
+@pytest.mark.parametrize(
+    "identity_headers",
+    [
+        {"x-probe": "synthetic"},
+        {"x-fi-served-identity": "include"},
+    ],
+    ids=["trusted-probe", "authorized-opt-in"],
+)
+async def test_non_streaming_chat_fallback_reports_the_route_that_served(
+    chat_app, identity_headers
+):
     """After a fallback, the non-streaming headers must describe the route that
     actually served, and a private host label must still not be published."""
 
@@ -529,7 +556,7 @@ async def test_non_streaming_chat_fallback_reports_the_route_that_served(chat_ap
         r = await client.post(
             "/v1/chat/completions",
             json={"model": CHAT_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
-            headers={"x-probe": "synthetic"},
+            headers=identity_headers,
         )
     assert r.status_code == 200
     assert r.headers["x-fi-requested-model"] == CHAT_MODEL
