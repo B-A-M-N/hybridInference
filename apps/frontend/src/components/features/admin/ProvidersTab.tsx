@@ -11,6 +11,7 @@ import {
   setProviderQuotaKeyDisabled,
 } from '@/lib/api/admin';
 import { getErrorMessage } from '@/lib/utils/errors';
+import { useConfirmAction } from '@/components/features/admin/confirm/useConfirmAction';
 import { PerformanceTab } from '@/components/features/admin/PerformanceTab';
 import { ProviderKeysTab } from '@/app/dashboard/admin/ProviderKeysTab';
 import { ProviderOverviewTab } from '@/app/dashboard/admin/ProviderOverviewTab';
@@ -271,8 +272,7 @@ function QuotasSection() {
     'https://github.com/HarvardMadSys/hybridInference/blob/dev/docs/developer/backend-extensions.md#quota-reporting';
   const [providerQuotas, setProviderQuotas] = useState<ProviderQuotaResult[]>([]);
   const [providerQuotasLoading, setProviderQuotasLoading] = useState(false);
-  const [togglingProvider, setTogglingProvider] = useState<string | null>(null);
-  const [togglingKeyRef, setTogglingKeyRef] = useState<string | null>(null);
+  const writes = useConfirmAction();
 
   const loadProviderQuotas = useCallback(async () => {
     setProviderQuotasLoading(true);
@@ -286,59 +286,50 @@ function QuotasSection() {
     }
   }, [toast]);
 
+  const { perform } = writes;
+
+  // Both switches act on the click: switching back undoes either one.
   const handleToggle = useCallback(
     async (provider: ProviderQuotaResult) => {
       const next = !provider.disabled;
-      setTogglingProvider(provider.name);
-      try {
-        await setProviderDisabled(provider.name, next);
-        // Reflect the new state on every card sharing this provider label.
-        setProviderQuotas((prev) =>
-          prev.map((p) => (p.name === provider.name ? { ...p, disabled: next } : p)),
-        );
-        toast.success(
-          `${provider.display_name} ${next ? 'disabled — excluded from routing' : 'enabled'}`,
-        );
-      } catch (e) {
-        toast.error(getErrorMessage(e));
-      } finally {
-        setTogglingProvider(null);
-      }
+      const failure = await perform({
+        run: async () => {
+          await setProviderDisabled(provider.name, next);
+          // Reflect the new state on every card sharing this provider label.
+          setProviderQuotas((prev) =>
+            prev.map((p) => (p.name === provider.name ? { ...p, disabled: next } : p)),
+          );
+          toast.success(
+            `${provider.display_name} ${next ? 'disabled — excluded from routing' : 'enabled'}`,
+          );
+        },
+      });
+      if (failure) toast.error(failure);
     },
-    [toast],
+    [perform, toast],
   );
 
   const handleToggleKey = useCallback(
     async (provider: ProviderQuotaResult) => {
-      if (!provider.key_ref) return;
+      const keyRef = provider.key_ref;
+      if (!keyRef) return;
       const next = !provider.key_disabled;
-      if (
-        next &&
-        !window.confirm(
-          `Disable key ${provider.key_masked ?? ''} for ${provider.name}? ` +
-            'It stops serving traffic immediately.',
-        )
-      ) {
-        return;
-      }
-      setTogglingKeyRef(provider.key_ref);
-      try {
-        const res = await setProviderQuotaKeyDisabled(provider.name, provider.key_ref, next);
-        if (!next && res.pools_updated === 0) {
-          toast.error('Key enabled but not attached to any live pool — it will not be used.');
-        } else {
-          toast.success(`Key ${next ? 'disabled' : 'enabled'}`);
-        }
-        // Reload rather than patch in place: disabling moves the key out of the
-        // probed set and onto a disabled card (and enabling does the reverse).
-        await loadProviderQuotas();
-      } catch (e) {
-        toast.error(getErrorMessage(e));
-      } finally {
-        setTogglingKeyRef(null);
-      }
+      const failure = await perform({
+        run: async () => {
+          const res = await setProviderQuotaKeyDisabled(provider.name, keyRef, next);
+          if (!next && res.pools_updated === 0) {
+            toast.error('Key enabled but not attached to any live pool — it will not be used.');
+          } else {
+            toast.success(`Key ${next ? 'disabled' : 'enabled'}`);
+          }
+          // Reload rather than patch in place: disabling moves the key out of the
+          // probed set and onto a disabled card (and enabling does the reverse).
+          await loadProviderQuotas();
+        },
+      });
+      if (failure) toast.error(failure);
     },
-    [loadProviderQuotas, toast],
+    [loadProviderQuotas, perform, toast],
   );
 
   useEffect(() => {
@@ -385,10 +376,10 @@ function QuotasSection() {
             <ProviderCard
               key={`${p.name}-${p.key_index ?? 'single'}-${p.key_ref ?? p.key_masked ?? index}`}
               provider={p}
-              busy={togglingProvider === p.name}
-              keyBusy={p.key_ref != null && togglingKeyRef === p.key_ref}
-              onToggleDisabled={() => handleToggle(p)}
-              onToggleKeyDisabled={() => handleToggleKey(p)}
+              busy={writes.busy}
+              keyBusy={writes.busy}
+              onToggleDisabled={() => void handleToggle(p)}
+              onToggleKeyDisabled={() => void handleToggleKey(p)}
             />
           ))}
         </div>
@@ -401,7 +392,8 @@ function AvailabilitySection() {
   const toast = useAccountToast();
   const [providers, setProviders] = useState<RoutableProvider[]>([]);
   const [loading, setLoading] = useState(false);
-  const [toggling, setToggling] = useState<string | null>(null);
+  const writes = useConfirmAction();
+  const { perform } = writes;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -415,25 +407,24 @@ function AvailabilitySection() {
     }
   }, [toast]);
 
+  // The switch acts on the click: switching it back undoes it.
   const handleToggle = useCallback(
     async (provider: RoutableProvider) => {
       const next = !provider.disabled;
-      setToggling(provider.provider);
-      try {
-        await setProviderDisabled(provider.provider, next);
-        setProviders((prev) =>
-          prev.map((p) => (p.provider === provider.provider ? { ...p, disabled: next } : p)),
-        );
-        toast.success(
-          `${provider.provider} ${next ? 'disabled — excluded from routing' : 'enabled'}`,
-        );
-      } catch (e) {
-        toast.error(getErrorMessage(e));
-      } finally {
-        setToggling(null);
-      }
+      const failure = await perform({
+        run: async () => {
+          await setProviderDisabled(provider.provider, next);
+          setProviders((prev) =>
+            prev.map((p) => (p.provider === provider.provider ? { ...p, disabled: next } : p)),
+          );
+          toast.success(
+            `${provider.provider} ${next ? 'disabled — excluded from routing' : 'enabled'}`,
+          );
+        },
+      });
+      if (failure) toast.error(failure);
     },
-    [toast],
+    [perform, toast],
   );
 
   useEffect(() => {
@@ -516,8 +507,8 @@ function AvailabilitySection() {
                     <div className="flex justify-end">
                       <ProviderToggle
                         disabled={p.disabled}
-                        busy={toggling === p.provider}
-                        onToggle={() => handleToggle(p)}
+                        busy={writes.busy}
+                        onToggle={() => void handleToggle(p)}
                         label={p.provider}
                       />
                     </div>

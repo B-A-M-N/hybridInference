@@ -3,6 +3,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAccountToast } from '@/lib/hooks/useAccountToast';
 
+import { EditBar } from '@/components/features/admin/confirm/EditBar';
+import { useConfirmAction } from '@/components/features/admin/confirm/useConfirmAction';
+import { useReportEditing } from '@/components/features/admin/confirm/useReportEditing';
+import { writeEach } from '@/components/features/admin/confirm/writeEach';
+
 import type { RoutewiseProbeSampleItem, RoutewiseSettingItem } from '@/lib/api/admin';
 import {
   listRoutewiseProbeSamples,
@@ -13,11 +18,11 @@ import {
 } from '@/lib/api/admin';
 import { getErrorMessage } from '@/lib/utils/errors';
 import { validateNumericSettingInput } from './numericSettingValidation';
+import { Select } from '@/components/ui/Select';
 
 const SETTING_LABELS: Record<string, string> = {
   routewise_budget_alpha: 'Cost budget alpha',
   routewise_latency_slo_sec: 'Latency SLO (sec)',
-  routewise_latency_min_samples: 'Legacy sample threshold',
   routewise_probe_enabled: 'Background probes',
   routewise_probe_interval_sec: 'Probe interval (sec)',
 };
@@ -42,6 +47,8 @@ const PROBE_STALE_LOOKBEHIND_MS = 60 * 60 * 1000;
 interface RoutewiseSettingsPanelProps {
   modelId?: string;
   endpoints?: ProbeEndpointOption[];
+  /** Whether a change is unsaved or a write running, so the parent can hold the model selection. */
+  onEditingChange?: (active: boolean) => void;
 }
 
 function displayKey(setting: RoutewiseSettingItem) {
@@ -55,6 +62,8 @@ function settingDraft(setting: RoutewiseSettingItem) {
   return String(setting.value ?? '');
 }
 
+const SECTION = 'RouteWise parameters';
+
 function validateSettingDraft(setting: RoutewiseSettingItem, draft: string) {
   if (setting.value_type === 'int' || setting.value_type === 'float') {
     return validateNumericSettingInput(draft, {
@@ -66,6 +75,27 @@ function validateSettingDraft(setting: RoutewiseSettingItem, draft: string) {
   return { ok: true as const, value: draft };
 }
 
+/** The value a save would send, or the reason it cannot be sent. */
+function settingPayload(
+  setting: RoutewiseSettingItem,
+  draft: string,
+): { ok: true; value: string | number | boolean } | { ok: false; error: string } {
+  if (setting.value_type === 'bool') return { ok: true, value: draft === 'true' };
+  return validateSettingDraft(setting, draft);
+}
+
+/** Whether a draft differs from what is stored; a value typed back to it is no change. */
+function settingChanged(setting: RoutewiseSettingItem, draft: string | undefined) {
+  if (draft === undefined) return false;
+  const payload = settingPayload(setting, draft);
+  if (!payload.ok) return true;
+  if (setting.value_type === 'bool') return payload.value !== Boolean(setting.value);
+  if (setting.value_type === 'int' || setting.value_type === 'float') {
+    return payload.value !== setting.value;
+  }
+  return draft !== settingDraft(setting);
+}
+
 function formatTtft(ms: number | null) {
   if (ms === null || !Number.isFinite(ms)) return '—';
   return `${Math.round(ms).toLocaleString()} ms`;
@@ -74,7 +104,7 @@ function formatTtft(ms: number | null) {
 function formatCheckedAt(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString();
+  return date.toLocaleString('en-US');
 }
 
 function probeErrorMessage(error: string | null) {
@@ -116,11 +146,18 @@ function sampleStatusClass(sample: RoutewiseProbeSampleItem) {
   return sample.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700';
 }
 
-export function RoutewiseSettingsPanel({ modelId, endpoints = [] }: RoutewiseSettingsPanelProps) {
+export function RoutewiseSettingsPanel({
+  modelId,
+  endpoints = [],
+  onEditingChange,
+}: RoutewiseSettingsPanelProps) {
   const toast = useAccountToast();
+  const writes = useConfirmAction();
   const [settings, setSettings] = useState<RoutewiseSettingItem[]>([]);
+  // Setting key → the value typed in place, kept only while it differs from the
+  // stored one; written only on Save.
   const [drafts, setDrafts] = useState<Record<string, string>>({});
-  const [savingKey, setSavingKey] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [probeEndpointId, setProbeEndpointId] = useState('');
@@ -135,7 +172,6 @@ export function RoutewiseSettingsPanel({ modelId, endpoints = [] }: RoutewiseSet
   const settingsRequestId = useRef(0);
   const probeRequestId = useRef(0);
   const probeRunRequestId = useRef(0);
-  const mutationRequestIds = useRef<Record<string, number>>({});
   const modelIdentity = useRef({ modelId, epoch: 0 });
   const probeSelection = useRef({ modelId, endpointId: '' });
 
@@ -190,9 +226,11 @@ export function RoutewiseSettingsPanel({ modelId, endpoints = [] }: RoutewiseSet
     const requestId = ++settingsRequestId.current;
     const requestedModelId = modelId;
     const requestedEpoch = modelIdentity.current.epoch;
+    // Another model's drafts are never carried over.
+    setDrafts({});
+    setSaveError(null);
     if (!requestedModelId) {
       setSettings([]);
-      setDrafts({});
       setLoading(false);
       setError(null);
       return;
@@ -201,8 +239,6 @@ export function RoutewiseSettingsPanel({ modelId, endpoints = [] }: RoutewiseSet
     setLoading(true);
     setError(null);
     setSettings([]);
-    setDrafts({});
-    setSavingKey(null);
     try {
       const loaded = await listRoutewiseSettings(requestedModelId).then((resp) => resp.settings);
       if (
@@ -212,7 +248,6 @@ export function RoutewiseSettingsPanel({ modelId, endpoints = [] }: RoutewiseSet
         return;
       }
       setSettings(loaded);
-      setDrafts(Object.fromEntries(loaded.map((setting) => [setting.key, settingDraft(setting)])));
     } catch (e) {
       if (
         settingsRequestId.current !== requestId ||
@@ -299,109 +334,98 @@ export function RoutewiseSettingsPanel({ modelId, endpoints = [] }: RoutewiseSet
     void loadProbeSamples();
   }, [loadProbeSamples]);
 
-  const handleSaveSetting = useCallback(
-    async (setting: RoutewiseSettingItem) => {
-      if (!modelId) return;
-      const requestedModelId = modelId;
-      const requestedEpoch = modelIdentity.current.epoch;
-      const mutationId = (mutationRequestIds.current[setting.key] ?? 0) + 1;
-      mutationRequestIds.current[setting.key] = mutationId;
-      const draft = drafts[setting.key] ?? '';
-      let value: string | number | boolean = draft;
-
-      if (setting.value_type === 'bool') {
-        value = draft === 'true';
-      } else if (setting.value_type === 'int' || setting.value_type === 'float') {
-        const validated = validateNumericSettingInput(draft, {
-          min: setting.min,
-          max: setting.max,
-          integer: setting.value_type === 'int',
-        });
-        if (!validated.ok) {
-          toast.error(`${displayKey(setting)}: ${validated.error}`);
-          return;
-        }
-        value = validated.value;
-      }
-
-      setSavingKey(setting.key);
-      try {
-        const updated = await updateRoutewiseSetting(requestedModelId, setting.key, value);
-        if (
-          modelIdentity.current.epoch !== requestedEpoch ||
-          mutationRequestIds.current[setting.key] !== mutationId
-        ) {
-          return;
-        }
-        setSettings((prev) => prev.map((item) => (item.key === updated.key ? updated : item)));
-        setDrafts((prev) => ({ ...prev, [updated.key]: settingDraft(updated) }));
-        toast.success(`Updated ${displayKey(updated)}.`);
-      } catch (e) {
-        if (
-          modelIdentity.current.epoch !== requestedEpoch ||
-          mutationRequestIds.current[setting.key] !== mutationId
-        ) {
-          return;
-        }
-        toast.error(`Failed to update ${displayKey(setting)}: ${getErrorMessage(e)}`);
-      } finally {
-        if (
-          modelIdentity.current.epoch === requestedEpoch &&
-          mutationRequestIds.current[setting.key] === mutationId
-        ) {
-          setSavingKey(null);
-        }
-      }
-    },
-    [drafts, modelId, toast],
+  const changedSettings = settings.filter((setting) =>
+    settingChanged(setting, drafts[setting.key]),
   );
+  const hasChanges = changedSettings.length > 0;
+  useReportEditing(hasChanges || writes.busy, onEditingChange);
 
-  const handleResetSetting = useCallback(
-    async (setting: RoutewiseSettingItem) => {
-      if (!modelId) return;
-      const requestedModelId = modelId;
-      const requestedEpoch = modelIdentity.current.epoch;
-      const mutationId = (mutationRequestIds.current[setting.key] ?? 0) + 1;
-      mutationRequestIds.current[setting.key] = mutationId;
-      setSavingKey(setting.key);
-      try {
+  const changeDraft = (setting: RoutewiseSettingItem, value: string) => {
+    setDrafts((prev) => {
+      const next = { ...prev };
+      if (settingChanged(setting, value)) next[setting.key] = value;
+      else delete next[setting.key];
+      return next;
+    });
+  };
+
+  const discard = () => {
+    if (writes.busy) return;
+    setDrafts({});
+    setSaveError(null);
+  };
+
+  const handleSave = async () => {
+    if (!modelId || changedSettings.length === 0) return;
+    const pending: Array<{ setting: RoutewiseSettingItem; value: string | number | boolean }> = [];
+    for (const setting of changedSettings) {
+      const payload = settingPayload(setting, drafts[setting.key] ?? '');
+      if (!payload.ok) {
+        setSaveError(`${displayKey(setting)}: ${payload.error}`);
+        return;
+      }
+      pending.push({ setting, value: payload.value });
+    }
+    setSaveError(null);
+    const requestedModelId = modelId;
+    const requestedEpoch = modelIdentity.current.epoch;
+    // A response for a model no longer shown is dropped, not applied to this one.
+    const stale = () => modelIdentity.current.epoch !== requestedEpoch;
+    // Each value becomes an override for this model only. A failure shows on
+    // the bar, and the settings it did not write stay as drafts.
+    const failure = await writes.perform({
+      run: async () => {
+        await writeEach(
+          pending,
+          ({ setting }) => displayKey(setting),
+          async ({ setting, value }) => {
+            const updated = await updateRoutewiseSetting(requestedModelId, setting.key, value);
+            if (stale()) return;
+            setSettings((prev) => prev.map((item) => (item.key === updated.key ? updated : item)));
+            setDrafts((prev) => {
+              const next = { ...prev };
+              delete next[updated.key];
+              return next;
+            });
+          },
+        );
+        if (stale()) return;
+        toast.success(
+          pending.length === 1
+            ? `Updated ${displayKey(pending[0].setting)}.`
+            : `Updated ${pending.length} RouteWise parameters.`,
+        );
+      },
+    });
+    if (!stale()) setSaveError(failure);
+  };
+
+  // One value back to what models.yaml or the global default gives it.
+  const handleResetSetting = async (setting: RoutewiseSettingItem) => {
+    if (!modelId) return;
+    const requestedModelId = modelId;
+    const requestedEpoch = modelIdentity.current.epoch;
+    const stale = () => modelIdentity.current.epoch !== requestedEpoch;
+    const failure = await writes.perform({
+      run: async () => {
         const updated = await resetRoutewiseSetting(requestedModelId, setting.key);
-        if (
-          modelIdentity.current.epoch !== requestedEpoch ||
-          mutationRequestIds.current[setting.key] !== mutationId
-        ) {
-          return;
-        }
+        if (stale()) return;
         setSettings((prev) => prev.map((item) => (item.key === updated.key ? updated : item)));
-        setDrafts((prev) => ({ ...prev, [updated.key]: settingDraft(updated) }));
         toast.success(`Reset ${displayKey(updated)} to its inherited value.`);
-      } catch (e) {
-        if (
-          modelIdentity.current.epoch !== requestedEpoch ||
-          mutationRequestIds.current[setting.key] !== mutationId
-        ) {
-          return;
-        }
-        toast.error(`Failed to reset ${displayKey(setting)}: ${getErrorMessage(e)}`);
-      } finally {
-        if (
-          modelIdentity.current.epoch === requestedEpoch &&
-          mutationRequestIds.current[setting.key] === mutationId
-        ) {
-          setSavingKey(null);
-        }
-      }
-    },
-    [modelId, toast],
-  );
+      },
+    });
+    if (failure && !stale()) toast.error(`Failed to reset ${displayKey(setting)}: ${failure}`);
+  };
 
-  const handleRunProbe = useCallback(async () => {
+  const runProbe = useCallback(async () => {
     if (!modelId) return;
     const requestedModelId = modelId;
     const requestedEpoch = modelIdentity.current.epoch;
     const runRequestId = ++probeRunRequestId.current;
     const requestedEndpointId =
       probeSelection.current.modelId === requestedModelId ? probeSelection.current.endpointId : '';
+    const current = () =>
+      probeRunRequestId.current === runRequestId && modelIdentity.current.epoch === requestedEpoch;
     setProbeRunning(true);
     setProbeBanner(null);
     try {
@@ -410,12 +434,7 @@ export function RoutewiseSettingsPanel({ modelId, endpoints = [] }: RoutewiseSet
         endpoint_id: requestedEndpointId || null,
         idle_only: false,
       });
-      if (
-        probeRunRequestId.current !== runRequestId ||
-        modelIdentity.current.epoch !== requestedEpoch
-      ) {
-        return;
-      }
+      if (!current()) return;
       const failed = response.results.filter((result) => !result.ok);
       if (failed.length === 0) {
         const count = response.results.length;
@@ -431,34 +450,32 @@ export function RoutewiseSettingsPanel({ modelId, endpoints = [] }: RoutewiseSet
         });
         toast.error('RouteWise probe finished with failures');
       }
-      await loadProbeSamples();
+      void loadProbeSamples();
     } catch (e) {
-      if (
-        probeRunRequestId.current !== runRequestId ||
-        modelIdentity.current.epoch !== requestedEpoch
-      ) {
-        return;
-      }
+      if (!current()) return;
       const message = getErrorMessage(e);
       setProbeBanner({ kind: 'error', text: message });
       toast.error(`Probe failed: ${message}`);
     } finally {
-      if (
-        probeRunRequestId.current === runRequestId &&
-        modelIdentity.current.epoch === requestedEpoch
-      ) {
-        setProbeRunning(false);
-      }
+      if (current()) setProbeRunning(false);
     }
   }, [loadProbeSamples, modelId, toast]);
 
+  // A run reports its own outcome in the banner, a failure included.
+  const handleRunProbe = () => void writes.perform({ run: runProbe });
+
   return (
-    <section className="rounded-lg border border-gray-200 bg-white p-4">
-      <div className="mb-3">
-        <h2 className="text-[14px] font-semibold text-gray-900">RouteWise parameters</h2>
-        <p className="mt-1 text-[12px] text-gray-500">
-          Runtime knobs and probe controls used by RouteWise latency/cost decisions.
-        </p>
+    <section
+      aria-label={SECTION}
+      className={`rounded-lg border bg-white p-4 ${hasChanges ? 'border-gray-400 shadow-sm' : 'border-gray-200'}`}
+    >
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0 flex-1">
+          <h2 className="text-[14px] font-semibold text-gray-900">{SECTION}</h2>
+          <p className="mt-1 text-[12px] text-gray-500">
+            Runtime knobs and probe controls used by RouteWise latency/cost decisions.
+          </p>
+        </div>
       </div>
 
       {error && (
@@ -485,10 +502,9 @@ export function RoutewiseSettingsPanel({ modelId, endpoints = [] }: RoutewiseSet
       ) : (
         <div className="space-y-3">
           {settings.map((setting) => {
-            const draft = drafts[setting.key] ?? '';
-            const isSaving = savingKey === setting.key;
+            const draft = drafts[setting.key] ?? settingDraft(setting);
+            const changed = settingChanged(setting, drafts[setting.key]);
             const validated = validateSettingDraft(setting, draft);
-            const isDirty = validated.ok ? draft !== settingDraft(setting) : false;
             const isBoolean = setting.value_type === 'bool';
 
             return (
@@ -506,7 +522,7 @@ export function RoutewiseSettingsPanel({ modelId, endpoints = [] }: RoutewiseSet
                   <p className="mt-1 text-[11px] font-medium text-gray-500">
                     Source: {SETTING_SOURCE_LABELS[setting.source]}
                   </p>
-                  {!validated.ok && draft !== '' && (
+                  {changed && !validated.ok && draft !== '' && (
                     <p className="mt-0.5 text-[11px] text-red-600" role="alert">
                       {validated.error}
                     </p>
@@ -514,56 +530,45 @@ export function RoutewiseSettingsPanel({ modelId, endpoints = [] }: RoutewiseSet
                 </div>
                 <div className="flex items-center gap-2 justify-self-start sm:justify-self-end">
                   {isBoolean ? (
-                    <label className="flex h-8 items-center gap-2 rounded-md border border-gray-200 px-2 text-[12px] font-medium text-gray-700">
+                    <label
+                      className={`flex h-8 items-center gap-2 rounded-md border px-2 text-[12px] font-medium text-gray-700 ${
+                        changed ? 'border-amber-400' : 'border-gray-200'
+                      }`}
+                    >
                       <input
                         aria-label={`${displayKey(setting)} enabled`}
                         className="h-4 w-4 rounded border-gray-300 text-gray-900"
-                        disabled={isSaving}
+                        disabled={writes.busy}
                         type="checkbox"
                         checked={draft === 'true'}
-                        onChange={(e) =>
-                          setDrafts((prev) => ({
-                            ...prev,
-                            [setting.key]: String(e.target.checked),
-                          }))
-                        }
+                        onChange={(e) => changeDraft(setting, String(e.target.checked))}
                       />
                       Enabled
                     </label>
                   ) : (
                     <input
                       aria-label={`${displayKey(setting)} value`}
-                      className="w-28 rounded-md border border-gray-300 px-2 py-1 text-right text-[13px] text-gray-900"
-                      disabled={isSaving}
+                      className={`w-28 rounded-md border px-2 py-1 text-right text-[13px] text-gray-900 ${
+                        changed ? 'border-amber-400' : 'border-gray-300'
+                      }`}
+                      disabled={writes.busy}
                       max={setting.max ?? undefined}
                       min={setting.min ?? undefined}
                       step={setting.value_type === 'int' ? 1 : 'any'}
                       type="number"
                       value={draft}
-                      onChange={(e) =>
-                        setDrafts((prev) => ({ ...prev, [setting.key]: e.target.value }))
-                      }
+                      onChange={(e) => changeDraft(setting, e.target.value)}
                     />
                   )}
-                  <button
-                    type="button"
-                    aria-label={`Save ${displayKey(setting)}`}
-                    disabled={!isDirty || isSaving}
-                    onClick={() => {
-                      void handleSaveSetting(setting);
-                    }}
-                    className="rounded-md bg-gray-900 px-3 py-1 text-[12px] font-medium text-white disabled:opacity-40"
-                  >
-                    Save
-                  </button>
                   {setting.overridden && (
+                    // The reset replaces the value this setting's draft was
+                    // typed against, so it waits for the draft.
                     <button
                       type="button"
                       aria-label={`Reset ${displayKey(setting)}`}
-                      disabled={isSaving}
-                      onClick={() => {
-                        void handleResetSetting(setting);
-                      }}
+                      disabled={writes.busy || changed}
+                      title={changed ? 'Save or discard the unsaved change first' : undefined}
+                      onClick={() => void handleResetSetting(setting)}
                       className="rounded-md border border-gray-200 px-3 py-1 text-[12px] font-medium text-gray-700 disabled:opacity-40"
                     >
                       Reset
@@ -576,12 +581,24 @@ export function RoutewiseSettingsPanel({ modelId, endpoints = [] }: RoutewiseSet
         </div>
       )}
 
+      <EditBar
+        target={SECTION}
+        changeCount={changedSettings.length}
+        onCancel={discard}
+        onSave={() => void handleSave()}
+        busy={writes.busy}
+        error={saveError}
+        inPlace
+      />
+
       <div className="mt-5 border-t border-gray-100 pt-4">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
             <h3 className="text-[13px] font-semibold text-gray-900">Active probes</h3>
             <p className="mt-1 text-[12px] text-gray-500">
-              Warm RouteWise TTFT state for this model without waiting for user traffic.
+              Warm RouteWise TTFT state for this model without waiting for user traffic. Run probe
+              sends a short live request to the chosen endpoint, or to each one, and counts against
+              the providers&apos; quotas.
             </p>
           </div>
           <div className="flex w-full flex-wrap items-end gap-3 lg:w-auto">
@@ -592,28 +609,30 @@ export function RoutewiseSettingsPanel({ modelId, endpoints = [] }: RoutewiseSet
               >
                 Endpoint
               </label>
-              <select
+              <Select
                 id="routewise-probe-endpoint"
                 value={probeEndpointId}
-                onChange={(event) => {
-                  const endpointId = event.target.value;
+                onValueChange={(endpointId) => {
                   probeSelection.current = { modelId, endpointId };
                   setProbeEndpointId(endpointId);
                 }}
-                className="h-10 w-full min-w-0 rounded-lg border border-gray-200 bg-white px-3 text-[13px] text-gray-800 sm:w-[420px]"
-              >
-                <option value="">All endpoints</option>
-                {probeEndpointOptions.map((endpoint) => (
-                  <option key={endpoint.endpointId} value={endpoint.endpointId}>
-                    {endpoint.label}
-                  </option>
-                ))}
-              </select>
+                options={[
+                  { value: '', label: 'All endpoints' },
+                  ...probeEndpointOptions.map((endpoint) => ({
+                    value: endpoint.endpointId,
+                    label: endpoint.label,
+                  })),
+                ]}
+                searchable={probeEndpointOptions.length > 6}
+                searchPlaceholder="Search endpoints…"
+                size="lg"
+                className="w-full sm:w-[420px]"
+              />
             </div>
             <button
               type="button"
-              disabled={!modelId || probeRunning}
-              onClick={() => void handleRunProbe()}
+              disabled={!modelId || probeRunning || writes.busy}
+              onClick={handleRunProbe}
               className={
                 probeBanner?.kind === 'success'
                   ? 'h-10 rounded-lg bg-emerald-600 px-4 text-[13px] font-medium text-white shadow-sm shadow-emerald-100 disabled:opacity-50'

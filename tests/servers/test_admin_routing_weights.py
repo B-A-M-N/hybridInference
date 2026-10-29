@@ -9,8 +9,8 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from routing.executor import RouteExecutor
 from routing.model_router_registry import ModelRouterRegistry
+from routing.routers import FixedRouter
 from serving.config.weight_overrides import WeightOverrideResolver
 from serving.servers.deps import AppServices
 from serving.servers.routers import admin as admin_router
@@ -51,7 +51,7 @@ async def admin_client(monkeypatch):
     op_store.get_user_by_id = AsyncMock(return_value=None)
     op_store.create_audit_log = AsyncMock()
 
-    router = RouteExecutor()
+    router = FixedRouter()
     local = _adapter("public-model", "local", "public-model:local")
     remote = _adapter("public-model", "remote", "public-model:remote")
     router.register_route(
@@ -241,6 +241,26 @@ async def test_put_rejects_negative_unknown_endpoint_and_all_zero(admin_client):
     )
     assert all_zero.status_code == 400
     assert all_zero.json()["detail"] == "cannot zero all routes for model"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("literal", ["NaN", "Infinity"])
+async def test_route_weight_rejects_a_non_finite_number(admin_client, literal):
+    """NaN passed both checks (its comparisons are all false) and was stored.
+
+    The router selects only routes with a weight above 0, so a NaN weight took
+    the route out of service as surely as 0, past the guard against zeroing them all.
+    """
+    client, op_store, _, _ = admin_client
+
+    response = await client.put(
+        "/admin/routing/weights/public-model/public-model:remote",
+        content=f'{{"weight": {literal}}}',
+        headers={"Authorization": "Bearer test-admin", "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    op_store.upsert_weight_override.assert_not_awaited()
 
 
 @pytest.mark.asyncio

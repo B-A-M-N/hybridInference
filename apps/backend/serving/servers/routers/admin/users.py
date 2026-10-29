@@ -9,6 +9,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from serving.audit import AuditActor, AuditTarget
 from serving.config.provider_labels import resolve_display_names
 from serving.config.settings import get_settings
 from serving.exceptions import HardDeleteStateChanged
@@ -56,7 +57,9 @@ from serving.schemas_admin import (
 from serving.servers.auth import log_admin_action
 from serving.servers.deps import (
     AppServices,
+    get_admin_audit_actor,
     get_admin_user_id,
+    get_batch_store_for_purge,
     get_log_store,
     get_operational_store,
     get_response_store,
@@ -66,7 +69,6 @@ from serving.servers.deps import (
 )
 from serving.servers.routers.admin._common import _serialize_for_audit
 from serving.servers.routers.admin.providers import _enumerate_routable_providers
-from serving.utils.request_ip import get_client_ip
 
 router = APIRouter(prefix="/admin")
 logger = logging.getLogger(__name__)
@@ -504,6 +506,7 @@ async def approve_user(
     user_id: str,
     payload: ApproveUserRequest | None = None,
     admin_id: str = Depends(verify_admin_access),
+    actor: AuditActor = Depends(get_admin_audit_actor),
     op_store=Depends(get_operational_store),
 ) -> ApproveUserResponse:
     """Approve a pending user registration.
@@ -532,10 +535,10 @@ async def approve_user(
 
     await log_admin_action(
         op_store,
-        admin_id,
-        "approve_user",
-        user_id,
-        {"email": user_row["email"], "note": note},
+        action="approve_user",
+        details={"email": user_row["email"], "note": note},
+        actor=actor,
+        target=AuditTarget.user(user_id),
     )
 
     from serving.utils.email import is_email_enabled, send_approval_email
@@ -558,6 +561,7 @@ async def reject_user(
     user_id: str,
     payload: RejectUserRequest,
     admin_id: str = Depends(verify_admin_access),
+    actor: AuditActor = Depends(get_admin_audit_actor),
     op_store=Depends(get_operational_store),
 ) -> RejectUserResponse:
     """Reject a pending user registration.
@@ -585,10 +589,10 @@ async def reject_user(
 
     await log_admin_action(
         op_store,
-        admin_id,
-        "reject_user",
-        user_id,
-        {"email": user_row["email"], "reason": payload.reason},
+        action="reject_user",
+        details={"email": user_row["email"], "reason": payload.reason},
+        actor=actor,
+        target=AuditTarget.user(user_id),
     )
 
     from serving.utils.email import is_email_enabled, send_rejection_email
@@ -720,11 +724,12 @@ async def get_user_detail(
         last_login_at=user_row.get("last_login_at"),
         has_key=has_key,
         key_prefix=key_row["key_prefix"] if key_row else None,
+        # ``is not None``: a quota of 0 is a limit, not an unset one.
         quota_daily_usd=float(key_row["quota_daily_cost_usd"])
-        if key_row and key_row.get("quota_daily_cost_usd")
+        if key_row and key_row.get("quota_daily_cost_usd") is not None
         else None,
         quota_monthly_usd=float(key_row["quota_monthly_cost_usd"])
-        if key_row and key_row.get("quota_monthly_cost_usd")
+        if key_row and key_row.get("quota_monthly_cost_usd") is not None
         else None,
         usage_today_usd=usage_today_usd,
         usage_today_requests=usage_today_req,
@@ -748,6 +753,7 @@ async def update_user(
     user_id: str,
     payload: UpdateUserRequest,
     admin_id: str = Depends(verify_admin_access),
+    actor: AuditActor = Depends(get_admin_audit_actor),
     op_store=Depends(get_operational_store),
     router_exec=Depends(get_router),
 ) -> UpdateUserResponse:
@@ -794,6 +800,26 @@ async def update_user(
                 f"Cannot transition from '{current_status}' to '{new_status}'. "
                 f"Use the approve/reject endpoints for pending users.",
             )
+        # The lockout the role check above prevents: a suspended account loses
+        # its sessions and its admin access, and only an admin can resume it.
+        if new_status == "suspended" and user_id == get_admin_user_id(request):
+            raise HTTPException(409, "Cannot suspend your own account.")
+
+    # Validate key-level fields: the quota is written to the active key, so
+    # with no key -- or with the suspension below revoking it -- nothing of
+    # this request may be written either.
+    key_fields = {
+        k: v
+        for k, v in payload_dict.items()
+        if k in ("quota_daily_cost_usd", "quota_monthly_cost_usd")
+    }
+    if key_fields:
+        if new_status == "suspended":
+            raise HTTPException(
+                409, "Suspending a user revokes their API key; change its quota separately"
+            )
+        if not await op_store.get_active_key_by_account(user_id):
+            raise HTTPException(409, "User has no active API key to update")
 
     # Collect all users-table fields for a single round-trip
     user_table_updates: dict[str, object] = {}
@@ -837,23 +863,19 @@ async def update_user(
         await op_store.update_user_fields(user_id, **user_table_updates)
 
     # Update key-level fields
-    key_fields = {
-        k: v
-        for k, v in payload_dict.items()
-        if k in ("quota_daily_cost_usd", "quota_monthly_cost_usd")
-    }
     if key_fields:
-        has_key = await op_store.get_active_key_by_account(user_id)
-        if not has_key:
-            raise HTTPException(409, "User has no active API key to update")
-
         await op_store.update_key(user_id, **key_fields)
         updated.extend(key_fields)
 
     if "disabled_models" in payload_dict:
+        # Embedding models are gated by the same denylist (the embeddings
+        # surface reads it through model_access_denial) and listed by the
+        # model visibility catalog the admin UI picks from, so their
+        # canonical ids are as known as the chat routes'.
         known_model_ids = {
             adapter.config.id
-            for route in router_exec.routes.values()
+            for routes in (router_exec.routes, getattr(router_exec, "embedding_routes", {}))
+            for route in routes.values()
             for adapter, _weight in route.adapters
             if getattr(adapter, "config", None) is not None
         }
@@ -869,10 +891,10 @@ async def update_user(
 
     await log_admin_action(
         op_store,
-        admin_id,
-        "update_user",
-        user_id,
-        _serialize_for_audit({"updated_fields": updated, "values": payload_dict}),
+        action="update_user",
+        details=_serialize_for_audit({"updated_fields": updated, "values": payload_dict}),
+        actor=actor,
+        target=AuditTarget.user(user_id),
     )
 
     return UpdateUserResponse(
@@ -893,9 +915,14 @@ async def list_audit_log(
 ) -> ListAuditLogResponse:
     """List admin audit log entries with optional filtering.
 
+    Each entry carries its actor (``actor_type`` / ``actor_id``), the
+    trusted ``source_ip`` and its typed target (``target_type`` /
+    ``target_id``), all null for a row written before they were recorded;
+    ``admin_ip`` and ``target_user_id`` are returned as stored.
+
     Query Parameters:
     - action: Filter by action type (e.g. approve_user, reject_user)
-    - target_user_id: Filter by affected user
+    - target_user_id: Filter by affected user (matches ``target_user_id``)
     - limit: Max results (default: 50)
     - offset: Pagination offset
 
@@ -926,6 +953,11 @@ async def list_audit_log(
                 target_user_id=row["target_user_id"],
                 details=details,
                 success=row["success"],
+                actor_type=row.get("actor_type"),
+                actor_id=row.get("actor_id"),
+                source_ip=row.get("source_ip"),
+                target_type=row.get("target_type"),
+                target_id=row.get("target_id"),
             )
         )
 
@@ -938,6 +970,7 @@ async def delete_user(
     user_id: str,
     payload: DeleteUserRequest,
     admin_id: str = Depends(verify_admin_access),
+    actor: AuditActor = Depends(get_admin_audit_actor),
     op_store=Depends(get_operational_store),
 ) -> DeleteUserResponse:
     """Soft-delete a user account.
@@ -957,6 +990,11 @@ async def delete_user(
     if not user_row:
         raise HTTPException(404, f"User '{user_id}' not found")
 
+    if user_id == get_admin_user_id(request):
+        # As with demoting or suspending oneself: it signs the admin out for
+        # good, and nothing but another admin could undo it.
+        raise HTTPException(409, "Cannot delete your own account.")
+
     if user_row["status"] not in ("active", "suspended"):
         raise HTTPException(
             409,
@@ -968,10 +1006,10 @@ async def delete_user(
     # and inserts audit log — all in a single transaction.
     await op_store.delete_user(
         user_id,
-        admin_ip=get_client_ip(request),
         admin_id=admin_id,
         reason=payload.reason,
         email=user_row["email"],
+        actor=actor,
     )
 
     return DeleteUserResponse(
@@ -985,10 +1023,10 @@ async def delete_user(
 
 @router.post("/users/{user_id}/resume", response_model=ResumeUserResponse)
 async def resume_user(
-    request: Request,
     user_id: str,
     payload: ResumeUserRequest,
     admin_id: str = Depends(verify_admin_access),
+    actor: AuditActor = Depends(get_admin_audit_actor),
     op_store=Depends(get_operational_store),
     log_store=Depends(get_log_store),
 ) -> ResumeUserResponse:
@@ -1029,10 +1067,10 @@ async def resume_user(
     try:
         await op_store.resume_user(
             user_id,
-            admin_ip=get_client_ip(request),
             admin_id=admin_id,
             reason=payload.reason,
             email=user_row["email"],
+            actor=actor,
         )
     except HardDeleteStateChanged:
         raise HTTPException(
@@ -1052,21 +1090,22 @@ async def resume_user(
 
 @router.post("/users/{user_id}/hard-delete", response_model=HardDeleteUserResponse)
 async def hard_delete_user(
-    request: Request,
     user_id: str,
     payload: HardDeleteUserRequest,
     admin_id: str = Depends(verify_admin_access),
+    actor: AuditActor = Depends(get_admin_audit_actor),
     op_store=Depends(get_operational_store),
     log_store=Depends(get_log_store),
     response_store=Depends(get_response_store),
+    batch_store=Depends(get_batch_store_for_purge),
 ) -> HardDeleteUserResponse:
     """Permanently delete a user and all linked rows.
 
     Two-step gate: only allowed when the user is already soft-deleted
     (status='deleted').  Wipes the user row, all api_keys, sessions/tokens,
-    user_daily_cost, prior admin_audit_log entries, and (via the LogStore)
-    api_logs and email_broadcast_recipients.  A fresh ``hard_delete_user``
-    audit row is recorded.
+    user_daily_cost, prior admin_audit_log entries, (via the LogStore)
+    api_logs and email_broadcast_recipients, and the user's stored Responses
+    API rows and batches.  A fresh ``hard_delete_user`` audit row is recorded.
 
     The operational store and log store acquire connections from the pool
     independently (and may be configured against different databases/engines),
@@ -1143,7 +1182,8 @@ async def hard_delete_user(
     # the account is still soft-deleted *under the exclusive advisory lock*.
     # If a concurrent resume won first and reactivated the user, it raises
     # HardDeleteStateChanged. We catch that here and abort the entire
-    # hard-delete workflow — neither response_store nor op_store is touched.
+    # hard-delete workflow — none of response_store, batch_store or op_store
+    # is touched.
     fence_established = False
     try:
         if log_store is not None:
@@ -1154,15 +1194,20 @@ async def hard_delete_user(
         if response_store is not None:
             await response_store.delete_user_responses(user_id)
 
+        # Purge the user's batches, with the requests and results they hold
+        # (also while the batch schema migration is still pending at boot).
+        if batch_store is not None:
+            await batch_store.delete_user_batches(user_id)
+
         # Wipe operational rows + write the new hard-delete audit row,
         # atomically.
         await op_store.hard_delete_user(
             user_id,
             claim_token=claim_token,
-            admin_ip=get_client_ip(request),
             admin_id=admin_id,
             reason=payload.reason,
             email=email,
+            actor=actor,
         )
     except Exception:
         if claim_token and not fence_established:

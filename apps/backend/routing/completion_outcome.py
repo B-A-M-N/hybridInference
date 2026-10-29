@@ -25,13 +25,13 @@ carries no routing policy; consumers decide what each outcome means for them.
 from __future__ import annotations
 
 import re
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 __all__ = ["CompletionOutcome", "classify_completion_outcome"]
 
 
-class CompletionOutcome(str, Enum):
+class CompletionOutcome(StrEnum):
     """What a completed request actually represents."""
 
     #: Real assistant output was produced.

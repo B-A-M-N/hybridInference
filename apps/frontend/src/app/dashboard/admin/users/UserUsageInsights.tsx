@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useState } from 'react';
+import { useConfirmAction } from '@/components/features/admin/confirm/useConfirmAction';
 import {
   analyzeUsageInsights,
   sampleUsageInsights,
@@ -22,26 +23,29 @@ const SAMPLE_LIMIT = 100;
  * Settings → Usage Insights; if no key is set the backend returns a 400 that
  * points the admin there. "View user turns" returns the same random sample
  * without calling the model.
+ *
+ * Both run on the click. Analyze usage sends this user's request text to an
+ * LLM, a paid call on the configured analysis key that the audit log records,
+ * as the panel says beside the buttons. View user turns is a read (the backend
+ * only records an audit entry).
  */
 export function UserUsageInsights({ userId }: { userId: string }) {
-  const [analyzing, setAnalyzing] = useState(false);
+  const writes = useConfirmAction();
+  const analyzing = writes.busy;
   const [sampling, setSampling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<UsageInsightsResponse | null>(null);
   const [samples, setSamples] = useState<UsageInsightsSamplesResponse | null>(null);
 
-  const analyze = useCallback(async () => {
-    setAnalyzing(true);
+  const analyze = async () => {
     setError(null);
-    try {
-      const res = await analyzeUsageInsights({ user_id: userId, limit: SAMPLE_LIMIT });
-      setResult(res);
-    } catch (e) {
-      setError(getErrorMessage(e));
-    } finally {
-      setAnalyzing(false);
-    }
-  }, [userId]);
+    const failure = await writes.perform({
+      run: async () => {
+        setResult(await analyzeUsageInsights({ user_id: userId, limit: SAMPLE_LIMIT }));
+      },
+    });
+    if (failure) setError(failure);
+  };
 
   const viewTurns = useCallback(async () => {
     setSampling(true);
@@ -75,7 +79,7 @@ export function UserUsageInsights({ userId }: { userId: string }) {
           </button>
           <button
             type="button"
-            onClick={analyze}
+            onClick={() => void analyze()}
             disabled={busy}
             className="rounded-md bg-gray-900 px-3 py-1.5 text-[12px] font-medium text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -86,8 +90,9 @@ export function UserUsageInsights({ userId }: { userId: string }) {
 
       <p className="text-[12px] text-gray-500">
         Random sample of up to {SAMPLE_LIMIT} of this user&apos;s requests. Analyze usage sends each
-        request&apos;s user-turn text (not assistant/tool turns) to an LLM; View user turns shows
-        those same turns without calling the model.
+        request&apos;s user-turn text (not assistant/tool turns) to an LLM, a paid call on the Usage
+        Insights analysis key that is recorded in the audit log; View user turns shows those same
+        turns without calling the model.
       </p>
 
       {error && (

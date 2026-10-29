@@ -32,6 +32,7 @@ import {
 import { ComputedAt } from '@/components/features/admin/ComputedAt';
 import { useRefreshedAdminView } from '@/components/features/admin/useRefreshedAdminView';
 import { getErrorMessage } from '@/lib/utils/errors';
+import { Select } from '@/components/ui/Select';
 
 type RangeKey = '24h' | '7d' | '30d';
 
@@ -127,8 +128,9 @@ function ScatterDot(props: { cx?: number; cy?: number; fill?: string; fillOpacit
 
 function TtftScatterCard({ model }: { model: AdminTtftScatterModel }) {
   const safePoints = model.points.filter((p) => p.prompt_tokens > 0);
-  const cached = safePoints.filter((p) => p.cache_hit);
-  const uncached = safePoints.filter((p) => !p.cache_hit);
+  const cached = safePoints.filter((p) => p.cache_hit === true);
+  const uncached = safePoints.filter((p) => p.cache_hit === false);
+  const unknownCache = safePoints.filter((p) => p.cache_hit === null);
   const heading = `${model.model_id} · ${model.provider}`;
 
   const [xDomain, setXDomain] = useState<AxisDomain>(['auto', 'auto']);
@@ -270,7 +272,8 @@ function TtftScatterCard({ model }: { model: AdminTtftScatterModel }) {
     const header = 'timestamp,prompt_tokens,ttft_ms,cache_hit\n';
     const body = safePoints
       .map(
-        (p) => `${p.timestamp},${p.prompt_tokens},${p.ttft_ms},${p.cache_hit ? 'true' : 'false'}`,
+        (p) =>
+          `${p.timestamp},${p.prompt_tokens},${p.ttft_ms},${p.cache_hit === null ? 'unknown' : p.cache_hit ? 'true' : 'false'}`,
       )
       .join('\n');
     const blob = new Blob([`${header}${body}\n`], { type: 'text/csv;charset=utf-8' });
@@ -328,7 +331,11 @@ function TtftScatterCard({ model }: { model: AdminTtftScatterModel }) {
         </span>
         <span className="inline-flex items-center gap-1.5">
           <span className="h-2 w-2 rounded-full bg-slate-500 opacity-60" aria-hidden="true" />
-          No cache ({uncached.length.toLocaleString()})
+          Measured miss ({uncached.length.toLocaleString()})
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="h-2 w-2 rounded-full bg-amber-500 opacity-50" aria-hidden="true" />
+          Unknown ({unknownCache.length.toLocaleString()})
         </span>
         <span className="text-gray-400">· drag to zoom</span>
         <ScaleToggle label="X" value={xScale} onChange={setXScale} />
@@ -406,10 +413,17 @@ function TtftScatterCard({ model }: { model: AdminTtftScatterModel }) {
               shape={<ScatterDot />}
             />
             <Scatter
-              name="No cache"
+              name="Measured miss"
               data={uncached}
               fill="#64748b"
               fillOpacity={0.6}
+              shape={<ScatterDot />}
+            />
+            <Scatter
+              name="Unknown"
+              data={unknownCache}
+              fill="#f59e0b"
+              fillOpacity={0.5}
               shape={<ScatterDot />}
             />
             {showDragArea ? (
@@ -527,7 +541,7 @@ function ProviderObservabilitySection({ data }: { data: ProviderObservabilityRes
   const totals = data.totals;
   const errorRate = pctValue(totals.error_count, totals.request_count);
   const cacheHitRate = pctValue(totals.cache_hit_count, totals.cache_eligible_count);
-  const cacheTokenShare = pctValue(totals.cache_read_tokens, totals.input_tokens);
+  const cacheTokenShare = pctValue(totals.cache_read_tokens, totals.cache_eligible_input_tokens);
   const trendData = data.buckets.map((bucket) => ({
     t: fmtHour(bucket.start_time),
     error_rate: pctValue(bucket.error_count, bucket.request_count),
@@ -834,50 +848,44 @@ export function ProviderPerformanceTab({ refreshKey = 0 }: { refreshKey?: number
       <div className="flex flex-wrap gap-3 items-end">
         <label className="text-sm">
           <span className="block text-gray-500 mb-1">Provider</span>
-          <select
-            className="border rounded px-2 py-1"
+          <Select
             value={provider}
-            onChange={(e) => {
-              setProvider(e.target.value);
+            onValueChange={(next) => {
+              setProvider(next);
               // Model lists differ per provider; clear the filter on switch.
               setModel('__all__');
             }}
-          >
-            {allProviders.map((p) => (
-              <option key={p} value={p}>
-                {providerOptionLabel(p, providerDisplayNames[p])}
-              </option>
-            ))}
-          </select>
+            options={allProviders.map((p) => ({
+              value: p,
+              label: providerOptionLabel(p, providerDisplayNames[p]),
+            }))}
+            aria-label="Provider"
+            className="w-56"
+          />
         </label>
         <label className="text-sm">
           <span className="block text-gray-500 mb-1">Model</span>
-          <select
-            className="border rounded px-2 py-1"
+          <Select
             value={model}
-            onChange={(e) => setModel(e.target.value)}
-          >
-            <option value="__all__">All models</option>
-            {providerModels.map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
-          </select>
+            onValueChange={setModel}
+            options={[
+              { value: '__all__', label: 'All models' },
+              ...providerModels.map((m) => ({ value: m, label: m })),
+            ]}
+            aria-label="Model"
+            searchPlaceholder="Search models…"
+            className="w-56"
+          />
         </label>
         <label className="text-sm">
           <span className="block text-gray-500 mb-1">Range</span>
-          <select
-            className="border rounded px-2 py-1"
+          <Select<RangeKey>
             value={range}
-            onChange={(e) => setRange(e.target.value as RangeKey)}
-          >
-            {RANGES.map((r) => (
-              <option key={r.key} value={r.key}>
-                {r.label}
-              </option>
-            ))}
-          </select>
+            onValueChange={setRange}
+            options={RANGES.map((r) => ({ value: r.key, label: r.label }))}
+            aria-label="Range"
+            className="w-40"
+          />
         </label>
       </div>
 

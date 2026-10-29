@@ -24,6 +24,7 @@ from aiohttp.helpers import sentinel as _aiohttp_sentinel
 from serving.servers.sse import SSEMessage, SSEParser
 from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
+from serving.utils.metadata_addresses import refuse_metadata_socket
 
 logger = get_logger(__name__)
 
@@ -94,7 +95,12 @@ class AsyncHTTPClient:
         if self._session is None or self._session.closed:
             # Set a conservative default timeout; callers can override per request.
             timeout = aiohttp.ClientTimeout(total=60)
-            connector = aiohttp.TCPConnector(limit=200, limit_per_host=50)
+            # Every adapter's upstream request goes through this connector, so
+            # it is where a Base URL whose name now resolves to a cloud metadata
+            # endpoint is refused -- whatever it resolved to when it was saved.
+            connector = aiohttp.TCPConnector(
+                limit=200, limit_per_host=50, socket_factory=refuse_metadata_socket
+            )
             self._session = aiohttp.ClientSession(
                 timeout=timeout,
                 connector=connector,
@@ -159,7 +165,7 @@ class AsyncHTTPClient:
         for attempt in range(retries):
             try:
                 return await self.json_post(url, json=json, headers=headers, timeout=timeout)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            except (TimeoutError, aiohttp.ClientError) as err:
                 last_err = err
                 if attempt == retries - 1:
                     raise
@@ -178,26 +184,6 @@ class AsyncHTTPClient:
         # Should never reach here, but keep mypy happy.
         assert last_err is not None
         raise last_err
-
-    async def json_get(
-        self,
-        url: str,
-        *,
-        headers: dict[str, str] | None = None,
-        timeout: aiohttp.ClientTimeout | None = None,
-    ) -> dict[str, Any]:
-        """Send a GET request and return JSON response.
-
-        ``timeout=None`` falls back to the session default (see json_post).
-        """
-        session = await self._ensure_session()
-        async with session.get(
-            url, headers=headers, timeout=timeout if timeout is not None else _aiohttp_sentinel
-        ) as resp:
-            resp.raise_for_status()
-            from typing import cast
-
-            return cast("dict[str, Any]", await resp.json())
 
     async def stream_post(
         self,

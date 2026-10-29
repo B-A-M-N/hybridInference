@@ -226,8 +226,7 @@ def unavailable_errors() -> tuple[type[BaseException], ...]:
     import asyncpg
 
     return (
-        OSError,  # refused, unresolvable host, and TimeoutError from Python 3.11
-        asyncio.TimeoutError,
+        OSError,  # refused, unresolvable host, and TimeoutError
         asyncpg.PostgresConnectionError,
         asyncpg.InvalidAuthorizationSpecificationError,
         asyncpg.InvalidCatalogNameError,
@@ -388,11 +387,13 @@ async def ensure_database(name: str, *, template: str | None = None) -> bool:
 async def prepare_schema(pool: Any) -> None:
     """Bring a test database to the full current schema.
 
-    The same three steps the gateway runs at startup. Running only the first
+    The same steps the gateway runs at startup. Running only the first
     leaves the operational columns (``users.signup_reason`` and friends)
     missing, which is what made the server tests fail on a fresh database.
     Idempotent: on a prepared database every step only reads the catalog.
     """
+    from serving.storage import alert_history_store
+    from serving.storage.batch_store import BatchStore
     from serving.storage.database import DatabaseLogger
     from serving.storage.postgres_operational import PostgresOperationalStore
     from serving.storage.responses_store import ResponseStore
@@ -402,6 +403,9 @@ async def prepare_schema(pool: Any) -> None:
     await logger.ensure_schema()
     await PostgresOperationalStore(pool).initialize()
     await ResponseStore(pool).initialize()
+    await BatchStore(pool).initialize()
+    async with pool.acquire() as conn:
+        await alert_history_store.ensure_schema(conn)
 
 
 #: Prefix of the comment :func:`prepare_databases` puts on a database it

@@ -53,10 +53,12 @@ if TYPE_CHECKING:
         AuthIpBlockedConfig,
         ClientErrorBurstConfig,
         CountRule,
+        KeyPoolExhaustionBurstConfig,
         LatencyRule,
         PendingPrefixCacheLeakConfig,
         ProviderHourlySpend,
         RateRule,
+        RequestLogQueueSaturationConfig,
         StreamFailureRateConfig,
         TrackedTaskFailureRateConfig,
         UserOverrun,
@@ -145,6 +147,10 @@ class _SlidingWindow:
     def items(self, now: float) -> list[dict]:
         self._evict(now)
         return [v for _, v in self._items]
+
+    def is_empty(self, now: float) -> bool:
+        self._evict(now)
+        return not self._items
 
 
 class FailedRequestRateRule:
@@ -809,6 +815,93 @@ class PendingPrefixCacheLeakRule:
         )
 
 
+class RequestLogQueueSaturationRule:
+    """Alert when the bounded request-log queue discards report rows.
+
+    Reads the ``request_log_queue_saturated`` warning emitted by
+    ``CompletionsLogger.schedule_log`` when the fixed worker pool falls behind
+    and drop-oldest evicts an ``api_logs`` row. The producer emits the warning
+    on the first loss, every 100th, and at least once per 60 seconds while
+    drops continue, so this rule receives a bounded event stream rather than
+    one record per dropped payload; its sliding window and ``cooldown_sec``
+    turn a sustained stall into a rate-limited page.
+
+    This is the alerting surface the ``request_log`` tracked-task failure rate
+    cannot provide: a dropped row never becomes a failed write, and the queue's
+    cumulative ``dropped_count`` is process-local. The record carries only the
+    cumulative count and the queue bound, never the payload or request text.
+    A drop is report-data loss; quota increments are separately scheduled
+    background tasks, not rows on this queue. The context says both so the page
+    is not read as billing-ledger corruption.
+    """
+
+    name = "request_log_queue_saturation"
+
+    def __init__(self, cfg: RequestLogQueueSaturationConfig) -> None:
+        self._cfg = cfg
+        self._window = _SlidingWindow(cfg.window_sec)
+
+    async def on_record(self, record: logging.LogRecord) -> None:
+        """Track loss warnings and alert when the window reaches the threshold."""
+        if not self._cfg.enabled:
+            return
+        # Structured attribute, not message text, for the reason documented on
+        # ClientErrorBurstRule: this engine's root handler also sees its own
+        # log output, and none of those records carries an ``event``.
+        if getattr(record, "event", None) != "request_log_queue_saturated":
+            return
+        now = time.time()
+        self._window.add(
+            now,
+            {
+                "dropped_total": getattr(record, "dropped_total", None),
+                "queue_maxsize": getattr(record, "queue_maxsize", None),
+            },
+        )
+        items = self._window.items(now)
+
+        def breach_context() -> dict[str, Any]:
+            dropped_totals = [
+                item["dropped_total"] for item in items if isinstance(item["dropped_total"], int)
+            ]
+            bounds = [
+                item["queue_maxsize"] for item in items if isinstance(item["queue_maxsize"], int)
+            ]
+            return {
+                "events_in_window": len(items),
+                "dropped_total": max(dropped_totals) if dropped_totals else "unknown",
+                "queue_maxsize": max(bounds) if bounds else "unknown",
+                "window_sec": self._cfg.window_sec,
+                "note": (
+                    "api_logs report rows were discarded. Quota-authoritative "
+                    "increments are separate background tasks, not rows on this "
+                    "queue, so this eviction did not drop them; usage and "
+                    "task/grant cost reports that read api_logs undercount "
+                    "these rows"
+                ),
+            }
+
+        await alert_on_transition(
+            key=self.name,
+            # ``>=``: unlike the burst rules that tolerate background noise,
+            # one discarded report row is already a loss. threshold_count is
+            # the number of rate-limited warnings that constitute a breach.
+            breached=len(items) >= self._cfg.threshold_count,
+            severity=AlertSeverity.WARN,
+            title="Request-log queue saturated; report rows dropped",
+            context=breach_context,
+            cooldown_sec=self._cfg.cooldown_sec,
+            # Its own window, not the longest rule's: a 60-second rule whose
+            # traffic stops should close on its own timescale.
+            stale_after=self._cfg.window_sec * _STALE_WINDOW_FACTOR,
+            now=now,
+            # Warnings only exist while rows are being dropped, so their
+            # absence is not evidence the queue recovered; close the incident
+            # silently rather than posting a recovery the rule never measured.
+            announce_resolution=False,
+        )
+
+
 class TrackedTaskFailureRateRule:
     """Alert when a tracked task type fails at a sustained rate.
 
@@ -964,6 +1057,85 @@ class ClientErrorBurstRule:
             stale_after=self._cfg.window_sec * _STALE_WINDOW_FACTOR,
             now=now,
         )
+
+
+class KeyPoolExhaustionBurstRule:
+    """Alert when one endpoint's key-pool refusals pile up past the breaker.
+
+    Fires when more than ``threshold_count`` ``key_pool_exhausted_skip_breaker``
+    events arrive for a single endpoint within ``window_sec``. The breaker
+    exemption is intentional: exhaustion happens before an upstream dispatch, so
+    it is not endpoint failure evidence. Provider-wide 402/403 incidents are also
+    exempt as client errors, which makes this rule their alerting surface after
+    the circuit no longer opens on the exhaustion echo.
+
+    **Per endpoint**, in both the count and the incident key, because the page it
+    stands in for -- ``circuit_open:<endpoint>`` -- was per endpoint. One shared
+    window and key let an endpoint already in breach spend the cooldown for every
+    other: a second endpoint whose account went dry minutes later joined the open
+    incident and was not reported for up to an hour, and two quiet endpoints
+    could add up to a breach neither had. Scoped to the ``endpoint_id`` the
+    registry logs, not a provider or key-pool identity the record does not carry,
+    so routes sharing one provider's keys page separately.
+    """
+
+    name = "key_pool_exhaustion_burst"
+
+    def __init__(self, cfg: KeyPoolExhaustionBurstConfig) -> None:
+        self._cfg = cfg
+        self._windows: dict[str, _SlidingWindow] = {}
+
+    async def on_record(self, record: logging.LogRecord) -> None:
+        """Track breaker-exempt key-pool refusals per endpoint and alert on a burst."""
+        if not self._cfg.enabled:
+            return
+        if getattr(record, "event", None) != "key_pool_exhausted_skip_breaker":
+            return
+        # ``record_failure`` always names the endpoint; the fallback only keeps a
+        # malformed record from raising or from sharing a key with a real one.
+        endpoint_id = str(getattr(record, "endpoint_id", None) or "unknown")
+        now = time.time()
+        self._drop_idle_windows(now)
+        win = self._windows.setdefault(endpoint_id, _SlidingWindow(self._cfg.window_sec))
+        win.add(now, {})
+        count = len(win.items(now))
+
+        def breach_context() -> dict[str, Any]:
+            return {
+                "endpoint_id": endpoint_id,
+                "count": count,
+                "window_sec": self._cfg.window_sec,
+                "note": (
+                    "key-pool exhaustion happens before an upstream dispatch and bypasses "
+                    "the circuit breaker by design. Provider-wide 402/403 incidents can "
+                    "produce these refusals without a circuit-open alert; inspect "
+                    "key-pool mutes and recent upstream statuses in logs. Endpoints "
+                    "sharing these keys are counted and paged separately"
+                ),
+            }
+
+        await alert_on_transition(
+            key=f"key_pool_exhaustion_burst:{endpoint_id}",
+            breached=count > self._cfg.threshold_count,
+            severity=AlertSeverity.ERROR,
+            title=f"Key-pool exhaustion burst on {endpoint_id}",
+            context=breach_context,
+            cooldown_sec=self._cfg.cooldown_sec,
+            stale_after=self._cfg.window_sec * _STALE_WINDOW_FACTOR,
+            now=now,
+        )
+
+    def _drop_idle_windows(self, now: float) -> None:
+        """Forget endpoints with nothing left in their window.
+
+        Routes are added and removed at runtime, so a window per endpoint ever
+        seen would only grow. An empty one holds nothing a fresh window would
+        not, and any incident it opened is closed by the next evaluation or by
+        the stale sweep, which tracks the key, not this window.
+        """
+        idle = [key for key, win in self._windows.items() if win.is_empty(now)]
+        for key in idle:
+            del self._windows[key]
 
 
 class StreamFailureRateRule:
@@ -1129,7 +1301,7 @@ class UserCostOverrunJob:
         # midnight, and the requirement is one alert per user per UTC day. On a
         # host in any other zone the local date would split or merge days
         # against the data, dropping or doubling an alert at the seam.
-        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        today = dt.datetime.now(dt.UTC).date().isoformat()
         if self._latched_day != today:
             self._latched_day = today
             self._latched = {}
@@ -1248,7 +1420,7 @@ class ProviderHourlySpendJob:
         """Query per-provider hourly spend and emit alerts when budgets are exceeded."""
         if not self._cfg.enabled or self._log_store is None:
             return
-        now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+        now = dt.datetime.now(dt.UTC).replace(minute=0, second=0, microsecond=0)
         hour_iso = now.isoformat()
         try:
             spends = await self._log_store.query_provider_hourly_spend(hour_iso)
@@ -1300,10 +1472,6 @@ class AlertEngine:
         self._rules: list[_Rule] = []
         self._scheduled_jobs: list[Any] = []
 
-    def is_running(self) -> bool:
-        """Return True if the drain task is alive."""
-        return self._task is not None and not self._task.done()
-
     async def start(self) -> None:
         """Build rules, schedule periodic jobs, and start the drain task."""
         self._build_rules()
@@ -1347,11 +1515,17 @@ class AlertEngine:
         # service fault, so it must never page Slack.
         self._rules.append(PendingPrefixCacheLeakRule(self._config.rules.prefix_cache_pending_leak))
         self._rules.append(TrackedTaskFailureRateRule(self._config.rules.tracked_task_failure_rate))
+        # The tracked-task rule cannot see a dropped row: no write was attempted.
+        # This reads the queue's own loss warning. See RequestLogQueueSaturationRule.
+        self._rules.append(
+            RequestLogQueueSaturationRule(self._config.rules.request_log_queue_saturation)
+        )
         # The two symptoms nothing above can see: a relayed-4xx storm that is
         # routed past the circuit breaker on purpose, and streams that break
         # after the response has already started. See ClientErrorBurstRule and
         # StreamFailureRateRule.
         self._rules.append(ClientErrorBurstRule(self._config.rules.client_error_burst))
+        self._rules.append(KeyPoolExhaustionBurstRule(self._config.rules.key_pool_exhaustion_burst))
         self._rules.append(StreamFailureRateRule(self._config.rules.stream_failure_rate))
 
     def _schedule_periodic_jobs(self) -> None:

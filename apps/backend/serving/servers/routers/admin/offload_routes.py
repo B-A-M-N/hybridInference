@@ -19,7 +19,7 @@ the route to another host, so a retargeted route stays the offload route.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -27,6 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from routing.endpoints import endpoint_id_for_adapter, route_id_for_adapter
 from routing.offload import OffloadPolicy
 from serving.adapters.upstream_limiter import get_upstream_limiter
+from serving.audit import AuditActor, AuditTarget
 from serving.config.offload_routes import (
     OFFLOAD_ROUTE_VALUE_TYPE,
     OffloadRouteRecord,
@@ -42,6 +43,7 @@ from serving.schemas_admin import (
 )
 from serving.servers.auth import log_admin_action
 from serving.servers.deps import (
+    get_admin_audit_actor,
     get_operational_store,
     get_services,
     model_router_transition_lock,
@@ -123,12 +125,18 @@ def _route_is_weighted(
 ) -> bool:
     """Return whether routing gives the route a weight above zero.
 
-    Mirrors the two runtime rules ``FixedRouter`` applies on top of the model
-    registry: a per-endpoint weight override, and the provider kill switch.
-    Either one at zero means routing sends the route nothing, offloads included.
+    Mirrors the runtime rules ``FixedRouter`` applies on top of the model
+    registry: a per-endpoint weight override, the provider kill switch, and a
+    disabled route. Any of them at zero means routing sends the route nothing,
+    offloads included.
     """
     disabled = getattr(services, "disabled_provider_resolver", None)
     if disabled is not None and disabled.is_disabled(adapter.config.provider):
+        return False
+    route_states = getattr(services, "route_state_resolver", None)
+    if route_states is not None and route_states.is_excluded(
+        model_id, route_id_for_adapter(adapter)
+    ):
         return False
     weight = float(raw_weight)
     overrides = getattr(services, "weight_override_resolver", None)
@@ -158,6 +166,13 @@ def _offload_item(services: Any, model_id: str, record: OffloadRouteRecord) -> O
             reason = reason or "The route no longer exists"
         else:
             adapter, raw_weight, endpoint_id = entries[0]
+            route_states = getattr(services, "route_state_resolver", None)
+            if (
+                reason is None
+                and route_states is not None
+                and route_states.is_excluded(model_id, policy.route_id)
+            ):
+                reason = "The route is disabled, so routing sends it nothing; enable it first"
             if reason is None and not _route_is_weighted(
                 services, model_id, adapter, raw_weight, endpoint_id
             ):
@@ -235,6 +250,7 @@ async def set_offload_route(
     model_id: str,
     payload: UpdateOffloadRouteRequest,
     admin_id: str = Depends(verify_admin_access),
+    actor: AuditActor = Depends(get_admin_audit_actor),
     services=Depends(get_services),
     op_store=Depends(get_operational_store),
 ) -> ModelOffloadRouteResponse:
@@ -299,14 +315,14 @@ async def set_offload_route(
             model_id,
             policy,
             updated_by=admin_id,
-            updated_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(UTC),
         )
         await log_admin_action(
             op_store,
-            admin_id,
-            "routing.offload_routes.update",
-            None,
-            {
+            action="routing.offload_routes.update",
+            actor=actor,
+            target=AuditTarget.model(model_id),
+            details={
                 "model_id": model_id,
                 "route_id": policy.route_id,
                 "endpoint_id": endpoint_id,
@@ -334,7 +350,7 @@ async def set_offload_route(
 )
 async def clear_offload_route(
     model_id: str,
-    admin_id: str = Depends(verify_admin_access),
+    actor: AuditActor = Depends(get_admin_audit_actor),
     services=Depends(get_services),
     op_store=Depends(get_operational_store),
 ) -> ModelOffloadRouteResponse:
@@ -359,10 +375,10 @@ async def clear_offload_route(
         if previous is not None or removed:
             await log_admin_action(
                 op_store,
-                admin_id,
-                "routing.offload_routes.clear",
-                None,
-                {
+                action="routing.offload_routes.clear",
+                actor=actor,
+                target=AuditTarget.model(model_id),
+                details={
                     "model_id": model_id,
                     "old_route_id": previous.policy.route_id if previous is not None else None,
                     "old_wait_seconds": (

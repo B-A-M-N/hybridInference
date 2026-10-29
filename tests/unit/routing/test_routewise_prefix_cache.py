@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -12,9 +13,7 @@ from routing.routers import RoutingObservation
 from routing.routewise.config import RouteWiseConfig
 from routing.routewise.prefix_cache import (
     Block,
-    CacheAwareCostEstimator,
     CacheScope,
-    CacheSignal,
     PrefixCacheCoordinator,
     SessionProviderPrefixMemory,
     build_blocks,
@@ -149,7 +148,6 @@ class TestSessionProviderPrefixMemory:
         assert signal.has_history is False
         assert signal.matched_prefix_tokens == 0
         assert signal.meets_threshold is False
-        assert signal.expected_cached_tokens == 0.0
 
     def test_observe_then_lookup_matches_prefix(self):
         mem = SessionProviderPrefixMemory(min_match_tokens=150)
@@ -174,6 +172,16 @@ class TestSessionProviderPrefixMemory:
         mem.observe(scope, _blocks(("a", 100)), now=0.0)
         assert mem.lookup(scope, _blocks(("a", 100)), now=50.0).has_history is True
         assert mem.lookup(scope, _blocks(("a", 100)), now=200.0).has_history is False
+
+    def test_refresh_liveness_preserves_blocks_and_ttl(self):
+        mem = SessionProviderPrefixMemory(ttl_sec=10.0, min_match_tokens=1)
+        scope = _scope()
+        old_blocks = _blocks(("old", 100))
+        mem.observe(scope, old_blocks, now=0.0)
+
+        assert mem.refresh_liveness(scope, now=9.0) is True
+        assert mem.lookup(scope, old_blocks, now=11.0).matched_prefix_tokens == 100
+        assert mem.lookup(scope, _blocks(("new", 100)), now=11.0).matched_prefix_tokens == 0
 
     def test_lru_evicts_oldest_over_cap(self):
         mem = SessionProviderPrefixMemory(max_entries=2, ttl_sec=0.0, min_match_tokens=1)
@@ -210,58 +218,81 @@ class TestSessionProviderPrefixMemory:
         assert mem.lookup(live, _blocks(("x", 10)), now=20.0).has_history is True
 
 
+_PRICE_DELTA = 0.27 / 1_000_000.0
+
+
 @pytest.mark.unit
-class TestCacheAwareCostEstimator:
-    def _signal(self, **kw) -> CacheSignal:
-        base = {
-            "matched_prefix_tokens": 1000,
-            "meets_threshold": True,
-            "has_history": True,
-        }
-        base.update(kw)
-        return CacheSignal(**base)
+class TestPrefixCacheDiscount:
+    """The cached-token discount ``PrefixCacheCoordinator.evaluate`` prices in.
+
+    A remembered prefix that clears the threshold is estimated as cached:
+    the discount is
+    ``matched_prefix_tokens * (p_in - p_cache)``, floored at the cold cost.
+    """
+
+    def _coord(self, *, enabled: bool = True, min_match_tokens: int = 1) -> PrefixCacheCoordinator:
+        return PrefixCacheCoordinator(
+            enabled=enabled,
+            memory=SessionProviderPrefixMemory(min_match_tokens=min_match_tokens),
+            block_size=8,
+            secret=SECRET,
+            tokenize=_chars,
+        )
+
+    def _warm(self, coord: PrefixCacheCoordinator) -> tuple[CacheScope, tuple[Block, ...]]:
+        """Return a scope that remembers the prior turn, and the next turn's blocks."""
+        prior = [{"role": "system", "content": "S" * 200}, {"role": "user", "content": "q1"}]
+        scope = coord.scope_for(session="s", provider_id="p", endpoint_id="e", model_profile="m")
+        coord.remember(scope, coord.build_blocks(prior))
+        return scope, coord.build_blocks([*prior, {"role": "user", "content": "q2"}])
 
     def test_applies_matched_prefix_discount(self):
-        est = CacheAwareCostEstimator()
-        # expected cached tokens = matched prefix (1000); no hit-rate / confidence.
-        result = est.adjust(0.01, self._signal(), price_delta=0.27 / 1_000_000.0)
-        assert result.expected_cached_tokens == pytest.approx(1000.0)
-        assert result.cache_discount == pytest.approx(1000 * 0.27 / 1_000_000.0)
-        assert result.adjusted_cost == pytest.approx(0.01 - 1000 * 0.27 / 1_000_000.0)
-        assert result.applied is True
+        coord = self._coord()
+        scope, blocks = self._warm(coord)
+        record = coord.evaluate(scope, blocks, cold_cost=0.01, price_delta=_PRICE_DELTA)
+        assert record.matched_prefix_tokens > 0
+        # No hit-rate or observed-reuse model: the whole matched prefix counts.
+        assert record.expected_cached_tokens == pytest.approx(record.matched_prefix_tokens)
+        assert record.cache_discount == pytest.approx(record.matched_prefix_tokens * _PRICE_DELTA)
+        assert record.would_apply is True
 
     def test_discount_floored_so_cost_never_negative(self):
-        est = CacheAwareCostEstimator()
-        result = est.adjust(0.01, self._signal(), price_delta=1.0)  # absurd delta
-        assert result.cache_discount == pytest.approx(0.01)
-        assert result.adjusted_cost == pytest.approx(0.0)
+        coord = self._coord()
+        scope, blocks = self._warm(coord)
+        record = coord.evaluate(scope, blocks, cold_cost=0.01, price_delta=1.0)  # absurd delta
+        assert record.cache_discount == pytest.approx(0.01)
 
     def test_no_discount_below_threshold(self):
-        est = CacheAwareCostEstimator()
-        result = est.adjust(
-            0.01, self._signal(meets_threshold=False), price_delta=0.27 / 1_000_000.0
-        )
-        assert result.applied is False
-        assert result.adjusted_cost == pytest.approx(0.01)
+        coord = self._coord(min_match_tokens=100_000)
+        scope, blocks = self._warm(coord)
+        record = coord.evaluate(scope, blocks, cold_cost=0.01, price_delta=_PRICE_DELTA)
+        assert record.meets_threshold is False
+        assert record.would_apply is False
+        assert record.cache_discount == 0.0
 
     def test_no_discount_when_price_delta_zero(self):
         # The minimax-m2.5 OpenRouter leg (cache_reads=0) must be a no-op.
-        est = CacheAwareCostEstimator()
-        result = est.adjust(0.01, self._signal(), price_delta=0.0)
-        assert result.applied is False
-        assert result.adjusted_cost == pytest.approx(0.01)
+        coord = self._coord()
+        scope, blocks = self._warm(coord)
+        record = coord.evaluate(scope, blocks, cold_cost=0.01, price_delta=0.0)
+        assert record.would_apply is False
+        assert record.cache_discount == 0.0
 
-    def test_no_discount_for_cold_signal(self):
-        est = CacheAwareCostEstimator()
-        result = est.adjust(0.01, CacheSignal.empty(), price_delta=0.27 / 1_000_000.0)
-        assert result.applied is False
-        assert result.adjusted_cost == pytest.approx(0.01)
+    def test_no_discount_for_cold_scope(self):
+        coord = self._coord()
+        _scope_with_history, blocks = self._warm(coord)
+        cold = coord.scope_for(session="cold", provider_id="p", endpoint_id="e", model_profile="m")
+        record = coord.evaluate(cold, blocks, cold_cost=0.01, price_delta=_PRICE_DELTA)
+        assert record.has_history is False
+        assert record.would_apply is False
+        assert record.cache_discount == 0.0
 
     def test_disabled_skips_discount(self):
-        est = CacheAwareCostEstimator()
-        result = est.adjust(0.01, self._signal(), price_delta=0.27 / 1_000_000.0, enabled=False)
-        assert result.applied is False
-        assert result.adjusted_cost == pytest.approx(0.01)
+        coord = self._coord(enabled=False)
+        scope, blocks = self._warm(coord)
+        record = coord.evaluate(scope, blocks, cold_cost=0.01, price_delta=_PRICE_DELTA)
+        assert record.would_apply is False
+        assert record.cache_discount == 0.0
 
 
 @pytest.mark.unit
@@ -420,10 +451,6 @@ class TestRouteWiseRouterPrefixCacheWarm:
         router._stash_prefix_for_commit((blocks, {"scopes": scopes}), request_id)
 
     @staticmethod
-    def _dispatch(router, request_id, endpoint_id):
-        router._reserve_prefix_generation_for_dispatch(request_id, endpoint_id)
-
-    @staticmethod
     def _observe(router, request_id, endpoint_id, *, success=True):
         router._commit_prefix_cache_observation(
             _obs(
@@ -451,84 +478,69 @@ class TestRouteWiseRouterPrefixCacheWarm:
         assert signal.has_history is True
         assert signal.matched_prefix_tokens > 0
 
-    def test_only_dispatched_candidates_reserve_generations(self):
+    def test_transient_success_refreshes_without_replacing_prefix(self):
+        now = [0.0]
+        router = RouteWiseRouter(config=RouteWiseConfig(prefix_cache_cost_adjustment_enabled=True))
+        router.prefix_cache = PrefixCacheCoordinator(
+            enabled=True,
+            memory=SessionProviderPrefixMemory(
+                ttl_sec=10.0,
+                min_match_tokens=1,
+                time_source=lambda: now[0],
+            ),
+            block_size=8,
+            secret=SECRET,
+            tokenize=_chars,
+        )
+        scope = self._scope(router, "prov-a", "prov-a:h:1")
+        old_blocks = router.prefix_cache.build_blocks(_MSGS1)
+        router.prefix_cache.remember(scope, old_blocks, now=0.0)
+        self._stash(
+            router, "warmup", {"prov-a:h:1": scope}, messages=[{"role": "user", "content": "new"}]
+        )
+        now[0] = 9.0
+
+        router._commit_prefix_cache_observation(
+            replace(
+                _obs("prov-a:h:1", request_id="warmup"),
+                outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS,
+            )
+        )
+
+        retained = router.prefix_cache.memory.lookup(scope, old_blocks, now=11.0)
+        new_blocks = router.prefix_cache.build_blocks([{"role": "user", "content": "new"}])
+        replaced = router.prefix_cache.memory.lookup(scope, new_blocks, now=11.0)
+        assert retained.has_history is True
+        assert retained.matched_prefix_tokens == sum(block.token_count for block in old_blocks)
+        assert replaced.matched_prefix_tokens < sum(block.token_count for block in new_blocks)
+
+    def test_reported_cache_usage_neither_gates_nor_creates_the_discount(self):
+        # Observed-reuse evidence was withdrawn: a success that reported a cache
+        # miss still warms the full prefix, and a failed attempt that reported a
+        # cache hit warms nothing.
         router = self._router()
         scope_a = self._scope(router, "prov-a", "prov-a:h:1")
         scope_b = self._scope(router, "prov-b", "prov-b:h:1")
-
-        self._stash(router, "r1", {"prov-a:h:1": scope_a, "prov-b:h:1": scope_b})
-        assert router.prefix_cache._scope_generations == {}
-
-        self._dispatch(router, "r1", "prov-b:h:1")
-
-        assert scope_a not in router.prefix_cache._scope_generations
-        assert scope_b in router.prefix_cache._scope_generations
-
-    def test_unrelated_candidate_does_not_supersede_dispatched_generation(self):
-        """A's X observation survives B evaluating X while dispatching Y."""
-        router = self._router()
-        scope_x = self._scope(router, "prov-x", "prov-x:h:1")
-        scope_y = self._scope(router, "prov-y", "prov-y:h:1")
-        blocks_a = router.prefix_cache.build_blocks(_MSGS1)
-        blocks_b = router.prefix_cache.build_blocks(_MSGS2)
-
-        self._stash(
-            router,
-            "request-a",
-            {"prov-x:h:1": scope_x, "prov-y:h:1": scope_y},
-            messages=_MSGS1,
+        self._stash(router, "miss", {"prov-a:h:1": scope_a})
+        router._commit_prefix_cache_observation(
+            replace(_obs("prov-a:h:1", request_id="miss"), cached_tokens=0)
         )
-        self._dispatch(router, "request-a", "prov-x:h:1")
-        generation_x = router.prefix_cache._scope_generations[scope_x]
-
-        self._stash(
-            router,
-            "request-b",
-            {"prov-x:h:1": scope_x, "prov-y:h:1": scope_y},
-            messages=_MSGS2,
+        self._stash(router, "hit", {"prov-b:h:1": scope_b})
+        router._commit_prefix_cache_observation(
+            replace(_obs("prov-b:h:1", request_id="hit", success=False), cached_tokens=10_000)
         )
-        self._dispatch(router, "request-b", "prov-y:h:1")
 
-        assert router.prefix_cache._scope_generations[scope_x] == generation_x
-        router._commit_prefix_cache_observation(_obs("prov-x:h:1", request_id="request-a"))
-        assert router.prefix_cache.memory.current_blocks(scope_x) == blocks_a
-        assert router.prefix_cache.memory.current_blocks(scope_y) is None
-        assert router.pending_prefix_cache.pop("request-b") is not None
-
-        # A newer dispatch to X does supersede the older X generation.
-        self._stash(
-            router,
-            "request-c",
-            {"prov-x:h:1": scope_x},
-            messages=_MSGS2,
+        next_turn = router.prefix_cache.build_blocks(_MSGS2)
+        warmed = router.prefix_cache.evaluate(
+            scope_a, next_turn, cold_cost=0.01, price_delta=_PRICE_DELTA
         )
-        self._dispatch(router, "request-c", "prov-x:h:1")
-        router._commit_prefix_cache_observation(_obs("prov-x:h:1", request_id="request-c"))
-        assert router.prefix_cache.memory.current_blocks(scope_x) == blocks_b
-
-    def test_retry_stashes_accumulate_only_actual_dispatch_generations(self):
-        router = self._router()
-        scope_a = self._scope(router, "prov-a", "prov-a:h:1")
-        scope_b = self._scope(router, "prov-b", "prov-b:h:1")
-        scope_c = self._scope(router, "prov-c", "prov-c:h:1")
-
-        self._stash(
-            router,
-            "retry",
-            {"prov-a:h:1": scope_a, "prov-b:h:1": scope_b},
+        assert warmed.would_apply is True
+        assert warmed.expected_cached_tokens == pytest.approx(warmed.matched_prefix_tokens)
+        cold = router.prefix_cache.evaluate(
+            scope_b, next_turn, cold_cost=0.01, price_delta=_PRICE_DELTA
         )
-        self._dispatch(router, "retry", "prov-a:h:1")
-        self._stash(
-            router,
-            "retry",
-            {"prov-b:h:1": scope_b, "prov-c:h:1": scope_c},
-        )
-        self._dispatch(router, "retry", "prov-b:h:1")
-
-        entry = router.pending_prefix_cache.pop("retry")
-        assert entry is not None
-        assert set(entry.generations) == {"prov-a:h:1", "prov-b:h:1"}
-        assert "prov-c:h:1" in entry.scopes
+        assert cold.has_history is False
+        assert cold.cache_discount == 0.0
 
     def test_failed_does_not_warm_and_keeps_stash_for_fallback_winner(self):
         # The logging path emits one failed observation per failed attempt
@@ -671,8 +683,6 @@ class TestRouteWiseRouterPrefixCacheCostAdjustment:
             cache_params="{}",
         )
         router.prefix_cache.remember(scope, blocks)
-        # Record verified reuse evidence so the discount can apply.
-        router.prefix_cache.record_evidence(scope, cached_tokens=800)
 
     @staticmethod
     def _select(router: RouteWiseRouter):

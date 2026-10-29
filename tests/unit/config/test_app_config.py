@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import textwrap
 
@@ -89,6 +90,31 @@ def test_before_loading_the_resolver_is_the_environment(config_env, monkeypatch)
     assert app_config.config_value("SITE_NAME") == "From env"
     assert app_config.config_value("SITE_DOCS_URL") is None
     assert app_config.config_value("SITE_DOCS_URL", "fallback") == "fallback"
+
+
+def test_admin_preview_uses_environment_but_skips_invalid_values(config_env, monkeypatch) -> None:
+    monkeypatch.setenv("WECOM_ALERTS_WEBHOOK_URL", "https://example.invalid/synthetic-secret")
+    monkeypatch.setenv("STREAM_MAX_IDLE_S", "0")
+
+    assert app_config.configured_value("WECOM_ALERTS_WEBHOOK_URL") == (
+        "https://example.invalid/synthetic-secret"
+    )
+    assert app_config.configured_value("STREAM_MAX_IDLE_S", "240") == "240"
+
+
+@pytest.mark.asyncio
+async def test_admin_preview_tracks_replaced_and_cleared_pending_secrets(config_env) -> None:
+    key = "WECOM_ALERTS_WEBHOOK_URL"
+    store = FakeAppConfigStore([row(key, "https://example.invalid/old", secret=True)])
+    await _boot(store)
+
+    await app_config.update({key: "https://example.invalid/new"}, updated_by="admin")
+    assert app_config.configured_value(key) == "https://example.invalid/new"
+    assert app_config.config_value(key) == "https://example.invalid/old"
+
+    await app_config.update({key: ""}, updated_by="admin")
+    assert app_config.configured_value(key) == ""
+    assert app_config.config_value(key) == "https://example.invalid/old"
 
 
 @pytest.mark.asyncio
@@ -448,6 +474,81 @@ async def test_restart_required_values_keep_their_boot_value(config_env) -> None
 
 
 @pytest.mark.asyncio
+async def test_wecom_webhook_takes_effect_only_after_a_restart(config_env) -> None:
+    """The DB failed-request detector registers once at startup.
+
+    Applying a WeCom URL live would leave it configured in the console while
+    the detector that reads it was never registered.
+    """
+    store = FakeAppConfigStore()
+    await _boot(store)
+    url = "https://qyapi.weixin.test/cgi-bin/webhook/send?key=abc"
+
+    await app_config.update({"WECOM_ALERTS_WEBHOOK_URL": url}, updated_by="admin")
+
+    assert app_config.config_value("WECOM_ALERTS_WEBHOOK_URL", "") == ""
+    assert get_settings().wecom_alerts_webhook_url == ""
+    assert "WECOM_ALERTS_WEBHOOK_URL" in app_config.get_config_health().pending_restart
+
+    await _restart(store)
+
+    assert app_config.config_value("WECOM_ALERTS_WEBHOOK_URL", "") == url
+    assert get_settings().wecom_alerts_webhook_url == url
+    assert app_config.get_config_health().pending_restart == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("old_key", "new_key", "old_url", "new_url", "old_name", "new_name"),
+    [
+        (
+            "SLACK_ALERTS_WEBHOOK_URL",
+            "WECOM_ALERTS_WEBHOOK_URL",
+            "https://hooks.slack.test/old",
+            "https://qyapi.weixin.test/cgi-bin/webhook/send?key=new",
+            "slack",
+            "wecom",
+        ),
+        (
+            "WECOM_ALERTS_WEBHOOK_URL",
+            "SLACK_ALERTS_WEBHOOK_URL",
+            "https://qyapi.weixin.test/cgi-bin/webhook/send?key=old",
+            "https://hooks.slack.test/new",
+            "wecom",
+            "slack",
+        ),
+    ],
+)
+async def test_switching_alert_channels_waits_for_restart(
+    config_env, old_key, new_key, old_url, new_url, old_name, new_name
+) -> None:
+    """Clearing one channel and setting the other must not leave a gap.
+
+    Both channel settings are restart-required and are judged together, so the
+    runtime keeps the boot channel until the restart that installs the other.
+    """
+    from serving.observability.alerts import configured_sink
+
+    store = FakeAppConfigStore([row(old_key, old_url)])
+    await _boot(store)
+    assert configured_sink() is not None and configured_sink().name == old_name
+
+    # One admin save clears the old channel and installs the new one.
+    await app_config.update({old_key: "", new_key: new_url}, updated_by="admin")
+
+    # Neither side is applied yet: the old channel keeps serving, and there is
+    # no moment with both (mutual-exclusion error) or neither (missed alert).
+    assert configured_sink() is not None and configured_sink().name == old_name
+    pending = app_config.get_config_health().pending_restart
+    assert old_key in pending
+    assert new_key in pending
+
+    await _restart(store)
+
+    assert configured_sink() is not None and configured_sink().name == new_name
+
+
+@pytest.mark.asyncio
 async def test_an_equivalent_spelling_is_not_pending(config_env, monkeypatch) -> None:
     monkeypatch.setenv("ENABLE_ROUTEWISE", "1")
     get_settings.cache_clear()
@@ -479,19 +580,25 @@ async def test_a_stale_refresh_never_replaces_a_newer_apply(config_env) -> None:
     await _boot(store)
 
     class _SlowStore(FakeAppConfigStore):
-        intercepted = False
+        writer: asyncio.Task | None = None
 
         async def fetch_all(self, **options):
             snapshot = await super().fetch_all(**options)
-            if not self.intercepted:
-                self.intercepted = True
-                # An administrator's write lands while this read is in flight.
-                await app_config.update({"SITE_NAME": "new"}, updated_by="admin")
+            if self.writer is None:
+                # An administrator's write, served by another request, lands
+                # while this read is in flight.
+                self.writer = asyncio.create_task(
+                    app_config.update({"SITE_NAME": "new"}, updated_by="admin")
+                )
+                for _ in range(5):
+                    await asyncio.sleep(0)
             return snapshot
 
     slow = _SlowStore(store.rows.values())
     app_config.attach(slow)
-    await app_config.refresh()
+    await asyncio.wait_for(app_config.refresh(), timeout=5)
+    assert slow.writer is not None
+    await asyncio.wait_for(slow.writer, timeout=5)
 
     assert app_config.config_value("SITE_NAME") == "new"
 
@@ -712,6 +819,9 @@ async def test_describe_types_values_and_names_their_source(config_env, monkeypa
     assert entries["SITE_DOCS_URL"]["source"] == "default"
     assert entries["CORS_ALLOWED_ORIGINS"]["value"].startswith("http://localhost:3000,")
     assert entries["SMTP_PASSWORD"]["setup"] is True
+    assert entries["COOKIE_SECURE"]["one_time"] is True
+    assert entries["SMTP_PORT"]["one_time"] is True  # by its category
+    assert entries["ROUTING_AFFINITY_ENABLED"]["one_time"] is False
 
 
 @pytest.mark.asyncio
@@ -737,6 +847,58 @@ async def test_describe_compares_the_environment_as_a_typed_value(config_env, mo
     entries = {entry["key"]: entry for entry in app_config.describe()["entries"]}
     assert entries["COOKIE_SECURE"]["environment_ignored"] is False
     assert entries["SMTP_PORT"]["environment_ignored"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_console_listing_leaves_out_settings_with_nothing_to_choose(
+    config_env, extension_registry
+) -> None:
+    # No extension registers a delivery provider: email has SMTP alone, and the
+    # phone settings can do nothing without an SMS provider.
+    await _boot(FakeAppConfigStore())
+
+    offered = {entry["key"] for entry in app_config.describe(offered_only=True)["entries"]}
+    assert "EMAIL_PROVIDER" not in offered
+    assert not {"SMS_PROVIDER", "SMS_AUTH_ENABLED", "SMS_OTP_MAX_ATTEMPTS"} & offered
+    assert {"SMTP_HOST", "LOG_LEVEL", "BATCH_MIN_ROLE"} <= offered
+    # The full description, which the command line lists, keeps them.
+    described = {entry["key"] for entry in app_config.describe()["entries"]}
+    assert {"EMAIL_PROVIDER", "SMS_PROVIDER", "SMS_AUTH_ENABLED"} <= described
+
+
+@pytest.mark.asyncio
+async def test_the_console_lists_delivery_settings_once_an_extension_offers_a_choice(
+    config_env, sample_delivery
+) -> None:
+    await _boot(FakeAppConfigStore())
+
+    offered = {entry["key"] for entry in app_config.describe(offered_only=True)["entries"]}
+    assert {"EMAIL_PROVIDER", "SMS_PROVIDER", "SMS_AUTH_ENABLED", "SAMPLE_SMS_REGION"} <= offered
+
+
+@pytest.mark.asyncio
+async def test_the_console_lists_a_setting_it_does_not_offer_while_it_needs_attention(
+    config_env, extension_registry
+) -> None:
+    _write_models(
+        config_env,
+        """
+        models:
+          - id: chat
+            base_url: https://api.example/v1
+            api_key: ${SMS_DEFAULT_COUNTRY_CODE}
+        """,
+    )
+    store = FakeAppConfigStore(
+        [row("EMAIL_PROVIDER", "unloaded_email"), row("SMS_OTP_MAX_ATTEMPTS", "99")]
+    )
+    await _boot(store)
+
+    entries = {entry["key"]: entry for entry in app_config.describe(offered_only=True)["entries"]}
+    assert entries["EMAIL_PROVIDER"]["invalid"] == "must be one of smtp"
+    assert entries["SMS_OTP_MAX_ATTEMPTS"]["invalid"] == "must be at most 10"
+    assert entries["SMS_DEFAULT_COUNTRY_CODE"]["missing"] is True
+    assert "SMS_AUTH_ENABLED" not in entries
 
 
 # --- writes ------------------------------------------------------------------
@@ -928,6 +1090,28 @@ async def test_a_save_may_not_break_a_rule_an_environment_value_relies_on(
         {"TRUST_PROXY_HEADERS": False, "TRUST_X_REAL_IP": False}, updated_by="admin"
     )
     assert _in_force_trust() == (False, False, False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slack_key", ["SLACK_ALERTS_WEBHOOK_URL", "SLACK_WEBHOOK_URL"])
+async def test_a_save_may_not_configure_two_alert_channels(config_env, slack_key) -> None:
+    """Slack and WeCom are alternatives, not a fan-out pair."""
+    store = FakeAppConfigStore()
+    await _boot(store)
+    slack = "https://hooks.slack.test/x"
+    wecom = "https://qyapi.weixin.test/cgi-bin/webhook/send?key=abc"
+
+    with pytest.raises(app_config.ConfigUpdateError, match="mutually exclusive"):
+        await app_config.update(
+            {slack_key: slack, "WECOM_ALERTS_WEBHOOK_URL": wecom},
+            updated_by="admin",
+        )
+    assert slack_key not in await store.fetch_all()
+
+    await app_config.update({slack_key: slack}, updated_by="admin")
+    with pytest.raises(app_config.ConfigUpdateError, match="mutually exclusive"):
+        await app_config.update({"WECOM_ALERTS_WEBHOOK_URL": wecom}, updated_by="admin")
+    assert "WECOM_ALERTS_WEBHOOK_URL" not in await store.fetch_all()
 
 
 @pytest.mark.asyncio
@@ -1441,6 +1625,76 @@ def _entry(key: str) -> dict:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored_key,environment_keys,channel",
+    [
+        ("SLACK_ALERTS_WEBHOOK_URL", ("WECOM_ALERTS_WEBHOOK_URL",), "slack"),
+        ("SLACK_WEBHOOK_URL", ("WECOM_ALERTS_WEBHOOK_URL",), "slack"),
+        ("WECOM_ALERTS_WEBHOOK_URL", ("SLACK_ALERTS_WEBHOOK_URL",), "wecom"),
+        ("WECOM_ALERTS_WEBHOOK_URL", ("SLACK_WEBHOOK_URL",), "wecom"),
+        (
+            "WECOM_ALERTS_WEBHOOK_URL",
+            ("SLACK_ALERTS_WEBHOOK_URL", "SLACK_WEBHOOK_URL"),
+            "wecom",
+        ),
+    ],
+    ids=[
+        "canonical-slack-stored",
+        "legacy-slack-stored",
+        "wecom-stored-canonical-slack-env",
+        "wecom-stored-legacy-slack-env",
+        "wecom-stored-both-slack-env",
+    ],
+)
+async def test_stored_alert_channel_wins_over_conflicting_environment_at_startup(
+    config_env, monkeypatch, caplog, stored_key, environment_keys, channel
+) -> None:
+    from serving.observability.alerts import configured_sink
+
+    urls = {
+        "slack": "https://hooks.slack.test/services/stored/test/token",
+        "wecom": "https://qyapi.weixin.test/cgi-bin/webhook/send?key=stored-token",
+    }
+    other_channel = "wecom" if channel == "slack" else "slack"
+    for key in environment_keys:
+        monkeypatch.setenv(key, urls[other_channel])
+    get_settings.cache_clear()
+    store = FakeAppConfigStore([row(stored_key, urls[channel], secret=True)])
+
+    with caplog.at_level("WARNING", logger="serving.config.app_config"):
+        await _boot(store)
+    app_config.require_valid_environment()
+
+    settings = get_settings()
+    assert settings.broken_rules() == {}
+    assert settings.slack_alerts_webhook_url == (urls["slack"] if channel == "slack" else "")
+    assert settings.wecom_alerts_webhook_url == (urls["wecom"] if channel == "wecom" else "")
+    assert settings.slack_webhook_url == (
+        urls["slack"] if stored_key == "SLACK_WEBHOOK_URL" else ""
+    )
+    sink = configured_sink()
+    assert sink is not None
+    assert sink.name == channel
+    assert sink.webhook_url == urls[channel]
+    stored = _entry(stored_key)
+    assert (stored["source"], stored["is_set"], stored["invalid"]) == ("database", True, None)
+    assert store.rows[stored_key].value == urls[channel]
+    for key in environment_keys:
+        # Importing the losing environment value would make the conflict
+        # permanent in the database on the next restart.
+        assert key not in store.rows
+        assert key in app_config._STATE.environment_aside
+        assert app_config.configured_value(key, "") == ""
+        ignored = _entry(key)
+        assert (ignored["source"], ignored["is_set"], ignored["invalid"]) == (
+            "default",
+            False,
+            None,
+        )
+        assert f"Not importing {key} from the environment" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_an_environment_value_never_beats_a_stored_row_through_a_rule(
     config_env, monkeypatch, caplog
 ) -> None:
@@ -1756,6 +2010,20 @@ def test_unloaded_provider_environment_is_rejected(
     get_settings.cache_clear()
     app_config.use_environment(database_enabled=False)
     with pytest.raises(app_config.ConfigBootstrapError, match=key):
+        app_config.require_valid_environment()
+
+
+@pytest.mark.parametrize("slack_key", ["SLACK_ALERTS_WEBHOOK_URL", "SLACK_WEBHOOK_URL"])
+def test_startup_refuses_two_alert_channels(config_env, monkeypatch, slack_key) -> None:
+    monkeypatch.setenv(slack_key, "https://hooks.slack.test/x")
+    monkeypatch.setenv(
+        "WECOM_ALERTS_WEBHOOK_URL",
+        "https://qyapi.weixin.test/cgi-bin/webhook/send?key=abc",
+    )
+    get_settings.cache_clear()
+    app_config.use_environment(database_enabled=False)
+
+    with pytest.raises(app_config.ConfigBootstrapError, match="mutually exclusive"):
         app_config.require_valid_environment()
 
 

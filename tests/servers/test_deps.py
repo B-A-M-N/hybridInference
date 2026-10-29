@@ -12,7 +12,7 @@ import pytest
 from fastapi import Depends, FastAPI, Request
 from fastapi.testclient import TestClient
 
-from routing.executor import RouteExecutor
+from routing.routers import FixedRouter
 from serving.servers.deps import (
     AppServices,
     get_current_user,
@@ -30,7 +30,7 @@ class TestAppServices:
 
     def test_app_services_creation(self):
         """Test creating AppServices with all fields."""
-        router = RouteExecutor()
+        router = FixedRouter()
         db_logger = MagicMock(spec=DatabaseLogger)
         routing_manager = MagicMock()
         model_visibility_resolver = MagicMock()
@@ -49,7 +49,7 @@ class TestAppServices:
 
     def test_app_services_with_defaults(self):
         """Test creating AppServices with only required fields."""
-        router = RouteExecutor()
+        router = FixedRouter()
 
         services = AppServices(router=router)
 
@@ -71,7 +71,7 @@ class TestAppServices:
 class TestDependencyFunctions:
     """Test dependency injection functions."""
 
-    def test_get_services(self, app_services):
+    async def test_get_services(self, app_services):
         """Test get_services returns services from app.state."""
         app = FastAPI()
         app.state.services = app_services
@@ -79,60 +79,60 @@ class TestDependencyFunctions:
         request = Mock(spec=Request)
         request.app = app
 
-        result = get_services(request)
+        result = await get_services(request)
 
         assert result is app_services
 
-    def test_get_router(self, app_services):
+    async def test_get_router(self, app_services):
         """Test get_router extracts router from services."""
 
         # Create a mock that simulates the Depends behavior
         def mock_get_services():
             return app_services
 
-        result = get_router(mock_get_services())
+        result = await get_router(mock_get_services())
 
         assert result is app_services.router
 
-    def test_get_db_logger(self, app_services):
+    async def test_get_db_logger(self, app_services):
         """Test get_db_logger extracts database logger from services."""
 
         def mock_get_services():
             return app_services
 
-        result = get_db_logger(mock_get_services())
+        result = await get_db_logger(mock_get_services())
 
         assert result is app_services.db_logger
 
-    def test_get_model_visibility_resolver(self, app_services):
+    async def test_get_model_visibility_resolver(self, app_services):
         """Test get_model_visibility_resolver extracts resolver from services."""
 
         def mock_get_services():
             return app_services
 
-        result = get_model_visibility_resolver(mock_get_services())
+        result = await get_model_visibility_resolver(mock_get_services())
 
         assert result is app_services.model_visibility_resolver
 
-    def test_get_model_visibility_resolver_when_none(self):
+    async def test_get_model_visibility_resolver_when_none(self):
         """Test get_model_visibility_resolver returns None when not configured."""
-        services = AppServices(router=RouteExecutor())
+        services = AppServices(router=FixedRouter())
 
         def mock_get_services():
             return services
 
-        result = get_model_visibility_resolver(mock_get_services())
+        result = await get_model_visibility_resolver(mock_get_services())
 
         assert result is None
 
-    def test_get_db_logger_when_none(self):
+    async def test_get_db_logger_when_none(self):
         """Test get_db_logger returns None when not configured."""
-        services = AppServices(router=RouteExecutor())
+        services = AppServices(router=FixedRouter())
 
         def mock_get_services():
             return services
 
-        result = get_db_logger(mock_get_services())
+        result = await get_db_logger(mock_get_services())
 
         assert result is None
 
@@ -149,7 +149,7 @@ class TestDependencyIntegration:
         app.state.services = app_services
 
         @app.get("/test-router")
-        def test_router_endpoint(router: RouteExecutor = Depends(get_router)):
+        def test_router_endpoint(router: FixedRouter = Depends(get_router)):
             return {"has_router": router is not None}
 
         @app.get("/test-logger")
@@ -176,7 +176,7 @@ class TestDependencyIntegration:
         assert response.status_code == 200
         assert response.json()["has_resolver"] is True
 
-    def test_dependencies_with_missing_state(self):
+    async def test_dependencies_with_missing_state(self):
         """Test that dependencies fail gracefully when app.state is not set."""
         app = FastAPI()
         # Don't set app.state.services
@@ -185,7 +185,7 @@ class TestDependencyIntegration:
         request.app = app
 
         with pytest.raises(AttributeError):
-            get_services(request)
+            await get_services(request)
 
     def test_nested_dependency_chain(self, app_services):
         """Test that nested dependencies work correctly."""
@@ -198,7 +198,7 @@ class TestDependencyIntegration:
         @app.get("/test-nested")
         def test_nested_endpoint(
             services: AppServices = Depends(get_services),
-            router: RouteExecutor = Depends(get_router),
+            router: FixedRouter = Depends(get_router),
         ):
             return {
                 "services_router_match": services.router is router,
@@ -217,7 +217,7 @@ class TestDependencyIntegration:
 class TestDependencyEdgeCases:
     """Test edge cases and error conditions."""
 
-    def test_get_services_with_none_state(self):
+    async def test_get_services_with_none_state(self):
         """Test get_services when app.state exists but services is None."""
         app = FastAPI()
         app.state.services = None
@@ -225,7 +225,7 @@ class TestDependencyEdgeCases:
         request = Mock(spec=Request)
         request.app = app
 
-        result = get_services(request)
+        result = await get_services(request)
 
         assert result is None
 
@@ -237,8 +237,8 @@ class TestDependencyEdgeCases:
         app.state.services = app_services
 
         @app.get("/test-async")
-        async def test_async_endpoint(router: RouteExecutor = Depends(get_router)):
-            return {"is_router": isinstance(router, RouteExecutor)}
+        async def test_async_endpoint(router: FixedRouter = Depends(get_router)):
+            return {"is_router": isinstance(router, FixedRouter)}
 
         client = TestClient(app)
 
