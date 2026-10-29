@@ -84,7 +84,7 @@ from serving.utils.jwt import (
 from serving.utils.logging import get_logger
 from serving.utils.login_rate_limit import check_and_record_login
 from serving.utils.phone_auth import phone_identity_unverified
-from serving.utils.request_ip import get_client_ip, get_client_ip_info
+from serving.utils.request_ip import get_client_ip_info
 from serving.utils.signup_rate_limit import check_and_record_signup
 from serving.utils.turnstile import verify_turnstile_token
 
