@@ -10,6 +10,7 @@ response body and no outcome argument at all, because that is how
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
@@ -191,6 +192,22 @@ def test_notice_suffix_is_bounded_to_known_provider_wording(text, expected):
     outcome = classify_completion_outcome(content=text, usage=None, http_status=200, terminal=True)
     is_transient = outcome is CompletionOutcome.TRANSIENT_NO_PROGRESS
     assert is_transient is expected
+
+
+def test_adversarial_notice_punctuation_is_progress_and_bounded():
+    """Malformed notice tails stay semantic answers without regex blowup."""
+    adversarial = "the model is starting up" + (". " * 30) + "x"
+    start = time.perf_counter()
+    outcome = classify_completion_outcome(
+        content=adversarial,
+        usage=None,
+        http_status=200,
+        terminal=True,
+    )
+    elapsed = time.perf_counter() - start
+
+    assert outcome is CompletionOutcome.PROGRESS
+    assert elapsed < 0.1, f"classification took {elapsed:.3f}s"
 
 
 def test_logger_classifies_response_body_when_supplied():

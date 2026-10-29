@@ -104,8 +104,11 @@ _DEFAULT_TRANSIENT_MARKERS: tuple[str, ...] = (
 # just because it quotes a warmup phrase in the middle or continues the phrase
 # with free-form explanation.
 _NOTICE_SUFFIX = (
-    r"(?:"
+    # Keep the punctuation fallback outside the repeated group. Repeating an
+    # optional group let caller-controlled punctuation trigger exponential
+    # backtracking in the event loop.
     r"[\s.!\u2026,;:-]*"  # punctuation / spacing
+    r"(?:"
     r"(?:"
     r"this (?:takes|will take) about \d{1,4} (?:seconds?|minutes?)"
     r"|please wait(?: while (?:the )?model (?:loads|starts|initializes))?"
@@ -115,7 +118,7 @@ _NOTICE_SUFFIX = (
     r"|shortly"
     r"|yet"
     r"|now"
-    r")?"
+    r")[\s.!\u2026,;:-]*"
     r")*$"
 )
 _TRANSIENT_MARKERS: list[re.Pattern[str]] = [
