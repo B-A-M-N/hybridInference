@@ -500,11 +500,13 @@ async def test_a_model_the_caller_may_not_use_is_never_chosen(gateway):
 async def test_auto_selection_conceals_served_identity_for_diagnostic_access(
     mock_db_logger, mock_log_store, surface, stream, identity_headers
 ):
-    gateway = _Gateway(
-        mock_db_logger,
-        mock_log_store,
-        user={**USER, "role": "internal"},
-    )
+    diagnostic_user = {**USER, "role": "internal"}
+    if "x-fi-served-identity" in identity_headers:
+        diagnostic_user = {
+            **USER,
+            "diagnostic_entitlements": frozenset({"served_identity"}),
+        }
+    gateway = _Gateway(mock_db_logger, mock_log_store, user=diagnostic_user)
     if surface == "chat":
         path = "/v1/chat/completions"
         body = _chat("auto-balance", stream=stream)

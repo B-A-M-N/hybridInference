@@ -28,7 +28,6 @@ import re
 from typing import Any
 
 from serving.utils.synthetic_probe import (
-    is_trusted_probe_caller,
     is_trusted_probe_headers,
 )
 
@@ -38,6 +37,7 @@ SERVED_ENDPOINT_HEADER = "X-FI-Served-Endpoint"
 SERVED_PROVIDER_HEADER = "X-FI-Served-Provider"
 SERVED_IDENTITY_OPT_IN_HEADER = "X-FI-Served-Identity"
 SERVED_IDENTITY_OPT_IN_VALUE = "include"
+SERVED_IDENTITY_DIAGNOSTIC_ENTITLEMENT = "served_identity"
 SERVED_IDENTITY_HEADER_NAMES = frozenset(
     (REQUESTED_MODEL_HEADER, SERVED_MODEL_HEADER, SERVED_ENDPOINT_HEADER, SERVED_PROVIDER_HEADER)
 )
@@ -52,13 +52,20 @@ def should_include_served_identity_headers(headers: Any, user_ctx: Any) -> bool:
     """Authorize identity headers for a trusted probe or opted-in diagnostic call.
 
     The caller entitlement is derived only from the authenticated server-side
-    context: the existing internal/admin trust tier, excluding agent grants.
-    A request header can express per-call intent, but cannot grant that
+    context's explicit diagnostic entitlements, excluding agent grants. A
+    request header can express per-call intent, but cannot grant that
     entitlement. Synthetic probes retain their existing marker and policy.
     """
     if is_trusted_probe_headers(headers, user_ctx):
         return True
-    if not is_trusted_probe_caller(user_ctx):
+    if not user_ctx or not user_ctx.get("authenticated"):
+        return False
+    if user_ctx.get("agent_grant_id") or user_ctx.get("agent_job_id"):
+        return False
+    entitlements = user_ctx.get("diagnostic_entitlements")
+    if not isinstance(entitlements, (set, frozenset, tuple, list)):
+        return False
+    if SERVED_IDENTITY_DIAGNOSTIC_ENTITLEMENT not in entitlements:
         return False
     return (
         headers.get(SERVED_IDENTITY_OPT_IN_HEADER, "").strip().lower()

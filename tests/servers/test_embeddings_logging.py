@@ -120,6 +120,7 @@ def _build_app(
     *,
     log_synthetic_probes: bool = False,
     user_role: str = "internal",
+    diagnostic_entitlements: frozenset[str] = frozenset(),
 ) -> FastAPI:
     # ``internal`` by default so the probe-suppression tests exercise a caller
     # whose X-Probe marker is actually honoured; pass a lower role to model an
@@ -131,6 +132,7 @@ def _build_app(
         "user_id": "user-emb",
         "role": user_role,
         "authenticated": True,
+        "diagnostic_entitlements": diagnostic_entitlements,
     }
     app.dependency_overrides[enforce_user_concurrency] = lambda: None
     # Register the access gate the surface now requires (fail-closed): a
@@ -459,7 +461,9 @@ async def test_authorized_embedding_opt_in_keeps_request_logging_and_billing():
     adapter.config.endpoint_identity_publishable = True
     logger = _CapturingLogger()
     op_store = _CapturingOpStore()
-    app = _build_app(adapter, logger, op_store)
+    app = _build_app(
+        adapter, logger, op_store, diagnostic_entitlements=frozenset({"served_identity"})
+    )
 
     response = await _post(
         app,

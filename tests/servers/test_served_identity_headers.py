@@ -52,6 +52,19 @@ def _enable_trusted_probe(app):
     }
 
 
+def _enable_served_identity_diagnostic(app):
+    """Model an auth dependency that attached an explicit server entitlement."""
+    from serving.servers.auth import verify_api_key
+
+    app.dependency_overrides[verify_api_key] = lambda: {
+        "authenticated": True,
+        "is_admin": False,
+        "role": "free",
+        "user_id": "diagnostic-caller",
+        "diagnostic_entitlements": frozenset({"served_identity"}),
+    }
+
+
 def _anthropic_body(**overrides):
     body = {
         "model": NATIVE_MODEL,
@@ -165,7 +178,10 @@ async def test_messages_response_carries_served_identity_headers(
     # The route's registry-minted identity, as production configs carry it.
     adapter.config.endpoint_id = f"{NATIVE_MODEL}:anthropic-api"
     adapter.config.endpoint_identity_publishable = True
-    _enable_trusted_probe(anthropic_test_app)
+    if "x-fi-served-identity" in identity_headers:
+        _enable_served_identity_diagnostic(anthropic_test_app)
+    else:
+        _enable_trusted_probe(anthropic_test_app)
 
     r = await anthropic_client.post(
         "/v1/messages",
@@ -257,7 +273,10 @@ async def test_messages_stream_carries_the_same_served_identity_headers(
     adapter = anthropic_test_app.state.services.router.routes[NATIVE_MODEL].adapters[0][0]
     adapter.config.endpoint_id = f"{NATIVE_MODEL}:anthropic-api"
     adapter.config.endpoint_identity_publishable = True
-    _enable_trusted_probe(anthropic_test_app)
+    if "x-fi-served-identity" in identity_headers:
+        _enable_served_identity_diagnostic(anthropic_test_app)
+    else:
+        _enable_trusted_probe(anthropic_test_app)
     async with anthropic_client.stream(
         "POST",
         "/v1/messages",
@@ -297,7 +316,7 @@ async def test_chat_completions_response_carries_served_identity_headers(chat_cl
 @pytest.mark.asyncio
 async def test_authorized_opt_in_discloses_chat_identity_without_marking_probe(chat_client):
     app = chat_client._transport.app
-    _enable_trusted_probe(app)
+    _enable_served_identity_diagnostic(app)
     response = await chat_client.post(
         "/v1/chat/completions",
         json={"model": CHAT_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
@@ -312,6 +331,21 @@ async def test_authorized_opt_in_discloses_chat_identity_without_marking_probe(c
 
 
 @pytest.mark.asyncio
+async def test_internal_role_alone_does_not_authorize_identity_opt_in(chat_client):
+    app = chat_client._transport.app
+    _enable_trusted_probe(app)
+
+    response = await chat_client.post(
+        "/v1/chat/completions",
+        json={"model": CHAT_MODEL, "messages": [{"role": "user", "content": "Hi"}]},
+        headers={"x-fi-served-identity": "include"},
+    )
+
+    assert response.status_code == 200
+    assert not any(name.lower().startswith("x-fi-") for name in response.headers)
+
+
+@pytest.mark.asyncio
 async def test_alias_request_publishes_canonical_model_and_endpoint(chat_client):
     """An alias remains the requested spelling; identity uses the canonical id."""
     chat_client._transport.app.state.services.router.register_route(
@@ -319,7 +353,7 @@ async def test_alias_request_publishes_canonical_model_and_endpoint(chat_client)
         [(chat_client._transport.app.state.services.router.routes[CHAT_MODEL].adapters[0][0], 1.0)],
         aliases=["glm-latest"],
     )
-    _enable_trusted_probe(chat_client._transport.app)
+    _enable_served_identity_diagnostic(chat_client._transport.app)
 
     response = await chat_client.post(
         "/v1/chat/completions",
@@ -410,7 +444,10 @@ async def test_non_latin_model_id_does_not_fail_chat_or_stream(chat_client):
 )
 async def test_chat_completions_stream_carries_requested_identity(chat_client, identity_headers):
     """A trusted diagnostic stream carries the selected route identity."""
-    _enable_trusted_probe(chat_client._transport.app)
+    if "x-fi-served-identity" in identity_headers:
+        _enable_served_identity_diagnostic(chat_client._transport.app)
+    else:
+        _enable_trusted_probe(chat_client._transport.app)
     r = await chat_client.post(
         "/v1/chat/completions",
         json={
@@ -484,7 +521,10 @@ async def test_multi_backend_streaming_uses_observed_route_identity(chat_app, id
         [(chat_app.state.services.router.routes[CHAT_MODEL].adapters[0][0], 0.5), (second, 0.5)],
     )
     transport = ASGITransport(app=chat_app)
-    _enable_trusted_probe(chat_app)
+    if "x-fi-served-identity" in identity_headers:
+        _enable_served_identity_diagnostic(chat_app)
+    else:
+        _enable_trusted_probe(chat_app)
     from httpx import AsyncClient as _AC
 
     async with _AC(transport=transport, base_url="http://test") as client:
@@ -547,7 +587,10 @@ async def test_non_streaming_chat_fallback_reports_the_route_that_served(
         CHAT_MODEL,
         [(_FailingAdapter(primary_cfg), 0.9), (DummyAdapter(fallback_cfg), 0.1)],
     )
-    _enable_trusted_probe(chat_app)
+    if "x-fi-served-identity" in identity_headers:
+        _enable_served_identity_diagnostic(chat_app)
+    else:
+        _enable_trusted_probe(chat_app)
 
     transport = ASGITransport(app=chat_app)
     from httpx import AsyncClient as _AC

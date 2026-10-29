@@ -34,6 +34,17 @@ def _auth() -> dict[str, str]:
     return {"x-api-key": RESPONSES_TEST_API_KEY}
 
 
+def _enable_served_identity_diagnostic(app: FastAPI) -> None:
+    """Model server-authenticated diagnostic entitlement for this test call."""
+
+    app.dependency_overrides[verify_api_key] = lambda: {
+        "authenticated": True,
+        "user_id": "diagnostic-user",
+        "role": "free",
+        "diagnostic_entitlements": frozenset({"served_identity"}),
+    }
+
+
 def _rc(messages: list[dict[str, Any]]) -> list[tuple[Any, Any]]:
     """(role, content) pairs — chat_completions adds None defaults via model_dump."""
     return [(m.get("role"), m.get("content")) for m in messages]
@@ -263,6 +274,8 @@ async def test_responses_non_stream_copies_trusted_identity_headers(
     responses_client, identity_headers
 ):
     app = responses_client._transport.app
+    if "x-fi-served-identity" in identity_headers:
+        _enable_served_identity_diagnostic(app)
     adapter = app.state.services.router.routes[TEXT_MODEL].adapters[0][0]
     adapter.config.provider = "zai"
     adapter.config.endpoint_id = f"{TEXT_MODEL}:zai-api"
@@ -487,6 +500,8 @@ async def test_streaming_text_events(responses_client):
 )
 async def test_responses_stream_copies_trusted_identity_headers(responses_client, identity_headers):
     app = responses_client._transport.app
+    if "x-fi-served-identity" in identity_headers:
+        _enable_served_identity_diagnostic(app)
     adapter = app.state.services.router.routes[TEXT_MODEL].adapters[0][0]
     adapter.config.provider = "zai"
     adapter.config.endpoint_id = f"{TEXT_MODEL}:zai-api"
