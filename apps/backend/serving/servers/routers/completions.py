@@ -515,7 +515,7 @@ class ChatStream:
         model: str,
         request_headers: Mapping[str, str],
         provider_header: str | None,
-        identity_headers_for_response: Callable[[], dict[str, str]],
+        identity_headers_for_response: Callable[[], dict[str, str]] | None = None,
     ) -> None:
         """Hold the session and the router stream it reads."""
         self.session = session
@@ -525,7 +525,7 @@ class ChatStream:
         self.model = model
         self.request_headers = request_headers
         self.provider_header = provider_header
-        self._identity_headers_for_response = identity_headers_for_response
+        self._identity_headers_for_response = identity_headers_for_response or (lambda: {})
         self._sse: Any = None
         # What the response body yields: a first item already read, then the
         # rest of the started stream it came from.
