@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -65,7 +65,7 @@ async def admin_client(monkeypatch, mock_stores):
 @pytest.mark.asyncio
 async def test_create_api_key_success(admin_client, monkeypatch):
     client, op_store, _log_store, log_action = admin_client
-    created_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    created_at = datetime(2025, 1, 1, tzinfo=UTC)
     op_store.check_active_key_exists.return_value = False
     op_store.create_key.return_value = {"id": 1, "created_at": created_at}
 
@@ -117,7 +117,7 @@ async def test_create_api_key_requires_token(admin_client):
 @pytest.mark.asyncio
 async def test_list_api_keys_batches_usage(admin_client):
     client, op_store, _log_store, _log_action = admin_client
-    created_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    created_at = datetime(2025, 1, 1, tzinfo=UTC)
 
     op_store.list_keys.return_value = (
         1,
@@ -157,7 +157,7 @@ async def test_list_api_keys_batches_usage(admin_client):
 @pytest.mark.asyncio
 async def test_get_api_key_detail_success(admin_client):
     client, op_store, log_store, _log_action = admin_client
-    created_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    created_at = datetime(2025, 1, 1, tzinfo=UTC)
 
     op_store.get_key_detail.return_value = {
         "user_id": "alice",
@@ -192,6 +192,39 @@ async def test_get_api_key_detail_success(admin_client):
 
 
 @pytest.mark.asyncio
+async def test_get_api_key_detail_reports_a_zero_quota_as_exhausted(admin_client):
+    """A quota of 0 refuses every request; it must not read as the $1000 default."""
+    client, op_store, log_store, _log_action = admin_client
+    op_store.get_key_detail.return_value = {
+        "user_id": "alice",
+        "user_name": "Alice",
+        "key_prefix": "hyi-alice",
+        "status": "active",
+        "quota_daily_cost_usd": Decimal("0.0000"),
+        "quota_monthly_cost_usd": Decimal("0.0000"),
+        "created_at": datetime(2025, 1, 1, tzinfo=UTC),
+        "last_used_at": None,
+        "expires_at": None,
+        "notes": None,
+        "metadata": None,
+    }
+    log_store.get_key_detail_usage.return_value = {
+        "today": {"cost_usd": 0.0, "requests": 0},
+        "this_month": {"cost_usd": 0.0, "requests": 0},
+        "models_used": [],
+        "last_request_at": None,
+    }
+
+    response = await client.get(
+        "/admin/api-keys/alice", headers={"Authorization": "Bearer test-admin"}
+    )
+
+    usage = response.json()["usage"]
+    assert usage["today"]["quota_remaining_usd"] == 0.0
+    assert usage["this_month"]["quota_remaining_usd"] == 0.0
+
+
+@pytest.mark.asyncio
 async def test_update_api_key_success(admin_client):
     client, op_store, _log_store, log_action = admin_client
     op_store.get_key_detail.return_value = {"user_id": "alice"}
@@ -206,6 +239,38 @@ async def test_update_api_key_success(admin_client):
     body = response.json()
     assert body["updated_fields"] == ["quota_daily_cost_usd"]
     log_action.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_api_key_refuses_a_revoked_key_instead_of_reporting_success(admin_client):
+    """``update_key`` skips revoked rows, so a 200 here claimed a change never written."""
+    client, op_store, _log_store, log_action = admin_client
+    op_store.get_key_detail.return_value = {"user_id": "alice", "status": "revoked"}
+
+    response = await client.patch(
+        "/admin/api-keys/alice",
+        headers={"Authorization": "Bearer test-admin"},
+        json={"status": "active"},
+    )
+
+    assert response.status_code == 409
+    op_store.update_key.assert_not_awaited()
+    log_action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_api_key_still_updates_a_suspended_key(admin_client):
+    client, op_store, _log_store, _log_action = admin_client
+    op_store.get_key_detail.return_value = {"user_id": "alice", "status": "suspended"}
+
+    response = await client.patch(
+        "/admin/api-keys/alice",
+        headers={"Authorization": "Bearer test-admin"},
+        json={"status": "active"},
+    )
+
+    assert response.status_code == 200
+    op_store.update_key.assert_awaited_once_with("alice", status="active")
 
 
 @pytest.mark.asyncio

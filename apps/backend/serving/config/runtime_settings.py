@@ -37,6 +37,26 @@ logger = get_logger(__name__)
 REFRESH_INTERVAL_SECONDS = 10.0
 
 RUNTIME_SETTINGS_REGISTRY: dict[str, dict[str, Any]] = {
+    "analytics_token_usage_enabled": {
+        "type": "bool",
+        "default": True,
+        "description": "Show Token Usage on Admin Analytics for all administrators.",
+    },
+    "analytics_users_and_requests_enabled": {
+        "type": "bool",
+        "default": True,
+        "description": "Show Users and Requests on Admin Analytics for all administrators.",
+    },
+    "analytics_performance_metrics_enabled": {
+        "type": "bool",
+        "default": True,
+        "description": "Show Performance Metrics on Admin Analytics for all administrators.",
+    },
+    "analytics_growth_rate_enabled": {
+        "type": "bool",
+        "default": False,
+        "description": "Show the Growth Rate card on Admin Analytics for all administrators.",
+    },
     "user_auth_enabled": {
         "type": "bool",
         "default": True,
@@ -188,12 +208,6 @@ RUNTIME_SETTINGS_REGISTRY: dict[str, dict[str, Any]] = {
         "min": 0.1,
         "description": "Latency SLO in seconds for Routewise LP decisions",
     },
-    "routewise_latency_min_samples": {
-        "type": "int",
-        "default": 10,
-        "min": 1,
-        "description": "Legacy RouteWise latency sample threshold retained for compatibility",
-    },
     "routewise_probe_enabled": {
         "type": "bool",
         "default": False,
@@ -257,11 +271,6 @@ class RuntimeSettings:
         """Return the setting value as a float."""
         val = await self._get(key)
         return float(val) if val is not None else 0.0
-
-    async def get_str(self, key: str) -> str:
-        """Return the setting value as a string."""
-        val = await self._get(key)
-        return str(val) if val is not None else ""
 
     async def _get(self, key: str) -> Any:
         entry = RUNTIME_SETTINGS_REGISTRY.get(key)

@@ -224,7 +224,7 @@ copied, and the log names each with a warning:
   stored value wins and the environment's counts as unset. Check proxy trust
   after an upgrade: the Compose file passes `TRUST_PROXY_HEADERS` with a
   default of `0`, so a database that stored that `0` keeps the gateway off
-  forwarded headers whatever `.env` says. Change it on the Configuration tab;
+  forwarded headers whatever `.env` says. Change it on the Settings tab;
   see [Trusted Proxies and Client IPs](trusted-proxies-and-client-ips.md).
 - `ERASURE_FENCE_SECRET`, once the erasure fence uses `API_KEY_SECRET` in its
   place. Leave the variable out: while it is set, the backend refuses to
@@ -342,17 +342,47 @@ the routing-observation and `X-Provider` behaviour is unchanged.
 
 ## Alerting
 
-The backend has an in-process alert engine that posts to a Slack webhook. It is
-off unless you turn it on, with two settings under **Alerts** on the
-**Configuration** tab:
+The backend sends alerts to one Slack or WeCom (企业微信) group webhook. In
+**Admin → Settings → Alerts**, choose a **Notification channel** and enter
+its webhook URL. Only the selected channel's field is shown; saved URLs remain
+write-only. Choose **None** to turn off notifications.
+
+The in-process engine is off unless you enable `ALERTS_ENABLED`. Its underlying
+configuration keys are:
 
 | Setting | Value |
 |---|---|
 | `ALERTS_ENABLED` | on; applies after a backend restart |
-| `SLACK_ALERTS_WEBHOOK_URL` | `https://hooks.slack.com/services/...` |
+| `SLACK_ALERTS_WEBHOOK_URL` | optional dedicated Slack webhook |
+| `SLACK_WEBHOOK_URL` | Slack fallback; also enables the failed-request detector |
+| `WECOM_ALERTS_WEBHOOK_URL` | WeCom group webhook; also enables the failed-request detector |
 
 If `SLACK_ALERTS_WEBHOOK_URL` is empty it falls back to `SLACK_WEBHOOK_URL`, so
-one webhook can serve both code paths.
+one webhook can serve both code paths. The console preserves existing dedicated
+Slack settings and uses the fallback key for a new Slack configuration.
+
+Slack and WeCom are mutually exclusive. Saving a channel switch clears the old
+channel in the same update. Webhook changes apply after a backend restart until
+an operator activates the `alerts.runtime` live group; from then on they apply
+in every backend process within about ten seconds, without a restart. See
+[Settings that apply without a restart](configuration.md#settings-that-apply-without-a-restart).
+Until a change applies, normal alerts continue using the previous channel.
+**Restart pending**, or the **Applied in each backend process** panel once the
+group is active, shows what is still waiting.
+
+**Send test notification** sends a marked test using the URL currently entered,
+or the latest saved URL when no draft is entered. It works before a restart and
+does not save changes, enable alerting or change incident/cooldown state. The
+success message includes a test ID to check in the receiving group.
+
+A URL typed into the test field must be the selected platform's official HTTPS
+endpoint (`hooks.slack.com` / `hooks.slack-gov.com`, or
+`qyapi.weixin.qq.com/cgi-bin/webhook/send`); that restriction exists so an admin
+session cannot make the server request an arbitrary address. A **saved** URL is
+not held to that host list: normal delivery already posts to it, so a
+Slack-compatible destination (Mattermost, Rocket.Chat, an egress proxy) tests
+normally. It must still be `https`. Discord, Telegram and arbitrary webhook
+formats are not supported by this selector.
 
 Rules and thresholds are a deployment's own; this repository ships no alerts
 file. Point `ALERTS_CONFIG_PATH` at yours, or leave it unset and the built-in
@@ -439,6 +469,11 @@ else can claim the account:
 2. Open the console. While setup is pending, every page sends you to `/setup`.
 3. Enter the code and choose a username and a password. This administrator has
    no email address and signs in with the username.
+
+Once email delivery is configured, this administrator can bind an email in
+**Account Settings → Email Address**. Confirm the current password and follow
+the verification link sent to the new address. The username continues to work
+after binding; the same settings section also lets you change a bound email.
 
 Whoever can read the backend log, or the database that holds the code, can
 create this account, so keep both as private as the host. Wrong codes are
@@ -529,7 +564,7 @@ docker exec -it hybridinference-backend python -m serving.config.manage reset JW
 ```
 
 `list`, `get KEY`, `set KEY VALUE` and `reset KEY` work like the
-Configuration tab, with its validation, and never print a secret's value; see
+Settings tab, with its validation, and never print a secret's value; see
 [Without the console](configuration.md#without-the-console). The running
 backend picks the change up within about ten seconds, or after a restart for a
 setting marked **Restart required**.

@@ -17,6 +17,7 @@ import {
 } from 'recharts';
 import { AdminAnalyticsResponse, AnalyticsPeriod } from '@/lib/api/admin';
 import { userAccountLabel } from '@/lib/utils/userLabel';
+import { Select } from '@/components/ui/Select';
 
 const CHART_COLORS = [
   '#3b82f6',
@@ -51,7 +52,7 @@ function fmtBucketTime(iso: string): string {
   if (!iso) return '';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString(undefined, {
+  return d.toLocaleString('en-US', {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
@@ -303,18 +304,14 @@ function TopUsersByModelCard({
     <div className="rounded-xl border border-gray-200 bg-white p-5 sm:col-span-2">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <CardTitle>Top Users by Model</CardTitle>
-        <select
+        <Select
           aria-label="Select model"
           value={active.model}
-          onChange={(e) => setSelectedModel(e.target.value)}
-          className="max-w-[220px] rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-[13px] font-medium text-gray-700 transition hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-        >
-          {models.map((m) => (
-            <option key={m.model} value={m.model}>
-              {m.model}
-            </option>
-          ))}
-        </select>
+          onValueChange={setSelectedModel}
+          options={models.map((m) => ({ value: m.model, label: m.model }))}
+          searchPlaceholder="Search models…"
+          className="w-56 max-w-full"
+        />
       </div>
       <p className="mb-3 text-[11px] text-gray-400">
         {fmtCount(active.requests)} requests · {fmtCount(active.tokens)} tokens · signed-in users

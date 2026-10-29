@@ -10,6 +10,7 @@ import { ACCOUNT_CHANGED_EVENT, AUTH_EXPIRED_EVENT } from '@/lib/api/client';
 import { useAccountToast } from '@/lib/hooks/useAccountToast';
 import { AuthProvider, useAuth } from './AuthProvider';
 import { SiteConfigProvider } from './SiteConfigProvider';
+import { chooseValue } from '@/test-utils/select';
 import { ToastProvider } from './ToastProvider';
 
 const api = vi.hoisted(() => ({
@@ -59,7 +60,9 @@ vi.mock('@/lib/api/admin', () => ({
 const admin = { id: 'admin-user', email: 'admin@example.test', role: 'admin', is_admin: true };
 const normal = { id: 'normal-user', email: 'normal@example.test', role: 'free', is_admin: false };
 const SUCCESS = 'Key reserved for internal and above';
-const FAILURE = 'Tier change failed: old administrator request failed';
+// A failed write is reported in the save bar (and once by a toast in older
+// builds); neither may surface for an account that has moved on.
+const FAILURE = /old administrator request failed/;
 
 let controller: ReturnType<typeof useAuth>;
 function Page() {
@@ -114,8 +117,11 @@ async function startAdminMutation() {
       </QueryClientProvider>
     </SiteConfigProvider>,
   );
+  // A tier change is an edit in place: change the draft, then Save changes writes it.
   const selector = await screen.findByLabelText('Reserved tier for key fixture-key-prefix');
-  fireEvent.change(selector, { target: { value: 'internal' } });
+  chooseValue(selector, 'internal');
+  expect(api.setProviderKeyMinRole).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: 'Save changes to zai key tiers' }));
   expect(api.setProviderKeyMinRole).toHaveBeenCalledWith('key-1', 'internal');
   return pending;
 }

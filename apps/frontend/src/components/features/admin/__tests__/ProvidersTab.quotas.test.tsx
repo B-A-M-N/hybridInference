@@ -37,11 +37,14 @@ vi.mock('@/app/dashboard/admin/UpstreamConcurrencyPanel', () => ({
   UpstreamConcurrencyPanel: () => null,
 }));
 
+import toast from 'react-hot-toast';
 import {
   getProviderQuotas,
+  getRoutableProviders,
   setProviderDisabled,
   setProviderQuotaKeyDisabled,
 } from '@/lib/api/admin';
+import type { ProviderKeyByRefResponse } from '@/lib/api/admin';
 
 const ACTIVE_KEY = {
   name: 'zai',
@@ -124,12 +127,18 @@ describe('ProvidersTab quotas', () => {
       status: 'disabled',
       pools_updated: 1,
     });
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(setProviderDisabled).mockResolvedValue({
+      provider: 'zai',
+      disabled: true,
+      affected_model_count: 3,
+    });
+    vi.spyOn(window, 'confirm');
   });
 
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+    vi.restoreAllMocks();
   });
 
   it('opens the requested provider keys and retains selection across tabs', () => {
@@ -366,33 +375,70 @@ describe('ProvidersTab quotas', () => {
     ).not.toBeChecked();
   });
 
-  it('disables a single key after confirmation and reloads the quotas', async () => {
+  it('disables a single key on the click, with no confirmation, and reloads the quotas', async () => {
     await openQuotas();
 
     await clickSwitch('Disable ZAI #1 key sk-zaiaaa...aaaa');
 
-    expect(window.confirm).toHaveBeenCalled();
-    expect(setProviderQuotaKeyDisabled).toHaveBeenCalledWith('zai', 'ref-active', true);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(vi.mocked(setProviderQuotaKeyDisabled).mock.calls).toEqual([
+      ['zai', 'ref-active', true],
+    ]);
     await waitFor(() => expect(getProviderQuotas).toHaveBeenCalledTimes(2));
+    expect(toast.success).toHaveBeenCalledWith('Key disabled');
+    expect(window.confirm).not.toHaveBeenCalled();
   });
 
-  it('leaves the key untouched when the confirmation is declined', async () => {
-    vi.mocked(window.confirm).mockReturnValue(false);
-    await openQuotas();
-
-    await clickSwitch('Disable ZAI #1 key sk-zaiaaa...aaaa');
-
-    expect(setProviderQuotaKeyDisabled).not.toHaveBeenCalled();
-  });
-
-  it('re-enables a disabled key without a confirmation prompt', async () => {
+  it('re-enables a disabled key on the click', async () => {
     await openQuotas();
 
     expect(screen.getByText('Key disabled')).toBeInTheDocument();
     await clickSwitch('Enable ZAI #2 key sk-zaibbb...bbbb');
 
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(vi.mocked(setProviderQuotaKeyDisabled).mock.calls).toEqual([
+      ['zai', 'ref-disabled', false],
+    ]);
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Key enabled'));
     expect(window.confirm).not.toHaveBeenCalled();
-    expect(setProviderQuotaKeyDisabled).toHaveBeenCalledWith('zai', 'ref-disabled', false);
+  });
+
+  it('holds the switches while a key switch is in flight, says why it failed, and switches on a retry', async () => {
+    let fail!: (error: Error) => void;
+    vi.mocked(setProviderQuotaKeyDisabled)
+      .mockImplementationOnce(
+        () =>
+          new Promise<ProviderKeyByRefResponse>((_, reject) => {
+            fail = reject;
+          }),
+      )
+      .mockResolvedValueOnce({
+        provider: 'zai',
+        key_ref: 'ref-active',
+        source: 'db',
+        status: 'disabled',
+        pools_updated: 1,
+      });
+    await openQuotas();
+
+    await clickSwitch('Disable ZAI #1 key sk-zaiaaa...aaaa');
+    const keySwitch = screen.getByRole('switch', { name: 'Disable ZAI #1 key sk-zaiaaa...aaaa' });
+    expect(keySwitch).toBeDisabled();
+    expect(screen.getByRole('switch', { name: 'Disable ZAI #1' })).toBeDisabled();
+    await clickSwitch('Disable ZAI #1 key sk-zaiaaa...aaaa');
+    expect(setProviderQuotaKeyDisabled).toHaveBeenCalledTimes(1);
+
+    await act(async () => fail(new Error('pool locked')));
+    expect(toast.error).toHaveBeenCalledWith('pool locked');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    // Nothing changed, so nothing is reloaded and the key still reads as enabled.
+    expect(getProviderQuotas).toHaveBeenCalledTimes(1);
+    expect(keySwitch).toBeChecked();
+    expect(keySwitch).toBeEnabled();
+
+    await clickSwitch('Disable ZAI #1 key sk-zaiaaa...aaaa');
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Key disabled'));
+    expect(setProviderQuotaKeyDisabled).toHaveBeenCalledTimes(2);
   });
 
   it('offers no key toggle for cookie-based credentials', async () => {
@@ -407,7 +453,111 @@ describe('ProvidersTab quotas', () => {
 
     await clickSwitch('Disable ZAI #1');
 
-    expect(setProviderDisabled).toHaveBeenCalledWith('zai', true);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(vi.mocked(setProviderDisabled).mock.calls).toEqual([['zai', true]]);
     expect(setProviderQuotaKeyDisabled).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getAllByText('Disabled').length).toBeGreaterThan(0));
+    expect(toast.success).toHaveBeenCalledWith('ZAI #1 disabled — excluded from routing');
+  });
+
+  it('leaves the provider as it was when its switch fails, and says why', async () => {
+    vi.mocked(setProviderDisabled).mockRejectedValueOnce(new Error('not allowed'));
+    await openQuotas();
+
+    await clickSwitch('Disable ZAI #1');
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('not allowed'));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByRole('switch', { name: 'Disable ZAI #1' })).toBeChecked();
+    expect(screen.queryByText('Disabled')).not.toBeInTheDocument();
+  });
+});
+
+describe('ProvidersTab availability', () => {
+  beforeEach(() => {
+    vi.mocked(getRoutableProviders).mockResolvedValue({
+      providers: [
+        {
+          provider: 'zai',
+          display_name: 'ZAI',
+          model_count: 3,
+          endpoint_count: 4,
+          disabled: false,
+        },
+        {
+          provider: 'openrouter',
+          display_name: 'OpenRouter',
+          model_count: 1,
+          endpoint_count: 1,
+          disabled: true,
+        },
+      ],
+    });
+    vi.mocked(setProviderDisabled).mockResolvedValue({
+      provider: 'zai',
+      disabled: true,
+      affected_model_count: 3,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  async function openAvailability() {
+    render(<ProvidersTab />);
+    fireEvent.click(screen.getByRole('tab', { name: 'Availability' }));
+    await screen.findByRole('switch', { name: 'Disable zai' });
+  }
+
+  it('disables a provider on the click, with no confirmation', async () => {
+    await openAvailability();
+
+    await clickSwitch('Disable zai');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(vi.mocked(setProviderDisabled).mock.calls).toEqual([['zai', true]]);
+    expect(await screen.findByRole('switch', { name: 'Enable zai' })).not.toBeChecked();
+    expect(toast.success).toHaveBeenCalledWith('zai disabled — excluded from routing');
+  });
+
+  it('holds the switches while a provider switch is in flight, and switches once', async () => {
+    let finish!: (value: Awaited<ReturnType<typeof setProviderDisabled>>) => void;
+    vi.mocked(setProviderDisabled).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await openAvailability();
+
+    await clickSwitch('Disable zai');
+    expect(screen.getByRole('switch', { name: 'Disable zai' })).toBeDisabled();
+    expect(screen.getByRole('switch', { name: 'Enable openrouter' })).toBeDisabled();
+    await clickSwitch('Disable zai');
+    expect(setProviderDisabled).toHaveBeenCalledTimes(1);
+
+    await act(async () => finish({ provider: 'zai', disabled: true, affected_model_count: 3 }));
+    expect(screen.getByRole('switch', { name: 'Enable zai' })).toBeEnabled();
+    expect(setProviderDisabled).toHaveBeenCalledTimes(1);
+  });
+
+  it('says why re-enabling a provider failed, leaves it disabled, and enables it on a retry', async () => {
+    vi.mocked(setProviderDisabled)
+      .mockRejectedValueOnce(new Error('not allowed'))
+      .mockResolvedValueOnce({ provider: 'openrouter', disabled: false, affected_model_count: 1 });
+    await openAvailability();
+
+    await clickSwitch('Enable openrouter');
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('not allowed'));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByRole('switch', { name: 'Enable openrouter' })).not.toBeChecked();
+
+    await clickSwitch('Enable openrouter');
+    expect(await screen.findByRole('switch', { name: 'Disable openrouter' })).toBeChecked();
+    expect(vi.mocked(setProviderDisabled).mock.calls).toEqual([
+      ['openrouter', false],
+      ['openrouter', false],
+    ]);
   });
 });

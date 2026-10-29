@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import re
 
+import pytest
+
 from serving.responses_translator import (
     ResponsesStreamTranslator,
     assistant_message_from_chat,
@@ -184,6 +186,43 @@ def test_input_function_call_output_non_string_serialized():
     assert msgs == [{"role": "tool", "tool_call_id": "c", "content": '{"k": 1}'}]
 
 
+def test_input_function_call_output_part_list_is_translated_like_message_content():
+    """The spec's array form: text and images, as Codex sends a screenshot tool's result.
+
+    Serialized as JSON, the parts reached the model as scaffolding, with the image's
+    base64 as prompt text and out of the modality check's sight.
+    """
+    image = "data:image/png;base64,iVBORw0KGgo"
+    msgs = responses_input_to_messages(
+        [
+            {
+                "type": "function_call_output",
+                "call_id": "c",
+                "output": [
+                    {"type": "input_text", "text": "Captured 1 image"},
+                    {"type": "input_image", "image_url": image},
+                ],
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "d",
+                "output": [{"type": "input_text", "text": "done"}],
+            },
+        ]
+    )
+    assert msgs == [
+        {
+            "role": "tool",
+            "tool_call_id": "c",
+            "content": [
+                {"type": "text", "text": "Captured 1 image"},
+                {"type": "image_url", "image_url": {"url": image}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "d", "content": "done"},
+    ]
+
+
 # --- request: params -------------------------------------------------------
 
 
@@ -351,6 +390,67 @@ def test_chat_response_nested_usage_details_preserved():
     r = chat_response_to_responses(chat, response_id="r", created_at=1, model="m", request_body={})
     assert r["usage"]["input_tokens_details"]["cached_tokens"] == 12
     assert r["usage"]["output_tokens_details"]["reasoning_tokens"] == 5
+
+
+@pytest.mark.parametrize(
+    ("provider_usage", "cached_tokens"),
+    [
+        pytest.param({"prompt_cache_hit_tokens": 7}, 7, id="deepseek"),
+        pytest.param({"cache_read_input_tokens": 8}, 8, id="anthropic"),
+        pytest.param({"prompt_tokens_details": {"cached_tokens": 9}}, 9, id="nested-openai"),
+    ],
+)
+def test_chat_response_emits_provider_cache_usage(provider_usage, cached_tokens):
+    chat = {
+        "choices": [
+            {"index": 0, "message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}
+        ],
+        "usage": {
+            "prompt_tokens": 20,
+            "completion_tokens": 5,
+            "total_tokens": 25,
+            **provider_usage,
+        },
+    }
+
+    response = chat_response_to_responses(
+        chat, response_id="r", created_at=1, model="m", request_body={}
+    )
+
+    assert response["usage"]["input_tokens_details"]["cached_tokens"] == cached_tokens
+
+
+@pytest.mark.parametrize(
+    ("provider_usage", "cached_tokens"),
+    [
+        pytest.param({"prompt_cache_hit_tokens": 7}, 7, id="deepseek"),
+        pytest.param({"cache_read_input_tokens": 8}, 8, id="anthropic"),
+        pytest.param({"prompt_tokens_details": {"cached_tokens": 9}}, 9, id="nested-openai"),
+    ],
+)
+def test_stream_translator_emits_provider_cache_usage(provider_usage, cached_tokens):
+    usage = {
+        "prompt_tokens": 20,
+        "completion_tokens": 5,
+        "total_tokens": 25,
+        **provider_usage,
+    }
+    chunks = [
+        "data: "
+        + json.dumps(
+            {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": usage,
+            }
+        )
+        + "\n\n"
+    ]
+
+    translator, _joined = _collect(chunks)
+
+    assert translator.final_response["usage"]["input_tokens_details"]["cached_tokens"] == (
+        cached_tokens
+    )
 
 
 def test_chat_response_length_is_incomplete():

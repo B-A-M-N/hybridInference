@@ -563,15 +563,6 @@ msgstr ""
 "这两个值。写了未注册的名字，配置校验会失败，错误消息里会列出已知的策略。每个策略都声明了一个 `extra=\"forbid\"` 的 "
 "Pydantic 参数模型，所以 `router_params:` 里有拼写错误时，启动就会报错，而不是悄悄退回默认值。"
 
-#: ../developer/architecture.md:237
-msgid ""
-"`apps/backend/routing/executor.py` is a backward-compatibility shim that "
-"re-exports `FixedRouter` under its old name `RouteExecutor`. Edit "
-"`apps/backend/routing/routers.py` instead."
-msgstr ""
-"`apps/backend/routing/executor.py` 只是一个向后兼容的 shim，用旧名字 `RouteExecutor` "
-"重新导出 `FixedRouter`。改代码请直接改 `apps/backend/routing/routers.py`。"
-
 #: ../developer/architecture.md:241
 msgid "Two layers of \"strategy\""
 msgstr "两层「策略」"
@@ -1099,8 +1090,9 @@ msgstr ""
 #: ../developer/architecture.md:461
 msgid ""
 "**Alerting.** `alert_slack()` and `alert_on_transition()` in "
-"`apps/backend/serving/observability/alerts.py` post to a Slack webhook "
-"(`SLACK_ALERTS_WEBHOOK_URL`). Thresholds come from the alert config "
+"`apps/backend/serving/observability/alerts.py` post through an `AlertSink` to "
+"one Slack or WeCom webhook, selected in Admin Configuration. Channel changes "
+"take effect after a restart. Thresholds come from the alert config "
 "resolved by the same `resolve_config_path()` chain; with no alert file "
 "present the built-in thresholds apply. The circuit breaker pages on "
 "`circuit_open` transitions and on upstream-credential rejections, with "
@@ -1108,8 +1100,8 @@ msgid ""
 "instead of flooding."
 msgstr ""
 "**告警**。`apps/backend/serving/observability/alerts.py` 里的 `alert_slack()` "
-"和 `alert_on_transition()` 把告警发到 Slack "
-"webhook（`SLACK_ALERTS_WEBHOOK_URL`）。阈值取自告警配置，它的路径同样由 "
+"和 `alert_on_transition()` 通过 `AlertSink`，把告警发送到在管理台 Configuration "
+"中选定的一个 Slack 或企业微信 webhook。渠道变更在重启后生效。阈值取自告警配置，它的路径同样由 "
 "`resolve_config_path()` 这条链确定；没有告警文件时使用内置阈值。熔断器切换到 "
 "`circuit_open`、或者上游凭据被拒时，都会发告警；每个端点有各自的冷却时间，持续存在的故障会按固定间隔重复告警，而不会刷屏。"
 
@@ -1272,6 +1264,53 @@ msgid ""
 "[Installation](installation.md) for a local checkout, and "
 "[Contributing](contributing.md) before sending a change."
 msgstr "要部署运行，见[部署指南](deployment.md)；要在本地开发，见[安装](installation.md)；提交改动前，先读[参与贡献](contributing.md)。"
+
+#: ../developer/architecture.md
+msgid "[Batch inference](batches.md)"
+msgstr "[批量推理](batches.md)"
+
+#: ../developer/architecture.md
+#, python-brace-format
+msgid "`POST` and `GET /v1/batches`, `GET` and `DELETE /v1/batches/{id}`, `POST /v1/batches/{id}/cancel`, `GET /v1/batches/{id}/results`, `GET /v1/batches/{id}/output.jsonl` (JSONL export); chat, embeddings, Responses and Messages targets, as direct requests or a JSONL file"
+msgstr "`POST` 和 `GET /v1/batches`、`GET` 和 `DELETE /v1/batches/{id}`、`POST /v1/batches/{id}/cancel`、`GET /v1/batches/{id}/results`、`GET /v1/batches/{id}/output.jsonl`（JSONL 导出）；目标可以是 Chat、Embeddings、Responses 和 Messages，请求可以直接提交，也可以用 JSONL 文件提交"
+
+#: ../developer/architecture.md
+msgid "API key; creating a batch needs the `BATCH_MIN_ROLE` role, `internal` by default"
+msgstr "API key；创建批次需要 `BATCH_MIN_ROLE` 角色，默认为 `internal`"
+
+#: ../developer/architecture.md
+msgid "[Batch files](batches.md#batches-from-a-file)"
+msgstr "[批次文件](batches.md#batches-from-a-file)"
+
+#: ../developer/architecture.md
+#, python-brace-format
+msgid "`POST` and `GET /v1/files`, `GET` and `DELETE /v1/files/{id}`, `GET /v1/files/{id}/content`"
+msgstr "`POST` 和 `GET /v1/files`、`GET` 和 `DELETE /v1/files/{id}`、`GET /v1/files/{id}/content`"
+
+#: ../developer/architecture.md
+msgid "[Batch webhooks](batches.md#webhooks)"
+msgstr "[批次 webhook](batches.md#webhooks)"
+
+#: ../developer/architecture.md
+msgid "`GET`, `PUT` and `DELETE /v1/batch_webhook`, `GET /v1/batch_webhook/events`"
+msgstr "`GET`、`PUT` 和 `DELETE /v1/batch_webhook`、`GET /v1/batch_webhook/events`"
+
+#: ../developer/architecture.md:490
+msgid "`BATCH_ENABLED` controls all batch, file and webhook routes together; when it is off, even management and result routes answer `404`, and no queued request starts. With it on, all batch kinds are available. `BATCH_MIN_ROLE` controls creating batches, uploading files and setting up or changing a webhook. An owner whose role is lowered can still manage existing batches and files, read or delete their webhook, and receive its deliveries."
+msgstr "`BATCH_ENABLED` 统一控制所有批次、文件和 webhook 路由；关闭时，管理和结果路由也会返回 `404`，排队中的请求不会开始执行。开启时，所有批次类型都可用。`BATCH_MIN_ROLE` 控制创建批次、上传文件以及设置或修改 webhook 的权限。所有者的角色降低后，仍可管理已有批次和文件，读取或删除自己的 webhook，并接收其事件投递。"
+
+#: ../developer/architecture.md:466
+msgid ""
+"**Alert history** (on with a database; `ALERT_HISTORY_ENABLED=false` turns "
+"it off). The same alert path records what it did "
+"— breaches, recoveries, suppression decisions, deliveries and their results "
+"— into PostgreSQL through a bounded buffer and one writer per process "
+"(`serving/observability/alert_history/`). It never changes what is sent. See"
+" [Alert history](alert-history.md)."
+msgstr ""
+"**告警历史**（有数据库时开启；`ALERT_HISTORY_ENABLED=false` 可关闭）。同一条告警路径会把自己做过的事——越限、恢复、抑制决定、投递及其结果——通过一个有上限的缓冲区和每个进程一个写入器记录到 "
+"PostgreSQL 中（`serving/observability/alert_history/`）。它从不改变发送的内容。参见 "
+"[告警历史](alert-history.md)。"
 
 #~ msgid ""
 #~ "`FixedRouter.chat_completion` / `stream_chat_completion`"
@@ -1725,3 +1764,11 @@ msgstr "要部署运行，见[部署指南](deployment.md)；要在本地开发�
 #~ "There is no Prometheus exporter; it "
 #~ "was removed. The supported surfaces are:"
 #~ msgstr "没有 Prometheus exporter，它已经被移除。受支持的观测面是："
+
+#: ../developer/architecture.md:0
+msgid "API key; uploading a file needs `BATCH_MIN_ROLE`"
+msgstr "API 密钥；上传文件需要达到 `BATCH_MIN_ROLE`"
+
+#: ../developer/architecture.md:0
+msgid "API key; setting up or changing a webhook needs `BATCH_MIN_ROLE`"
+msgstr "API 密钥；设置或修改 webhook 需要达到 `BATCH_MIN_ROLE`"

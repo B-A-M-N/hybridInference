@@ -1,11 +1,12 @@
 """Authentication routes for user signup, login, logout, and email verification."""
 
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 
+from serving.audit import AuditActor, AuditTarget
 from serving.auth.browser_sessions import (
     MAX_ACCOUNTS_PER_BROWSER,
     BrowserSession,
@@ -53,7 +54,12 @@ from serving.schemas_auth import (
     VerifyEmailResponse,
 )
 from serving.servers.auth import log_admin_action
-from serving.servers.deps import get_current_user, get_db_logger, get_operational_store
+from serving.servers.deps import (
+    get_current_user,
+    get_db_logger,
+    get_operational_store,
+    user_audit_actor,
+)
 from serving.servers.routers.phone_auth_routes import router as phone_auth_router
 from serving.servers.routers.reauth import account_identifier, confirm_account_owner
 from serving.setup_state import refresh_setup_state
@@ -130,7 +136,7 @@ async def start_user_session(
     # The browser's cookie names its browser session, never this one, so the
     # session's own refresh hash is a value no browser holds.
     auth_session_id = generate_ulid()
-    session_expires = datetime.now(timezone.utc) + timedelta(days=get_refresh_token_expire_days())
+    session_expires = datetime.now(UTC) + timedelta(days=get_refresh_token_expire_days())
     await op_store.create_session(
         session_id=auth_session_id,
         user_id=user_row["id"],
@@ -161,7 +167,7 @@ async def start_user_session(
             status=user_row["status"],
             email_verified=user_row["email_verified"],
             created_at=user_row["created_at"],
-            last_login_at=datetime.now(timezone.utc),
+            last_login_at=datetime.now(UTC),
             is_admin=is_admin,
         ),
     )
@@ -294,7 +300,7 @@ async def signup(
     # Skipping when SIGNUP_REQUIRE_EMAIL_VERIFICATION=false avoids burning SMTP quota.
     if require_verification and is_email_enabled():
         verification_token = secrets.token_urlsafe(32)
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        expires_at = datetime.now(UTC) + timedelta(hours=24)
         await op_store.create_verification_token(
             token=verification_token, user_id=user_id, expires_at=expires_at
         )
@@ -319,12 +325,14 @@ async def signup(
             )
 
     logger.info(f"New user registered: {user_id} ({body.email}) [status={initial_status}]")
+    # Registration is unauthenticated: the requester is anonymous, and the
+    # account it created is the target.
     await log_admin_action(
         db_logger,
-        client_ip,
-        "create_user",
-        user_id,
-        {
+        action="create_user",
+        actor=AuditActor.anonymous(client_ip),
+        target=AuditTarget.user(user_id),
+        details={
             "email": body.email.lower(),
             "user_name": body.user_name,
             "status": initial_status,
@@ -662,16 +670,14 @@ async def delete_own_account(
         purpose="delete_account",
     )
 
-    client_ip = get_client_ip(request)
     browser = await resolve_browser_session(op_store, request)
     try:
         await op_store.delete_user(
             user_id,
-            admin_ip=client_ip,
-            admin_id=user_id,
             reason="Deleted by the account owner",
             email=user_row.get("email"),
             self_service=True,
+            actor=user_audit_actor(request, current_user),
         )
     except SelfDeleteRefused:
         raise HTTPException(
@@ -900,7 +906,7 @@ async def verify_email(
             )
 
         if not user_row["email_verified"]:
-            if token_row["expires_at"] < datetime.now(timezone.utc):
+            if token_row["expires_at"] < datetime.now(UTC):
                 raise HTTPException(
                     status_code=400,
                     detail="Verification token has expired. Please request a new one.",
@@ -917,7 +923,7 @@ async def verify_email(
             email_verified=True,
         )
 
-    if token_row["expires_at"] < datetime.now(timezone.utc):
+    if token_row["expires_at"] < datetime.now(UTC):
         raise HTTPException(
             status_code=400,
             detail="Verification token has expired. Please request a new one.",
@@ -931,6 +937,9 @@ async def verify_email(
                 status_code=409,
                 detail="Email address cannot be bound to this account.",
             )
+        # Reset links already sent to the replaced address go with it, as the
+        # notice below tells that address.
+        await op_store.delete_user_reset_tokens(token_row["user_id"])
         if previous_email and previous_email.lower() != pending_email.lower():
             background_tasks.add_task(send_email_changed_email, previous_email, pending_email)
     else:
@@ -971,7 +980,7 @@ async def forgot_password(
 
     # Generate reset token
     reset_token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    expires_at = datetime.now(UTC) + timedelta(hours=1)
     await op_store.create_reset_token(
         token=reset_token, user_id=user_row["id"], expires_at=expires_at
     )
@@ -1017,7 +1026,7 @@ async def reset_password(
     if token_row["used_at"]:
         raise HTTPException(status_code=400, detail="This reset link has already been used.")
 
-    if token_row["expires_at"] < datetime.now(timezone.utc):
+    if token_row["expires_at"] < datetime.now(UTC):
         raise HTTPException(
             status_code=400, detail="Reset link has expired. Please request a new one."
         )
@@ -1026,8 +1035,9 @@ async def reset_password(
     password_hash_str = password_utils.hash_password(body.new_password)
     await op_store.update_user_fields(token_row["user_id"], password_hash=password_hash_str)
 
-    # Mark token as used
-    await op_store.mark_reset_used(body.token)
+    # The link is spent, and so is every other one the account still holds:
+    # each was sent to reset the password just replaced.
+    await op_store.delete_user_reset_tokens(token_row["user_id"])
 
     # Revoke all existing sessions for security
     await op_store.delete_user_sessions(token_row["user_id"])
@@ -1067,7 +1077,7 @@ async def resend_verification(
 
     # Generate new verification token
     verification_token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+    expires_at = datetime.now(UTC) + timedelta(hours=24)
     await op_store.create_verification_token(
         token=verification_token, user_id=user_row["id"], expires_at=expires_at
     )
@@ -1147,7 +1157,7 @@ async def bind_email(
         )
 
     verification_token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+    expires_at = datetime.now(UTC) + timedelta(hours=24)
     await op_store.delete_user_verification_tokens(user_id)
     await op_store.create_verification_token(
         token=verification_token,
@@ -1160,10 +1170,10 @@ async def bind_email(
     )
     await log_admin_action(
         db_logger,
-        get_client_ip(request),
-        "request_bind_email",
-        user_id,
-        {"email": normalized_email},
+        action="request_bind_email",
+        details={"email": normalized_email},
+        actor=user_audit_actor(request, current_user),
+        target=AuditTarget.user(user_id),
     )
     return BindEmailResponse(
         message="Verification email sent. Please check your inbox to complete binding.",

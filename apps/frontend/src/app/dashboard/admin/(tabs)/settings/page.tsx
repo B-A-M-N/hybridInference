@@ -1,10 +1,18 @@
 import { SettingsTab } from '../../SettingsTab';
-import { AdminFormWidth } from '@/components/features/admin/AdminFormWidth';
+import { settingsTabKey } from '../../settingsLayout';
 
-export default function Page() {
+interface PageProps {
+  searchParams?: Promise<{ tab?: string; missing?: string }>;
+}
+
+// `?tab=` opens a sub-tab. `?missing=1` is where the "required settings are
+// missing" banner links: the page opens filtered to what needs a value.
+export default async function Page({ searchParams }: PageProps) {
+  const params = await searchParams;
   return (
-    <AdminFormWidth>
-      <SettingsTab />
-    </AdminFormWidth>
+    <SettingsTab
+      initialTab={settingsTabKey(params?.tab)}
+      initialMissingOnly={params?.missing === '1'}
+    />
   );
 }
