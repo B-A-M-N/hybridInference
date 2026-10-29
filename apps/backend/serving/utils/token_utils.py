@@ -341,9 +341,7 @@ def normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
     # exists at all; extract_cache_tokens already honors it, and the
     # normalized dict must honor it too.
     cache_read_reported = usage.get("cache_read_reported")
-    cache_read_reported = (
-        cache_read_reported if isinstance(cache_read_reported, bool) else None
-    )
+    cache_read_reported = cache_read_reported if isinstance(cache_read_reported, bool) else None
 
     # Create normalized usage dict
     normalized = dict(usage)  # Copy to avoid modifying original

@@ -727,7 +727,10 @@ class TestCacheEvidenceStates:
         """No cache fields anywhere => UNKNOWN, never a fabricated miss."""
         out = chat_response_to_responses(
             self._chat({"prompt_tokens": 100, "completion_tokens": 5}),
-            response_id="r1", created_at=1, model="m", request_body={},
+            response_id="r1",
+            created_at=1,
+            model="m",
+            request_body={},
         )
         assert out["usage"]["input_tokens_details"]["cached_tokens"] == 0
         assert out["usage"]["cache_read_reported"] is False
@@ -735,27 +738,40 @@ class TestCacheEvidenceStates:
     def test_measured_miss_is_reported_zero(self):
         """An explicit 0 stays 0, flagged as measured."""
         out = chat_response_to_responses(
-            self._chat({
-                "prompt_tokens": 100, "completion_tokens": 5,
-                "cache_read_tokens": 0, "cached_tokens": 0,
-                "prompt_tokens_details": {"cached_tokens": 0},
-            }),
-            response_id="r2", created_at=2, model="m", request_body={},
+            self._chat(
+                {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 5,
+                    "cache_read_tokens": 0,
+                    "cached_tokens": 0,
+                    "prompt_tokens_details": {"cached_tokens": 0},
+                }
+            ),
+            response_id="r2",
+            created_at=2,
+            model="m",
+            request_body={},
         )
         assert out["usage"]["input_tokens_details"]["cached_tokens"] == 0
         assert out["usage"]["cache_read_reported"] is True
 
-    @pytest.mark.parametrize("shape", [
-        {"prompt_tokens_details": {"cached_tokens": 79}},
-        {"cache_read_tokens": 79},
-        {"prompt_cache_hit_tokens": 79},  # DeepSeek
-        {"cache_read_input_tokens": 79},  # Anthropic
-    ])
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            {"prompt_tokens_details": {"cached_tokens": 79}},
+            {"cache_read_tokens": 79},
+            {"prompt_cache_hit_tokens": 79},  # DeepSeek
+            {"cache_read_input_tokens": 79},  # Anthropic
+        ],
+    )
     def test_measured_hits_are_positive_and_reported(self, shape):
         usage = {"prompt_tokens": 100, "completion_tokens": 5, **shape}
         out = chat_response_to_responses(
             self._chat(usage),
-            response_id="r3", created_at=3, model="m", request_body={},
+            response_id="r3",
+            created_at=3,
+            model="m",
+            request_body={},
         )
         assert out["usage"]["input_tokens_details"]["cached_tokens"] == 79
         assert out["usage"]["cache_read_reported"] is True
@@ -768,13 +784,14 @@ class TestCacheEvidenceStates:
         be consumed for the state machine to advance.
         """
         import json as _json
+
         events = list(translator.finalize())
         for frame in events:
             if not isinstance(frame, str) or "response.completed" not in frame:
                 continue
             for line in frame.splitlines():
                 if line.startswith("data: "):
-                    payload = _json.loads(line[len("data: "):])
+                    payload = _json.loads(line[len("data: ") :])
                     if payload.get("type") == "response.completed":
                         return payload["response"]
         return None
@@ -782,22 +799,36 @@ class TestCacheEvidenceStates:
     def test_streaming_preserves_the_same_three_states(self):
         """The stream translator funnels through _map_usage too."""
         t = ResponsesStreamTranslator(
-            response_id="s1", created_at=1, model="m", request_body={},
+            response_id="s1",
+            created_at=1,
+            model="m",
+            request_body={},
         )
         list(t.feed('data: {"id":"c1","choices":[{"delta":{"content":"Hi"}}]}\n\n'))
         # UNKNOWN: final chat chunk carries no cache fields
-        list(t.feed('data: {"id":"c1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1}}\n\n'))
+        list(
+            t.feed(
+                'data: {"id":"c1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1}}\n\n'
+            )
+        )
         list(t.feed("data: [DONE]\n\n"))
         final = self._completed_response(t)
         assert final is not None and final.get("usage")
         assert final["usage"]["cache_read_reported"] is False
 
         t2 = ResponsesStreamTranslator(
-            response_id="s2", created_at=1, model="m", request_body={},
+            response_id="s2",
+            created_at=1,
+            model="m",
+            request_body={},
         )
         list(t2.feed('data: {"id":"c2","choices":[{"delta":{"content":"Hi"}}]}\n\n'))
         # MISS: final chat chunk explicitly reports cache_read_tokens: 0
-        list(t2.feed('data: {"id":"c2","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1,"cache_read_tokens":0}}\n\n'))
+        list(
+            t2.feed(
+                'data: {"id":"c2","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1,"cache_read_tokens":0}}\n\n'
+            )
+        )
         list(t2.feed("data: [DONE]\n\n"))
         final2 = self._completed_response(t2)
         assert final2 is not None and final2.get("usage")
@@ -813,7 +844,10 @@ class TestCacheEvidenceStates:
         ):
             out = chat_response_to_responses(
                 self._chat(usage),
-                response_id="x", created_at=1, model="m", request_body={},
+                response_id="x",
+                created_at=1,
+                model="m",
+                request_body={},
             )
             v = out["usage"]["input_tokens_details"]["cached_tokens"]
             assert isinstance(v, int) and v >= 0

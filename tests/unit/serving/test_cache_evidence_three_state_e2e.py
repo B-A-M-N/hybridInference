@@ -57,7 +57,11 @@ def _responses_payload(usage: dict) -> dict:
         "usage": usage,
     }
     return chat_response_to_responses(
-        chat, response_id="r", created_at=1, model="m", request_body={},
+        chat,
+        response_id="r",
+        created_at=1,
+        model="m",
+        request_body={},
     )
 
 
