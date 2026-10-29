@@ -1,7 +1,7 @@
 """The batch store's expansion contracts, against real PostgreSQL.
 
 Surfaces and phases (a validating batch is never claimed, a sealing one never
-expires or cancels), Anthropic admission failures settling at create, file
+expires or cancels), legacy Message Batch admission failures settling at create, file
 batches staged and published or failed whole, sealing guarded by generation,
 attempt accounting (billed once, unknown never zero, replays change nothing),
 idempotency (replay, conflict, tombstone, concurrency), atomic per-user caps,
@@ -23,7 +23,6 @@ from serving.storage.batch_file_store import BatchFileStore
 from serving.storage.batch_store import (
     BatchDeleteInProgress,
     BatchLimitExceeded,
-    BatchNotEnded,
     BatchStore,
     IdempotencyConflict,
     IdempotencyTombstoned,
@@ -140,6 +139,55 @@ async def test_a_validating_batch_is_never_claimed_settled_or_listed_as_model_wo
     assert (row["status"], row["phase"], row["request_count"]) == ("validating", "validating", 3)
 
 
+@pytest.mark.parametrize(
+    "future",
+    [{"schema_version": 3}, {"api_surface": "future_surface"}, {"target": "future_target"}],
+    ids=["schema_version", "api_surface", "target"],
+)
+async def test_a_batch_of_a_kind_this_worker_does_not_support_is_never_touched(pool, store, future):
+    """With every kind available by default, a newer version's batch still belongs to it alone.
+
+    The kind filter is what keeps this version's worker off whatever a later
+    version adds; there is no flag in front of it any more.
+    """
+    user, model = _user(store), _model()
+    batch = await _create(store, user, _items(model, 2))
+    (column, value), batch_id = next(iter(future.items())), batch["id"]
+    async with pool.acquire() as conn:
+        await conn.execute(f"UPDATE batch_jobs SET {column} = $2 WHERE id = $1", batch_id, value)
+
+    assert model not in await store.active_models()
+    assert await _claim(store, model) == []
+
+    # Past its window, with nothing open: still neither expired nor finalized.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE batch_jobs SET expires_at = now() - interval '1 minute' WHERE id = $1",
+            batch_id,
+        )
+    await store.sweep(retention_days=7)
+    row = await store.get_batch(batch_id)
+    assert (row["status"], row["phase"]) == ("validating", "runnable")
+    statuses = await _fetch(pool, "SELECT status FROM batch_items WHERE batch_id = $1", batch_id)
+    assert {r["status"] for r in statuses} == {"queued"}
+
+    # Nor validated or sealed: those leases are restricted to the same kinds.
+    for phase, status in (("validating", "validating"), ("sealing", "in_progress")):
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE batch_jobs SET phase = $2, status = $3, expires_at = now() + "
+                "interval '1 hour' WHERE id = $1",
+                batch_id,
+                phase,
+                status,
+            )
+        taken = await store.claim_batch_work(
+            phase=phase, worker_id="w-old", lease_seconds=60, limit=100
+        )
+        assert batch_id not in {b["id"] for b in taken}, phase
+    assert batch_id not in await store.stale_validations()
+
+
 async def test_publishing_flips_the_phase_and_makes_the_items_claimable(store):
     user, model = _user(store), _model()
     batch = await _create(store, user, [], api_surface="openai_file", phase="validating")
@@ -206,7 +254,8 @@ async def test_cancelling_while_validating_ends_cancelled_without_running(store)
     assert sealed["cancelled_at"] is not None
 
 
-async def test_anthropic_items_refused_at_admission_are_errored_and_never_claimed(store):
+async def test_legacy_message_batch_items_refused_at_admission_are_never_claimed(store):
+    """Batches the retired Message Batches API stored still drain as they were stored."""
     user, model = _user(store), _model()
     items = [
         *_items(model, 2),
@@ -525,16 +574,23 @@ async def test_splitting_into_more_batches_earns_no_more_turns(store):
 # -- deletion, erasure, leases ---------------------------------------------------------
 
 
-async def test_anthropic_style_delete_needs_an_ended_batch(store):
+async def test_a_legacy_message_batch_is_deleted_like_any_other_batch(store):
+    """No longer only once ended: refused only while an upstream call may be live."""
     user, model = _user(store), _model()
-    batch = await _create(store, user, _items(model, 1), api_surface="anthropic", target="messages")
-    with pytest.raises(BatchNotEnded):
-        await store.delete_batch(batch["id"], user_id=user, require_ended=True)
+    running = await _create(
+        store, user, _items(model, 1), api_surface="anthropic", target="messages"
+    )
     (item,) = await _claim(store, model)
     with pytest.raises(BatchDeleteInProgress):
-        await store.delete_batch(batch["id"], user_id=user)
+        await store.delete_batch(running["id"], user_id=user)
     await _complete(store, item)
-    assert await store.delete_batch(batch["id"], user_id=user, require_ended=True)
+    assert await store.delete_batch(running["id"], user_id=user)
+    queued = await _create(
+        store, user, _items(model, 2, prefix="q"), api_surface="anthropic", target="messages"
+    )
+    assert (await store.get_batch(queued["id"]))["phase"] == "runnable"
+    assert await store.delete_batch(queued["id"], user_id=user)
+    assert await store.get_batch(queued["id"]) is None
 
 
 async def test_a_delete_during_a_download_hides_the_batch_until_the_sweep(pool, store):

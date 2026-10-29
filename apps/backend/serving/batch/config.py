@@ -2,7 +2,7 @@
 
 Every value resolves through :func:`serving.config.app_config.config_value`
 (database row, then environment, then the default here) on each call, so an
-administrator's change in Admin -> Configuration applies to the next request
+administrator's change in Admin -> Settings applies to the next request
 and the next worker round without a restart. The entries themselves are
 registered in ``serving.config.app_config_registry`` under the ``batch``
 category.
@@ -16,17 +16,14 @@ A user's batch work is bounded by its own per-role quota
 limit: a batch neither waits on its owner's interactive requests nor takes the
 slots they need.
 
-Two switches with different reaches:
-
-- ``BATCH_ENABLED`` is the whole surface and the worker. Off, every batch
-  route answers 404 (results and management included) and nothing is claimed.
-- ``BATCH_EXPANSION_ENABLED`` only decides whether the batch kinds added after
-  the first release (Anthropic Message Batches, file batches and the Files
-  upload, Embeddings and Responses targets) may be **created**. Off, batches
-  already accepted keep running, and their results stay readable,
-  downloadable, cancellable and deletable. It is off by default so a gateway
-  that still runs an older worker never stores work that worker would
-  misread; turn it on once every process runs this version.
+``BATCH_ENABLED`` is the one switch: off, every batch route answers 404
+(results and management included) and nothing is claimed. On, every batch kind
+this version runs is available -- inline and file batches, the Chat,
+Embeddings, Messages and Responses targets, and webhooks -- to the
+roles ``BATCH_MIN_ROLE`` admits. ``BATCH_EXPANSION_ENABLED``, which once held
+the newer kinds back, is retired (``RETIRED_SETTINGS`` in the registry): a
+value left in the environment or the database controls nothing here. See
+``docs/agents/specs/2026-10-27-batch-default-availability-amendment.zh.md``.
 """
 
 from __future__ import annotations
@@ -39,8 +36,6 @@ from serving.config.settings import VALID_ROLES, has_role
 #: Batch inference is served at all. Off, every batch route answers 404 and
 #: the worker claims nothing; stored batches are kept.
 ENABLED_KEY = "BATCH_ENABLED"
-#: The batch kinds added after the first release may be created.
-EXPANSION_KEY = "BATCH_EXPANSION_ENABLED"
 #: Lowest role that may create batches.
 MIN_ROLE_KEY = "BATCH_MIN_ROLE"
 #: Concurrent batch requests a model runs when it has no per-model cap.
@@ -78,7 +73,7 @@ ROLE_CONCURRENCY_KEYS: dict[str, str] = {
 }
 #: Slots of every model's batch cap kept free for interactive traffic.
 INTERACTIVE_RESERVE_KEY = "BATCH_INTERACTIVE_RESERVE"
-#: Anthropic API versions a Message Batch may be created under.
+#: Anthropic API versions a new Messages batch may name (its ``anthropic-version`` header).
 ANTHROPIC_VERSIONS_KEY = "BATCH_ANTHROPIC_VERSIONS"
 #: Webhooks may target private, loopback or link-local addresses (testing only).
 WEBHOOK_ALLOW_PRIVATE_KEY = "BATCH_WEBHOOK_ALLOW_PRIVATE_TARGETS"
@@ -105,7 +100,7 @@ DEFAULT_INTERACTIVE_RESERVE = 0
 KNOWN_ANTHROPIC_VERSIONS: tuple[str, ...] = ("2023-06-01", "2026-10-21")
 DEFAULT_ANTHROPIC_VERSIONS = ",".join(KNOWN_ANTHROPIC_VERSIONS)
 
-#: The window of file and Anthropic batches: the protocols fix it at 24 hours.
+#: The window of file batches: the protocol fixes it at 24 hours.
 PROTOCOL_WINDOW_SECONDS = 24 * 3600
 
 
@@ -114,7 +109,6 @@ class BatchConfig:
     """One consistent reading of every batch setting."""
 
     enabled: bool = True
-    expansion_enabled: bool = False
     min_role: str = DEFAULT_MIN_ROLE
     default_model_concurrency: int = DEFAULT_MODEL_CONCURRENCY
     yield_to_interactive: bool = True
@@ -178,7 +172,6 @@ def batch_config() -> BatchConfig:
     """Read every batch setting now. Cheap: in-memory lookups only."""
     return BatchConfig(
         enabled=_flag(ENABLED_KEY, True),
-        expansion_enabled=_flag(EXPANSION_KEY, False),
         min_role=_role(MIN_ROLE_KEY, DEFAULT_MIN_ROLE),
         default_model_concurrency=_int(MODEL_CONCURRENCY_KEY, DEFAULT_MODEL_CONCURRENCY, minimum=0),
         yield_to_interactive=_flag(YIELD_KEY, True),

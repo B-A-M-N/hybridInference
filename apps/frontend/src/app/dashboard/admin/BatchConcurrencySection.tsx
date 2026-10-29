@@ -15,7 +15,6 @@ import {
   PANEL,
   TABLE_HEAD_CELL,
 } from '@/components/features/admin/adminStyles';
-import { ChangeList, plural } from '@/components/features/admin/confirm/ChangeList';
 import { EditBar } from '@/components/features/admin/confirm/EditBar';
 import { useConfirmAction } from '@/components/features/admin/confirm/useConfirmAction';
 import { writeEach } from '@/components/features/admin/confirm/writeEach';
@@ -28,14 +27,17 @@ import {
 import { getErrorMessage } from '@/lib/utils/errors';
 
 import { validateNumericSettingInput } from './numericSettingValidation';
+import { useReportUnsaved } from './useReportUnsaved';
 
 const SECTION = 'Batch Concurrency';
 
 interface BatchConcurrencySectionProps {
   onToast: (msg: string) => void;
+  /** Called with the number of unsaved changes whenever it changes. */
+  onUnsavedChange?: (count: number) => void;
 }
 
-/** A cap as the table and the confirmation show it; `null` is the default. */
+/** A cap as the table shows it; `null` is the default. */
 function capLabel(cap: number | null, defaultCap: number): string {
   if (cap === null) return `Default (${defaultCap === 0 ? '0, paused' : defaultCap})`;
   return cap === 0 ? '0 (paused)' : String(cap);
@@ -60,11 +62,14 @@ function parseCap(raw: string): ParsedCap {
 
 /**
  * How many batch requests each model may run at once, across the deployment.
- * The caps are edited in place; the changed models are saved after the
- * administrator confirms the list, one request per model.
+ * The caps are edited in place; Save writes the changed models, one request
+ * per model.
  */
-export function BatchConcurrencySection({ onToast }: BatchConcurrencySectionProps) {
-  const confirmation = useConfirmAction();
+export function BatchConcurrencySection({
+  onToast,
+  onUnsavedChange,
+}: BatchConcurrencySectionProps) {
+  const writes = useConfirmAction();
   const [models, setModels] = useState<AdminBatchModelLimit[]>([]);
   const [defaultCap, setDefaultCap] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -101,7 +106,7 @@ export function BatchConcurrencySection({ onToast }: BatchConcurrencySectionProp
   };
 
   const cancel = () => {
-    if (confirmation.busy) return;
+    if (writes.busy) return;
     setDrafts({});
     setSaveError(null);
   };
@@ -118,38 +123,20 @@ export function BatchConcurrencySection({ onToast }: BatchConcurrencySectionProp
   );
   // An invalid cap is unsaved too: it keeps the bar up, with Save held back.
   const unsaved = changes.length + invalid.length;
+  useReportUnsaved(unsaved, onUnsavedChange);
   const blocked =
     invalid.length > 0
       ? `Correct the cap for ${invalid.map((model) => model.model_id).join(', ')} before saving.`
       : null;
 
-  const save = () => {
+  const save = async () => {
     // Enter in a field reaches here too; the bar already says what to correct.
     if (blocked || changes.length === 0) return;
     setSaveError(null);
     const pending = changes;
-    confirmation.request({
-      title: `Save ${plural(pending.length, 'batch concurrency change')}?`,
-      confirmLabel: 'Confirm save',
-      busyLabel: 'Saving…',
-      cancelLabel: 'Back to editing',
-      body: (
-        <>
-          <ChangeList
-            changes={pending.map(({ model, value }) => ({
-              label: model.model_id,
-              before: capLabel(model.max_concurrency, defaultCap),
-              after: capLabel(value, defaultCap),
-            }))}
-          />
-          <p>
-            Every gateway process applies the new caps within seconds. Batch requests already
-            running finish; a lower cap holds back the rest.
-          </p>
-        </>
-      ),
+    const failure = await writes.perform({
       run: async () => {
-        const failure = await writeEach(
+        await writeEach(
           pending,
           ({ model }) => model.model_id,
           async ({ model, value }) => {
@@ -164,8 +151,6 @@ export function BatchConcurrencySection({ onToast }: BatchConcurrencySectionProp
             });
           },
         );
-        setSaveError(failure);
-        if (failure) return;
         onToast(
           pending.length === 1
             ? `Updated batch concurrency for ${pending[0].model.model_id}.`
@@ -173,12 +158,13 @@ export function BatchConcurrencySection({ onToast }: BatchConcurrencySectionProp
         );
       },
     });
+    setSaveError(failure);
   };
 
   return (
     <AdminSection
       title={SECTION}
-      description="How many batch requests each model may run at once. A cap is shared by every gateway process and applies within seconds; an empty cap uses the default and 0 pauses batch work on the model. The default, and who may submit batches, are set in Admin → Configuration → Batch inference."
+      description="How many batch requests each model may run at once. A cap is shared by every gateway process and applies within seconds; an empty cap uses the default and 0 pauses batch work on the model. The default, and who may submit batches, are set under Batch inference, above."
     >
       {error && (
         <div className="mb-3">
@@ -234,13 +220,13 @@ export function BatchConcurrencySection({ onToast }: BatchConcurrencySectionProp
                         className={`${CONTROL} w-32 text-right ${
                           !parsed.ok ? FIELD_INVALID : changed ? 'border-amber-400' : ''
                         }`}
-                        disabled={confirmation.busy}
+                        disabled={writes.busy}
                         value={draft}
                         onChange={(e) => changeDraft(model, e.target.value)}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter') {
                             e.preventDefault();
-                            save();
+                            void save();
                           }
                         }}
                       />
@@ -268,13 +254,12 @@ export function BatchConcurrencySection({ onToast }: BatchConcurrencySectionProp
         target={SECTION}
         changeCount={unsaved}
         onCancel={cancel}
-        onSave={save}
-        busy={confirmation.busy}
+        onSave={() => void save()}
+        busy={writes.busy}
         error={saveError}
         blocked={blocked}
         inPlace
       />
-      {confirmation.dialog}
     </AdminSection>
   );
 }

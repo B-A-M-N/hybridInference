@@ -54,10 +54,13 @@ from serving.storage.batch_store import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-#: The OpenAI endpoint of each target an OpenAI-shaped batch can name.
-OPENAI_TARGET_URLS: dict[str, str] = {
+#: The ``url`` (inline) or ``endpoint`` (file) that names each target of
+#: ``/v1/batches``. ``/v1/messages`` is this gateway's extension of the OpenAI
+#: batch shape; a Messages batch also names its ``anthropic-version`` header.
+TARGET_URLS: dict[str, str] = {
     "/v1/chat/completions": TARGET_CHAT,
     "/v1/embeddings": TARGET_EMBEDDINGS,
+    "/v1/messages": TARGET_MESSAGES,
     "/v1/responses": TARGET_RESPONSES,
 }
 #: The endpoint each target is logged and described under.
@@ -179,6 +182,9 @@ class AdmissionContext:
     visibility_resolver: Any
     embedding_adapters: dict[str, Any] | None
     profile: AnthropicProfile | None = None
+    #: The router's embedding access gates (``FixedRouter.embedding_routes``).
+    #: An embedding model with no gate here is refused, as /v1/embeddings does.
+    embedding_routes: dict[str, Any] | None = None
     _models: dict[tuple[str, str], str] = field(default_factory=dict)
 
 
@@ -246,10 +252,15 @@ def _blocks_problem(
 
 
 def native_messages_problem(body: dict[str, Any]) -> str | None:
-    """Why *body* is outside what batch Messages items accept at all, or None."""
+    """Why *body* is outside what batch Messages items accept at all, or None.
+
+    Every top-level key outside the accepted set is refused rather than
+    ignored -- ``anthropic_version`` and ``betas`` included: the version is the
+    batch's own (its ``anthropic-version`` header), and betas are not supported in batches.
+    """
     unknown = sorted(set(body) - _NATIVE_TOP_LEVEL)
     if unknown:
-        return f"{', '.join(unknown)}: not supported in Message Batches"
+        return f"{', '.join(unknown)}: not supported in Messages batch requests"
     if body.get("stream"):
         return "stream: must not be true in a batch"
     problem = _tools_problem(body.get("tools"), translated=False)
@@ -348,10 +359,11 @@ def adapter_problem(adapter: Any, body: dict[str, Any]) -> str | None:
 
 @dataclass(frozen=True)
 class AdapterRequirement:
-    """The adapters that may serve one Messages batch item (published on req_ctx).
+    """The adapters that may serve one Messages batch item.
 
-    Read by the Anthropic surface when it chooses among a route's candidates;
-    see ``serving.servers.routers.anthropic_messages._pick_dispatch_adapter``.
+    Handed to the Messages execution in its ``MessagesConstraints``, which
+    narrows a route's candidates through it; see
+    ``serving.servers.routers.anthropic_messages._pick_dispatch_adapter``.
     """
 
     body: dict[str, Any]
@@ -442,7 +454,7 @@ async def admit_item(target: str, body: Any, ctx: AdmissionContext) -> str:
     if target == TARGET_CHAT:
         return await _admit_chat(body, ctx)
     if target == TARGET_EMBEDDINGS:
-        return _admit_embeddings(body, ctx)
+        return await _admit_embeddings(body, ctx)
     if target == TARGET_MESSAGES:
         return await _admit_messages(body, ctx)
     if target == TARGET_RESPONSES:
@@ -486,25 +498,63 @@ async def _admit_chat(body: dict[str, Any], ctx: AdmissionContext) -> str:
     return canonical
 
 
-def _admit_embeddings(body: dict[str, Any], ctx: AdmissionContext) -> str:
+async def _admit_embeddings(body: dict[str, Any], ctx: AdmissionContext) -> str:
     try:
         request = EmbeddingRequest.model_validate(body)
     except ValidationError as exc:
         raise ItemRejected(
             "invalid_request", f"body is not a valid embeddings request: {_describe(exc)}"
         ) from None
+    return await _admit_embedding_model(request.model, ctx)
+
+
+async def _admit_embedding_model(model: str, ctx: AdmissionContext) -> str:
+    """The canonical id of an embedding model the caller may batch."""
     adapters = ctx.embedding_adapters or {}
-    adapter = adapters.get(request.model)
-    if adapter is None:
+    adapter = adapters.get(model)
+    gate = (ctx.embedding_routes or {}).get(model)
+    if (
+        adapter is None
+        # The gate is mandatory, as on /v1/embeddings: an adapter without one
+        # is refused, never admitted ungated.
+        or gate is None
+        or (
+            await model_access_denial(
+                gate, model, ctx.user_ctx, visibility_resolver=ctx.visibility_resolver
+            )
+            is not None
+        )
+    ):
+        # Every reason reads as an unknown model, as on the interactive surface.
         raise ItemRejected(
             "model_not_found",
-            model_not_found_detail(request.model, user_ctx=ctx.user_ctx, noun="Embedding model"),
+            model_not_found_detail(model, user_ctx=ctx.user_ctx, noun="Embedding model"),
             status=404,
             param="model",
         )
     # The embedding adapter is looked up by the name as given, as the
     # interactive endpoint does; its configured id is what the cap keys on.
-    return getattr(getattr(adapter, "config", None), "id", None) or request.model
+    return getattr(getattr(adapter, "config", None), "id", None) or model
+
+
+async def resolve_model(target: str, model: Any, ctx: AdmissionContext) -> str:
+    """The canonical model a ``chat`` or ``embeddings`` item naming *model* would run on.
+
+    The model checks of :func:`admit_item` alone, with the same refusals --
+    auto models, and every reason the caller may not use a model reading as
+    an unknown one -- for a caller that checks the rest of the body itself.
+
+    Raises:
+        ItemRejected: The caller may not batch *model* for *target*.
+    """
+    if target == TARGET_CHAT:
+        canonical, _route = await _cached_route_model(model, ctx, TARGET_CHAT)
+        return canonical
+    if target == TARGET_EMBEDDINGS:
+        if not isinstance(model, str) or not model:
+            raise ItemRejected("invalid_request", "model: a model name is required", param="model")
+        return await _admit_embedding_model(model, ctx)
+    raise ItemRejected("invalid_request", f"unsupported batch target {target!r}")
 
 
 async def _admit_messages(body: dict[str, Any], ctx: AdmissionContext) -> str:
@@ -514,10 +564,13 @@ async def _admit_messages(body: dict[str, Any], ctx: AdmissionContext) -> str:
     problem = native_messages_problem(body)
     if problem:
         raise ItemRejected("invalid_request", problem)
-    if ctx.profile is not None:
-        violation = profile_violation(ctx.profile, body)
-        if violation:
-            raise ItemRejected("invalid_request", violation)
+    if ctx.profile is None:
+        # The batch's anthropic-version decides the rules below; without one a
+        # request would be admitted under none of them.
+        raise ItemRejected("invalid_request", "anthropic-version: a Messages batch needs one")
+    violation = profile_violation(ctx.profile, body)
+    if violation:
+        raise ItemRejected("invalid_request", violation)
     canonical, route = await _cached_route_model(
         body["model"], ctx, TARGET_MESSAGES, resolve_anthropic_alias
     )
