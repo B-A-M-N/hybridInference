@@ -11,7 +11,7 @@ const navigateToMock = vi.fn();
 
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ refresh: refreshMock, replace: vi.fn(), push: vi.fn() }),
-  usePathname: () => '/dashboard/admin/configuration',
+  usePathname: () => '/dashboard/admin/settings',
 }));
 
 vi.mock('@/lib/api/config', () => ({
@@ -24,6 +24,7 @@ vi.mock('@/lib/api/config', () => ({
   testAlertNotification: vi.fn(),
   restartBackend: vi.fn(),
   waitForBackendRestart: vi.fn(),
+  getLiveConfigStatus: vi.fn(),
 }));
 
 vi.mock('@/lib/utils/navigation', async (importOriginal) => ({
@@ -38,6 +39,7 @@ vi.mock('react-hot-toast', () => ({
 import {
   exportConfigBackup,
   getConfig,
+  getLiveConfigStatus,
   markConfigSecret,
   patchConfig,
   resetConfigKey,
@@ -48,8 +50,35 @@ import {
 } from '@/lib/api/config';
 import toast from 'react-hot-toast';
 
-import { ConfigurationTab } from './ConfigurationTab';
-import { escapingScreenReaderText } from './__tests__/layoutContainment';
+import {
+  AddVariableControl,
+  ConfigCategorySection,
+  ConfigurationBackupSection,
+  ConfigurationFilters,
+  ConfigurationNotices,
+  useConfigurationEditor,
+} from './ConfigurationEditor';
+
+/**
+ * Every part of the editor, with every category one after another. Admin →
+ * Settings spreads the same parts over its sub-tabs; how it places them is
+ * tested with the page.
+ */
+function Editor({ initialMissingOnly }: { initialMissingOnly?: boolean }) {
+  const editor = useConfigurationEditor({ initialMissingOnly });
+  return (
+    <>
+      <ConfigurationNotices editor={editor} />
+      {editor.config ? <ConfigurationFilters editor={editor} /> : null}
+      <AddVariableControl editor={editor} />
+      {editor.groups.map((group) => (
+        <ConfigCategorySection key={group.id} editor={editor} categoryId={group.id} />
+      ))}
+      <ConfigurationBackupSection editor={editor} />
+      {editor.backupConfirmation.dialog}
+    </>
+  );
+}
 
 /** What a misbehaving backend might leak; the page must never show it. */
 const LEAKED_SECRET = 'sk-live-should-never-render';
@@ -158,7 +187,7 @@ function section(name: string): HTMLElement {
 
 async function renderTab(config = makeConfig(), props: { initialMissingOnly?: boolean } = {}) {
   vi.mocked(getConfig).mockResolvedValue(config);
-  render(<ConfigurationTab {...props} />);
+  render(<Editor {...props} />);
   await screen.findByRole('region', { name: 'Email (SMTP)' });
 }
 
@@ -203,27 +232,14 @@ function alertConfig(setKeys: string[] = ['SLACK_ALERTS_WEBHOOK_URL']): ConfigRe
   };
 }
 
-/** Confirm the "Save N changes?" dialog a category's Save opens. */
-function confirmSave() {
-  fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Confirm save' }));
-}
-
-/** Save a category's unsaved changes, and confirm the list of them. */
-function saveAndConfirm(name: string) {
+/** Save a category's unsaved changes: the click writes them. */
+function save(name: string) {
   fireEvent.click(screen.getByRole('button', { name: `Save changes to ${name}` }));
-  confirmSave();
 }
 
-/** Confirm the test-send dialog that Send test notification opens. */
-function confirmTestSend() {
-  const dialog = screen.getByRole('dialog', { name: /^Send a test notification to / });
-  expect(testAlertNotification).not.toHaveBeenCalled();
-  fireEvent.click(within(dialog).getByRole('button', { name: 'Send test' }));
-}
-
-/** Confirm the review dialog that Add variable's submit opens. */
-function confirmAddVariable() {
-  fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Add variable' }));
+/** The category's Save, while its bar is up. */
+function saveButton(name: string) {
+  return screen.queryByRole('button', { name: `Save changes to ${name}` });
 }
 
 function chooseAlertChannel(label: 'None' | 'Slack' | 'WeCom') {
@@ -256,8 +272,7 @@ describe('alert notification channel', () => {
       target: { value: WECOM_WEBHOOK },
     });
     vi.mocked(patchConfig).mockResolvedValueOnce(alertConfig(['WECOM_ALERTS_WEBHOOK_URL']));
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Alerts' }));
-    confirmSave();
+    save('Alerts');
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({
         values: {
@@ -277,8 +292,7 @@ describe('alert notification channel', () => {
   it('does not clear the current channel when the chosen replacement is empty', async () => {
     await renderTab(alertConfig());
     chooseAlertChannel('WeCom');
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Alerts' }));
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    save('Alerts');
     expect(patchConfig).not.toHaveBeenCalled();
     expect(screen.getByText('Enter a webhook URL before saving this channel.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Send test notification' })).toBeDisabled();
@@ -326,8 +340,7 @@ describe('alert notification channel', () => {
     fireEvent.change(screen.getByLabelText('Slack webhook URL'), {
       target: { value: SLACK_WEBHOOK },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Alerts' }));
-    confirmSave();
+    save('Alerts');
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({
         values: {
@@ -345,8 +358,7 @@ describe('alert notification channel', () => {
     expect(
       screen.queryByRole('button', { name: 'Send test notification' }),
     ).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Alerts' }));
-    confirmSave();
+    save('Alerts');
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({
         values: {
@@ -365,8 +377,7 @@ describe('alert notification channel', () => {
     fireEvent.change(screen.getByLabelText('Slack webhook URL'), {
       target: { value: SLACK_WEBHOOK },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Alerts' }));
-    confirmSave();
+    save('Alerts');
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({
         values: {
@@ -408,8 +419,7 @@ describe('alert notification channel', () => {
     });
     fireEvent.change(screen.getByLabelText('Search settings'), { target: { value: 'webhook' } });
     expect(screen.queryByRole('switch', { name: 'ALERTS_ENABLED' })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Alerts' }));
-    confirmSave();
+    save('Alerts');
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({
         values: {
@@ -447,8 +457,7 @@ describe('alert notification channel', () => {
       target: { value: SLACK_WEBHOOK },
     });
     vi.mocked(patchConfig).mockResolvedValueOnce(alertConfig(['SLACK_WEBHOOK_URL']));
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Alerts' }));
-    confirmSave();
+    save('Alerts');
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({
         values: {
@@ -478,7 +487,6 @@ describe('alert notification channel', () => {
     await renderTab(config);
     expect(within(section('Alerts')).getAllByText('Pending restart').length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole('button', { name: 'Send test notification' }));
-    confirmTestSend();
     await waitFor(() => expect(testAlertNotification).toHaveBeenCalledWith({ channel: 'wecom' }));
     expect(
       await screen.findByText('Test sent. Check your WeCom channel for test-wecom.'),
@@ -494,7 +502,6 @@ describe('alert notification channel', () => {
       target: { value: SLACK_WEBHOOK },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Send test notification' }));
-    confirmTestSend();
     await waitFor(() =>
       expect(testAlertNotification).toHaveBeenCalledWith({
         channel: 'slack',
@@ -523,7 +530,6 @@ describe('alert notification channel', () => {
       target: { value: SLACK_WEBHOOK },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Send test notification' }));
-    confirmTestSend();
     expect(screen.getByLabelText('Notification channel')).toBeDisabled();
     expect(screen.getByLabelText('Slack webhook URL')).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Save changes to Alerts' })).toBeDisabled();
@@ -546,7 +552,6 @@ describe('alert notification channel', () => {
     );
     await renderTab(alertConfig());
     fireEvent.click(screen.getByRole('button', { name: 'Send test notification' }));
-    confirmTestSend();
     expect(screen.getByRole('button', { name: 'Sending test…' })).toBeDisabled();
     expect(screen.queryByRole('button', { name: /changes to Alerts$/ })).not.toBeInTheDocument();
     finish({ channel: 'slack', sent: true, test_id: 'test-123' });
@@ -561,14 +566,12 @@ describe('alert notification channel', () => {
       target: { value: `  ${SLACK_WEBHOOK}  ` },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Send test notification' }));
-    confirmTestSend();
     await screen.findByText('Test sent. Check your Slack channel for test-123.');
     expect(testAlertNotification).toHaveBeenCalledWith({
       channel: 'slack',
       webhook_url: SLACK_WEBHOOK,
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Alerts' }));
-    confirmSave();
+    save('Alerts');
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({
         values: {
@@ -579,14 +582,13 @@ describe('alert notification channel', () => {
     );
   });
 
-  it('sends no test notification when its confirmation is cancelled', async () => {
+  it('sends a test on the click, with no confirmation, and saves nothing', async () => {
     await renderTab(alertConfig());
     fireEvent.click(screen.getByRole('button', { name: 'Send test notification' }));
-    const dialog = screen.getByRole('dialog', { name: 'Send a test notification to Slack?' });
-    expect(dialog).toHaveTextContent('behind the saved webhook');
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
     expect(screen.queryByRole('dialog')).toBeNull();
-    expect(testAlertNotification).not.toHaveBeenCalled();
+    await screen.findByText('Test sent. Check your Slack channel for test-123.');
+    expect(testAlertNotification).toHaveBeenCalledTimes(1);
+    expect(testAlertNotification).toHaveBeenCalledWith({ channel: 'slack' });
     expect(patchConfig).not.toHaveBeenCalled();
   });
 
@@ -596,7 +598,6 @@ describe('alert notification channel', () => {
     );
     await renderTab(alertConfig());
     fireEvent.click(screen.getByRole('button', { name: 'Send test notification' }));
-    confirmTestSend();
     expect(
       await screen.findByText(
         'Test notifications are temporarily limited. Wait a few seconds and try again.',
@@ -611,7 +612,6 @@ describe('alert notification channel', () => {
     );
     await renderTab(alertConfig());
     fireEvent.click(screen.getByRole('button', { name: 'Send test notification' }));
-    confirmTestSend();
     expect(
       await screen.findByText('The test could not be sent. Check the webhook URL and try again.'),
     ).toBeInTheDocument();
@@ -625,7 +625,6 @@ describe('alert notification channel', () => {
     );
     await renderTab(alertConfig());
     fireEvent.click(screen.getByRole('button', { name: 'Send test notification' }));
-    confirmTestSend();
     expect(
       await screen.findByText(
         'The saved webhook could not be read. This is a backend problem, not the address; try again in a moment.',
@@ -640,7 +639,6 @@ describe('alert notification channel', () => {
     );
     await renderTab(alertConfig());
     fireEvent.click(screen.getByRole('button', { name: 'Send test notification' }));
-    confirmTestSend();
     expect(await screen.findByText('Enter a valid WeCom incoming webhook URL')).toBeInTheDocument();
     expect(document.body.innerHTML).not.toContain(LEAKED_SECRET);
   });
@@ -662,11 +660,7 @@ describe('alert notification channel', () => {
     // Staged like any edit: nothing is removed before the category is saved.
     expect(alerts.getByRole('button', { name: 'Undo reset of SLACK_WEBHOOK_URL' })).toBeVisible();
     expect(resetConfigKey).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Alerts' }));
-    expect(screen.getByRole('dialog', { name: 'Save 1 change to Alerts?' })).toHaveTextContent(
-      'SLACK_WEBHOOK_URLReset to the environment or default',
-    );
-    confirmSave();
+    save('Alerts');
     await waitFor(() => expect(resetConfigKey).toHaveBeenCalledWith('SLACK_WEBHOOK_URL'));
     expect(patchConfig).not.toHaveBeenCalled();
   });
@@ -707,7 +701,7 @@ describe('alert notification channel', () => {
     ).toBeInTheDocument();
 
     fireEvent.click(alerts.getByRole('button', { name: 'Reset SLACK_ALERTS_WEBHOOK_URL' }));
-    saveAndConfirm('Alerts');
+    save('Alerts');
     await waitFor(() => expect(resetConfigKey).toHaveBeenCalledWith('SLACK_ALERTS_WEBHOOK_URL'));
     expect(resetConfigKey).toHaveBeenCalledTimes(1);
   });
@@ -770,9 +764,9 @@ describe('editing in place', () => {
     const port = email.getByLabelText('SMTP_PORT');
 
     expect(email.queryByRole('button', { name: 'Save changes to Email (SMTP)' })).toBeNull();
-    // Enter with nothing changed asks nothing.
+    // Enter with nothing changed writes nothing.
     fireEvent.submit(port.closest('form') as HTMLFormElement);
-    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(patchConfig).not.toHaveBeenCalled();
 
     fireEvent.change(port, { target: { value: '587' } });
     fireEvent.change(email.getByLabelText('SMTP_HOST'), { target: { value: 'smtp.test' } });
@@ -824,25 +818,25 @@ describe('editing in place', () => {
     expect(email.getByText('1 unsaved change')).toBeVisible();
     expect(network.getByText('2 unsaved changes')).toBeVisible();
 
-    saveAndConfirm('Email (SMTP)');
-    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    save('Email (SMTP)');
+    // Its bar goes once the save is written.
+    await waitFor(() => expect(saveButton('Email (SMTP)')).toBeNull());
     expect(patchConfig).toHaveBeenCalledTimes(1);
     expect(patchConfig).toHaveBeenCalledWith({ values: { SMTP_PORT: 587 } });
     expect(email.getByLabelText('SMTP_PORT')).toHaveValue(587);
-    expect(email.queryByRole('button', { name: 'Save changes to Email (SMTP)' })).toBeNull();
     // Network's drafts outlive the other category's save, still unsaved.
     expect(network.getByRole('switch', { name: 'TRUST_PROXY_HEADERS' })).toBeChecked();
     expect(network.getByLabelText('CORS_ALLOWED_ORIGINS')).toHaveValue('https://b.test');
     expect(network.getByText('2 unsaved changes')).toBeVisible();
 
-    saveAndConfirm('Network');
+    save('Network');
     await waitFor(() => expect(patchConfig).toHaveBeenCalledTimes(2));
     expect(patchConfig).toHaveBeenLastCalledWith({
       values: { TRUST_PROXY_HEADERS: true, CORS_ALLOWED_ORIGINS: 'https://b.test' },
     });
   });
 
-  it('writes once, on Confirm save, and then shows the saved values', async () => {
+  it('writes once, on Save, and then shows the saved values', async () => {
     const saved = makeConfig();
     saved.entries = saved.entries.map((item) =>
       item.key === 'SMTP_PORT' ? { ...item, value: 587 } : item,
@@ -850,20 +844,14 @@ describe('editing in place', () => {
     vi.mocked(patchConfig).mockResolvedValueOnce(saved);
     await renderTab();
     fireEvent.change(screen.getByLabelText('SMTP_PORT'), { target: { value: '587' } });
-
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Email (SMTP)' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Back to editing' }));
-    expect(screen.getByLabelText('SMTP_PORT')).toHaveValue(587);
     expect(patchConfig).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Email (SMTP)' }));
-    const dialog = screen.getByRole('dialog', { name: 'Save 1 change to Email (SMTP)?' });
-    expect(dialog).toHaveTextContent('SMTP_PORT25 → 587');
-    const confirm = within(dialog).getByRole('button', { name: 'Confirm save' });
-    fireEvent.click(confirm);
-    fireEvent.click(confirm);
+    const button = screen.getByRole('button', { name: 'Save changes to Email (SMTP)' });
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(screen.queryByRole('dialog')).toBeNull();
 
-    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await waitFor(() => expect(saveButton('Email (SMTP)')).toBeNull());
     expect(patchConfig).toHaveBeenCalledTimes(1);
     expect(patchConfig).toHaveBeenCalledWith({ values: { SMTP_PORT: 587 } });
     // The saved value, with nothing left unsaved.
@@ -871,7 +859,7 @@ describe('editing in place', () => {
     expect(screen.queryByRole('button', { name: 'Save changes to Email (SMTP)' })).toBeNull();
   });
 
-  it('blocks a second submission while the save is in flight', async () => {
+  it('holds every save, its Discard and its fields while a save is in flight', async () => {
     let finish!: (value: ConfigResponse) => void;
     vi.mocked(patchConfig).mockImplementationOnce(
       () =>
@@ -881,20 +869,31 @@ describe('editing in place', () => {
     );
     await renderTab();
     fireEvent.change(screen.getByLabelText('SMTP_PORT'), { target: { value: '587' } });
-    saveAndConfirm('Email (SMTP)');
+    fireEvent.click(screen.getByRole('switch', { name: 'TRUST_PROXY_HEADERS' }));
+    save('Email (SMTP)');
 
-    const dialog = screen.getByRole('dialog');
-    expect(within(dialog).getByRole('button', { name: 'Saving…' })).toBeDisabled();
-    expect(within(dialog).getByRole('button', { name: 'Back to editing' })).toBeDisabled();
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Saving…' }));
-    fireEvent.keyDown(window, { key: 'Escape' });
-    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    const saving = screen.getByRole('button', { name: 'Save changes to Email (SMTP)' });
+    expect(saving).toHaveTextContent('Saving…');
+    expect(saving).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Discard changes to Email (SMTP)' })).toBeDisabled();
+    expect(screen.getByLabelText('SMTP_PORT')).toBeDisabled();
+    fireEvent.click(saving);
+    fireEvent.submit(saving.closest('form') as HTMLFormElement);
+    // One save at a time: another category waits too, with its drafts kept.
+    expect(screen.getByRole('button', { name: 'Save changes to Network' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Discard changes to Network' })).toBeDisabled();
+    fireEvent.submit(
+      screen
+        .getByRole('switch', { name: 'TRUST_PROXY_HEADERS' })
+        .closest('form') as HTMLFormElement,
+    );
     expect(patchConfig).toHaveBeenCalledTimes(1);
 
     finish(makeConfig());
-    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await waitFor(() => expect(saveButton('Email (SMTP)')).toBeNull());
     expect(patchConfig).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: 'Save changes to Network' })).toBeEnabled();
+    expect(screen.getByRole('switch', { name: 'TRUST_PROXY_HEADERS' })).toBeChecked();
   });
 
   it('keeps the drafts when the save fails, until they are discarded', async () => {
@@ -904,11 +903,10 @@ describe('editing in place', () => {
     await renderTab();
     fireEvent.change(screen.getByLabelText('SMTP_PORT'), { target: { value: '587' } });
     fireEvent.change(screen.getByLabelText('SMTP_HOST'), { target: { value: 'smtp.test' } });
-    saveAndConfirm('Email (SMTP)');
+    save('Email (SMTP)');
 
     const email = within(section('Email (SMTP)'));
     expect(await email.findByRole('alert')).toHaveTextContent('The database is unavailable.');
-    expect(screen.queryByRole('dialog')).toBeNull();
     expect(screen.getByLabelText('SMTP_PORT')).toHaveValue(587);
     expect(screen.getByLabelText('SMTP_HOST')).toHaveValue('smtp.test');
     expect(screen.getByText('2 unsaved changes')).toBeVisible();
@@ -922,7 +920,7 @@ describe('editing in place', () => {
     expect(patchConfig).toHaveBeenCalledTimes(1);
   });
 
-  it('confirms a secret only as Replace or Clear, never its value', async () => {
+  it('saves a replaced and a cleared secret together, and shows neither value', async () => {
     const config = makeConfig();
     config.entries.push(
       entry({ key: 'SMTP_API_TOKEN', category: 'email', secret: true, value: LEAKED_SECRET }),
@@ -933,12 +931,16 @@ describe('editing in place', () => {
       target: { value: 'typed-new-secret' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Clear SMTP_API_TOKEN' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Email (SMTP)' }));
+    save('Email (SMTP)');
 
-    const dialog = screen.getByRole('dialog', { name: 'Save 2 changes to Email (SMTP)?' });
-    expect(dialog).toHaveTextContent('SMTP_PASSWORDReplace');
-    expect(dialog).toHaveTextContent('SMTP_API_TOKENClear');
-    expect(dialog.innerHTML).not.toContain('typed-new-secret');
+    await waitFor(() =>
+      expect(patchConfig).toHaveBeenCalledWith({
+        values: { SMTP_PASSWORD: 'typed-new-secret', SMTP_API_TOKEN: '' },
+      }),
+    );
+    await waitFor(() => expect(saveButton('Email (SMTP)')).toBeNull());
+    expect(screen.queryByDisplayValue('typed-new-secret')).not.toBeInTheDocument();
+    expect(document.body.innerHTML).not.toContain('typed-new-secret');
     expect(document.body.innerHTML).not.toContain(LEAKED_SECRET);
   });
 
@@ -951,7 +953,7 @@ describe('editing in place', () => {
     fireEvent.change(screen.getByLabelText('SMTP_PASSWORD'), {
       target: { value: 'typed-new-secret' },
     });
-    saveAndConfirm('Email (SMTP)');
+    save('Email (SMTP)');
 
     // Beside the save and on the setting it names, as the other reasons are.
     const email = within(section('Email (SMTP)'));
@@ -993,7 +995,7 @@ describe('edit flow edge cases', () => {
     vi.mocked(resetConfigKey)
       .mockResolvedValueOnce(written)
       .mockRejectedValueOnce(new APIError('HTTP_503', 'The database is unavailable.', 503));
-    saveAndConfirm('Email (SMTP)');
+    save('Email (SMTP)');
 
     const email = within(section('Email (SMTP)'));
     expect(await email.findByRole('alert')).toHaveTextContent(
@@ -1005,14 +1007,10 @@ describe('edit flow edge cases', () => {
     expect(email.getByLabelText('SMTP_FROM_NAME')).toHaveTextContent('Reset when you save');
     expect(email.getByLabelText('SMTP_FROM_EMAIL')).toHaveTextContent('Reset when you save');
 
-    // The retry lists, and sends, only what is left.
+    // Saving again sends only what is left.
     vi.mocked(resetConfigKey).mockResolvedValue(written);
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Email (SMTP)' }));
-    const dialog = screen.getByRole('dialog', { name: 'Save 2 changes to Email (SMTP)?' });
-    expect(dialog).not.toHaveTextContent('SMTP_HOST');
-    expect(dialog).not.toHaveTextContent('SMTP_PORT');
-    confirmSave();
-    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    save('Email (SMTP)');
+    await waitFor(() => expect(saveButton('Email (SMTP)')).toBeNull());
     expect(patchConfig).toHaveBeenCalledTimes(1);
     expect(vi.mocked(resetConfigKey).mock.calls.map(([key]) => key)).toEqual([
       'SMTP_PORT',
@@ -1039,23 +1037,23 @@ describe('edit flow edge cases', () => {
       });
     }
 
-    async function stageTrustChange() {
+    async function saveTrustChange() {
       await renderTab(trustConfig());
       fireEvent.click(
         within(section('Network')).getByRole('switch', { name: 'TRUST_PROXY_HEADERS' }),
       );
       fireEvent.click(screen.getByRole('button', { name: 'Reset TRUST_X_REAL_IP' }));
-      fireEvent.click(screen.getByRole('button', { name: 'Save changes to Network' }));
-      return screen.getByRole('dialog', { name: 'Save 2 changes to Network?' });
+      save('Network');
     }
 
-    it('says in the review that the resets follow the value changes as separate requests', async () => {
-      const dialog = await stageTrustChange();
+    it('sends the value changes first, in one request, then each reset on its own', async () => {
+      await saveTrustChange();
 
-      expect(dialog).toHaveTextContent(
-        'The value changes are sent first, in one request; then each reset, on its own. ' +
-          'The backend checks each request by itself, so a change that is valid only together ' +
-          'with one of these resets can be refused; if so, save that reset on its own first.',
+      await waitFor(() => expect(resetConfigKey).toHaveBeenCalledWith('TRUST_X_REAL_IP'));
+      expect(patchConfig).toHaveBeenCalledTimes(1);
+      expect(patchConfig).toHaveBeenCalledWith({ values: { TRUST_PROXY_HEADERS: false } });
+      expect(vi.mocked(patchConfig).mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(resetConfigKey).mock.invocationCallOrder[0],
       );
     });
 
@@ -1068,8 +1066,7 @@ describe('edit flow edge cases', () => {
           400,
         ),
       );
-      await stageTrustChange();
-      confirmSave();
+      await saveTrustChange();
 
       // The category's own alert, beside its Save; the setting it names shows the reason too.
       const alerts = await within(section('Network')).findAllByRole('alert');
@@ -1100,13 +1097,16 @@ describe('edit flow edge cases', () => {
     vi.mocked(resetConfigKey).mockRejectedValueOnce(
       new APIError('HTTP_503', 'The database is unavailable.', 503),
     );
-    saveAndConfirm('Alerts');
+    save('Alerts');
     await within(section('Alerts')).findByRole('alert');
+    // Only the reset is left.
+    expect(within(section('Alerts')).getByText('1 unsaved change')).toBeVisible();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Alerts' }));
-    const dialog = screen.getByRole('dialog', { name: 'Save 1 change to Alerts?' });
-    expect(dialog).toHaveTextContent('ALERTS_ENABLED');
-    expect(dialog).not.toHaveTextContent('SLACK_ALERTS_WEBHOOK_URL');
+    vi.mocked(resetConfigKey).mockResolvedValueOnce(alertConfig(['WECOM_ALERTS_WEBHOOK_URL']));
+    save('Alerts');
+    await waitFor(() => expect(resetConfigKey).toHaveBeenCalledTimes(2));
+    expect(resetConfigKey).toHaveBeenLastCalledWith('ALERTS_ENABLED');
+    expect(patchConfig).toHaveBeenCalledTimes(1);
   });
 
   it('drops a staged webhook reset when the channel changes, so the new URL is saved', async () => {
@@ -1124,7 +1124,7 @@ describe('edit flow edge cases', () => {
     const field = screen.getByLabelText('Slack webhook URL');
     expect(field.tagName).toBe('INPUT');
     fireEvent.change(field, { target: { value: SLACK_WEBHOOK } });
-    saveAndConfirm('Alerts');
+    save('Alerts');
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({
         values: { SLACK_WEBHOOK_URL: SLACK_WEBHOOK, WECOM_ALERTS_WEBHOOK_URL: '' },
@@ -1153,10 +1153,6 @@ describe('edit flow edge cases', () => {
     ).toBeVisible();
     expect(email.getByRole('button', { name: 'Discard changes to Email (SMTP)' })).toBeEnabled();
     expect(email.getByRole('button', { name: 'Save changes to Email (SMTP)' })).toBeEnabled();
-    const index = screen.getByRole('navigation', { name: 'Configuration categories' });
-    expect(within(index).getByRole('link', { name: /Email \(SMTP\)/ })).toHaveTextContent(
-      'unsaved changes',
-    );
     // A category with nothing unsaved is still filtered out.
     expect(screen.queryByRole('region', { name: 'Network' })).toBeNull();
 
@@ -1178,8 +1174,7 @@ describe('edit flow edge cases', () => {
           'Unsaved changes to them are kept and saved with the rest.',
       ),
     ).toBeVisible();
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Email (SMTP)' }));
-    confirmSave();
+    save('Email (SMTP)');
     await waitFor(() => expect(patchConfig).toHaveBeenCalledWith({ values: { SMTP_PORT: 587 } }));
   });
 
@@ -1203,8 +1198,15 @@ describe('edit flow edge cases', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Mark ROUTE_REGION as secret' }));
 
     expect(screen.getByText('1 unsaved change')).toBeVisible();
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Providers' }));
-    expect(screen.getByRole('dialog', { name: 'Save 1 change to Providers?' })).toBeVisible();
+    // And saves both in one request.
+    save('Providers');
+    await waitFor(() =>
+      expect(patchConfig).toHaveBeenCalledWith({
+        values: { ROUTE_REGION: 'us-east' },
+        secrets: { ROUTE_REGION: true },
+      }),
+    );
+    expect(patchConfig).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1234,7 +1236,6 @@ describe('secrets', () => {
     expect(input).toHaveValue('');
     fireEvent.change(input, { target: { value: 'new-smtp-secret' } });
     fireEvent.click(within(email).getByRole('button', { name: 'Save changes to Email (SMTP)' }));
-    confirmSave();
 
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({ values: { SMTP_PASSWORD: 'new-smtp-secret' } }),
@@ -1252,7 +1253,6 @@ describe('secrets', () => {
     fireEvent.click(within(email).getByRole('button', { name: 'Clear SMTP_PASSWORD' }));
     expect(within(email).getByText('Cleared when you save')).toBeInTheDocument();
     fireEvent.click(within(email).getByRole('button', { name: 'Save changes to Email (SMTP)' }));
-    confirmSave();
 
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({ values: { SMTP_PASSWORD: '' } }),
@@ -1318,7 +1318,7 @@ describe('marking a variable secret', () => {
   /** Stage the flag on `key` and save Providers with it. */
   function saveMarking(key: string) {
     fireEvent.click(screen.getByRole('button', { name: `Mark ${key} as secret` }));
-    saveAndConfirm('Providers');
+    save('Providers');
   }
 
   it('is offered for stored variables, not for built-in settings or secrets', async () => {
@@ -1380,20 +1380,16 @@ describe('marking a variable secret', () => {
     fireEvent.click(
       within(providers).getByRole('button', { name: 'Mark MY_ROUTE_HEADER as secret' }),
     );
-    // Staged: a note and an undo, and nothing sent.
-    expect(providers).toHaveTextContent('Becomes secret when you save.');
+    // Staged: a warning and an undo, and nothing sent.
+    expect(providers).toHaveTextContent(
+      'Becomes secret when you save. This cannot be undone from the console.',
+    );
     expect(
       within(providers).getByRole('button', { name: 'Keep MY_ROUTE_HEADER visible' }),
     ).toBeVisible();
     expect(patchConfig).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Providers' }));
-    const dialog = screen.getByRole('dialog', { name: 'Save 1 change to Providers?' });
-    expect(dialog).toHaveTextContent('Mark as secret');
-    expect(dialog).toHaveTextContent(
-      'Marking a variable secret cannot be undone from the console.',
-    );
-    confirmSave();
+    save('Providers');
 
     // One PATCH carries the value and the flag.
     await waitFor(() =>
@@ -1404,7 +1400,7 @@ describe('marking a variable secret', () => {
     );
     expect(patchConfig).toHaveBeenCalledTimes(1);
     expect(markConfigSecret).not.toHaveBeenCalled();
-    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    await waitFor(() => expect(saveButton('Providers')).toBeNull());
     // Neither the stored value (still in the buggy response) nor the edit.
     for (const plaintext of [HEADER_VALUE, 'typed-value']) {
       expect(screen.queryByDisplayValue(plaintext)).not.toBeInTheDocument();
@@ -1446,7 +1442,6 @@ describe('marking a variable secret', () => {
       (await within(section('Providers')).findByText(message, { exact: false })).textContent,
     ).toContain(message.replace(/^ROUTE_REGION: /, ''));
     // Nothing changed on the page, and the staged flag is still there to retry.
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(screen.getByLabelText('ROUTE_REGION')).toHaveValue('eu-west');
     expect(screen.getByRole('button', { name: 'Keep ROUTE_REGION visible' })).toBeVisible();
   });
@@ -1475,7 +1470,7 @@ describe('locked settings', () => {
         entry({ key: 'PINNED', category: 'security', value: 'v1', locked: true }),
       ]),
     );
-    render(<ConfigurationTab />);
+    render(<Editor />);
     const security = await screen.findByRole('region', { name: 'Security' });
 
     const fence = within(security).getByLabelText('ERASURE_FENCE_SECRET');
@@ -1505,7 +1500,7 @@ describe('locked settings', () => {
         }),
       ]),
     );
-    render(<ConfigurationTab />);
+    render(<Editor />);
     const security = await screen.findByRole('region', { name: 'Security' });
 
     expect(within(security).getByLabelText('ERASURE_FENCE_SECRET')).toHaveAttribute(
@@ -1543,29 +1538,20 @@ describe('forms', () => {
     expect(value).toHaveAttribute('data-1p-ignore', 'true');
   });
 
-  it('asks for confirmation, listing each change, before anything is saved', async () => {
+  it('writes nothing while a value is typed or left, and saves it on Save without asking', async () => {
     await renderTab();
     const email = section('Email (SMTP)');
-    fireEvent.change(within(email).getByLabelText('SMTP_PORT'), { target: { value: '587' } });
-    fireEvent.click(within(email).getByRole('button', { name: 'Save changes to Email (SMTP)' }));
-
-    const dialog = screen.getByRole('dialog', { name: 'Save 1 change to Email (SMTP)?' });
-    expect(within(dialog).getByText('SMTP_PORT')).toBeInTheDocument();
-    expect(within(dialog).getByText(/→ 587$/)).toBeInTheDocument();
+    const port = within(email).getByLabelText('SMTP_PORT');
+    fireEvent.change(port, { target: { value: '587' } });
+    fireEvent.blur(port);
     expect(patchConfig).not.toHaveBeenCalled();
 
-    // Back to editing writes nothing and keeps the edit, so it can still be saved.
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Back to editing' }));
+    fireEvent.click(within(email).getByRole('button', { name: 'Save changes to Email (SMTP)' }));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
-    expect(patchConfig).not.toHaveBeenCalled();
-    expect(within(email).getByLabelText('SMTP_PORT')).toHaveValue(587);
-
-    fireEvent.click(within(email).getByRole('button', { name: 'Save changes to Email (SMTP)' }));
-    confirmSave();
     await waitFor(() => expect(patchConfig).toHaveBeenCalledWith({ values: { SMTP_PORT: 587 } }));
   });
 
-  it('saves a category on Enter, after confirmation', async () => {
+  it('saves a category on Enter', async () => {
     await renderTab();
     const email = section('Email (SMTP)');
     const port = within(email).getByLabelText('SMTP_PORT');
@@ -1576,9 +1562,36 @@ describe('forms', () => {
     expect(save).toHaveAttribute('type', 'submit');
     expect(save.closest('form')).toBe(port.closest('form'));
     fireEvent.submit(port.closest('form') as HTMLFormElement);
-    confirmSave();
 
     await waitFor(() => expect(patchConfig).toHaveBeenCalledWith({ values: { SMTP_PORT: 587 } }));
+  });
+
+  it('holds the fields of a new variable while it is added, and adds it once', async () => {
+    let finish!: (value: Awaited<ReturnType<typeof patchConfig>>) => void;
+    vi.mocked(patchConfig).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await renderTab();
+    fireEvent.click(screen.getByRole('button', { name: 'Add variable' }));
+    const form = screen.getByRole('form', { name: 'Add variable' });
+    fireEvent.change(within(form).getByLabelText('Name'), { target: { value: 'MY_REGION' } });
+    fireEvent.change(within(form).getByLabelText('Value'), { target: { value: 'eu' } });
+    fireEvent.submit(form);
+
+    // What is being added stays what the form shows.
+    expect(within(form).getByLabelText('Name')).toBeDisabled();
+    expect(within(form).getByLabelText('Value')).toBeDisabled();
+    expect(within(form).getByRole('checkbox')).toBeDisabled();
+    expect(within(form).getByRole('button', { name: 'Adding…' })).toBeDisabled();
+    fireEvent.submit(form);
+    expect(patchConfig).toHaveBeenCalledTimes(1);
+
+    finish(makeConfig());
+    await waitFor(() => expect(screen.queryByRole('form', { name: 'Add variable' })).toBeNull());
+    expect(patchConfig).toHaveBeenCalledTimes(1);
   });
 
   it('adds a variable on Enter', async () => {
@@ -1589,11 +1602,7 @@ describe('forms', () => {
     fireEvent.change(within(form).getByLabelText('Value'), { target: { value: 'eu' } });
 
     fireEvent.submit(form);
-    // Enter reviews; the write waits for the confirmation.
-    const dialog = screen.getByRole('dialog', { name: 'Add MY_REGION?' });
-    expect(dialog).toHaveTextContent('MY_REGIONeu');
-    expect(patchConfig).not.toHaveBeenCalled();
-    confirmAddVariable();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
 
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({
@@ -1601,6 +1610,8 @@ describe('forms', () => {
         secrets: { MY_REGION: false },
       }),
     );
+    await waitFor(() => expect(screen.queryByRole('form', { name: 'Add variable' })).toBeNull());
+    expect(toast.success).toHaveBeenCalledWith('Added MY_REGION.');
   });
 });
 
@@ -1615,14 +1626,13 @@ describe('editors', () => {
       target: { value: 'smtp.example.test' },
     });
     fireEvent.click(within(section('Email (SMTP)')).getByRole('button', { name: /^Save changes/ }));
-    confirmSave();
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({
         values: { SMTP_PORT: 587, SMTP_HOST: 'smtp.example.test' },
       }),
     );
 
-    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await waitFor(() => expect(saveButton('Email (SMTP)')).toBeNull());
     fireEvent.click(
       within(section('Network')).getByRole('switch', { name: 'TRUST_PROXY_HEADERS' }),
     );
@@ -1632,7 +1642,6 @@ describe('editors', () => {
     fireEvent.click(
       within(section('Network')).getByRole('button', { name: 'Save changes to Network' }),
     );
-    confirmSave();
     await waitFor(() =>
       expect(patchConfig).toHaveBeenLastCalledWith({
         values: {
@@ -1652,7 +1661,6 @@ describe('editors', () => {
 
     expect(within(email).getByText('Enter a whole number.')).toBeInTheDocument();
     fireEvent.click(within(email).getByRole('button', { name: 'Save changes to Email (SMTP)' }));
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(patchConfig).not.toHaveBeenCalled();
   });
 
@@ -1665,7 +1673,6 @@ describe('editors', () => {
 
     fireEvent.change(within(email).getByLabelText('SMTP_PORT'), { target: { value: '70000' } });
     fireEvent.click(within(email).getByRole('button', { name: 'Save changes to Email (SMTP)' }));
-    confirmSave();
 
     expect(await within(email).findByText('SMTP_PORT: must be between 1 and 65535')).toBeVisible();
     expect(within(email).getByText('must be between 1 and 65535')).toBeVisible();
@@ -1736,7 +1743,7 @@ describe('badges', () => {
 });
 
 describe('reset and custom variables', () => {
-  it('resets a setting with DELETE after confirming', async () => {
+  it('resets a setting with DELETE when the category is saved', async () => {
     await renderTab();
 
     fireEvent.click(screen.getByRole('button', { name: 'Reset SMTP_PORT' }));
@@ -1747,15 +1754,10 @@ describe('reset and custom variables', () => {
     expect(screen.getByLabelText('SMTP_PORT')).toHaveValue(25);
     fireEvent.click(screen.getByRole('button', { name: 'Reset SMTP_PORT' }));
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Email (SMTP)' }));
-    const dialog = screen.getByRole('dialog', { name: 'Save 1 change to Email (SMTP)?' });
-    expect(dialog).toHaveTextContent('25 → environment or default');
-    expect(dialog).toHaveTextContent('falls back to the environment, then to its default');
-    expect(resetConfigKey).not.toHaveBeenCalled();
-    confirmSave();
+    save('Email (SMTP)');
 
     await waitFor(() => expect(resetConfigKey).toHaveBeenCalledWith('SMTP_PORT'));
-    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    await waitFor(() => expect(saveButton('Email (SMTP)')).toBeNull());
     expect(patchConfig).not.toHaveBeenCalled();
     expect(refreshMock).toHaveBeenCalled();
   });
@@ -1782,7 +1784,7 @@ describe('reset and custom variables', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'Reset SMTP_PORT' }));
-    saveAndConfirm('Email (SMTP)');
+    save('Email (SMTP)');
 
     await waitFor(() => expect(resetConfigKey).toHaveBeenCalledWith('SMTP_PORT'));
   });
@@ -1824,9 +1826,7 @@ describe('reset and custom variables', () => {
     expect(box).toBeDisabled();
     expect(box).toHaveAccessibleDescription('A name like this one is always secret.');
     fireEvent.change(within(form).getByLabelText('Value'), { target: { value: 'k-123' } });
-    fireEvent.click(within(form).getByRole('button', { name: 'Review and add' }));
-    expect(patchConfig).not.toHaveBeenCalled();
-    confirmAddVariable();
+    fireEvent.click(within(form).getByRole('button', { name: 'Add variable' }));
 
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({
@@ -1836,7 +1836,7 @@ describe('reset and custom variables', () => {
     );
   });
 
-  it('masks the secret value of a refused new variable in its review', async () => {
+  it('masks the secret value of a refused new variable, and keeps the form to retry', async () => {
     vi.mocked(patchConfig).mockRejectedValueOnce(
       new APIError('HTTP_400', 'MY_PROVIDER_API_KEY: k-123-typed is not accepted', 400),
     );
@@ -1848,13 +1848,17 @@ describe('reset and custom variables', () => {
       target: { value: 'my_provider_api_key' },
     });
     fireEvent.change(within(form).getByLabelText('Value'), { target: { value: 'k-123-typed' } });
-    fireEvent.click(within(form).getByRole('button', { name: 'Review and add' }));
-    confirmAddVariable();
+    fireEvent.click(within(form).getByRole('button', { name: 'Add variable' }));
 
-    expect(await within(screen.getByRole('dialog')).findByRole('alert')).toHaveTextContent(
+    expect(await within(form).findByRole('alert')).toHaveTextContent(
       'MY_PROVIDER_API_KEY: •••• is not accepted',
     );
     expect(document.body.textContent).not.toContain('k-123-typed');
+    expect(within(form).getByLabelText('Value')).toHaveValue('k-123-typed');
+
+    fireEvent.click(within(form).getByRole('button', { name: 'Add variable' }));
+    await waitFor(() => expect(screen.queryByRole('form', { name: 'Add variable' })).toBeNull());
+    expect(patchConfig).toHaveBeenCalledTimes(2);
   });
 
   it.each(['sentry_dsn', 'vertex_sa_json', 'upstream_bearer', 'ftp_pass', 'basic_auth'])(
@@ -1886,9 +1890,7 @@ describe('reset and custom variables', () => {
     fireEvent.click(box);
     expect(within(form).getByLabelText('Value')).toHaveAttribute('type', 'password');
     fireEvent.change(within(form).getByLabelText('Value'), { target: { value: 'eu' } });
-    fireEvent.click(within(form).getByRole('button', { name: 'Review and add' }));
-    expect(patchConfig).not.toHaveBeenCalled();
-    confirmAddVariable();
+    fireEvent.click(within(form).getByRole('button', { name: 'Add variable' }));
 
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith({
@@ -1904,11 +1906,11 @@ describe('reset and custom variables', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add variable' }));
     const form = screen.getByRole('form', { name: 'Add variable' });
     fireEvent.change(within(form).getByLabelText('Name'), { target: { value: '1BAD' } });
-    fireEvent.click(within(form).getByRole('button', { name: 'Review and add' }));
+    fireEvent.click(within(form).getByRole('button', { name: 'Add variable' }));
     expect(await within(form).findByRole('alert')).toHaveTextContent(/environment-variable name/);
 
     fireEvent.change(within(form).getByLabelText('Name'), { target: { value: 'SMTP_PORT' } });
-    fireEvent.click(within(form).getByRole('button', { name: 'Review and add' }));
+    fireEvent.click(within(form).getByRole('button', { name: 'Add variable' }));
     expect(await within(form).findByRole('alert')).toHaveTextContent('already listed');
     expect(patchConfig).not.toHaveBeenCalled();
   });
@@ -1930,56 +1932,9 @@ describe('filters', () => {
     expect(screen.queryByLabelText('SMTP_HOST')).not.toBeInTheDocument();
   });
 
-  it('indexes the categories the filters leave, and keeps one marked', async () => {
-    await renderTab();
-    const index = screen.getByRole('navigation', { name: 'Configuration categories' });
-    const names = () =>
-      within(index)
-        .getAllByRole('link')
-        .map((link) => link.textContent);
-    expect(names()).toEqual(['Email (SMTP)1 missing', 'Network', 'Providers1 missing', 'Security']);
-    expect(within(index).getByRole('link', { name: 'Network' })).toHaveAttribute(
-      'href',
-      '#config-network',
-    );
-    expect(document.getElementById('config-network')).toBe(
-      screen.getByRole('region', { name: 'Network' }),
-    );
-
-    fireEvent.click(within(index).getByRole('link', { name: 'Network' }));
-    fireEvent.change(screen.getByLabelText('Search settings'), { target: { value: 'glm' } });
-
-    expect(names()).toEqual(['Providers1 missing']);
-    expect(within(index).getByRole('link', { name: /Providers/ })).toHaveAttribute(
-      'aria-current',
-      'location',
-    );
-  });
-
-  it('flags a category with unsaved changes in the index, until they are discarded', async () => {
-    await renderTab();
-    const index = screen.getByRole('navigation', { name: 'Configuration categories' });
-    const link = within(index).getByRole('link', { name: /Email \(SMTP\)/ });
-    expect(link).not.toHaveTextContent('unsaved changes');
-
-    fireEvent.change(screen.getByLabelText('SMTP_PORT'), { target: { value: '2525' } });
-    expect(link).toHaveTextContent('unsaved changes');
-    // Those notes are screen-reader text inside a row that scrolls sideways
-    // on a phone: they must not widen the page.
-    expect(escapingScreenReaderText(index)).toEqual([]);
-
-    fireEvent.click(screen.getByRole('button', { name: 'Discard changes to Email (SMTP)' }));
-    expect(link).not.toHaveTextContent('unsaved changes');
-    expect(patchConfig).not.toHaveBeenCalled();
-  });
-
-  it('counts a staged reset in the index like the edit bar does', async () => {
+  it('counts a staged reset like an edit', async () => {
     await renderTab();
     fireEvent.click(screen.getByRole('button', { name: 'Reset SMTP_PORT' }));
-    const index = screen.getByRole('navigation', { name: 'Configuration categories' });
-    expect(within(index).getByRole('link', { name: /Email \(SMTP\)/ })).toHaveTextContent(
-      'unsaved changes',
-    );
     expect(within(section('Email (SMTP)')).getByText('1 unsaved change')).toBeVisible();
     expect(resetConfigKey).not.toHaveBeenCalled();
   });
@@ -2005,9 +1960,7 @@ describe('restart', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Restart backend' }));
 
     await waitFor(() => expect(restartBackend).toHaveBeenCalledTimes(1));
-    await waitFor(() =>
-      expect(navigateToMock).toHaveBeenCalledWith('/dashboard/admin/configuration'),
-    );
+    await waitFor(() => expect(navigateToMock).toHaveBeenCalledWith('/dashboard/admin/settings'));
     expect(waitForBackendRestart).toHaveBeenCalled();
   });
 
@@ -2038,9 +1991,7 @@ describe('restart', () => {
     );
     fireEvent.click(await screen.findByRole('button', { name: 'Keep waiting' }));
 
-    await waitFor(() =>
-      expect(navigateToMock).toHaveBeenCalledWith('/dashboard/admin/configuration'),
-    );
+    await waitFor(() => expect(navigateToMock).toHaveBeenCalledWith('/dashboard/admin/settings'));
     const [first, second] = vi.mocked(waitForBackendRestart).mock.calls;
     expect(second[0]?.progress).toBe(first[0]?.progress);
     // The process asked to restart, which only a different one ends.
@@ -2075,7 +2026,7 @@ describe('restart', () => {
 describe('loading', () => {
   it('explains a backend without the configuration API', async () => {
     vi.mocked(getConfig).mockRejectedValueOnce(new APIError('HTTP_404', 'Not Found', 404));
-    render(<ConfigurationTab />);
+    render(<Editor />);
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'does not support database-backed configuration',
@@ -2084,7 +2035,7 @@ describe('loading', () => {
 });
 
 describe('backup and restore', () => {
-  it('warns about plaintext secrets before downloading a configuration backup', async () => {
+  it('downloads a backup on the click, warning before and after that it holds secrets in plain text', async () => {
     vi.mocked(exportConfigBackup).mockResolvedValueOnce({
       schema_version: 1,
       exported_at: '2026-10-25T15:00:00Z',
@@ -2092,16 +2043,34 @@ describe('backup and restore', () => {
     });
     await renderTab();
 
+    const backup = screen.getByRole('button', { name: 'Backup' });
+    expect(backup.title).toContain('secrets in plain text');
+    fireEvent.click(backup);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith(
+        'Downloaded configuration backup. It holds API keys and secrets in plain text: store it securely.',
+      ),
+    );
+    expect(exportConfigBackup).toHaveBeenCalledTimes(1);
+  });
+
+  it('says why a backup could not be downloaded, and allows another try', async () => {
+    vi.mocked(exportConfigBackup).mockRejectedValueOnce(
+      new APIError('HTTP_500', 'The database is unavailable.', 500),
+    );
+    await renderTab();
+
     fireEvent.click(screen.getByRole('button', { name: 'Backup' }));
-    const dialog = screen.getByRole('dialog', { name: 'Download configuration backup?' });
-    expect(dialog).toHaveTextContent('includes API keys and secrets in plain text');
-    expect(exportConfigBackup).not.toHaveBeenCalled();
-
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Download backup' }));
-
-    await waitFor(() => expect(exportConfigBackup).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
-    expect(toast.success).toHaveBeenCalledWith('Downloaded configuration backup.');
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        'The backup could not be downloaded: The database is unavailable.',
+      ),
+    );
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Backup' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Restore' })).toBeEnabled();
   });
 
   it('validates a selected backup JSON, confirms summary, and restores state', async () => {
@@ -2178,5 +2147,679 @@ describe('backup and restore', () => {
       ),
     );
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('keeps the drafts and reloads when the configuration changed elsewhere', async () => {
+    await renderTab(makeConfig({ source_version: { epoch: 'e1', revision: 7 } }));
+    const email = section('Email (SMTP)');
+    fireEvent.change(within(email).getByLabelText('SMTP_PORT'), { target: { value: '2525' } });
+    vi.mocked(patchConfig).mockRejectedValueOnce(
+      new APIError(
+        'CONFIG_VERSION_CONFLICT',
+        'The configuration changed since it was loaded.',
+        409,
+      ),
+    );
+    vi.mocked(getConfig).mockClear();
+    // The reload shows what was saved elsewhere: no restart is pending any more.
+    vi.mocked(getConfig).mockResolvedValueOnce(
+      makeConfig({ source_version: { epoch: 'e1', revision: 9 }, pending_restart: [] }),
+    );
+    save('Email (SMTP)');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(patchConfig).toHaveBeenCalledWith(
+      { values: { SMTP_PORT: 2525 } },
+      { expectedVersion: { epoch: 'e1', revision: 7 } },
+    );
+    expect(
+      await screen.findByText(/changed elsewhere since this page loaded, so this was not saved/),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(getConfig).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.queryByRole('region', { name: 'Restart pending' })).not.toBeInTheDocument(),
+    );
+    // The change the administrator typed is still there to review and save again.
+    expect(within(email).getByLabelText('SMTP_PORT')).toHaveValue(2525);
+
+    // Saved again, on the version the reload showed: one click writes it.
+    vi.mocked(patchConfig).mockResolvedValueOnce(
+      makeConfig({
+        source_version: { epoch: 'e1', revision: 10 },
+        saved_version: { epoch: 'e1', revision: 10 },
+      }),
+    );
+    save('Email (SMTP)');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await waitFor(() => expect(patchConfig).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(patchConfig).mock.calls[1]).toEqual([
+      { values: { SMTP_PORT: 2525 } },
+      { expectedVersion: { epoch: 'e1', revision: 9 } },
+    ]);
+    await waitFor(() =>
+      expect(within(email).queryByText(/changed elsewhere/)).not.toBeInTheDocument(),
+    );
+  });
+
+  it('shows how each process applied a live group beside its settings', async () => {
+    vi.mocked(getLiveConfigStatus).mockResolvedValue({
+      database: true,
+      source: 'app_config',
+      version: { epoch: 'e1', revision: 7 },
+      this_instance: 'p1',
+      stale_after_seconds: 60,
+      read_ok: true,
+      unknown_groups: [],
+      groups: [
+        {
+          name: 'alerts.runtime',
+          keys: ['SLACK_ALERTS_WEBHOOK_URL'],
+          schema_version: 1,
+          contract: { active: true, schema_version: 1 },
+          coverage: {
+            registered: 1,
+            live: 1,
+            converged: 1,
+            applying: 0,
+            failed: 0,
+            unsupported: 0,
+            dormant: 0,
+            unknown: 0,
+            stopped: 0,
+            verified: false,
+          },
+          instances: [
+            {
+              instance_id: 'p1',
+              this_process: true,
+              build: 'b',
+              host: 'h',
+              lifecycle: 'running',
+              started_at: null,
+              heartbeat_age_seconds: 2,
+              stale: false,
+              supports: true,
+              status: { state: 'applied', epoch: 'e1', reconciled_revision: 7 },
+            },
+          ],
+          local: null,
+        },
+      ],
+    });
+    const config = alertConfig();
+    config.entries = config.entries.map((item) =>
+      item.category === 'alerts' && item.key !== 'ALERTS_ENABLED'
+        ? { ...item, group: 'alerts.runtime', apply_mode: 'managed' as const }
+        : item,
+    );
+    config.source_version = { epoch: 'e1', revision: 7 };
+    await renderTab(config);
+    const alerts = section('Alerts');
+    expect(
+      await within(alerts).findByText('1 of 1 registered process has applied revision 7', {
+        exact: false,
+      }),
+    ).toBeInTheDocument();
+    expect(document.body.innerHTML).not.toContain(LEAKED_SECRET);
+  });
+});
+
+describe('configuration versions', () => {
+  const v = (revision: number) => ({ epoch: 'e1', revision });
+
+  /** Email and General, both editable, read at revision 41. */
+  function versionedConfig(overrides: Partial<ConfigResponse> = {}): ConfigResponse {
+    return makeConfig({
+      categories: [
+        { id: 'email', label: 'Email (SMTP)', description: 'Outgoing mail.' },
+        { id: 'general', label: 'General', description: 'Site.' },
+      ],
+      entries: [
+        entry({ key: 'SMTP_HOST', category: 'email', value: 'smtp.example.test' }),
+        entry({ key: 'SMTP_PORT', category: 'email', type: 'int', value: 25, default: 587 }),
+        entry({ key: 'SMTP_FROM_NAME', category: 'email', value: 'Ops' }),
+        entry({ key: 'SITE_NAME', category: 'general', value: 'Gateway' }),
+      ],
+      missing: [],
+      pending_restart: [],
+      source_version: v(41),
+      ...overrides,
+    });
+  }
+
+  /** The same, with SMTP_HOST as another administrator saved it: shown once a read lands. */
+  function savedElsewhere(host: string, overrides: Partial<ConfigResponse> = {}) {
+    return versionedConfig({
+      entries: versionedConfig().entries.map((item) =>
+        item.key === 'SMTP_HOST' ? { ...item, value: host } : item,
+      ),
+      ...overrides,
+    });
+  }
+
+  function conflict() {
+    return new APIError(
+      'CONFIG_VERSION_CONFLICT',
+      'The configuration changed since it was loaded.',
+      409,
+    );
+  }
+
+  it('chains each request of one save on the version the one before it committed', async () => {
+    await renderTab(versionedConfig());
+    fireEvent.change(screen.getByLabelText('SMTP_HOST'), { target: { value: 'smtp.new.test' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Reset SMTP_PORT' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Reset SMTP_FROM_NAME' }));
+    // Each response also reports a newer source_version: a save made elsewhere
+    // in between, which the next request must not silently build on.
+    vi.mocked(patchConfig).mockResolvedValueOnce(
+      versionedConfig({ saved_version: v(42), source_version: v(44) }),
+    );
+    vi.mocked(resetConfigKey)
+      .mockResolvedValueOnce(versionedConfig({ saved_version: v(45), source_version: v(47) }))
+      .mockResolvedValueOnce(versionedConfig({ saved_version: v(48), source_version: v(48) }));
+    save('Email (SMTP)');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    await waitFor(() => expect(resetConfigKey).toHaveBeenCalledTimes(2));
+    expect(patchConfig).toHaveBeenCalledWith(
+      { values: { SMTP_HOST: 'smtp.new.test' } },
+      { expectedVersion: v(41) },
+    );
+    expect(vi.mocked(resetConfigKey).mock.calls).toEqual([
+      ['SMTP_PORT', { expectedVersion: v(42) }],
+      ['SMTP_FROM_NAME', { expectedVersion: v(45) }],
+    ]);
+  });
+
+  it('carries a draft across this page’s own save in another category, and no further', async () => {
+    await renderTab(versionedConfig());
+    fireEvent.change(screen.getByLabelText('SMTP_PORT'), { target: { value: '2525' } });
+    fireEvent.change(screen.getByLabelText('SITE_NAME'), { target: { value: 'Renamed' } });
+    // General's save, conditional on 41, committed 42; by the time it answered
+    // someone else had saved 43.
+    vi.mocked(patchConfig).mockResolvedValueOnce(
+      versionedConfig({ saved_version: v(42), source_version: v(43) }),
+    );
+    save('General');
+    await waitFor(() => expect(patchConfig).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(saveButton('General')).not.toBeInTheDocument());
+    expect(screen.getByLabelText('SMTP_PORT')).toHaveValue(2525);
+
+    save('Email (SMTP)');
+    await waitFor(() => expect(patchConfig).toHaveBeenCalledTimes(2));
+    // 41 → 42 was this page's own write; 43 is not, so it is a conflict to review.
+    expect(vi.mocked(patchConfig).mock.calls[1]).toEqual([
+      { values: { SMTP_PORT: 2525 } },
+      { expectedVersion: v(42) },
+    ]);
+  });
+
+  it('never moves an older draft onto a version a later read brought in', async () => {
+    await renderTab(versionedConfig());
+    fireEvent.change(screen.getByLabelText('SMTP_PORT'), { target: { value: '2525' } });
+    fireEvent.change(screen.getByLabelText('SITE_NAME'), { target: { value: 'Renamed' } });
+    // General's save conflicts, and the page reads revision 50 to show it.
+    vi.mocked(patchConfig).mockRejectedValueOnce(conflict());
+    vi.mocked(getConfig).mockClear();
+    vi.mocked(getConfig).mockResolvedValueOnce(
+      savedElsewhere('smtp.elsewhere.test', { source_version: v(50) }),
+    );
+    save('General');
+    await screen.findByText(/changed elsewhere since this page loaded/);
+    await waitFor(() => expect(getConfig).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.getByLabelText('SMTP_HOST')).toHaveValue('smtp.elsewhere.test'),
+    );
+    expect(screen.getByLabelText('SITE_NAME')).toHaveValue('Renamed');
+
+    // Email's draft was made on 41 and nobody showed its owner 50.
+    vi.mocked(patchConfig).mockResolvedValueOnce(
+      versionedConfig({ saved_version: v(51), source_version: v(51) }),
+    );
+    save('Email (SMTP)');
+    await waitFor(() => expect(patchConfig).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(patchConfig).mock.calls[1][1]).toEqual({ expectedVersion: v(41) });
+    await waitFor(() => expect(saveButton('Email (SMTP)')).not.toBeInTheDocument());
+
+    // General's owner was shown 50 with the conflict, and saves on it.
+    save('General');
+    await waitFor(() => expect(patchConfig).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(patchConfig).mock.calls[2]).toEqual([
+      { values: { SITE_NAME: 'Renamed' } },
+      { expectedVersion: v(50) },
+    ]);
+  });
+
+  it('pins a save’s version at the click, whatever a read lands while it is in flight', async () => {
+    await renderTab(versionedConfig());
+    fireEvent.change(screen.getByLabelText('SMTP_PORT'), { target: { value: '2525' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Reset SMTP_FROM_NAME' }));
+    fireEvent.change(screen.getByLabelText('SITE_NAME'), { target: { value: 'Renamed' } });
+    // General's conflict starts a reload that is slow to answer...
+    let finishRead: (config: ConfigResponse) => void = () => undefined;
+    vi.mocked(getConfig).mockClear();
+    vi.mocked(getConfig).mockImplementationOnce(
+      () => new Promise<ConfigResponse>((resolve) => (finishRead = resolve)),
+    );
+    vi.mocked(patchConfig).mockRejectedValueOnce(conflict());
+    save('General');
+    await screen.findByText(/changed elsewhere since this page loaded/);
+    await waitFor(() => expect(getConfig).toHaveBeenCalledTimes(1));
+
+    // ...and Email is saved before it does: the click writes at once, on the
+    // version Email's changes were made on.
+    let finishPatch: (config: ConfigResponse) => void = () => undefined;
+    vi.mocked(patchConfig).mockImplementationOnce(
+      () => new Promise<ConfigResponse>((resolve) => (finishPatch = resolve)),
+    );
+    await waitFor(() => expect(saveButton('Email (SMTP)')).toBeEnabled());
+    save('Email (SMTP)');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(vi.mocked(patchConfig).mock.calls[1]).toEqual([
+      { values: { SMTP_PORT: 2525 } },
+      { expectedVersion: v(41) },
+    ]);
+    // While it is in flight every Save bar is held, so a second click sends nothing.
+    expect(saveButton('Email (SMTP)')).toBeDisabled();
+    expect(saveButton('General')).toBeDisabled();
+
+    // The slow read lands mid-save, with revision 44: saves made elsewhere.
+    finishRead(savedElsewhere('smtp.read.test', { source_version: v(44) }));
+    await waitFor(() => expect(screen.getByLabelText('SMTP_HOST')).toHaveValue('smtp.read.test'));
+
+    // The PATCH committed 42, and its answer already reports 44. The reset that
+    // follows is conditional on 42, the save's own write, never on 44; it is refused.
+    vi.mocked(resetConfigKey).mockRejectedValueOnce(conflict());
+    vi.mocked(getConfig).mockResolvedValueOnce(
+      savedElsewhere('smtp.elsewhere.test', { source_version: v(44) }),
+    );
+    finishPatch(versionedConfig({ saved_version: v(42), source_version: v(44) }));
+    await waitFor(() => expect(resetConfigKey).toHaveBeenCalledTimes(1));
+    expect(resetConfigKey).toHaveBeenCalledWith('SMTP_FROM_NAME', { expectedVersion: v(42) });
+    expect(
+      await screen.findByText(
+        /changed elsewhere since this page loaded.*1 change was saved before that/,
+      ),
+    ).toBeInTheDocument();
+    // The port was written; the reset was not, and stays staged with the latest values shown.
+    await waitFor(() =>
+      expect(screen.getByLabelText('SMTP_HOST')).toHaveValue('smtp.elsewhere.test'),
+    );
+    expect(
+      screen.getByRole('button', { name: 'Undo reset of SMTP_FROM_NAME' }),
+    ).toBeInTheDocument();
+
+    // Saved again: the reset alone, on the version the conflict showed.
+    vi.mocked(resetConfigKey).mockResolvedValueOnce(
+      versionedConfig({ saved_version: v(45), source_version: v(45) }),
+    );
+    save('Email (SMTP)');
+    await waitFor(() => expect(resetConfigKey).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(resetConfigKey).mock.calls[1]).toEqual([
+      'SMTP_FROM_NAME',
+      { expectedVersion: v(44) },
+    ]);
+    expect(patchConfig).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(saveButton('Email (SMTP)')).not.toBeInTheDocument());
+  });
+
+  it('keeps two loaded editing views on their own versions', async () => {
+    vi.mocked(getConfig)
+      .mockResolvedValueOnce(versionedConfig({ source_version: v(41) }))
+      .mockResolvedValueOnce(versionedConfig({ source_version: v(42) }));
+    const first = render(<Editor />);
+    const firstView = within(first.container);
+    await firstView.findByRole('region', { name: 'Email (SMTP)' });
+    const second = render(<Editor />);
+    const secondView = within(second.container);
+    await secondView.findByRole('region', { name: 'Email (SMTP)' });
+
+    fireEvent.change(firstView.getByLabelText('SMTP_PORT'), { target: { value: '2525' } });
+    fireEvent.change(secondView.getByLabelText('SMTP_PORT'), { target: { value: '2626' } });
+    fireEvent.click(secondView.getByRole('button', { name: 'Save changes to Email (SMTP)' }));
+    await waitFor(() => expect(patchConfig).toHaveBeenCalledTimes(1));
+    fireEvent.click(firstView.getByRole('button', { name: 'Save changes to Email (SMTP)' }));
+    await waitFor(() => expect(patchConfig).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(patchConfig).mock.calls.map((call) => call[1])).toEqual([
+      { expectedVersion: v(42) },
+      { expectedVersion: v(41) },
+    ]);
+  });
+});
+
+describe('when a saved change applies', () => {
+  /** The alert category with the detector threshold, its group in the given mode. */
+  function groupConfig(applyMode: 'managed' | 'restart', pending: boolean = false): ConfigResponse {
+    const config = alertConfig();
+    config.entries = [
+      ...config.entries,
+      entry({
+        key: 'FAILED_REQUEST_ALERT_THRESHOLD',
+        category: 'alerts',
+        type: 'int',
+        value: 200,
+        default: 200,
+        restart_required: true,
+      }),
+    ].map((item) =>
+      item.category === 'alerts' && item.key !== 'ALERTS_ENABLED'
+        ? {
+            ...item,
+            group: 'alerts.runtime',
+            apply_mode: applyMode,
+            pending_restart: pending && item.key === 'FAILED_REQUEST_ALERT_THRESHOLD',
+          }
+        : item,
+    );
+    config.pending_restart = pending ? ['FAILED_REQUEST_ALERT_THRESHOLD'] : [];
+    return config;
+  }
+
+  beforeEach(() => {
+    vi.mocked(getLiveConfigStatus).mockResolvedValue({
+      database: true,
+      source: 'app_config',
+      version: null,
+      this_instance: null,
+      stale_after_seconds: 60,
+      read_ok: true,
+      unknown_groups: [],
+      groups: [],
+    });
+  });
+
+  it('labels an active group live: no restart badge, note or confirmation', async () => {
+    await renderTab(groupConfig('managed'));
+    const alerts = within(section('Alerts'));
+    expect(alerts.getByText('Applies live')).toBeInTheDocument();
+    expect(alerts.queryByText('Restart required')).toBeNull();
+    expect(alerts.queryByText('Pending restart')).toBeNull();
+    expect(alerts.getByText(/without a restart/)).toBeInTheDocument();
+    expect(alerts.queryByText('Changes apply after saving and restarting the backend.')).toBeNull();
+
+    fireEvent.change(alerts.getByLabelText('FAILED_REQUEST_ALERT_THRESHOLD'), {
+      target: { value: '50' },
+    });
+    vi.mocked(patchConfig).mockResolvedValueOnce(groupConfig('managed'));
+    save('Alerts');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(patchConfig).toHaveBeenCalledWith({ values: { FAILED_REQUEST_ALERT_THRESHOLD: 50 } });
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Saved Alerts.'));
+    expect(screen.queryByRole('region', { name: 'Restart pending' })).not.toBeInTheDocument();
+  });
+
+  it('labels a dormant group restart-required, and its saved-but-unapplied value pending', async () => {
+    await renderTab(groupConfig('restart'));
+    let alerts = within(section('Alerts'));
+    expect(alerts.getAllByText('Restart required').length).toBeGreaterThan(0);
+    expect(alerts.queryByText('Applies live')).toBeNull();
+    expect(
+      alerts.getByText('Changes apply after saving and restarting the backend.'),
+    ).toBeVisible();
+    fireEvent.change(alerts.getByLabelText('FAILED_REQUEST_ALERT_THRESHOLD'), {
+      target: { value: '50' },
+    });
+    // Saved on the click; the answer says the value waits for a restart.
+    vi.mocked(patchConfig).mockResolvedValueOnce(groupConfig('restart', true));
+    save('Alerts');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(await screen.findByRole('region', { name: 'Restart pending' })).toHaveTextContent(
+      'FAILED_REQUEST_ALERT_THRESHOLD',
+    );
+    cleanup();
+
+    // Deactivated after it applied (dormant-frozen): a later save waits for the restart.
+    await renderTab(groupConfig('restart', true));
+    alerts = within(section('Alerts'));
+    expect(alerts.getAllByText('Pending restart').length).toBeGreaterThan(0);
+    expect(alerts.queryByText('Applies live')).toBeNull();
+  });
+
+  it('says beside Send test that it tests the saved webhook, not the channel in use', async () => {
+    await renderTab(groupConfig('managed'));
+    const button = screen.getByRole('button', { name: 'Send test notification' });
+    expect(button).toHaveAccessibleDescription(
+      /saved Slack webhook.*tests the saved setting, not necessarily the channel alerts go to now.*until it applies the save\.$/,
+    );
+    // The test goes on the click, with nothing to confirm, to the saved webhook.
+    fireEvent.click(button);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await waitFor(() => expect(testAlertNotification).toHaveBeenCalledWith({ channel: 'slack' }));
+    await screen.findByText('Test sent. Check your Slack channel for test-123.');
+    expect(patchConfig).not.toHaveBeenCalled();
+    expect(document.body.innerHTML).not.toContain(LEAKED_SECRET);
+  });
+
+  it('says a restart applies the saved webhook while the group is dormant', async () => {
+    await renderTab(groupConfig('restart'));
+    expect(
+      screen.getByRole('button', { name: 'Send test notification' }),
+    ).toHaveAccessibleDescription(/until it applies the save, after a restart\.$/);
+  });
+
+  it('says a typed address is what is tested, without showing it', async () => {
+    await renderTab(groupConfig('managed'));
+    fireEvent.click(screen.getByRole('button', { name: 'Replace Slack webhook URL' }));
+    fireEvent.change(screen.getByLabelText('Slack webhook URL'), {
+      target: { value: SLACK_WEBHOOK },
+    });
+    const button = screen.getByRole('button', { name: 'Send test notification' });
+    expect(button).toHaveAccessibleDescription(
+      'Sends a test to the address you typed, without saving it.',
+    );
+    // Only the field holds the address; no text on the page repeats it.
+    expect(within(section('Alerts')).queryByText(SLACK_WEBHOOK, { exact: false })).toBeNull();
+    fireEvent.click(button);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(testAlertNotification).toHaveBeenCalledWith({
+        channel: 'slack',
+        webhook_url: SLACK_WEBHOOK,
+      }),
+    );
+    expect(patchConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe('adding a variable after a save elsewhere', () => {
+  const v = (revision: number) => ({ epoch: 'e1', revision });
+
+  function addConfig(overrides: Partial<ConfigResponse> = {}): ConfigResponse {
+    return makeConfig({ missing: [], pending_restart: [], source_version: v(1), ...overrides });
+  }
+
+  function conflict() {
+    // The type the API client throws for a 409 on `If-Match`.
+    return new APIError(
+      'CONFIG_VERSION_CONFLICT',
+      'The configuration changed since it was loaded.',
+      409,
+    );
+  }
+
+  function openForm(name: string, value: string): HTMLElement {
+    fireEvent.click(screen.getByRole('button', { name: 'Add variable' }));
+    const form = screen.getByRole('form', { name: 'Add variable' });
+    fireEvent.change(within(form).getByLabelText('Name'), { target: { value: name } });
+    fireEvent.change(within(form).getByLabelText('Value'), { target: { value } });
+    return form;
+  }
+
+  it.each([
+    ['a plain', 'MY_REGION', 'eu-west', false],
+    ['a secret', 'MY_PROVIDER_API_KEY', 'k-typed-secret', true],
+  ])(
+    'keeps %s draft through a conflict and adds it on the newer version only when asked',
+    async (_label, name, value, secret) => {
+      await renderTab(addConfig());
+      const form = openForm(name, value);
+      vi.mocked(patchConfig).mockRejectedValueOnce(conflict());
+      vi.mocked(getConfig).mockClear();
+      vi.mocked(getConfig).mockResolvedValueOnce(addConfig({ source_version: v(2) }));
+
+      fireEvent.click(within(form).getByRole('button', { name: 'Add variable' }));
+
+      expect(await within(form).findByRole('alert')).toHaveTextContent(
+        /changed elsewhere since this form opened, so the variable was not added\. The latest configuration is shown now/,
+      );
+      expect(getConfig).toHaveBeenCalledTimes(1);
+      expect(patchConfig).toHaveBeenCalledTimes(1);
+      expect(patchConfig).toHaveBeenCalledWith(
+        { values: { [name]: value }, secrets: { [name]: secret } },
+        { expectedVersion: v(1) },
+      );
+      // Kept: the name, the value and the secrecy, and nothing retried for them.
+      expect(within(form).getByLabelText('Name')).toHaveValue(name);
+      expect(within(form).getByLabelText('Value')).toHaveValue(value);
+      expect(within(form).getByRole('checkbox')).toHaveProperty('checked', secret);
+      if (secret) {
+        expect(within(form).getByLabelText('Value')).toHaveAttribute('type', 'password');
+        expect(document.body.textContent).not.toContain(value);
+      }
+
+      vi.mocked(patchConfig).mockResolvedValueOnce(
+        addConfig({ source_version: v(3), saved_version: v(3) }),
+      );
+      fireEvent.click(within(form).getByRole('button', { name: 'Add again' }));
+      await waitFor(() => expect(screen.queryByRole('form', { name: 'Add variable' })).toBeNull());
+      expect(vi.mocked(patchConfig).mock.calls[1]).toEqual([
+        { values: { [name]: value }, secrets: { [name]: secret } },
+        { expectedVersion: v(2) },
+      ]);
+      expect(toast.success).toHaveBeenCalledWith(`Added ${name}.`);
+    },
+  );
+
+  it('blocks an add once the reload shows the same name added elsewhere', async () => {
+    await renderTab(addConfig());
+    const form = openForm('MY_REGION', 'eu-west');
+    vi.mocked(patchConfig).mockRejectedValueOnce(conflict());
+    const base = addConfig();
+    vi.mocked(getConfig).mockResolvedValueOnce(
+      addConfig({
+        source_version: v(2),
+        entries: [
+          ...base.entries,
+          entry({ key: 'MY_REGION', category: 'network', custom: true, value: 'us-east' }),
+        ],
+      }),
+    );
+
+    fireEvent.click(within(form).getByRole('button', { name: 'Add variable' }));
+
+    expect(await within(form).findByRole('alert')).toHaveTextContent(
+      'MY_REGION was added elsewhere in the meantime, so it was not added here. Edit it in its category (Network).',
+    );
+    // The page shows it where it is edited.
+    expect(await within(section('Network')).findByLabelText('MY_REGION')).toHaveValue('us-east');
+    fireEvent.click(within(form).getByRole('button', { name: 'Add again' }));
+    expect(await within(form).findByRole('alert')).toHaveTextContent(
+      'MY_REGION is already listed. Edit it in its category.',
+    );
+    expect(patchConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the version when the reload fails, so adding again conflicts again', async () => {
+    await renderTab(addConfig());
+    const form = openForm('MY_REGION', 'eu-west');
+    vi.mocked(patchConfig).mockRejectedValueOnce(conflict());
+    vi.mocked(getConfig).mockRejectedValueOnce(new Error('network down'));
+
+    fireEvent.click(within(form).getByRole('button', { name: 'Add variable' }));
+
+    expect(await within(form).findByRole('alert')).toHaveTextContent(
+      /the latest configuration could not be loaded\. Your entry is kept; try adding it again\./,
+    );
+    expect(within(form).getByLabelText('Value')).toHaveValue('eu-west');
+
+    vi.mocked(patchConfig).mockRejectedValueOnce(conflict());
+    vi.mocked(getConfig).mockResolvedValueOnce(addConfig({ source_version: v(2) }));
+    fireEvent.click(within(form).getByRole('button', { name: 'Add again' }));
+    expect(await within(form).findByRole('alert')).toHaveTextContent(
+      /The latest configuration is shown now/,
+    );
+    expect(vi.mocked(patchConfig).mock.calls.map((call) => call[1])).toEqual([
+      { expectedVersion: v(1) },
+      { expectedVersion: v(1) },
+    ]);
+  });
+
+  it('waits for the reload before it can be added again', async () => {
+    await renderTab(addConfig());
+    const form = openForm('MY_REGION', 'eu-west');
+    vi.mocked(patchConfig).mockRejectedValueOnce(conflict());
+    let land: (config: ConfigResponse) => void = () => undefined;
+    vi.mocked(getConfig).mockReturnValueOnce(
+      new Promise((resolve) => {
+        land = resolve;
+      }),
+    );
+
+    fireEvent.click(within(form).getByRole('button', { name: 'Add variable' }));
+    const pending = await within(form).findByRole('button', { name: 'Loading latest…' });
+    expect(pending).toBeDisabled();
+    fireEvent.submit(form);
+    expect(patchConfig).toHaveBeenCalledTimes(1);
+
+    land(addConfig({ source_version: v(2) }));
+    await within(form).findByRole('button', { name: 'Add again' });
+    expect(patchConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it("moves along with this page's own save of a category while it is open", async () => {
+    await renderTab(addConfig());
+    const form = openForm('MY_REGION', 'eu-west');
+    const email = section('Email (SMTP)');
+    fireEvent.change(within(email).getByLabelText('SMTP_PORT'), { target: { value: '2525' } });
+    vi.mocked(patchConfig).mockResolvedValueOnce(
+      addConfig({ source_version: v(2), saved_version: v(2) }),
+    );
+    save('Email (SMTP)');
+    await waitFor(() => expect(patchConfig).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(patchConfig).mock.calls[0][1]).toEqual({ expectedVersion: v(1) });
+    await waitFor(() => expect(saveButton('Email (SMTP)')).toBeNull());
+
+    vi.mocked(patchConfig).mockResolvedValueOnce(
+      addConfig({ source_version: v(3), saved_version: v(3) }),
+    );
+    fireEvent.click(within(form).getByRole('button', { name: 'Add variable' }));
+    await waitFor(() => expect(screen.queryByRole('form', { name: 'Add variable' })).toBeNull());
+    // Conditional on what the page's own save committed, not on what it opened on.
+    expect(vi.mocked(patchConfig).mock.calls[1][1]).toEqual({ expectedVersion: v(2) });
+  });
+
+  it('does not move along with a save that only reports a newer version', async () => {
+    await renderTab(addConfig());
+    const form = openForm('MY_REGION', 'eu-west');
+    const email = section('Email (SMTP)');
+    fireEvent.change(within(email).getByLabelText('SMTP_PORT'), { target: { value: '2525' } });
+    // Saved as revision 2; revision 3 is someone else's.
+    vi.mocked(patchConfig).mockResolvedValueOnce(
+      addConfig({ source_version: v(3), saved_version: v(2) }),
+    );
+    save('Email (SMTP)');
+    await waitFor(() => expect(saveButton('Email (SMTP)')).toBeNull());
+
+    fireEvent.click(within(form).getByRole('button', { name: 'Add variable' }));
+    await waitFor(() => expect(patchConfig).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(patchConfig).mock.calls[1][1]).toEqual({ expectedVersion: v(2) });
+  });
+
+  it('opens on the version shown when it opens, after closing on another', async () => {
+    await renderTab(addConfig());
+    fireEvent.click(screen.getByRole('button', { name: 'Add variable' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    const email = section('Email (SMTP)');
+    fireEvent.change(within(email).getByLabelText('SMTP_PORT'), { target: { value: '2525' } });
+    vi.mocked(patchConfig).mockResolvedValueOnce(
+      addConfig({ source_version: v(5), saved_version: v(2) }),
+    );
+    save('Email (SMTP)');
+    await waitFor(() => expect(saveButton('Email (SMTP)')).toBeNull());
+
+    const form = openForm('MY_REGION', 'eu-west');
+    fireEvent.click(within(form).getByRole('button', { name: 'Add variable' }));
+    await waitFor(() => expect(patchConfig).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(patchConfig).mock.calls[1][1]).toEqual({ expectedVersion: v(5) });
   });
 });
