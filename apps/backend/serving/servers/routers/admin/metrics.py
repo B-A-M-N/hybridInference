@@ -8,7 +8,7 @@ import inspect
 import json
 import time
 from datetime import UTC, datetime
-from typing import Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -39,6 +39,7 @@ from serving.schemas_admin import (
 )
 from serving.servers.auth import log_admin_action
 from serving.servers.deps import (
+    get_admin_audit_actor,
     get_db_logger,
     get_log_store,
     get_operational_store,
@@ -56,7 +57,9 @@ from serving.servers.routers.admin._refreshing_cache import RefreshingResult
 from serving.storage import account_schema, admin_view_results, perf_metrics_index
 from serving.storage.utils import coerce_json_object
 from serving.utils.logging import get_logger
-from serving.utils.request_ip import get_client_ip
+
+if TYPE_CHECKING:
+    from serving.audit import AuditActor
 
 router = APIRouter(prefix="/admin")
 logger = get_logger(__name__)
@@ -660,12 +663,15 @@ async def _load_ttft_scatter(db_logger) -> AdminTtftScatterResponse:
     """Return TTFT vs input length scatter data per (model, provider).
 
     For each (model_id, provider) pair, returns up to the last 1000 successful
-    streaming requests *per cache-hit class* (so up to 1000 cached and 1000
-    uncached) with a recorded TTFT and a non-empty prompt. Partitioning by
-    cache class keeps the rarer uncached series well-populated instead of
-    being crowded out by cache hits. The query is bounded to the last 90 days
-    so the `ROW_NUMBER()` scan stays bounded as `api_logs` grows. `cache_hit`
-    is true iff `cache_read_tokens > 0`.
+    streaming requests *per cache class* (cached, measured miss, and unknown)
+    with a recorded TTFT and a non-empty prompt. Unknown rows remain visible:
+    a provider that never reports cache usage is still part of TTFT behavior,
+    and hiding it made its chart disappear. Partitioning by class keeps the
+    rarer uncached/unknown series well-populated instead of being crowded out
+    by cache hits. The query is bounded to the last 90 days so the
+    `ROW_NUMBER()` scan stays bounded as `api_logs` grows. `cache_hit` is
+    true iff `cache_read_tokens > 0`, false iff it is a measured zero, and
+    null when the provider did not report cache usage.
     """
     async with db_logger.pool.acquire() as conn:
         rows = await conn.fetch(
@@ -680,7 +686,12 @@ async def _load_ttft_scatter(db_logger) -> AdminTtftScatterResponse:
                     timestamp,
                     ROW_NUMBER() OVER (
                         PARTITION BY
-                            model_id, provider, (COALESCE(cache_read_tokens, 0) > 0)
+                            model_id, provider,
+                            CASE
+                                WHEN cache_read_tokens IS NULL THEN 'unknown'
+                                WHEN cache_read_tokens > 0 THEN 'hit'
+                                ELSE 'miss'
+                            END
                         ORDER BY timestamp DESC
                     ) AS rn
                 FROM api_logs
@@ -706,7 +717,7 @@ async def _load_ttft_scatter(db_logger) -> AdminTtftScatterResponse:
         point = AdminTtftScatterPoint(
             prompt_tokens=int(row["prompt_tokens"]),
             ttft_ms=int(row["ttft_ms"]),
-            cache_hit=cache_read is not None and cache_read > 0,
+            cache_hit=None if cache_read is None else cache_read > 0,
             timestamp=row["timestamp"],
         )
         by_pair.setdefault(key, []).append(point)
@@ -1835,9 +1846,8 @@ async def admin_get_recent_request_content(
 
 @router.post("/recent-requests/clear-errors", response_model=AdminClearErrorRequestsResponse)
 async def admin_clear_error_requests(
-    request: Request,
     hours: int = 1,
-    _admin_id: str = Depends(verify_admin_access),
+    actor: AuditActor = Depends(get_admin_audit_actor),
     log_store=Depends(get_log_store),
     op_store=Depends(get_operational_store),
 ) -> AdminClearErrorRequestsResponse:
@@ -1868,10 +1878,9 @@ async def admin_clear_error_requests(
     if op_store is not None:
         await log_admin_action(
             op_store,
-            get_client_ip(request),
-            "clear_error_requests",
-            None,
-            {"hours": hours, "deleted_count": deleted_count},
+            action="clear_error_requests",
+            details={"hours": hours, "deleted_count": deleted_count},
+            actor=actor,
         )
 
     _RECENT_REQUESTS_COUNT_CACHE.clear()

@@ -26,7 +26,7 @@ from routing.model_router_registry import ModelRouterRegistry
 from routing.routers import FixedRouter
 from serving.auto_mode import AutoMode, load_auto_mode
 from serving.batch.model_limits import BatchModelLimits
-from serving.config import app_config
+from serving.config import app_config, live as live_config
 from serving.config.app_config_store import AppConfigStore, connect as connect_app_config
 from serving.config.disabled_providers import DisabledProviderResolver
 from serving.config.distribution import resolve_config_path
@@ -38,6 +38,8 @@ from serving.config.settings import get_settings
 from serving.config.weight_overrides import WeightOverrideResolver
 from serving.extensions import load_backend_extensions
 from serving.http import AsyncHTTPClient
+from serving.observability import alert_runtime
+from serving.observability.alert_history import runtime as alert_history_runtime
 from serving.servers.routewise_compat import (
     EnvelopeNotCalibratedError,
     RouteWiseRouter,
@@ -45,7 +47,9 @@ from serving.servers.routewise_compat import (
     apply_routewise_settings_to_router,
 )
 from serving.setup_state import init_setup_state
+from serving.storage.batch_file_store import BatchFileStore
 from serving.storage.batch_store import BatchStore
+from serving.storage.batch_webhook_store import BatchWebhookStore
 from serving.storage.cache import CachedOperationalStore, InMemoryCache
 from serving.storage.database import DatabaseLogger
 from serving.storage.log_schema import ErasureFenceUnavailable, SchemaLockUnavailable
@@ -166,7 +170,8 @@ async def _initialize_operational_store(pg_operational: PostgresOperationalStore
     names, phone numbers): the store reads which of them exist and queries
     only those, so sign-in by email and API keys keep working while first-run
     setup and phone sign-in answer 503 until the retry lands them. Only the
-    hard-delete claim columns are required up front.
+    hard-delete claim columns and the audit-log attribution columns are
+    required up front.
 
     Anything other than a lock timeout still propagates — startup must not
     mask a genuinely broken schema.
@@ -175,9 +180,9 @@ async def _initialize_operational_store(pg_operational: PostgresOperationalStore
         await pg_operational.initialize()
     except RequiredOperationalSchemaUnavailable:
         logger.error(
-            "Operational store cannot start until the required users columns "
-            "(hard-delete claim) are installed; refusing to serve against an "
-            "unsafe schema."
+            "Operational store cannot start until its required columns "
+            "(users hard-delete claim, admin_audit_log attribution) are "
+            "installed; refusing to serve against an unsafe schema."
         )
         raise
     except SchemaLockUnavailable as lock_exc:
@@ -252,6 +257,10 @@ def _defer_batch_store(services: AppServices, store: BatchStore) -> None:
     async def finish() -> None:
         await store.initialize()  # SchemaLockUnavailable: retried by the caller
         services.batch_model_limits = BatchModelLimits(store)
+        pool = getattr(store, "pool", None)
+        if pool is not None:
+            services.batch_file_store = BatchFileStore(pool)
+            services.batch_webhook_store = BatchWebhookStore(pool)
         services.batch_store = store
         services.batch_store_pending = None
         logger.info("Batch store initialized (Postgres) after a deferred migration")
@@ -772,6 +781,41 @@ async def _load_app_config() -> None:
     app_config.use_environment(database_enabled=True)
 
 
+#: The share of the shutdown the live configuration groups may take.
+_LIVE_CONFIG_STOP_SECONDS = 10.0
+
+
+def _start_live_config(pool: Any) -> None:
+    """Publish every live group's boot baseline, register this process, and apply.
+
+    The baseline is the configuration the process booted with, so a group
+    whose contract is not active behaves exactly as before. With a database,
+    this process registers in ``config_instances`` and the snapshot the boot
+    read is applied at once; later snapshots come from ``app_config``'s
+    refresh. A group that fails to apply never stops the gateway: alerting is
+    degradable, and its failure is reported as the group's state.
+    """
+    live_config.COORDINATOR.install_baselines()
+    if pool is None:
+        return
+    from serving.config import instances
+    from serving.servers import restart
+
+    reporter = instances.InstanceReporter(
+        pool=pool,
+        instance_id=restart.INSTANCE_ID,
+        started_at=dt.datetime.now(dt.UTC),
+        capabilities={
+            **live_config.COORDINATOR.capabilities(),
+            "details": instances.default_details(),
+        },
+    )
+    live_config.COORDINATOR.start(reporter)
+    snapshot = app_config.last_snapshot()
+    if snapshot is not None:
+        live_config.COORDINATOR.submit(snapshot)
+
+
 def _init_db_logger() -> DatabaseLogger | None:
     """Initialize PostgreSQL database logger from environment configuration.
 
@@ -988,6 +1032,30 @@ def _apply_routing_manager(router: FixedRouter) -> RoutingManager | None:
     return None
 
 
+def _alert_history_db_config() -> dict[str, Any] | None:
+    """The database alert history writes to: the gateway's own, or none."""
+    if not database_enabled():
+        return None
+    settings = get_settings()
+    return {
+        "host": settings.db_host,
+        "port": settings.db_port,
+        "database": settings.db_name,
+        "user": settings.db_user,
+        "password": settings.db_password,
+    }
+
+
+def _alert_history_fence_secret() -> str | None:
+    """The erasure-fence secret, or ``None``: history then keeps no subject digests."""
+    from serving.storage.log_schema import resolve_fence_secret
+
+    try:
+        return resolve_fence_secret(get_settings().erasure_fence_secret)
+    except ErasureFenceUnavailable:
+        return None
+
+
 async def initialize() -> AppServices:
     """Initialize application services.
 
@@ -1029,12 +1097,20 @@ async def initialize() -> AppServices:
             ) from exc
         raise
 
+    # Alert history goes in before anything that can raise an alert, so the
+    # first breach of this process is recorded. On whenever there is a database,
+    # unless ALERT_HISTORY_ENABLED turns it off; it never stops startup, and a
+    # database that is down only delays its writes.
+    alert_history_runtime.start_runtime(
+        db_config=_alert_history_db_config(),
+        fence_secret=_alert_history_fence_secret(),
+    )
+
     endpoint_health_registry = EndpointHealthRegistry()
-    router = FixedRouter(health_registry=endpoint_health_registry)
     router_dependencies = RouterBuildDependencies(
         health_registry=endpoint_health_registry,
-        prefill_load=router.prefill_load,
     )
+    router = FixedRouter(health_registry=endpoint_health_registry)
 
     settings = get_settings()
     db_logger = _init_db_logger()
@@ -1090,21 +1166,21 @@ async def initialize() -> AppServices:
                             user_usage_rollup.register_rollup_job(sched, db_logger.pool)
                             daily_activity_rollup.register_rollup_job(sched, db_logger.pool)
 
-                            # Failed-request alerter (no-op unless
-                            # SLACK_WEBHOOK_URL or WECOM_ALERTS_WEBHOOK_URL
-                            # is set).
+                            # Failed-request alerter: one job, paused while
+                            # neither SLACK_WEBHOOK_URL nor
+                            # WECOM_ALERTS_WEBHOOK_URL is set.
                             from serving.admin.failed_request_alerter import (
                                 register_alerter_job,
                             )
 
-                            register_alerter_job(db_logger.pool, settings)
-                        elif (
-                            settings.slack_webhook_url.strip()
-                            or settings.wecom_alerts_webhook_url.strip()
-                        ):
-                            logger.warning(
-                                "Failed-request alerter not registered: APScheduler did not start"
-                            )
+                            register_alerter_job(db_logger.pool)
+                        else:
+                            if alert_runtime.current().detector_enabled:
+                                logger.warning(
+                                    "Failed-request alerter not registered: "
+                                    "APScheduler did not start"
+                                )
+                            alert_runtime.set_detector_state("unavailable")
 
                         # Roll up the hours of the last 30 days that
                         # provider_hourly_stats has not covered -- every hour on a
@@ -1235,6 +1311,7 @@ async def initialize() -> AppServices:
     # Administrator writes and the refresh loop use the logger's pool.
     if db_logger and db_logger.pool:
         app_config.attach(AppConfigStore(db_logger.pool))
+    _start_live_config(db_logger.pool if db_logger else None)
 
     # Models into router
     embedding_adapters, model_infos = await _init_router_and_models(router)
@@ -1401,32 +1478,40 @@ async def initialize() -> AppServices:
     # ``state_changes`` would be ignored by exactly the deployments still being
     # paged. Best-effort: a deployment with no alerts.yaml keeps the defaults
     # (page once per outage, 300s apart).
+    from serving.observability.alert_config import AlertConfig as _AlertConfig
+
+    _rules_in_force = _AlertConfig()
     try:
         from serving.observability.alert_config import load_alert_config as _load_alert_config
         from serving.observability.state_alert_policy import apply_state_change_policy
 
-        apply_state_change_policy(
-            _load_alert_config(str(resolve_config_path("alerts").path)).state_changes
-        )
+        _rules_in_force = _load_alert_config(str(resolve_config_path("alerts").path))
+        apply_state_change_policy(_rules_in_force.state_changes)
     except Exception:
         logger.debug("state-change alert policy unavailable; keeping defaults", exc_info=True)
+    # Alert history stamps every record with the hash of the rules in force
+    # (thresholds and switches only; the file holds no credentials).
+    _history_runtime = alert_history_runtime.get_runtime()
+    if _history_runtime is not None:
+        with contextlib.suppress(Exception):
+            _history_runtime.set_rules(_rules_in_force.model_dump(mode="json"))
 
     # In-process alerting framework. Defaults to disabled. Operators flip the
     # ALERTS_ENABLED env var (or set SLACK_ALERTS_WEBHOOK_URL) to turn it on.
     alert_engine = None
     if settings.alerts_enabled:
+        alert_handler = None
         try:
-            import logging as _stdlogging
-
             from serving.observability.alert_config import load_alert_config
             from serving.observability.alert_rules import AlertEngine
-            from serving.observability.log_handler import AlertingLogHandler
+            from serving.observability.log_handler import (
+                AlertingLogHandler,
+                install_alert_log_handler,
+                uninstall_alert_log_handler,
+            )
 
             alert_handler = AlertingLogHandler(maxsize=10_000)
-            _req_log = _stdlogging.getLogger("serving.servers.middleware.request_log")
-            _req_log.addHandler(alert_handler)
-            _req_log.propagate = False
-            _stdlogging.getLogger().addHandler(alert_handler)
+            install_alert_log_handler(alert_handler)
 
             alert_cfg = load_alert_config(str(resolve_config_path("alerts").path))
             alert_engine = AlertEngine(
@@ -1441,6 +1526,9 @@ async def initialize() -> AppServices:
         except Exception:
             logger.exception("Alert engine startup failed")
             alert_engine = None
+            if alert_handler is not None:
+                # Nothing will drain it.
+                uninstall_alert_log_handler(alert_handler)
     else:
         logger.info("alerts disabled (ALERTS_ENABLED=false)")
 
@@ -1869,6 +1957,8 @@ async def initialize() -> AppServices:
     # Every worker re-reads the stored configuration and the runtime settings,
     # so a write made through one of them reaches the others.
     app_config.start_refresh()
+    if live_config.COORDINATOR.reporter is not None:
+        live_config.COORDINATOR.reporter.set_lifecycle("running")
     if pricing_sync is not None:
         pricing_sync.start()
     if runtime_settings is not None:
@@ -1902,6 +1992,10 @@ async def initialize() -> AppServices:
         auto_mode=auto_mode,
         batch_store=batch_store,
         batch_model_limits=batch_model_limits,
+        batch_file_store=BatchFileStore(batch_store.pool) if batch_store is not None else None,
+        batch_webhook_store=(
+            BatchWebhookStore(batch_store.pool) if batch_store is not None else None
+        ),
         routewise_settings_refresh_task=routewise_settings_refresh_task,
         weight_override_refresh_task=weight_override_refresh_task,
         disabled_provider_refresh_task=disabled_provider_refresh_task,
@@ -1917,8 +2011,8 @@ def start_batch_scheduler(app: Any, services: AppServices) -> None:
     """Start the in-process batch worker when there is a batch store.
 
     Called from the app lifespan once ``app.state.services`` is set: the worker
-    runs each batch request through the chat-completions handler with a
-    synthetic request whose scope carries the live app. It starts whether or not
+    runs each batch request through the protocol execution of its target, which
+    reads services off the live app as the routes do. It starts whether or not
     ``BATCH_ENABLED`` is on, reads the setting every round and claims nothing
     while it is off, so turning batches on needs no restart.
 
@@ -1943,6 +2037,7 @@ def start_batch_scheduler(app: Any, services: AppServices) -> None:
         # imports the chat-completions handler, and this module stays
         # importable without the HTTP layer.
         from serving.batch.scheduler import BatchScheduler
+        from serving.servers.auth import decrypt_api_key
 
         if services.batch_model_limits is None:
             services.batch_model_limits = BatchModelLimits(store)
@@ -1951,6 +2046,12 @@ def start_batch_scheduler(app: Any, services: AppServices) -> None:
             services=services,
             store=store,
             limits=services.batch_model_limits,
+            # Every process publishes its interactive load and yields to all of
+            # them (serving/batch/interactive_load.py).
+            share_interactive_load=True,
+            file_store=getattr(services, "batch_file_store", None),
+            webhook_store=getattr(services, "batch_webhook_store", None),
+            decrypt_secret=decrypt_api_key,
         )
         scheduler.start()
     except Exception:
@@ -1995,6 +2096,14 @@ async def shutdown(services: AppServices) -> None:
             await services.routewise_settings_refresh_task
 
     await app_config.stop_refresh()
+    # No snapshot arrives any more: stop applying, retire what was replaced
+    # and report this process stopped. The state in use stays published for
+    # whatever still runs below.
+    try:
+        await live_config.COORDINATOR.stop(timeout=_LIVE_CONFIG_STOP_SECONDS)
+    except Exception as exc:
+        # The class only: a component's exception text can quote a credential.
+        logger.error("Live configuration shutdown failed (%s)", type(exc).__name__)
     if services.runtime_settings is not None:
         with contextlib.suppress(Exception):
             await services.runtime_settings.stop_refresh()
@@ -2010,16 +2119,23 @@ async def shutdown(services: AppServices) -> None:
             logger.exception("Alert engine shutdown failed")
         handler = getattr(services.alert_engine, "_handler", None)
         if handler is not None:
-            import logging as _stdlogging
+            from serving.observability.log_handler import uninstall_alert_log_handler
 
-            _stdlogging.getLogger("serving.servers.middleware.request_log").removeHandler(handler)
-            _stdlogging.getLogger().removeHandler(handler)
+            uninstall_alert_log_handler(handler)
 
     # Broadcast email scheduler
     try:
         email_scheduler.stop_scheduler()
     except Exception as exc:
         logger.error(f"Email scheduler shutdown failed: {exc}")
+
+    # CompletionsLogger — drain queued request-log rows while the log store
+    # can still write them (issue #133: billing rows must survive shutdown).
+    if services.completions_logger is not None:
+        try:
+            await services.completions_logger.stop()
+        except Exception as exc:
+            logger.error(f"Completions logger shutdown failed: {exc}")
 
     # Log store
     if services.log_store:
@@ -2075,6 +2191,11 @@ async def shutdown(services: AppServices) -> None:
         services.offload_route_refresh_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await services.offload_route_refresh_task
+
+    # Alert history last among the alert producers' dependents: every producer
+    # above has stopped, so it waits for sends still in flight, writes its open
+    # buckets and drains within its budget. Its pool is its own.
+    await alert_history_runtime.stop_runtime()
 
     # Close shared HTTP client
     with contextlib.suppress(Exception):

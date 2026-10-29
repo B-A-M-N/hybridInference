@@ -70,7 +70,7 @@ from routing.routers import (
     adapter_supports_modalities,
 )
 from routing.streaming import has_non_empty_content
-from routing.telemetry import failed_attempt, routing_chunk
+from routing.telemetry import adapter_pricing_snapshot, failed_attempt, routing_chunk
 from serving.exceptions import operator_safe_error
 from serving.utils import context as req_ctx
 from serving.utils.logging import get_logger
@@ -310,8 +310,6 @@ class FeasibleProviderCandidate:
     prefix_cache_discount_usd: float = 0.0
     prefix_cache_expected_tokens: float = 0.0
     prefix_cache_adjustment_applied: bool = False
-    prefix_cache_evidence_state: str = "UNKNOWN"
-    prefix_cache_evidence_confidence: float = 0.0
     quota_pool: str | None = None
     concurrency_pool: str | None = None
     quota_used_fraction: float | None = None
@@ -438,11 +436,8 @@ class RouteWiseRouter:
         # that genuinely serves the whole table. The registry narrows this to
         # the one model it built the router for; see attach_route_table.
         self._model_scope: frozenset[str] | None = None
-
-        # Prefill-load tracker: an existing PrefillLoadTracker can be shared
-        # (e.g. from FixedRouter) so RouteWise reads the same per-endpoint
-        # outstanding prefill state. When None, RouteWise creates its own
-        # standalone tracker (backward-compatible behavior).
+        # Share FixedRouter's tracker when the composition root injects it; a
+        # standalone RouteWise router keeps an independent tracker.
         self._prefill_load = prefill_load if prefill_load is not None else PrefillLoadTracker()
 
         self.predictor = BucketMeanOutputPredictor(
@@ -516,11 +511,6 @@ class RouteWiseRouter:
             detail=detail,
             exc=exc,
         )
-        # Invalidate any warm-prefix hints recorded against this endpoint.
-        # A failure (restart, replacement, OOM) likely emptied its radix cache,
-        # so a hint that outlives it would let a genuinely cold mega-prefill
-        # into the preempting tier. Mirrors FixedRouter's behavior.
-        self._prefill_load.forget_endpoint(endpoint_id)
 
     def get_provider_status(self) -> dict[str, dict[str, Any]]:
         """Return a snapshot of provider availability and circuit state."""
@@ -567,7 +557,6 @@ class RouteWiseRouter:
         *,
         budget_alpha: float | None = None,
         latency_slo_sec: float | None = None,
-        latency_min_samples: int | None = None,
         routewise_probe_enabled: bool | None = None,
         routewise_probe_interval_sec: float | None = None,
     ) -> None:
@@ -586,11 +575,6 @@ class RouteWiseRouter:
                 budget_alpha=(current.budget_alpha if budget_alpha is None else budget_alpha),
                 latency_slo_sec=(
                     current.latency_slo_sec if latency_slo_sec is None else latency_slo_sec
-                ),
-                latency_min_samples=(
-                    current.latency_min_samples
-                    if latency_min_samples is None
-                    else latency_min_samples
                 ),
                 routewise_probe_enabled=(
                     current.routewise_probe_enabled
@@ -1613,11 +1597,6 @@ class RouteWiseRouter:
                 output_tokens=predicted_output_tokens,
             )
 
-            # Default evidence fields (overridden in the on_demand branch when
-            # prefix-cache cost adjustment applies).
-            evidence_state = "UNKNOWN"
-            evidence_confidence = 0.0
-
             provider_type: Literal["on_demand", "quota", "concurrency"]
             if route_candidate.provider_type is ProviderType.ON_DEMAND:
                 provider_type = "on_demand"
@@ -1632,8 +1611,6 @@ class RouteWiseRouter:
                         prefix_discount,
                         prefix_expected,
                         prefix_applied,
-                        evidence_state,
-                        evidence_confidence,
                     ) = self._apply_prefix_cache_cost_adjustment(
                         model_id=model_id,
                         route_candidate=route_candidate,
@@ -1706,11 +1683,6 @@ class RouteWiseRouter:
                 concurrency_pool_id = None
 
             mean_ttft_sec, mean_ttft_source = self._latency_estimate(endpoint_id, now)
-
-            # Prefill-load-aware adjustment: read the existing tracker's
-            # outstanding prefill tokens for this endpoint and compute a bounded
-            # additive TTFT penalty. This is a soft signal — it never makes an
-            # endpoint infeasible, only less attractive in the LP.
             outstanding_prefill_tokens = 0
             prefill_load_adjusted_ttft_sec: float | None = None
             if self.config.prefill_load_routing_enabled:
@@ -1722,7 +1694,6 @@ class RouteWiseRouter:
                 penalty_ms = self._prefill_load_penalty_ms(outstanding_prefill_tokens)
                 if penalty_ms > 0:
                     prefill_load_adjusted_ttft_sec = mean_ttft_sec + penalty_ms / 1000.0
-
             candidates.append(
                 FeasibleProviderCandidate(
                     endpoint_id=endpoint_id,
@@ -1737,8 +1708,6 @@ class RouteWiseRouter:
                     prefix_cache_discount_usd=prefix_discount,
                     prefix_cache_expected_tokens=prefix_expected,
                     prefix_cache_adjustment_applied=prefix_applied,
-                    prefix_cache_evidence_state=evidence_state,
-                    prefix_cache_evidence_confidence=evidence_confidence,
                     quota_pool=quota_pool_id,
                     concurrency_pool=concurrency_pool_id,
                     quota_used_fraction=used_fraction,
@@ -1802,17 +1771,17 @@ class RouteWiseRouter:
         pricing: CandidatePricing,
         cold_cost: float,
         prefix_context: tuple[tuple[Any, ...], dict[str, Any]],
-    ) -> tuple[float, float, float, bool, str, float]:
+    ) -> tuple[float, float, float, bool]:
         """Return API effective cost after a guarded prefix-cache discount."""
         adapter = route_candidate.adapter
         if self._has_rotating_key_pool(adapter):
-            return cold_cost, 0.0, 0.0, False, "UNKNOWN", 0.0
+            return cold_cost, 0.0, 0.0, False
         delta = price_delta_per_token(
             pricing.prompt,
             pricing.cache_read,
         )
         if delta <= 0.0:
-            return cold_cost, 0.0, 0.0, False, "UNKNOWN", 0.0
+            return cold_cost, 0.0, 0.0, False
 
         blocks, info = prefix_context
         provider_id = str(getattr(adapter.config, "provider", "") or "")
@@ -1837,14 +1806,7 @@ class RouteWiseRouter:
         )
         discount = record.cache_discount if record.would_apply else 0.0
         adjusted = max(0.0, cold_cost - discount)
-        return (
-            adjusted,
-            discount,
-            record.expected_cached_tokens,
-            record.would_apply,
-            record.evidence_state,
-            record.evidence_confidence,
-        )
+        return adjusted, discount, record.expected_cached_tokens, record.would_apply
 
     @staticmethod
     def _has_rotating_key_pool(adapter: Any) -> bool:
@@ -2120,16 +2082,6 @@ class RouteWiseRouter:
                         for c in candidates
                         if c.quota_used_fraction is not None
                     },
-                    "candidate_prefix_cache_evidence_states": {
-                        c.endpoint_id: c.prefix_cache_evidence_state
-                        for c in candidates
-                        if c.prefix_cache_evidence_state != "UNKNOWN"
-                    },
-                    "candidate_prefix_cache_evidence_confidence": {
-                        c.endpoint_id: c.prefix_cache_evidence_confidence
-                        for c in candidates
-                        if c.prefix_cache_evidence_confidence > 0.0
-                    },
                 }
             )
         return metadata
@@ -2323,7 +2275,7 @@ class RouteWiseRouter:
         except BaseException:
             # ``HedgedAdapter._start_backup_at`` swallows whatever this raises,
             # so nothing downstream would ever release a commit made above it.
-            _release_backup_resources()
+            reservation.release()
             raise
 
     def _select_hedge_candidate_at_elapsed(
@@ -2337,65 +2289,32 @@ class RouteWiseRouter:
         latency_slo_sec: float,
     ) -> BackupCandidate[FeasibleProviderCandidate] | None:
         backup_candidates: list[BackupCandidate[FeasibleProviderCandidate]] = []
-        primary_prefill_penalty_sec = self._candidate_prefill_penalty_sec(selected)
         for candidate in candidates:
             if candidate.endpoint_id == selected.endpoint_id:
                 continue
             profile = self._latency_profiles.get(candidate.endpoint_id)
             if profile is None:
                 continue
-            prefill_penalty_sec = self._candidate_prefill_penalty_sec(candidate)
-
-            def primary_cdf(value_ms: float) -> float:
-                adjusted_value_sec = value_ms / 1000.0 - primary_prefill_penalty_sec
-                if adjusted_value_sec <= 0.0:
-                    return 0.0
-                return primary_profile.cdf_at(adjusted_value_sec, now)
-
-            def backup_cdf(
-                value_ms: float,
-                *,
-                profile=profile,
-                prefill_penalty_sec=prefill_penalty_sec,
-                now=now,
-            ) -> float:
-                adjusted_value_sec = value_ms / 1000.0 - prefill_penalty_sec
-                if adjusted_value_sec <= 0.0:
-                    return 0.0
-                return profile.cdf_at(adjusted_value_sec, now)
-
             success_probability = combined_success_probability(
-                primary_cdf,
-                backup_cdf,
+                lambda value_ms: primary_profile.cdf_at(value_ms / 1000.0, now),
+                lambda value_ms, backup_profile=profile: backup_profile.cdf_at(
+                    value_ms / 1000.0,
+                    now,
+                ),
                 elapsed_ms=elapsed_sec * 1000.0,
                 slo_ms=latency_slo_sec * 1000.0,
                 dispatch_overhead_ms=0.0,
-            )
-            adjusted_mean_ttft_sec = (
-                candidate.prefill_load_adjusted_ttft_sec
-                if candidate.prefill_load_adjusted_ttft_sec is not None
-                else candidate.mean_ttft_sec
             )
             backup_candidates.append(
                 BackupCandidate(
                     provider=candidate,
                     success_probability=success_probability,
                     marginal_cost=self._routing_dollar_estimate(candidate),
-                    true_mean_ms=adjusted_mean_ttft_sec * 1000.0,
+                    true_mean_ms=candidate.mean_ttft_sec * 1000.0,
                     success_target=HEDGE_SUCCESS_TARGET,
                 )
             )
         return select_probability_backup(backup_candidates)
-
-    @staticmethod
-    def _candidate_prefill_penalty_sec(candidate: FeasibleProviderCandidate) -> float:
-        """Return the candidate's additive prefill penalty in seconds."""
-        if candidate.prefill_load_adjusted_ttft_sec is None:
-            return 0.0
-        return max(
-            0.0,
-            candidate.prefill_load_adjusted_ttft_sec - candidate.mean_ttft_sec,
-        )
 
     def _record_hedge_dispatch(
         self,
@@ -2488,6 +2407,8 @@ class RouteWiseRouter:
         routing.setdefault("provider", adapter.config.provider)
         routing.setdefault("base_url", adapter.config.base_url)
         routing.setdefault("endpoint_id", getattr(adapter.config, "endpoint_id", None))
+        if "pricing" not in routing:
+            routing["pricing"] = adapter_pricing_snapshot(adapter)
         if failed_attempts:
             routing["fallback"] = True
             routing["fallback_policy"] = "routewise_resolve"
@@ -2559,18 +2480,6 @@ class RouteWiseRouter:
             trace.request_id = str(request_id)
 
         with self._route_commit_lock:
-            # The routing lock serializes load snapshot -> selection ->
-            # reservation across selectors so concurrent decisions cannot
-            # commit from the same stale load view. The tracker state lock
-            # remains independent, allowing release and cache/accounting
-            # updates while candidate construction and LP solving run.
-            prompt_tokens = self._prompt_tokens_from_context(context)
-            prediction = self._predict_output(model_id, prompt_tokens, context)
-            pool = self._routewise_pool(model_id)
-            envelope = (
-                self.envelope.snapshot(pool) if model_id in self._quota_bearing_models else None
-            )
-            now = time.time()
             reserve_prefill = reserve_prefill and self._prefill_lease_needed(model_id)
             tracker_transaction = (
                 self._prefill_load.routing_transaction()
@@ -2578,17 +2487,16 @@ class RouteWiseRouter:
                 else contextlib.nullcontext()
             )
             with tracker_transaction:
-                prefill_backlog = self._prefill_backlog_snapshot(model_id)
                 return self._select_decision_locked(
                     model_id,
                     context,
                     trace,
-                    prompt_tokens=prompt_tokens,
-                    prediction=prediction,
-                    envelope=envelope,
-                    now=now,
-                    prefill_backlog=prefill_backlog,
                     reserve_prefill=reserve_prefill,
+                    prefill_backlog=(
+                        self._prefill_backlog_snapshot(model_id)
+                        if self.config.prefill_load_routing_enabled
+                        else None
+                    ),
                 )
 
     def _select_decision_locked(
@@ -2597,13 +2505,18 @@ class RouteWiseRouter:
         context: dict[str, Any],
         trace: RoutingTrace,
         *,
-        prompt_tokens: int,
-        prediction: BucketMeanPrediction,
-        envelope: CostEnvelopeSnapshot | None,
-        now: float,
-        prefill_backlog: Mapping[str, int] | None = None,
         reserve_prefill: bool = False,
+        prefill_backlog: Mapping[str, int] | None = None,
     ) -> RoutingDecision | None:
+        prompt_tokens = self._prompt_tokens_from_context(context)
+        prediction = self._predict_output(model_id, prompt_tokens, context)
+        pool = self._routewise_pool(model_id)
+        # Only quota candidates are priced off the envelope. Sorting a window of
+        # workload costs to reach three unread metadata fields is the whole cost
+        # of the snapshot for an on-demand-only model, so skip it.
+        envelope = self.envelope.snapshot(pool) if model_id in self._quota_bearing_models else None
+        now = time.time()
+
         admission_refused: set[str] = set()
         capacity_refused: set[str] = set()
         candidates, prefix_context = self._build_candidates(
@@ -2746,7 +2659,6 @@ class RouteWiseRouter:
                         decision.adapter = HedgedAdapter(
                             primary=leaf,
                             event_sink=self._health_registry,
-                            endpoint_failure_hook=self._prefill_load.forget_endpoint,
                             hedge_checkpoints_sec=hedge_plan.checkpoints_sec,
                             checkpoint_backup_selector=_select_checkpoint_backup_for_request,
                             backup_dispatch_hook=lambda backup: (
@@ -2770,8 +2682,8 @@ class RouteWiseRouter:
                 except BaseException:
                     # Construction happens after a provider commit. Keep the
                     # ownership lexical even if metadata or hedge setup fails.
-                    self._prefill_load.release(prefill_lease)
                     reservation.release()
+                    self._prefill_load.release(prefill_lease)
                     raise
             # Losing the commit race on a recovering endpoint is the same
             # condition the build filter reports, just observed a moment later.
@@ -2837,13 +2749,11 @@ class RouteWiseRouter:
         prefix_context: tuple[tuple[Any, ...], dict[str, Any]] | None,
         request_id: str | None,
     ) -> None:
-        """Stash request blocks and eligible-candidate scopes for a later dispatch.
+        """Stash request blocks and eligible-candidate scopes for the warm on success.
 
         The scopes were collected by :meth:`_apply_prefix_cache_cost_adjustment`
         while pricing candidates, so only providers the cost estimate applied to
-        (direct, cache-priced, non-rotating) are present. Generation ownership is
-        added later by :meth:`_reserve_prefix_generation_for_dispatch` for each
-        endpoint that actually starts a dispatch. The commit
+        (direct, cache-priced, non-rotating) are present. The commit
         (:meth:`_commit_prefix_cache_observation`) looks the winning endpoint up by
         id, so a winner without a scope here -- e.g. a rotating-key or no-delta
         provider -- is simply not warmed.
@@ -2860,12 +2770,7 @@ class RouteWiseRouter:
         stash_key = str(request_id or "")
         if not stash_key:
             return
-        self.pending_prefix_cache.put(
-            stash_key,
-            blocks,
-            scopes,
-            merge=True,
-        )
+        self.pending_prefix_cache.put(stash_key, blocks, scopes)
 
     def _reserve_prefix_generation_for_dispatch(
         self,
@@ -2888,98 +2793,34 @@ class RouteWiseRouter:
             self.pending_prefix_cache.set_generation(request_key, endpoint_key, generation)
 
     def _commit_prefix_cache_observation(self, obs: RoutingObservation) -> None:
-        """On a selected observation, update prefix memory and cache evidence.
+        """On a selected success, commit the winning provider's prefix to memory.
 
-        Two distinct concerns are handled separately:
-
-        1. **Prefix warming** (``obs.success``): only successful dispatches
-           may have populated the endpoint's cache. A non-terminal failed
-           attempt must not consume the stash because the winning
-           fallback/hedge observation still needs it.
-
-        2. **Authoritative cache evidence** (``obs.cached_tokens``): observed
-           cache usage is recorded whenever it is available, independently
-           of whether the completion produced content. A streamed HTTP 200
-           with no completion content has ``success=False`` but may still
-           carry authoritative ``cached_tokens`` that must update evidence.
+        Only successful observations warm history, and only under the endpoint that
+        actually served (``obs.endpoint_id``) — so failed, fallback, or lost-hedge
+        attempts are never recorded as warm. ``RoutingObservation.request_id``
+        explicitly correlates the success with its route-time prefix snapshot.
         """
         request_id = str(getattr(obs, "request_id", None) or "")
         if not request_id:
             return
-
-        # Record authoritative cache evidence BEFORE the success/warming gate
-        # so that a streamed empty-completion path (success=False) still
-        # learns from an observed cache hit or miss.
-        cached_tokens = getattr(obs, "cached_tokens", None)
-        endpoint_id = getattr(obs, "endpoint_id", None)
-
+        # A non-terminal failed attempt must not consume the stash because the
+        # winning fallback/hedge observation still needs it. A terminal failed
+        # observation (including an empty completion) has no future winner and
+        # therefore discards it without warming.
         if not obs.success:
             if getattr(obs, "terminal", True):
-                # Terminal failure: no future winner. If authoritative cache
-                # evidence exists, extract the stash scope BEFORE discarding
-                # so the evidence can still be recorded.
-                if endpoint_id and cached_tokens is not None:
-                    stashed = self.pending_prefix_cache.pop(request_id)
-                    if stashed is not None:
-                        scope = stashed.scopes.get(endpoint_id)
-                        if scope is not None:
-                            generation = stashed.generations.get(endpoint_id)
-                            if cached_tokens > 0 and self.prefix_cache.remember(
-                                scope,
-                                stashed.blocks,
-                                generation=generation,
-                            ):
-                                # Bind positive evidence to the exact stashed
-                                # prefix so a later request matching these
-                                # blocks can use the observed cache hit.
-                                self.prefix_cache.record_evidence(
-                                    scope,
-                                    cached_tokens,
-                                    generation=generation,
-                                    blocks=stashed.blocks,
-                                )
-                            elif cached_tokens == 0:
-                                # A miss is measured before this request can
-                                # warm the cache. Do not replace remembered
-                                # prefix memory on a failed/empty response;
-                                # only update evidence if the exact remembered
-                                # prefix is still current.
-                                self.prefix_cache.record_evidence(
-                                    scope,
-                                    cached_tokens,
-                                    generation=generation,
-                                    blocks=stashed.blocks,
-                                )
-                else:
-                    self.pending_prefix_cache.discard(request_id)
+                self.pending_prefix_cache.discard(request_id)
             return
-
         stashed = self.pending_prefix_cache.pop(request_id)
         if stashed is None:
             return
         scope = stashed.scopes.get(obs.endpoint_id)
         if scope is None:
             return
-        generation = stashed.generations.get(obs.endpoint_id)
-        if not self.prefix_cache.remember(
+        self.prefix_cache.remember(
             scope,
             stashed.blocks,
-            generation=generation,
-        ):
-            return
-        # Record authoritative observed cache usage as evidence.
-        if cached_tokens is not None:
-            self.prefix_cache.record_evidence(
-                scope,
-                cached_tokens,
-                generation=generation,
-                blocks=stashed.blocks,
-                materialization_candidate=True,
-            )
-        else:
-            # No authoritative observation: successful dispatch may still
-            # establish potential warming.
-            self.prefix_cache.record_dispatch(scope, generation=generation)
+        )
 
     @staticmethod
     def _cache_affecting_params(params: Any) -> str:
@@ -3233,7 +3074,6 @@ class RouteWiseRouter:
         adapter = decision.adapter
         original_config = getattr(adapter, "config", None)
         lease = decision.prefill_lease
-
         try:
             endpoint_id = endpoint_id_for_adapter(adapter)
             self._reserve_prefix_generation_for_dispatch(decision.trace.request_id, endpoint_id)
@@ -3286,18 +3126,12 @@ class RouteWiseRouter:
                     # that actually served, so resolve the endpoint after the call.
                     self._on_success(endpoint_id_for_adapter(adapter))
             if getattr(adapter, "config", None) is not original_config:
-                # Backup won: primary did not complete prefill. Release the
-                # primary lease without confirmation rather than confirming a
-                # warm-prefix hint for an endpoint whose request was cancelled.
+                decision.metadata["backup_won"] = True
                 self._prefill_load.release(lease)
             else:
-                # Primary won: a returned response proves this endpoint finished
-                # prefilling this prompt, which is what makes its prefix safe to remember.
                 self._prefill_load.release(lease, prefill_confirmed=True)
             return result
         finally:
-            # Release prefill lease if it was acquired. Idempotent: no-op if
-            # already released with prefill_confirmed=True.
             if lease is not None:
                 self._prefill_load.release(lease)
             # Single call site: _record_hedge_explorer_samples appends a
@@ -3481,10 +3315,7 @@ class RouteWiseRouter:
         try:
             while True:
                 next_decision = self._select_decision(
-                    model_id,
-                    context,
-                    trace,
-                    reserve_prefill=True,
+                    model_id, context, trace, reserve_prefill=True
                 )
                 if next_decision is None:
                     if last_error is not None:
@@ -3610,10 +3441,7 @@ class RouteWiseRouter:
         try:
             while True:
                 next_decision = self._select_decision(
-                    model_id,
-                    context,
-                    trace,
-                    reserve_prefill=True,
+                    model_id, context, trace, reserve_prefill=True
                 )
                 if next_decision is None:
                     if last_error is not None:

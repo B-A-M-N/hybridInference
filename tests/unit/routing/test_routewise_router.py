@@ -1300,7 +1300,6 @@ class TestRouteWiseLayer2:
     def test_layer2_uses_lp_when_warmed(self):
         """After profile warmup, LP path is used for S_A selection."""
         config = RouteWiseConfig(
-            latency_min_samples=5,
             latency_slo_sec=2.0,
         )
         router, _api_a, _api_b = _make_router_with_two_api(config)
@@ -1325,10 +1324,8 @@ class TestRouteWiseLayer2:
         assert router._last_lp_statuses.get("test-model") != "not_run"
 
     def test_layer2_falls_back_to_cheapest_when_cold(self):
-        """When profiles have insufficient samples, falls back to cheapest."""
-        config = RouteWiseConfig(
-            latency_min_samples=100,  # Very high threshold.
-        )
+        """When no endpoint has latency samples, falls back to cheapest."""
+        config = RouteWiseConfig()
         router, api_a, _api_b = _make_router_with_two_api(config)
 
         # Warm predictor.
@@ -1402,7 +1399,7 @@ class TestRouteWiseLayer2:
         fr = _FakeRouteTable()
         fr.add("test-model", [(api_only, 1.0)])
 
-        config = RouteWiseConfig(latency_min_samples=1)
+        config = RouteWiseConfig()
         router = RouteWiseRouter(route_table=fr, config=config)
 
         # Warm predictor.
@@ -1441,7 +1438,7 @@ class TestRouteWiseLayer2:
 
     def test_latency_mean_includes_error_penalty(self):
         """Body LP latency matches real-eval mean-with-errors semantics."""
-        config = RouteWiseConfig(latency_min_samples=10, latency_unprofiled_ttft_ms=5000.0)
+        config = RouteWiseConfig(latency_unprofiled_ttft_ms=5000.0)
         router, _api_a, _api_b = _make_router_with_two_api(config)
         profile = router._latency_profiles["test-model:api-a"]
         now = time.time()
@@ -1780,7 +1777,6 @@ class TestRouteWiseLayer2:
         model B's LP interval check must be independent of model A.
         """
         config = RouteWiseConfig(
-            latency_min_samples=5,
             latency_slo_sec=2.0,
         )
 
@@ -3777,30 +3773,6 @@ class TestRouteWiseDecisionMetadata:
         # HedgedAdapter should have swapped config -> backup won
         assert hedged.config is backup_adapter.config
         assert decision.metadata["backup_won"] is True
-
-    @pytest.mark.asyncio
-    async def test_hedge_backup_dispatch_hook_runs_only_when_backup_launches(self):
-        """A prefix-generation hook fires at backup dispatch, not consideration."""
-        router, _quota, _api = _make_router_with_quota_and_api()
-        primary_adapter = _make_adapter(
-            provider="primary",
-            endpoint_id="test-model:primary",
-        )
-        backup_adapter = _make_adapter(
-            provider="backup",
-            endpoint_id="test-model:backup",
-        )
-        dispatch_hook = MagicMock()
-        hedged = HedgedAdapter(
-            primary=primary_adapter,
-            backup=backup_adapter,
-            hedge_threshold_sec=0.0,
-            event_sink=router._health_registry,
-            backup_dispatch_hook=dispatch_hook,
-        )
-
-        assert hedged._start_backup_at(0.0) is not None
-        dispatch_hook.assert_called_once_with(backup_adapter)
 
     @pytest.mark.asyncio
     async def test_exception_carries_routewise_in_routing(self):

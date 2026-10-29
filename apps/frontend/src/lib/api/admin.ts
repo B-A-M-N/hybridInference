@@ -392,14 +392,55 @@ export async function hardDeleteUser(
 // Audit Log
 // ========================================
 
+/**
+ * Who made a change. `admin` and `user` are signed-in accounts with a stable
+ * `actor_id`; `admin_token` is the shared admin token, which names no account;
+ * `anonymous` is a registration, `bootstrap` the first-run setup.
+ */
+export type AuditActorType =
+  | 'admin'
+  | 'user'
+  | 'admin_token'
+  | 'anonymous'
+  | 'bootstrap'
+  | 'system';
+
+/** What a change was made to. The list is open: a newer gateway may add kinds. */
+export type AuditTargetType =
+  | 'user'
+  | 'model'
+  | 'provider'
+  | 'provider_key'
+  | 'setting'
+  | 'config'
+  | 'alert_type'
+  | 'auth_block'
+  | 'signup_domain'
+  | 'site_update'
+  | 'broadcast'
+  | (string & {});
+
 export interface AuditLogEntry {
   id: number;
   timestamp: string;
+  /**
+   * The source as historically recorded, unvalidated: an address, a login or
+   * an email. Newer entries carry `source_ip` and may repeat it here.
+   */
   admin_ip: string;
   action: string;
+  /** Affected user for typed entries; an untyped raw ID on legacy entries. */
   target_user_id: string | null;
   details: Record<string, unknown> | null;
   success: boolean;
+  // Absent from an older gateway, and null on entries recorded before it
+  // stored them: nothing about the actor, target or source is known then.
+  actor_type?: AuditActorType | null;
+  actor_id?: string | null;
+  /** The trusted request address, or null when unavailable. */
+  source_ip?: string | null;
+  target_type?: AuditTargetType | null;
+  target_id?: string | null;
 }
 
 export interface ListAuditLogResponse {
@@ -521,7 +562,7 @@ export async function getPerformanceMetrics({
 export interface AdminTtftScatterPoint {
   prompt_tokens: number;
   ttft_ms: number;
-  cache_hit: boolean;
+  cache_hit: boolean | null;
   timestamp: string;
 }
 
@@ -1664,6 +1705,7 @@ export interface ProviderObservabilityTotals {
   cache_eligible_count: number;
   cache_hit_count: number;
   input_tokens: number;
+  cache_eligible_input_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
 }
@@ -1676,6 +1718,7 @@ export interface ProviderObservabilityBucket {
   cache_hit_count: number;
   cache_read_tokens: number;
   input_tokens: number;
+  cache_eligible_input_tokens: number;
 }
 
 export interface ProviderErrorTypeRow {
