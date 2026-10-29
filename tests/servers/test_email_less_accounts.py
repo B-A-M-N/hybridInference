@@ -6,7 +6,7 @@ admin endpoints that used to assume every account has an email.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -26,7 +26,7 @@ from tests.fixtures import browser_sessions
 ADMIN_ID = "u-admin"
 OTHER_ID = "u-other"
 PASSWORD = "Str0ngPassword"
-_CREATED = datetime(2026, 10, 10, tzinfo=timezone.utc)
+_CREATED = datetime(2026, 10, 10, tzinfo=UTC)
 
 
 def _row(user_id: str, **overrides: Any) -> dict[str, Any]:
@@ -240,7 +240,7 @@ class TestLogin:
             "user_id": ADMIN_ID,
             "sid": "sess",
             "revoked": False,
-            "expires_at": datetime(2099, 1, 1, tzinfo=timezone.utc),
+            "expires_at": datetime(2099, 1, 1, tzinfo=UTC),
         }
         op_store.get_session_by_token_hash = AsyncMock(return_value=legacy_session)
         op_store.browser_sessions.remember_session(legacy_session)
@@ -296,6 +296,30 @@ class TestAdminEndpoints:
         assert resp.status_code == 409
         assert resp.json()["detail"] == "Cannot demote your own admin role."
         op_store.update_user_fields.assert_not_awaited()
+
+    async def test_cannot_suspend_self(self, client, op_store):
+        # Suspension revokes the account's sessions and its admin access with
+        # them, and resuming takes an admin: the lockout demotion is refused for.
+        op_store.suspend_user = AsyncMock()
+        resp = await client.patch(
+            f"/admin/users/{ADMIN_ID}", headers=_admin_headers(), json={"status": "suspended"}
+        )
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == "Cannot suspend your own account."
+        op_store.suspend_user.assert_not_awaited()
+
+    async def test_cannot_delete_self(self, client, op_store):
+        op_store.delete_user = AsyncMock()
+        resp = await client.post(
+            f"/admin/users/{ADMIN_ID}/delete",
+            headers=_admin_headers(),
+            json={"reason": "tidying up"},
+        )
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == "Cannot delete your own account."
+        op_store.delete_user.assert_not_awaited()
 
     async def test_can_change_another_users_role(self, client, op_store, users):
         users[OTHER_ID]["status"] = "active"

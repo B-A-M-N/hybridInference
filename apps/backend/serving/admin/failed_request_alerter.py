@@ -1,29 +1,44 @@
-"""Periodic Slack alerter for spikes in service-side request failures.
+"""Periodic alerter for spikes in service-side request failures.
 
 Counts rows in ``api_logs`` where ``status_code >= 500`` or ``error IS NOT NULL``
-over a sliding window and posts to a Slack incoming webhook when the count
-exceeds a configured threshold. A cooldown prevents duplicate alerts during
-sustained incidents. Empty ``SLACK_WEBHOOK_URL`` disables the feature entirely.
+over a sliding window and raises an alert when the count exceeds a configured
+threshold. A cooldown prevents duplicate alerts during sustained incidents.
+With both ``SLACK_WEBHOOK_URL`` and ``WECOM_ALERTS_WEBHOOK_URL`` empty, the
+detector is paused: it queries nothing, changes no incident and sends nothing,
+and the stale sweep leaves its incident and any queued recovery alone (a
+paused detector is not a silent one). Once it resumes they stay held until a
+check has evaluated under the configuration in force, and that check settles
+afresh: healthy readings from before the pause do not count.
 
-Slack delivery now goes through :func:`serving.observability.alerts.alert_slack`,
-the unified sink for the new alerting framework. The legacy
-:func:`post_slack_alert` helper is kept as a thin wrapper for backward
-compatibility (existing call-sites and tests) and delegates to the framework's
-``_post_to_slack``.
+The webhooks and the five parameters are the ``alerts.runtime`` configuration
+group (:mod:`serving.observability.alert_runtime`). One job is registered
+whenever the scheduler and the database are available, and it stays registered
+when the configuration changes. Each check takes one configuration for its
+whole run and checks it is still in force after every query and before it
+changes any state, so a check overtaken by a configuration change is dropped
+without effect; the cooldown and the open incident carry over to the new
+configuration.
+
+Delivery goes through :func:`serving.observability.alerts.alert_slack`, which
+sends to the one configured channel.
 """
 
 from __future__ import annotations
 
-import traceback
-from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
 
-import httpx  # retained for backward-compat import symbol used by tests
-
-from serving.observability.alerts import AlertSeverity, alert_on_transition
+from serving.observability import alert_runtime
+from serving.observability.alert_history import hooks as alert_history
+from serving.observability.alerts import (
+    AlertSeverity,
+    alert_on_transition,
+    hold_while,
+    restart_settling,
+)
 from serving.utils.email_scheduler import get_scheduler
 from serving.utils.logging import get_logger
-from serving.utils.secret_urls import posting_to, scrub
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -31,8 +46,12 @@ if TYPE_CHECKING:
     import asyncpg
 
     from serving.config.settings import Settings
+    from serving.observability.alert_runtime import AlertRuntimeConfig
 
 logger = get_logger(__name__)
+
+#: The detector's incident key, as its alert call sites spell it.
+ALERT_KEY = "failed_request_rate_db"
 
 
 # Predicate shared by the count and breakdown queries.
@@ -194,48 +213,17 @@ async def fetch_failure_breakdown(pool: asyncpg.Pool, window_minutes: int) -> di
         return {}
 
 
-async def post_slack_alert(webhook_url: str, message: str) -> bool:
-    """POST ``{"text": message}`` to a Slack incoming webhook.
-
-    This wrapper performs its own ``httpx`` POST so that existing callers and
-    test patch-points continue to work.  Network and HTTP errors are caught
-    and logged; this function never raises.
-
-    Args:
-        webhook_url: Slack incoming-webhook URL.
-        message: Plain-text message body.
-
-    Returns:
-        True when Slack returned a 2xx response, False on any error.
-    """
-    # Same credential-in-the-URL problem as the framework sender: httpx logs the
-    # full request URL at INFO, and for a Slack webhook that URL is the secret.
-    # See :mod:`serving.utils.secret_urls`.
-    with posting_to(webhook_url) as sink:
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(webhook_url, json={"text": message})
-            if 200 <= resp.status_code < 300:
-                return True
-            logger.warning(
-                "Slack webhook returned non-2xx: status=%d sink=%s body=%s",
-                resp.status_code,
-                sink,
-                scrub(resp.text[:200], webhook_url),
-            )
-            return False
-        except Exception:
-            logger.error(
-                "Slack webhook POST failed: sink=%s\n%s",
-                sink,
-                scrub(traceback.format_exc(), webhook_url),
-            )
-            return False
-
-
 def _utcnow() -> datetime:
     """Default time source — timezone-aware UTC ``datetime``."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
+
+
+@dataclass(frozen=True)
+class _Fixed:
+    """A configuration that never changes: for an alerter built with explicit parameters."""
+
+    view: AlertRuntimeConfig
+    generation: int = 0
 
 
 class FailedRequestAlerter:
@@ -245,25 +233,29 @@ class FailedRequestAlerter:
     replica maintains its own cooldown window, which can produce up to N
     Slack messages per cooldown interval; this is acceptable for a low-noise
     incident signal and matches the "no new dependencies" constraint.
+
+    The configuration is read at the start of every check: the live
+    ``alerts.runtime`` group by default, or fixed parameters when the alerter
+    is built with them (tests and one-off callers).
     """
 
     def __init__(
         self,
         pool: asyncpg.Pool,
-        webhook_url: str,
-        threshold: int,
-        window_minutes: int,
-        cooldown_minutes: int,
+        threshold: int | None = None,
+        window_minutes: int | None = None,
+        cooldown_minutes: int | None = None,
         now_fn: Callable[[], datetime] = _utcnow,
         rate_threshold: float = 0.0,
         rate_min_count: int = 0,
     ) -> None:
-        """Initialize the alerter with a DB pool and configuration.
+        """Initialize the alerter with a DB pool and, optionally, fixed parameters.
 
         Args:
             pool: asyncpg pool used to query ``api_logs``.
-            webhook_url: Slack incoming-webhook URL.
             threshold: Strict greater-than threshold; ``count > threshold`` fires.
+                Leave the four parameters unset to follow the live
+                ``alerts.runtime`` configuration, including its channel switch.
             window_minutes: Sliding-window size for the failure count.
             cooldown_minutes: Minimum interval between alerts.
             now_fn: Injectable clock for deterministic testing.
@@ -274,39 +266,148 @@ class FailedRequestAlerter:
                 a quiet window (1 failure out of 3 requests) does not page.
         """
         self.pool = pool
-        self.webhook_url = webhook_url
-        self.threshold = threshold
-        self.window_minutes = window_minutes
-        self.cooldown_minutes = cooldown_minutes
-        self.rate_threshold = rate_threshold
-        self.rate_min_count = rate_min_count
+        self._fixed: _Fixed | None = None
+        if threshold is not None:
+            from serving.observability.alert_runtime import AlertRuntimeConfig
+
+            # Fixed parameters: the detector runs, as such an alerter always has.
+            self._fixed = _Fixed(
+                AlertRuntimeConfig(
+                    slack_webhook_url="fixed",
+                    failed_request_alert_threshold=threshold,
+                    failed_request_alert_window_minutes=(
+                        window_minutes if window_minutes is not None else 5
+                    ),
+                    failed_request_alert_cooldown_minutes=cooldown_minutes or 0,
+                    failed_request_alert_rate=rate_threshold,
+                    failed_request_alert_rate_min_count=rate_min_count,
+                )
+            )
         self._now_fn = now_fn
         self._last_alert_at: datetime | None = None
+        #: Checks dropped because the configuration changed while they ran.
+        self.superseded_checks = 0
+        #: The configuration of the last check, or ``None`` before the first.
+        self.last_state: str | None = None
+        #: The configuration generation the incident was last observed under.
+        self._observed_generation: int | None = None
+        if self._fixed is None:
+            hold_while(ALERT_KEY, self._holds_incident)
+
+    def _holds_incident(self) -> bool:
+        """Whether the sweep must leave this detector's incident alone, now.
+
+        While the configuration in force pauses the detector, and after that
+        until a check has observed the incident under it. Read at the sweep
+        itself, so it holds from the moment of the change, whether or not a
+        paused check has run since.
+        """
+        published = alert_runtime.acquire()
+        if not published.view.detector_enabled:
+            return True
+        return self._observed_generation != published.generation
+
+    def _observe(self, published: Any, *, healthy: bool) -> None:
+        """Note that a check is about to observe the incident under *published*.
+
+        Called synchronously right before the tracker is observed. The first
+        observation under a configuration settles afresh: healthy readings
+        under an earlier one, or before a pause, are no evidence under this one
+        -- including the close a queued recovery card reports.
+        """
+        if self._observed_generation != published.generation:
+            restart_settling(ALERT_KEY, healthy=healthy)
+        self._observed_generation = published.generation
+
+    def _acquire(self) -> Any:
+        if self._fixed is not None:
+            return self._fixed
+        return alert_runtime.acquire()
+
+    def _current(self, published: Any) -> bool:
+        if self._fixed is not None:
+            return True
+        if alert_runtime.is_current(published):
+            return True
+        self.superseded_checks += 1
+        logger.info(
+            "failed_request_alerter: check dropped, the configuration changed while it ran "
+            "(generation %d)",
+            published.generation,
+        )
+        return False
+
+    # The parameters of the configuration in force, for callers and tests that
+    # read them off the alerter.
+    @property
+    def threshold(self) -> int:
+        """Strict greater-than failure count that fires."""
+        return self._acquire().view.failed_request_alert_threshold
+
+    @property
+    def window_minutes(self) -> int:
+        """Sliding-window size, in minutes."""
+        return self._acquire().view.failed_request_alert_window_minutes
+
+    @property
+    def cooldown_minutes(self) -> int:
+        """Minimum interval between alerts, in minutes."""
+        return self._acquire().view.failed_request_alert_cooldown_minutes
+
+    @property
+    def rate_threshold(self) -> float:
+        """Failing fraction that fires on its own; 0 disables the rule."""
+        return self._acquire().view.failed_request_alert_rate
+
+    @property
+    def rate_min_count(self) -> int:
+        """Failures required before the rate rule applies."""
+        return self._acquire().view.failed_request_alert_rate_min_count
 
     async def run_check(self) -> None:
         """Run one check cycle: count failures, alert if over threshold and cooled down."""
+        published = self._acquire()
+        config = published.view
+        if not config.detector_enabled:
+            # Paused: no query, no incident change, no recovery message.
+            self.last_state = "paused"
+            return
+        self.last_state = "running"
+        threshold = config.failed_request_alert_threshold
+        window_minutes = config.failed_request_alert_window_minutes
+        cooldown_minutes = config.failed_request_alert_cooldown_minutes
+        rate_threshold = config.failed_request_alert_rate
+        rate_min_count = config.failed_request_alert_rate_min_count
+
+        def fence() -> bool:
+            return self._current(published)
+
         total = 0
         try:
-            if self.rate_threshold > 0:
-                count, total = await count_recent_failures_and_total(self.pool, self.window_minutes)
+            if rate_threshold > 0:
+                count, total = await count_recent_failures_and_total(self.pool, window_minutes)
             else:
-                count = await count_recent_failures(self.pool, self.window_minutes)
+                count = await count_recent_failures(self.pool, window_minutes)
         except Exception:
             logger.exception("failed_request_alerter: failure-count query failed")
+            return
+        if not fence():
             return
 
         # Two independent rules. The absolute count catches a loud spike; the
         # rate catches a sustained defect that never gets near it -- which is
         # the shape that went unalerted for 18 days in #1361.
         rate = (count / total) if total else 0.0
-        rate_breached = (
-            self.rate_threshold > 0 and count >= self.rate_min_count and rate >= self.rate_threshold
-        )
+        rate_breached = rate_threshold > 0 and count >= rate_min_count and rate >= rate_threshold
 
-        if count <= self.threshold and not rate_breached:
+        if count <= threshold and not rate_breached:
             # Healthy. The detector used to stop here, which is why its alert
             # was fire-only; reporting the crossing back down is what closes
-            # the incident it opened.
+            # the incident it opened. The fence is checked again before the
+            # tracker changes; the cooldown is cleared only if it passed.
+            if not fence():
+                return
+            self._observe(published, healthy=True)
             await alert_on_transition(
                 key="failed_request_rate_db",
                 breached=False,
@@ -314,17 +415,31 @@ class FailedRequestAlerter:
                 title="Failed-request rate exceeded (DB-query detector)",
                 context=dict,
                 cooldown_sec=0,
+                fence=fence,
             )
-            self._last_alert_at = None
+            # Only an evaluation still current after the transition owns the
+            # cooldown: one superseded while it awaited leaves it to the next.
+            if fence():
+                self._last_alert_at = None
             return
 
         now = self._now_fn()
         if self._last_alert_at is not None and now - self._last_alert_at < timedelta(
-            minutes=self.cooldown_minutes
+            minutes=cooldown_minutes
         ):
+            alert_history.external_decision(
+                "failed_request_rate_db",
+                reason="cooldown",
+                severity=AlertSeverity.ERROR,
+                title="Failed-request rate exceeded (DB-query detector)",
+                kind="metric",
+                context={"count": count, "window_minutes": window_minutes},
+            )
             return
 
-        breakdown = await fetch_failure_breakdown(self.pool, self.window_minutes)
+        breakdown = await fetch_failure_breakdown(self.pool, window_minutes)
+        if not fence():
+            return
 
         # Route through the unified alert sink. We pass cooldown_sec=0 because
         # this class enforces its own cooldown above (datetime-based, with a
@@ -333,17 +448,18 @@ class FailedRequestAlerter:
         # tables for the same dedupe key.
         context: dict = {
             "count": count,
-            "window_minutes": self.window_minutes,
-            "threshold": self.threshold,
+            "window_minutes": window_minutes,
+            "threshold": threshold,
             # Which rule fired, so the reader is not left guessing why a count
             # far below `threshold` produced a page.
-            "trigger": "rate" if count <= self.threshold else "count",
+            "trigger": "rate" if count <= threshold else "count",
         }
-        if self.rate_threshold > 0:
+        if rate_threshold > 0:
             context["total"] = total
             context["failure_rate"] = round(rate, 4)
-            context["rate_threshold"] = self.rate_threshold
+            context["rate_threshold"] = rate_threshold
         context.update(breakdown)
+        self._observe(published, healthy=False)
         ok = await alert_on_transition(
             key="failed_request_rate_db",
             breached=True,
@@ -351,48 +467,51 @@ class FailedRequestAlerter:
             title="Failed-request rate exceeded (DB-query detector)",
             context=lambda: context,
             cooldown_sec=0,
+            fence=fence,
         )
         if ok:
+            # A send admitted under this configuration was delivered: its
+            # cooldown stands even if the configuration changed during the post.
             self._last_alert_at = now
             logger.info(
-                "failed_request_alerter: posted Slack alert "
-                "(count=%d threshold=%d rate=%.4f of %d)",
+                "failed_request_alerter: posted alert "
+                "(count=%d threshold=%d rate=%.4f of %d, configuration generation %d)",
                 count,
-                self.threshold,
+                threshold,
                 rate,
                 total,
+                published.generation,
             )
 
 
-def register_alerter_job(pool: asyncpg.Pool, settings: Settings) -> None:
-    """Register the failure-rate alerter on the running APScheduler.
+def register_alerter_job(
+    pool: asyncpg.Pool, settings: Settings | None = None
+) -> FailedRequestAlerter | None:
+    """Register the failure-rate alerter on the running APScheduler; return it.
 
-    Empty ``settings.slack_webhook_url`` disables the feature: no job is
-    registered and no error is raised. When the scheduler has not been
-    started (rare; e.g. DB init failed earlier), the function logs a
-    warning and returns without crashing.
+    One job, registered whenever the scheduler is running, whatever the
+    configuration: with neither ``SLACK_WEBHOOK_URL`` nor
+    ``WECOM_ALERTS_WEBHOOK_URL`` set the detector is paused rather than absent,
+    so a webhook saved later starts it without a restart once the
+    ``alerts.runtime`` group is active. ``SLACK_ALERTS_WEBHOOK_URL`` alone
+    still does not enable it. When the scheduler has not been started (rare;
+    e.g. DB init failed earlier), the function logs a warning, reports the
+    detector unavailable and returns ``None``.
+
+    Args:
+        pool: The pool the checks query.
+        settings: Unused; kept for callers of the earlier signature. The
+            parameters come from the ``alerts.runtime`` configuration in force.
     """
     from apscheduler.triggers.interval import IntervalTrigger
-
-    webhook_url = settings.slack_webhook_url.strip()
-    if not webhook_url:
-        logger.info("Slack alerter disabled (SLACK_WEBHOOK_URL not set)")
-        return
 
     scheduler = get_scheduler()
     if scheduler is None:
         logger.warning("failed_request_alerter: scheduler not running, skipping registration")
-        return
+        alert_runtime.set_detector_state("unavailable")
+        return None
 
-    alerter = FailedRequestAlerter(
-        pool=pool,
-        webhook_url=webhook_url,
-        threshold=settings.failed_request_alert_threshold,
-        window_minutes=settings.failed_request_alert_window_minutes,
-        cooldown_minutes=settings.failed_request_alert_cooldown_minutes,
-        rate_threshold=settings.failed_request_alert_rate,
-        rate_min_count=settings.failed_request_alert_rate_min_count,
-    )
+    alerter = FailedRequestAlerter(pool=pool)
 
     scheduler.add_job(
         alerter.run_check,
@@ -403,9 +522,15 @@ def register_alerter_job(pool: asyncpg.Pool, settings: Settings) -> None:
         coalesce=True,
         max_instances=1,
     )
+    config = alert_runtime.current()
     logger.info(
-        "failed_request_alerter: registered (threshold=%d window_min=%d cooldown_min=%d)",
-        settings.failed_request_alert_threshold,
-        settings.failed_request_alert_window_minutes,
-        settings.failed_request_alert_cooldown_minutes,
+        "failed_request_alerter: registered (%s; threshold=%d window_min=%d cooldown_min=%d)",
+        "running"
+        if config.detector_enabled
+        else "paused until SLACK_WEBHOOK_URL or WECOM_ALERTS_WEBHOOK_URL is set",
+        config.failed_request_alert_threshold,
+        config.failed_request_alert_window_minutes,
+        config.failed_request_alert_cooldown_minutes,
     )
+    alert_runtime.set_detector_state("registered")
+    return alerter

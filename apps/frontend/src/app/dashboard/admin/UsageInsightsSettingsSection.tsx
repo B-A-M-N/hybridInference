@@ -1,31 +1,56 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 
+import { EditBar } from '@/components/features/admin/confirm/EditBar';
+import { useConfirmAction } from '@/components/features/admin/confirm/useConfirmAction';
+import { withoutSecret } from '@/components/features/admin/confirm/withoutSecret';
 import {
   UsageInsightsSettings,
   getUsageInsightsSettings,
   updateUsageInsightsSettings,
 } from '@/lib/api/admin';
 import { getErrorMessage } from '@/lib/utils/errors';
+import {
+  AdminLoading,
+  AdminNotice,
+  AdminSection,
+} from '@/components/features/admin/AdminPrimitives';
+import {
+  BUTTON_SECONDARY,
+  FORM_LABEL,
+  PANEL,
+  TEXT_FIELD,
+} from '@/components/features/admin/adminStyles';
+
+import { useReportUnsaved } from './useReportUnsaved';
 
 interface UsageInsightsSettingsSectionProps {
   onToast: (msg: string) => void;
+  /** Called with the number of unsaved changes whenever it changes. */
+  onUnsavedChange?: (count: number) => void;
 }
 
 /**
  * Configures the provider used by the admin Usage Insights analysis: a
  * gateway API key (stored server-side, never returned in full) and the
- * model to run the report with. The Analyze action lives on each user's detail
- * panel; this section only manages credentials.
+ * model to run the report with, both edited in place and saved together. The
+ * Analyze action lives on each user's detail panel; this section only manages
+ * credentials.
  */
-export function UsageInsightsSettingsSection({ onToast }: UsageInsightsSettingsSectionProps) {
+export function UsageInsightsSettingsSection({
+  onToast,
+  onUnsavedChange,
+}: UsageInsightsSettingsSectionProps) {
   const [settings, setSettings] = useState<UsageInsightsSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const confirmation = useConfirmAction();
+  const busy = confirmation.busy;
+  const baseId = useId();
 
-  // Empty key field means "leave the stored key unchanged" on save.
+  // The key field is never filled in: empty means "leave the stored key unchanged".
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState('');
 
@@ -58,76 +83,92 @@ export function UsageInsightsSettingsSection({ onToast }: UsageInsightsSettingsS
     };
   }, [load]);
 
-  const onSave = async () => {
-    const trimmedModel = model.trim();
-    if (!trimmedModel) {
-      onToast('Model name cannot be empty');
-      return;
-    }
-    setBusy(true);
-    try {
-      const patch: { api_key?: string; model?: string } = {};
-      if (apiKey.trim()) patch.api_key = apiKey.trim();
-      if (trimmedModel !== settings?.model) patch.model = trimmedModel;
-      if (patch.api_key === undefined && patch.model === undefined) {
-        onToast('Nothing to save');
-        setBusy(false);
-        return;
-      }
-      const updated = await updateUsageInsightsSettings(patch);
-      setSettings(updated);
-      setModel(updated.model);
-      setApiKey('');
-      onToast('Usage Insights provider saved');
-    } catch (e) {
-      onToast(`Failed to save: ${getErrorMessage(e)}`);
-    } finally {
-      setBusy(false);
-    }
+  const trimmedModel = model.trim();
+  const modelChanged = settings !== null && trimmedModel !== settings.model;
+  const keyTyped = apiKey.trim() !== '';
+
+  // An emptied model is unsaved too: it keeps the bar up, with Save held back.
+  const unsaved = Number(modelChanged) + Number(keyTyped);
+  useReportUnsaved(unsaved, onUnsavedChange);
+  const blocked = unsaved > 0 && !trimmedModel ? 'Model name cannot be empty.' : null;
+  // Clear key shares the write flow, but runs only with nothing unsaved.
+  const saving = busy && unsaved > 0;
+
+  const cancel = () => {
+    if (busy) return;
+    setApiKey('');
+    setModel(settings?.model ?? '');
+    setSaveError(null);
   };
 
-  const onClearKey = async () => {
-    setBusy(true);
-    try {
-      const updated = await updateUsageInsightsSettings({ api_key: '' });
-      setSettings(updated);
-      setApiKey('');
-      onToast('API key cleared');
-    } catch (e) {
-      onToast(`Failed to clear key: ${getErrorMessage(e)}`);
-    } finally {
-      setBusy(false);
-    }
+  const onSave = async () => {
+    if (blocked || unsaved === 0) return;
+    const patch: { api_key?: string; model?: string } = {};
+    if (keyTyped) patch.api_key = apiKey.trim();
+    if (modelChanged) patch.model = trimmedModel;
+    setSaveError(null);
+    const failure = await confirmation.perform({
+      run: async () => {
+        // The key is write-only: a refusal that echoes it back shows it masked.
+        const updated = await updateUsageInsightsSettings(patch).catch((err: unknown) => {
+          throw new Error(withoutSecret(getErrorMessage(err), patch.api_key ?? ''));
+        });
+        if (!mounted.current) return;
+        setSettings(updated);
+        setModel(updated.model);
+        setApiKey('');
+        onToast('Usage Insights provider saved');
+      },
+    });
+    if (mounted.current) setSaveError(failure);
+  };
+
+  const onClearKey = () => {
+    confirmation.request({
+      title: 'Clear the Usage Insights API key?',
+      confirmLabel: 'Clear key',
+      busyLabel: 'Clearing…',
+      tone: 'danger',
+      body: (
+        <p>
+          The stored key is removed, and Usage Insights analysis stops working until a new key is
+          saved.
+        </p>
+      ),
+      run: async () => {
+        const updated = await updateUsageInsightsSettings({ api_key: '' });
+        setSettings(updated);
+        setApiKey('');
+        onToast('API key cleared');
+      },
+    });
   };
 
   const configured = !!settings?.configured;
 
   return (
-    <div className="rounded-xl border border-gray-200 bg-white p-5">
-      <div className="mb-3">
-        <h2 className="text-[14px] font-semibold text-gray-900">Usage Insights</h2>
-        <p className="mt-1 text-[12px] text-gray-500">
+    <AdminSection
+      title="Usage Insights"
+      description={
+        <>
           API key and model for the LLM-powered Usage Insights analysis. The analysis runs through
           this gateway, so the key is one of its own. It is stored server-side and never shown
           again. Run the analysis from a user&apos;s detail panel using the &ldquo;Analyze
           usage&rdquo; button.
-        </p>
-      </div>
-
+        </>
+      }
+    >
       {error && (
-        <div className="mb-3 rounded-lg bg-red-50 px-3 py-2 text-[12px] text-red-600">
-          {error}{' '}
-          <button onClick={() => setError(null)} className="ml-2 font-bold">
-            &times;
-          </button>
+        <div className="mb-3">
+          <AdminNotice onDismiss={() => setError(null)}>{error}</AdminNotice>
         </div>
       )}
 
       {loading ? (
-        <div className="py-8 text-center text-[13px] text-gray-400">Loading...</div>
-      ) : (
-        <div className="space-y-4">
-          <div className="flex items-center gap-2">
+        <AdminLoading size="sm" />
+      ) : settings ? (
+        <div className={`${PANEL} max-w-3xl space-y-4 p-4`}>
+          <div className="flex flex-wrap items-center gap-2">
             <span
               className={`inline-block h-2.5 w-2.5 rounded-full ${
                 configured ? 'bg-emerald-500' : 'bg-gray-300'
@@ -143,56 +184,64 @@ export function UsageInsightsSettingsSection({ onToast }: UsageInsightsSettingsS
                 'No API key configured'
               )}
             </span>
+            {configured ? (
+              // Its own confirmed action, not part of the save; it would drop a typed key.
+              <button
+                type="button"
+                disabled={busy || unsaved > 0}
+                title={unsaved > 0 ? 'Save or discard the changes first' : undefined}
+                onClick={onClearKey}
+                className={`ml-auto ${BUTTON_SECONDARY}`}
+              >
+                Clear key
+              </button>
+            ) : null}
           </div>
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="sm:col-span-2">
-              <label className="mb-1 block text-[12px] font-medium text-gray-600">
+              <label htmlFor={`${baseId}-key`} className={FORM_LABEL}>
                 Gateway API key
               </label>
               <input
+                id={`${baseId}-key`}
                 type="password"
                 value={apiKey}
+                disabled={busy}
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder={configured ? 'Enter a new key to replace the stored one' : 'sk-...'}
-                autoComplete="off"
-                className="w-full rounded-md border border-gray-200 px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-gray-900"
+                autoComplete="new-password"
+                className={TEXT_FIELD}
               />
             </div>
             <div>
-              <label className="mb-1 block text-[12px] font-medium text-gray-600">Model</label>
+              <label htmlFor={`${baseId}-model`} className={FORM_LABEL}>
+                Model
+              </label>
               <input
+                id={`${baseId}-model`}
                 type="text"
                 value={model}
+                disabled={busy}
                 onChange={(e) => setModel(e.target.value)}
                 placeholder="glm-5.1"
-                className="w-full rounded-md border border-gray-200 px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-gray-900"
+                className={TEXT_FIELD}
               />
             </div>
           </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              disabled={busy}
-              onClick={onSave}
-              className="rounded-md bg-gray-900 px-3 py-1.5 text-[12px] font-medium text-white transition hover:bg-gray-700 disabled:opacity-40"
-            >
-              {busy ? 'Saving…' : 'Save'}
-            </button>
-            {configured && (
-              <button
-                type="button"
-                disabled={busy}
-                onClick={onClearKey}
-                className="rounded-md border border-gray-300 bg-white px-3 py-1.5 text-[12px] font-medium text-gray-700 transition hover:bg-gray-50 disabled:opacity-40"
-              >
-                Clear key
-              </button>
-            )}
-          </div>
+          <EditBar
+            target="Usage Insights"
+            changeCount={unsaved}
+            onCancel={cancel}
+            onSave={() => void onSave()}
+            busy={saving}
+            error={saveError}
+            blocked={blocked}
+            inPlace
+          />
         </div>
-      )}
-    </div>
+      ) : null}
+      {confirmation.dialog}
+    </AdminSection>
   );
 }

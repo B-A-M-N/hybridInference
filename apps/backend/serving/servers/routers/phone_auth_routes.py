@@ -1,11 +1,12 @@
 """Optional phone registration, login, and explicit account binding."""
 
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
 
+from serving.audit import AuditActor, AuditTarget
 from serving.auth.browser_sessions import complete_sign_in, hash_refresh_token, prepare_sign_in
 from serving.auth.signup_policy import allowlist_is_empty, is_public_signup_enabled
 from serving.config.settings import get_signup_notify_emails, settings
@@ -20,7 +21,12 @@ from serving.schemas_auth import (
     UserInfo,
 )
 from serving.servers.auth import log_admin_action
-from serving.servers.deps import get_current_user, get_db_logger, get_operational_store
+from serving.servers.deps import (
+    get_current_user,
+    get_db_logger,
+    get_operational_store,
+    user_audit_actor,
+)
 from serving.setup_state import refresh_setup_state
 from serving.storage.phone_auth import OWNER_PURPOSES
 from serving.utils.email import is_email_enabled, send_new_registration_admin_email
@@ -249,12 +255,14 @@ async def phone_signup(
                 user_id=user_id,
                 use_case=body.use_case,
             )
+    # Registration is unauthenticated: the requester is anonymous, and the
+    # account it created is the target.
     await log_admin_action(
         db_logger,
-        client_ip,
-        "create_user",
-        user_id,
-        {
+        action="create_user",
+        actor=AuditActor.anonymous(client_ip),
+        target=AuditTarget.user(user_id),
+        details={
             "phone": body.phone,
             "user_name": body.user_name,
             "status": status,
@@ -360,7 +368,7 @@ async def phone_login(
         refresh_token_hash=hash_refresh_token(create_refresh_token()),
         jti=jti,
         sid=sid,
-        expires_at=datetime.now(timezone.utc) + timedelta(days=get_refresh_token_expire_days()),
+        expires_at=datetime.now(UTC) + timedelta(days=get_refresh_token_expire_days()),
     )
     if not created:
         await record("failure", "account_inactive")
@@ -384,7 +392,7 @@ async def phone_login(
             email_verified=user.get("email_verified", False),
             is_admin=user_role == "admin",
             created_at=user["created_at"],
-            last_login_at=datetime.now(timezone.utc),
+            last_login_at=datetime.now(UTC),
         ),
     )
 
@@ -405,9 +413,9 @@ async def bind_phone(
         raise HTTPException(409, "Phone number cannot be bound to this account.")
     await log_admin_action(
         db_logger,
-        get_client_ip(request),
-        "bind_phone",
-        current_user["user_id"],
-        {"phone": body.phone},
+        action="bind_phone",
+        details={"phone": body.phone},
+        actor=user_audit_actor(request, current_user),
+        target=AuditTarget.user(current_user["user_id"]),
     )
     return {"message": "Phone number bound successfully."}

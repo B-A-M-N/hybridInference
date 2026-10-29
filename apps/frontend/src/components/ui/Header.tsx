@@ -6,7 +6,6 @@ import { useSiteConfig } from '@/components/providers/SiteConfigProvider';
 import { useT } from '@/components/providers/useT';
 import { fill } from '@/lib/utils/interpolate';
 import { AccountMenu } from './AccountMenu';
-import { LanguageSwitcher } from './LanguageSwitcher';
 import { useConsoleWidth } from '@/components/ui/consoleWidth';
 
 export function Header() {
@@ -70,6 +69,16 @@ export function Header() {
             {t('chrome.header.stats', 'Stats')}
           </Link>
         )}
+        {branding.docsUrl && (
+          <a
+            href={branding.docsUrl}
+            className="rounded-md px-2 py-1.5 text-sm font-medium text-gray-600 transition-colors hover:bg-gray-100 hover:text-gray-900 sm:px-3"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {t('chrome.header.docs', 'Docs')}
+          </a>
+        )}
         {branding.navLinks.map((link) => (
           <a
             key={link.url}
@@ -81,7 +90,6 @@ export function Header() {
             {link.label}
           </a>
         ))}
-        {!state.isAuthenticated && <LanguageSwitcher />}
         {state.isAuthenticated && (
           <>
             {features.rag && (

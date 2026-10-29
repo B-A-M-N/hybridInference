@@ -32,9 +32,10 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
+from serving.audit import AuditActor
 from serving.config.settings import get_settings
 from serving.utils.logging import get_logger
 
@@ -92,7 +93,7 @@ def _digest(code: str) -> bytes:
 
 def _now_iso() -> str:
     """Return the current time as an ISO 8601 timestamp, the marker's value."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 async def _load_code(store: Any) -> str | None:
@@ -167,14 +168,6 @@ async def init_setup_state(store: Any) -> None:
         _adopt_code(code)
 
 
-def is_setup_required() -> bool:
-    """Return whether first-run setup is still pending, from memory.
-
-    False in database-free mode and before :func:`init_setup_state` has run.
-    """
-    return _state.required
-
-
 async def refresh_setup_state() -> bool:
     """Re-check a pending setup against the database, then return whether it is pending.
 
@@ -185,7 +178,8 @@ async def refresh_setup_state() -> bool:
     or slow read leaves setup pending.
 
     Returns:
-        The same answer :func:`is_setup_required` gives afterwards.
+        Whether setup is still pending after the check: False in database-free
+        mode and before :func:`init_setup_state` has run.
     """
     if not _state.required or _state.store is None:
         return _state.required
@@ -212,7 +206,7 @@ async def complete_setup(
     login_name: str,
     password_hash: str,
     user_name: str,
-    admin_ip: str,
+    source_ip: str | None,
 ) -> bool:
     """Create the first administrator and record that setup is complete.
 
@@ -221,6 +215,10 @@ async def complete_setup(
     deletes the stored setup code in the same transaction. Unless it raises,
     setup is no longer pending afterwards: this call completed it, or the
     store found it already completed.
+
+    The audit row names a ``bootstrap`` actor from *source_ip*, the setup
+    request's client address: no account existed to act, and the setup code
+    that authorized the request belongs to no one.
 
     Returns:
         True when the administrator was created; False when setup had
@@ -234,7 +232,7 @@ async def complete_setup(
         marker_key=SETUP_MARKER_KEY,
         marker_value=_now_iso(),
         code_key=SETUP_CODE_KEY,
-        admin_ip=admin_ip,
+        actor=AuditActor.bootstrap(source_ip),
     )
     mark_setup_completed()
     return created

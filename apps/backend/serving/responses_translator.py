@@ -29,6 +29,7 @@ import uuid
 from typing import TYPE_CHECKING, Any
 
 from serving.utils.messages import merge_leading_system_messages
+from serving.utils.token_utils import normalize_usage
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -114,10 +115,17 @@ def _content_parts_to_text_or_blocks(content: Any) -> Any:
     return blocks
 
 
-def _function_call_output_to_text(output: Any) -> str:
-    """Coerce a Responses ``function_call_output.output`` into chat tool text."""
+def _function_call_output_to_content(output: Any) -> Any:
+    """Coerce a Responses ``function_call_output.output`` into chat tool content.
+
+    The spec's array form (``input_text`` / ``input_image`` parts) is translated
+    as message content is: text alone collapses to a string, and an image stays
+    an image block, so the modality check sees it. Anything else is serialized.
+    """
     if isinstance(output, str):
         return output
+    if isinstance(output, list):
+        return _content_parts_to_text_or_blocks(output)
     return json.dumps(output)
 
 
@@ -201,7 +209,7 @@ def responses_input_to_messages(
                 {
                     "role": "tool",
                     "tool_call_id": item.get("call_id") or item.get("id") or "",
-                    "content": _function_call_output_to_text(item.get("output")),
+                    "content": _function_call_output_to_content(item.get("output")),
                 }
             )
         # reasoning / item_reference / other types: skipped (no chat analogue).
@@ -367,15 +375,19 @@ def _map_usage(chat_usage: dict[str, Any] | None) -> dict[str, Any] | None:
     # shapes (prompt_tokens_details.cached_tokens /
     # completion_tokens_details.reasoning_tokens) so cache/reasoning tokens are
     # not under-reported for providers that emit the nested form.
-    prompt_details = chat_usage.get("prompt_tokens_details") or {}
-    completion_details = chat_usage.get("completion_tokens_details") or {}
-    cached = int(chat_usage.get("cache_read_tokens") or prompt_details.get("cached_tokens") or 0)
+    normalized = normalize_usage(chat_usage) or {}
+    completion_details = normalized.get("completion_tokens_details") or {}
+    cached = normalized.get("cache_read_tokens")
     reasoning = int(
-        chat_usage.get("reasoning_tokens") or completion_details.get("reasoning_tokens") or 0
+        normalized.get("reasoning_tokens") or completion_details.get("reasoning_tokens") or 0
     )
     return {
         "input_tokens": input_tokens,
-        "input_tokens_details": {"cached_tokens": cached},
+        "input_tokens_details": {
+            # The public shape requires a numeric field, so an unreported
+            # measurement is serialized as 0 for SDK compatibility.
+            "cached_tokens": cached if cached is not None else 0,
+        },
         "output_tokens": output_tokens,
         "output_tokens_details": {"reasoning_tokens": reasoning},
         "total_tokens": total,

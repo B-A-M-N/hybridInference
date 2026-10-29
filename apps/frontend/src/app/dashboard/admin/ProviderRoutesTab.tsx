@@ -10,6 +10,7 @@ import {
   ProviderRoute,
   ProviderRouteStrategy,
   ProviderRouteType,
+  RouteDeploymentType,
   ProviderRouteOption,
   Role,
   RouteWeight,
@@ -23,19 +24,41 @@ import {
   listProviderKeys,
   listOpenRouterProviderOptions,
   listProviderRoutes,
+  removeProviderRoute,
+  restoreProviderRoute,
   setRouteWeight,
   updateProviderRoute,
   updateProviderRouteCandidate,
+  updateProviderRouteState,
+  updateProviderRouteCapabilities,
+  resetProviderRouteCapabilities,
   updateProviderRouteStrategy,
   verifyProviderRoute,
   verifyProviderRouteModel,
   verifyProviderRouteCandidate,
 } from '@/lib/api/admin';
-import { getErrorMessage } from '@/lib/utils/errors';
+import { ChangeList, plural, type Change } from '@/components/features/admin/confirm/ChangeList';
+import { EditBar } from '@/components/features/admin/confirm/EditBar';
+import { useConfirmAction } from '@/components/features/admin/confirm/useConfirmAction';
+import { writeEach } from '@/components/features/admin/confirm/writeEach';
+import { BUTTON_GHOST, BUTTON_PRIMARY } from '@/components/features/admin/adminStyles';
+import { APIError, getErrorMessage } from '@/lib/utils/errors';
 import { OffloadRoutePanel } from './OffloadRoutePanel';
+import { RouteDeploymentField } from './RouteDeploymentField';
+import {
+  RouteCapabilityFields,
+  capabilityChanges,
+  capabilityDraftFrom,
+  describeCapabilities,
+  emptyCapabilityDraft,
+  readCapabilityDraft,
+  type CapabilityDraft,
+  type DeclaredChoice,
+} from './RouteCapabilityFields';
 import type { OffloadQueueInfo } from './OffloadRoutePanel';
 import { RoutewiseSettingsPanel } from './RoutewiseSettingsPanel';
 import { RoutewiseDecisionsPanel } from './RoutewiseDecisionsPanel';
+import { Select } from '@/components/ui/Select';
 
 type RouteForm = {
   upstreamProvider: string;
@@ -43,11 +66,16 @@ type RouteForm = {
   customOpenRouterProvider: string;
   openRouterSort: string;
   baseUrl: string;
+  // Null until the admin picks one in this edit: the server then keeps the
+  // route's declaration, or resets it to auto when the endpoint moves.
+  deploymentType: RouteDeploymentType | null;
   apiKeyId: string;
   providerModelId: string;
   quotaLimit: string;
   concurrencyLimit: string;
 };
+
+// Starts unanswered: a choice the admin never made must not be sent as "no".
 
 type CreateRouteForm = {
   routeType: ProviderRouteType;
@@ -56,6 +84,7 @@ type CreateRouteForm = {
   customOpenRouterProvider: string;
   openRouterSort: string;
   baseUrl: string;
+  deploymentType: RouteDeploymentType;
   apiKeyId: string;
   providerModelId: string;
   quotaLimit: string;
@@ -65,6 +94,11 @@ type CreateRouteForm = {
   pricingCompletion: string;
   pricingCacheReads: string;
   pricingCacheWrites: string;
+  contextLength: string;
+  maxOutputLength: string;
+  imageInput: DeclaredChoice;
+  toolCalling: DeclaredChoice;
+  otherInputModalities: string[];
 };
 
 const emptyCreateForm: CreateRouteForm = {
@@ -74,6 +108,7 @@ const emptyCreateForm: CreateRouteForm = {
   customOpenRouterProvider: '',
   openRouterSort: '',
   baseUrl: '',
+  deploymentType: 'auto',
   apiKeyId: '',
   providerModelId: '',
   quotaLimit: '5000',
@@ -83,6 +118,7 @@ const emptyCreateForm: CreateRouteForm = {
   pricingCompletion: '',
   pricingCacheReads: '',
   pricingCacheWrites: '',
+  ...emptyCapabilityDraft,
 };
 
 const OPENROUTER_PROVIDER_AUTO = '';
@@ -119,6 +155,13 @@ const MODEL_ROLE_OPTIONS: Array<{ value: Role; label: string }> = [
   { value: 'pro', label: 'Pro, internal, and admins' },
   { value: 'free', label: 'All users' },
 ];
+
+// The gateway's own reason. The shared mapping reads any 409 as a signup
+// conflict ("This email is already registered"), which would hide why a route
+// edit, disable or delete was refused.
+function routeErrorMessage(err: unknown) {
+  return err instanceof APIError && err.message ? err.message : getErrorMessage(err);
+}
 
 function routeKey(route: Pick<ProviderRoute, 'model_id' | 'route_id'>) {
   return `${route.model_id}\u0000${route.route_id}`;
@@ -192,7 +235,12 @@ function noProviderHelpText(routeType: ProviderRouteType) {
   return 'There are no configured providers left for this route type.';
 }
 
+function overrideNotApplied(route: ProviderRoute) {
+  return route.source === 'override' && route.override_applied === false;
+}
+
 function sourceLabel(route: ProviderRoute) {
+  if (overrideNotApplied(route) && !route.removed) return 'Override not applied';
   if (route.source === 'override') return 'Override active';
   if (route.source === 'runtime') return 'Runtime added';
   return 'Config default';
@@ -239,7 +287,7 @@ function routeQuotaResetLabel(route: ProviderRoute) {
   if (!route.quota_reset_at) return null;
   const resetAt = new Date(route.quota_reset_at);
   if (Number.isNaN(resetAt.getTime())) return null;
-  return resetAt.toLocaleTimeString(undefined, {
+  return resetAt.toLocaleTimeString('en-US', {
     hour: '2-digit',
     minute: '2-digit',
     timeZoneName: 'short',
@@ -371,11 +419,41 @@ function routePrimaryProvider(route: ProviderRoute) {
   return route.provider;
 }
 
+// Mirrors the gateway's endpoint comparison closely enough to tell whether an
+// edit still points at the route's current endpoint.
+function canonicalEndpointUrl(value: string) {
+  const trimmed = value.trim();
+  try {
+    const url = new URL(
+      trimmed.includes('://') ? trimmed : `https://${trimmed.replace(/^\/+/, '')}`,
+    );
+    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    return trimmed.replace(/\/+$/, '');
+  }
+}
+
 function routePrimaryUpstreamProvider(route: ProviderRoute) {
   if (route.upstream_provider !== 'openrouter' && route.key_provider === 'openrouter') {
     return 'openrouter';
   }
   return route.upstream_provider;
+}
+
+const ROUTE_EDIT_FIELD_LABELS: Record<string, string> = {
+  upstream_provider: 'Provider',
+  openrouter_provider: 'OpenRouter provider',
+  openrouter_sort: 'OpenRouter sort',
+  base_url: 'Base URL',
+  deployment_type: 'Deployment',
+  api_key_id: 'API key',
+  provider_model_id: 'Provider model ID',
+  quota_limit: 'Quota limit',
+  concurrency_limit: 'Concurrency limit',
+};
+
+function shownRouteValue(value: unknown): string {
+  return value === null || value === undefined || value === '' ? '(default)' : String(value);
 }
 
 function routeOpenRouterProvider(route: ProviderRoute) {
@@ -473,6 +551,24 @@ function openRouterRoutingOptions(
   ];
 }
 
+/**
+ * The OpenRouter routing choices for the selector: OpenRouter's own routing
+ * (automatic, or sorted by price, throughput or latency) apart from pinning
+ * one provider. Same values; only the presentation is grouped.
+ */
+function groupOpenRouterRouting(options: ReadonlyArray<{ value: string; label: string }>) {
+  const pinned = options.filter((option) =>
+    option.value.startsWith(OPENROUTER_ROUTING_PROVIDER_PREFIX),
+  );
+  const routing = options.filter(
+    (option) => !option.value.startsWith(OPENROUTER_ROUTING_PROVIDER_PREFIX),
+  );
+  return [
+    ...(routing.length ? [{ label: 'Let OpenRouter choose', options: routing }] : []),
+    ...(pinned.length ? [{ label: 'Pin a provider', options: pinned }] : []),
+  ];
+}
+
 function resolvedOpenRouterProvider(selectedProvider: string, customProvider: string) {
   if (selectedProvider === OPENROUTER_PROVIDER_CUSTOM) {
     const cleaned = customProvider.trim();
@@ -555,6 +651,9 @@ interface ProviderRoutesTabProps {
   showRoutewiseSettings?: boolean;
 }
 
+// Why a control that would drop an unsaved draft is unavailable for now.
+const HELD_FOR_DRAFTS = 'Save or discard the unsaved changes first';
+
 export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRoutesTabProps = {}) {
   const toast = useAccountToast();
   const [routes, setRoutes] = useState<ProviderRoute[]>([]);
@@ -562,7 +661,6 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
   const [draftWeights, setDraftWeights] = useState<Record<string, string>>({});
   const [draftConcurrencyLimits, setDraftConcurrencyLimits] = useState<Record<string, string>>({});
   const [savingWeightKey, setSavingWeightKey] = useState<string | null>(null);
-  const [savingConcurrencyKey, setSavingConcurrencyKey] = useState<string | null>(null);
   const [providerOptions, setProviderOptions] = useState<ProviderRouteOption[]>([]);
   const [openRouterProviderOptions, setOpenRouterProviderOptions] = useState<
     OpenRouterProviderOption[]
@@ -574,6 +672,9 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
   const [selectedModel, setSelectedModel] = useState('');
   const [loading, setLoading] = useState(false);
   const [editingRoute, setEditingRoute] = useState<ProviderRoute | null>(null);
+  // The route whose capabilities are being edited, and the fields as typed.
+  const [capabilityRoute, setCapabilityRoute] = useState<ProviderRoute | null>(null);
+  const [capabilityDraft, setCapabilityDraft] = useState<CapabilityDraft>(emptyCapabilityDraft);
   const [addingRoute, setAddingRoute] = useState(false);
   const [creatingModel, setCreatingModel] = useState(false);
   const [newModelId, setNewModelId] = useState('');
@@ -585,6 +686,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     customOpenRouterProvider: '',
     openRouterSort: '',
     baseUrl: '',
+    deploymentType: 'auto',
     apiKeyId: '',
     providerModelId: '',
     quotaLimit: '',
@@ -595,15 +697,26 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
   const [createKeyOptions, setCreateKeyOptions] = useState<ProviderApiKeyItem[]>([]);
   const [keysLoading, setKeysLoading] = useState(false);
   const [createKeysLoading, setCreateKeysLoading] = useState(false);
-  const [savingKey, setSavingKey] = useState<string | null>(null);
-  const [creatingRoute, setCreatingRoute] = useState(false);
+  const confirmation = useConfirmAction();
+  // Fixed weights, the routing policy and a concurrency limit are edited in
+  // place; Save writes their drafts.
+  const [weightsError, setWeightsError] = useState<string | null>(null);
+  // The policy chosen for the selected model; null while it is the saved one.
+  const [draftStrategy, setDraftStrategy] = useState<ProviderRouteStrategy | null>(null);
+  const [strategyError, setStrategyError] = useState<string | null>(null);
+  // Route key → why that row's concurrency limit could not be saved.
+  const [concurrencyErrors, setConcurrencyErrors] = useState<Record<string, string>>({});
+  const [routeEditError, setRouteEditError] = useState<string | null>(null);
+  // Why a create or a capability save failed, shown in its dialog with the values kept.
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [capabilityError, setCapabilityError] = useState<string | null>(null);
   const [verifyingKey, setVerifyingKey] = useState<string | null>(null);
   const [verifyingCreateRoute, setVerifyingCreateRoute] = useState(false);
   const [verifiedEditSignature, setVerifiedEditSignature] = useState<string | null>(null);
   const [verifiedCreateSignature, setVerifiedCreateSignature] = useState<string | null>(null);
   const [resettingKey, setResettingKey] = useState<string | null>(null);
   const [deletingKey, setDeletingKey] = useState<string | null>(null);
-  const [savingStrategy, setSavingStrategy] = useState(false);
+  const [togglingKey, setTogglingKey] = useState<string | null>(null);
   const [offloadRoutes, setOffloadRoutes] = useState<OffloadRoute[]>([]);
   const [offloadQueue, setOffloadQueue] = useState<OffloadQueueInfo | null>(null);
   const [offloadLoadError, setOffloadLoadError] = useState<string | null>(null);
@@ -618,7 +731,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
       setOffloadQueue({ enabled: resp.queue_enabled, maxWaitSeconds: resp.max_wait_seconds });
       setOffloadLoadError(null);
     } catch (err) {
-      setOffloadLoadError(getErrorMessage(err));
+      setOffloadLoadError(routeErrorMessage(err));
     }
   }, []);
 
@@ -640,7 +753,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
       const models = Array.from(new Set(resp.routes.map((route) => route.model_id))).sort();
       setSelectedModel((current) => current || models[0] || '');
     } catch (err) {
-      toast.error(`Failed to load provider routes: ${getErrorMessage(err)}`);
+      toast.error(`Failed to load provider routes: ${routeErrorMessage(err)}`);
     } finally {
       setLoading(false);
     }
@@ -715,18 +828,34 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
         : '';
   const strategy = selectedRoutes[0]?.strategy ?? 'fixed';
   const isRoutewise = strategy === 'routewise';
+  // RouteWise does not use offload routes, and the console refuses to switch a
+  // model that has one; a fixed model needs a second route to offload to. The
+  // panel still appears whenever a policy is stored (a RouteWise model's
+  // registry `router:` changed, or the other route went), so the leftover can
+  // be seen and cleared, and when the policies failed to load, to say so.
+  const showOffloadPanel =
+    Boolean(selectedModel) &&
+    selectedRoutes.length > 0 &&
+    (selectedOffload !== null ||
+      (!isRoutewise && (selectedRoutes.length > 1 || offloadLoadError !== null)));
   const createStrategy = creatingModel ? newModelStrategy : strategy;
   const createIsRoutewise = createStrategy === 'routewise';
   const createRouteTypeOptions = useMemo(
     () => routeTypeOptionsForStrategy(createIsRoutewise),
     [createIsRoutewise],
   );
-  const showCreateWeight = !createIsRoutewise;
+  // RouteWise reads no weights, and a new model's only route takes every
+  // request whatever its weight: a weight matters only beside other routes.
+  const showCreateWeight = !createIsRoutewise && !creatingModel;
   const showCreateLimits =
     createForm.routeType === 'quota' || createForm.routeType === 'concurrency' || showCreateWeight;
+  const editingRuntimeRoute = editingRoute?.source === 'runtime';
+  // A runtime quota route owns its local quota; a config route gets one only
+  // while an override provider serves it.
   const editsLocalQuota =
     editingRoute?.route_type === 'quota' &&
-    (form.upstreamProvider !== routePrimaryProvider(editingRoute) ||
+    (editingRuntimeRoute ||
+      form.upstreamProvider !== routePrimaryProvider(editingRoute) ||
       (form.upstreamProvider === 'openrouter' &&
         (selectedOpenRouterProvider ?? OPENROUTER_PROVIDER_AUTO) !==
           routeOpenRouterProvider(editingRoute)));
@@ -756,6 +885,10 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
       pricingValueValid(createForm.pricingCompletion) &&
       optionalPricingValueValid(createForm.pricingCacheReads) &&
       optionalPricingValueValid(createForm.pricingCacheWrites));
+  const createCapabilityReading = readCapabilityDraft(createForm);
+  const runtimeCapabilities = createCapabilityReading.payload;
+  // A new model and an added route both declare their own.
+  const createCapabilitiesValid = runtimeCapabilities !== null;
   const createQuotaValid =
     createForm.routeType !== 'quota' ||
     (parsedCreateQuotaLimit !== null &&
@@ -767,7 +900,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
       Number.isInteger(parsedCreateConcurrencyLimit) &&
       parsedCreateConcurrencyLimit > 0);
   const createWeightValid =
-    createIsRoutewise || (Number.isFinite(parsedCreateWeight) && parsedCreateWeight > 0);
+    !showCreateWeight || (Number.isFinite(parsedCreateWeight) && parsedCreateWeight > 0);
   const createRouteTypeValid = routeTypeAllowedForStrategy(createForm.routeType, createIsRoutewise);
   const formOpenRouterProviderValid = customOpenRouterProviderValid(
     form.openRouterProvider,
@@ -787,7 +920,8 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     createQuotaValid &&
     createConcurrencyValid &&
     createWeightValid &&
-    createPricingValid;
+    createPricingValid &&
+    createCapabilitiesValid;
   const editFormValid =
     Boolean(editingRoute) &&
     Boolean(form.upstreamProvider) &&
@@ -796,6 +930,16 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     formOpenRouterProviderValid &&
     quotaLimitValid &&
     concurrencyLimitValid;
+  const editDeploymentType: RouteDeploymentType =
+    form.deploymentType ??
+    (editingRoute &&
+    form.upstreamProvider === routePrimaryUpstreamProvider(editingRoute) &&
+    (form.upstreamProvider !== 'openrouter' ||
+      selectedOpenRouterProvider ===
+        resolvedOpenRouterProvider(routeOpenRouterProvider(editingRoute), '')) &&
+    canonicalEndpointUrl(form.baseUrl) === canonicalEndpointUrl(editingRoute.base_url)
+      ? (editingRoute.deployment_type ?? 'auto')
+      : 'auto');
   const editRoutePayload = useMemo(() => {
     if (!editingRoute) {
       return null;
@@ -810,6 +954,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
         form.openRouterSort,
       ),
       base_url: form.baseUrl.trim(),
+      ...(form.deploymentType ? { deployment_type: form.deploymentType } : {}),
       api_key_id: form.apiKeyId || null,
       provider_model_id: form.providerModelId.trim(),
       quota_limit: editsLocalQuota ? parsedQuotaLimit : null,
@@ -821,6 +966,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     editsLocalQuota,
     form.apiKeyId,
     form.baseUrl,
+    form.deploymentType,
     form.openRouterProvider,
     form.openRouterSort,
     form.providerModelId,
@@ -842,16 +988,18 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
         createForm.openRouterSort,
       ),
       base_url: createForm.baseUrl.trim(),
+      deployment_type: createForm.deploymentType,
       api_key_id: createForm.apiKeyId || null,
       provider_model_id: createForm.providerModelId.trim(),
       quota_limit: createForm.routeType === 'quota' ? parsedCreateQuotaLimit : null,
       concurrency_limit:
         createForm.routeType === 'concurrency' ? parsedCreateConcurrencyLimit : null,
-      weight: createIsRoutewise ? 1 : parsedCreateWeight,
+      weight: showCreateWeight ? parsedCreateWeight : 1,
     }),
     [
       createForm.apiKeyId,
       createForm.baseUrl,
+      createForm.deploymentType,
       createForm.openRouterProvider,
       createForm.openRouterSort,
       createForm.providerModelId,
@@ -861,7 +1009,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
       parsedCreateQuotaLimit,
       parsedCreateWeight,
       selectedCreateOpenRouterProvider,
-      createIsRoutewise,
+      showCreateWeight,
     ],
   );
   const editVerificationSignature = (() => {
@@ -879,11 +1027,38 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     strategy: creatingModel ? newModelStrategy : strategy,
     required_role: creatingModel ? newModelRequiredRole : undefined,
     pricing: creatingModel ? runtimePricing : undefined,
+    capabilities: runtimeCapabilities,
     payload: createRoutePayload,
   });
   const editRouteVerified =
     Boolean(editVerificationSignature) && verifiedEditSignature === editVerificationSignature;
   const createRouteVerified = verifiedCreateSignature === createVerificationSignature;
+
+  // The fields an Apply would change, `old → new`. A limit this edit does not
+  // own is sent as null ("leave it"), so it is never listed as a change.
+  const routeEditChanges: Change[] = (() => {
+    if (!editingRoute || !editRoutePayload) return [];
+    const current: Record<string, unknown> = {
+      ...editingRoute,
+      upstream_provider: routePrimaryUpstreamProvider(editingRoute),
+      openrouter_provider: routeOpenRouterProvider(editingRoute) || null,
+    };
+    const apiKeyLabel = (id: unknown) => {
+      const option = keyOptions.find((candidate) => candidate.id === id);
+      return option ? (option.label ?? option.key_prefix) : id;
+    };
+    return Object.entries(editRoutePayload)
+      .filter(([field]) => field !== 'quota_limit' || editsLocalQuota)
+      .filter(([field]) => field !== 'concurrency_limit' || editsConcurrencyLimit)
+      .filter(([field, value]) => shownRouteValue(current[field]) !== shownRouteValue(value))
+      .map(([field, value]) => ({
+        label: ROUTE_EDIT_FIELD_LABELS[field] ?? field,
+        before: shownRouteValue(
+          field === 'api_key_id' ? apiKeyLabel(current[field]) : current[field],
+        ),
+        after: shownRouteValue(field === 'api_key_id' ? apiKeyLabel(value) : value),
+      }));
+  })();
 
   useEffect(() => {
     if (!editingRoute) {
@@ -893,6 +1068,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
         customOpenRouterProvider: '',
         openRouterSort: '',
         baseUrl: '',
+        deploymentType: 'auto',
         apiKeyId: '',
         providerModelId: '',
         quotaLimit: '',
@@ -907,6 +1083,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
       customOpenRouterProvider: '',
       openRouterSort: editingRoute.openrouter_sort ?? '',
       baseUrl: editingRoute.base_url,
+      deploymentType: null,
       apiKeyId: editingRoute.api_key_id ?? '',
       providerModelId: editingRoute.provider_model_id ?? '',
       quotaLimit: editingRoute.quota_limit ? String(editingRoute.quota_limit) : '',
@@ -998,11 +1175,19 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
   ]);
 
   const providerSelectOptions = useMemo(() => {
-    if (!form.upstreamProvider || optionFor(providerSelectBaseOptions, form.upstreamProvider)) {
-      return providerSelectBaseOptions;
+    // A runtime route keeps its type, so it may only move to a provider the
+    // deployment allows that type for.
+    const baseOptions =
+      editingRoute?.source === 'runtime'
+        ? providerSelectBaseOptions.filter((option) =>
+            optionSupportsRouteType(option, editingRoute.route_type as ProviderRouteType),
+          )
+        : providerSelectBaseOptions;
+    if (!form.upstreamProvider || optionFor(baseOptions, form.upstreamProvider)) {
+      return baseOptions;
     }
     return [
-      ...providerSelectBaseOptions,
+      ...baseOptions,
       {
         provider: form.upstreamProvider,
         label: form.upstreamProvider,
@@ -1011,7 +1196,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
         default_base_url: form.baseUrl,
       },
     ];
-  }, [form.baseUrl, form.upstreamProvider, providerSelectBaseOptions]);
+  }, [editingRoute, form.baseUrl, form.upstreamProvider, providerSelectBaseOptions]);
 
   const loadKeys = useCallback(
     async (provider: string) => {
@@ -1025,7 +1210,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
         setKeyOptions(resp.keys.filter((key) => key.id));
       } catch (err) {
         setKeyOptions([]);
-        toast.error(`Failed to load provider keys: ${getErrorMessage(err)}`);
+        toast.error(`Failed to load provider keys: ${routeErrorMessage(err)}`);
       } finally {
         setKeysLoading(false);
       }
@@ -1045,7 +1230,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
         setCreateKeyOptions(resp.keys.filter((key) => key.id));
       } catch (err) {
         setCreateKeyOptions([]);
-        toast.error(`Failed to load provider keys: ${getErrorMessage(err)}`);
+        toast.error(`Failed to load provider keys: ${routeErrorMessage(err)}`);
       } finally {
         setCreateKeysLoading(false);
       }
@@ -1097,6 +1282,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
         customOpenRouterProvider: '',
         openRouterSort: '',
         baseUrl: '',
+        deploymentType: 'auto',
         apiKeyId: '',
         providerModelId: '',
       }));
@@ -1141,14 +1327,6 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     });
   }, []);
 
-  const replaceRoute = useCallback(
-    (updated: ProviderRoute) => {
-      updateRoute(updated);
-      setEditingRoute(updated);
-    },
-    [updateRoute],
-  );
-
   const replaceModelRoutes = useCallback((modelId: string, updated: ProviderRoute[]) => {
     setRoutes((current) => [...current.filter((route) => route.model_id !== modelId), ...updated]);
   }, []);
@@ -1169,6 +1347,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
           ? (editingRoute?.openrouter_sort ?? current.openRouterSort)
           : '',
       baseUrl: selected?.default_base_url || current.baseUrl,
+      deploymentType: upstreamProvider === current.upstreamProvider ? current.deploymentType : null,
       apiKeyId: '',
       providerModelId:
         editingRoute && upstreamProvider === routePrimaryUpstreamProvider(editingRoute)
@@ -1204,12 +1383,19 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
       providerModelId: firstProvider
         ? defaultProviderModelIdFor(firstProvider.provider, selectedRoutes)
         : '',
+      // A starting point, not a copy: the admin confirms or changes each value
+      // for this provider, and the route stores what was submitted.
+      ...(selectedRoutes[0]?.capabilities
+        ? capabilityDraftFrom(selectedRoutes[0].capabilities)
+        : emptyCapabilityDraft),
     });
     setCreateKeyOptions([]);
     setVerifiedCreateSignature(null);
+    setCreateError(null);
     setAddingRoute(true);
     setCreatingModel(false);
     setEditingRoute(null);
+    setCapabilityRoute(null);
   };
 
   const openCreateModelForm = () => {
@@ -1241,9 +1427,11 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     setNewModelRequiredRole('admin');
     setCreateKeyOptions([]);
     setVerifiedCreateSignature(null);
+    setCreateError(null);
     setCreatingModel(true);
     setAddingRoute(false);
     setEditingRoute(null);
+    setCapabilityRoute(null);
   };
 
   const onCreateProviderChange = (upstreamProvider: string) => {
@@ -1293,24 +1481,49 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
     }));
   };
 
+  const closeRouteEdit = () => {
+    if (confirmation.busy) return;
+    setRouteEditError(null);
+    setEditingRoute(null);
+  };
+
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!editingRoute || !editRoutePayload || !editFormValid) return;
-    const key = routeKey(editingRoute);
-    setSavingKey(key);
-    try {
-      const updated = await updateProviderRoute(
-        editingRoute.model_id,
-        editingRoute.route_id,
-        editRoutePayload,
+    if (!editingRoute || !editRoutePayload || routeEditChanges.length === 0) return;
+    if (!editFormValid) {
+      setRouteEditError(
+        !quotaLimitValid
+          ? 'Local daily quota must be a positive whole number.'
+          : !concurrencyLimitValid
+            ? 'Local concurrency limit must be a positive whole number.'
+            : !formOpenRouterProviderValid
+              ? 'Enter a valid custom OpenRouter provider slug.'
+              : 'Fill in the provider, base URL and provider model ID.',
       );
-      replaceRoute(updated);
-      toast.success('Provider route updated');
-    } catch (err) {
-      toast.error(`Update failed: ${getErrorMessage(err)}`);
-    } finally {
-      setSavingKey(null);
+      return;
     }
+    setRouteEditError(null);
+    const target = editingRoute;
+    const payload = editRoutePayload;
+    // The editor closes once the route is saved; a failure keeps it, and its drafts, open.
+    const failure = await confirmation.perform({
+      run: async () => {
+        let updated: ProviderRoute;
+        try {
+          updated =
+            target.source === 'runtime'
+              ? await updateProviderRouteCandidate(target.model_id, target.route_id, payload)
+              : await updateProviderRoute(target.model_id, target.route_id, payload);
+        } catch (err) {
+          throw new Error(routeErrorMessage(err));
+        }
+        if (updated.endpoint_id !== target.endpoint_id) refreshAfterRouteChange();
+        updateRoute(updated);
+        setEditingRoute(null);
+        toast.success('Provider route updated');
+      },
+    });
+    if (failure) setRouteEditError(failure);
   };
 
   const onVerify = async () => {
@@ -1323,7 +1536,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
       toast.success('Provider route verified');
     } catch (err) {
       setVerifiedEditSignature(null);
-      toast.error(`Verify failed: ${getErrorMessage(err)}`);
+      toast.error(`Verify failed: ${routeErrorMessage(err)}`);
     } finally {
       setVerifyingKey(null);
     }
@@ -1331,38 +1544,48 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
 
   const onCreateSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!createFormValid) return;
-    setCreatingRoute(true);
-    try {
-      let created: ProviderRoute;
-      if (creatingModel) {
-        created = await createProviderRouteModel({
+    // createFormValid already requires it; this check narrows the type.
+    if (!createFormValid || !runtimeCapabilities) return;
+    const model = creatingModel;
+    const capabilities = runtimeCapabilities;
+    // A new model and an added route both declare their own capabilities.
+    const routePayload = { ...createRoutePayload, capabilities };
+    const modelPayload = model
+      ? {
           ...createRoutePayload,
           model_id: newModelIdValue,
           strategy: newModelStrategy,
           required_role: newModelRequiredRole,
           pricing: runtimePricing,
-        });
-      } else {
-        created = await createProviderRouteCandidate(selectedModel, createRoutePayload);
-      }
-      setRoutes((current) => [...current, created]);
-      if (creatingModel) {
-        setSelectedModel(created.model_id);
-      }
-      setAddingRoute(false);
-      setCreatingModel(false);
-      setVerifiedCreateSignature(null);
-      toast.success(creatingModel ? 'Model created' : 'Provider route added');
-    } catch (err) {
-      toast.error(`${creatingModel ? 'Create' : 'Add'} failed: ${getErrorMessage(err)}`);
-    } finally {
-      setCreatingRoute(false);
-    }
+          capabilities,
+        }
+      : null;
+    const targetModel = selectedModel;
+    setCreateError(null);
+    // The form closes once the model or route exists; a failure keeps it, and its values, open.
+    const failure = await confirmation.perform({
+      run: async () => {
+        const created = modelPayload
+          ? await createProviderRouteModel(modelPayload)
+          : await createProviderRouteCandidate(targetModel, routePayload);
+        setRoutes((current) => [...current, created]);
+        if (model) {
+          setSelectedModel(created.model_id);
+          resetInlineDrafts();
+        }
+        setAddingRoute(false);
+        setCreatingModel(false);
+        setVerifiedCreateSignature(null);
+        toast.success(model ? 'Model created' : 'Provider route added');
+      },
+    });
+    if (failure) setCreateError(failure);
   };
 
   const onCreateVerify = async () => {
     if (!createFormValid) return;
+    // createFormValid already requires it; this check narrows the type.
+    if (!runtimeCapabilities) return;
     setVerifyingCreateRoute(true);
     try {
       if (creatingModel) {
@@ -1372,182 +1595,455 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
           strategy: newModelStrategy,
           required_role: newModelRequiredRole,
           pricing: runtimePricing,
+          capabilities: runtimeCapabilities,
         });
       } else {
-        await verifyProviderRouteCandidate(selectedModel, createRoutePayload);
+        await verifyProviderRouteCandidate(selectedModel, {
+          ...createRoutePayload,
+          capabilities: runtimeCapabilities,
+        });
       }
       setVerifiedCreateSignature(createVerificationSignature);
       toast.success(creatingModel ? 'Model route verified' : 'Provider route verified');
     } catch (err) {
       setVerifiedCreateSignature(null);
-      toast.error(`Verify failed: ${getErrorMessage(err)}`);
+      toast.error(`Verify failed: ${routeErrorMessage(err)}`);
     } finally {
       setVerifyingCreateRoute(false);
     }
   };
 
-  const onResetYaml = async (route: ProviderRoute) => {
-    const key = routeKey(route);
-    setResettingKey(key);
-    try {
-      const updated = await deleteProviderRoute(route.model_id, route.route_id);
-      updateRoute(updated);
-      setEditingRoute((current) => (current && routeKey(current) === key ? null : current));
-      toast.success('Reset route to config');
-    } catch (err) {
-      toast.error(`Reset failed: ${getErrorMessage(err)}`);
-    } finally {
-      setResettingKey(null);
-    }
+  const routeTarget = (route: ProviderRoute) => `${route.model_id} / ${route.provider}`;
+  const weightKeyFor = (route: ProviderRoute) =>
+    routeWeightKey({ model_id: route.model_id, endpoint_id: route.endpoint_id });
+  const effectiveWeightFor = (route: ProviderRoute) =>
+    routeWeightByKey.get(weightKeyFor(route))?.effective_weight ?? route.effective_weight;
+  const dropWeightDraft = (key: string) =>
+    setDraftWeights((current) => {
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  const dropConcurrencyDraft = (key: string) => {
+    setDraftConcurrencyLimits((current) => {
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+    setConcurrencyErrors((current) => {
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  };
+  // Drafts belong to the model they were made for. The model can only switch
+  // once none of them is a change, so this drops nothing unsaved.
+  const resetInlineDrafts = () => {
+    setDraftStrategy(null);
+    setStrategyError(null);
+    setDraftWeights({});
+    setWeightsError(null);
+    setDraftConcurrencyLimits({});
+    setConcurrencyErrors({});
   };
 
-  const onDeleteRuntimeRoute = async (route: ProviderRoute) => {
-    const key = routeKey(route);
-    setDeletingKey(key);
-    try {
-      const updated = await deleteProviderRouteCandidate(route.model_id, route.route_id);
-      replaceModelRoutes(updated.model_id ?? route.model_id, updated.routes);
-      setEditingRoute((current) => (current && routeKey(current) === key ? null : current));
-      toast.success('Provider route deleted');
-    } catch (err) {
-      toast.error(`Delete failed: ${getErrorMessage(err)}`);
-    } finally {
-      setDeletingKey(null);
-    }
-  };
-
-  const onStrategyChange = async (nextStrategy: ProviderRouteStrategy) => {
-    if (!selectedModel || nextStrategy === strategy) return;
-    setSavingStrategy(true);
-    try {
-      const updated = await updateProviderRouteStrategy(selectedModel, nextStrategy);
-      replaceModelRoutes(updated.model_id ?? selectedModel, updated.routes);
-      setEditingRoute(null);
-      toast.success('Routing policy updated');
-      void loadOffloadRoutes();
-    } catch (err) {
-      toast.error(`Policy update failed: ${getErrorMessage(err)}`);
-    } finally {
-      setSavingStrategy(false);
-    }
-  };
-
-  const onSaveWeight = async (route: ProviderRoute) => {
-    const key = routeWeightKey({ model_id: route.model_id, endpoint_id: route.endpoint_id });
-    const currentWeight = routeWeightByKey.get(key);
-    const draft =
-      draftWeights[key] ?? formatWeight(currentWeight?.effective_weight ?? route.effective_weight);
-    const parsed = parseWeightDraft(draft);
-    if (parsed === null) {
-      toast.error('Weight must be a non-negative number.');
-      return;
-    }
-
-    setSavingWeightKey(key);
-    try {
-      const updated = await setRouteWeight(route.model_id, route.endpoint_id, parsed);
-      replaceRouteWeight(updated);
-      setDraftWeights((current) => {
-        const next = { ...current };
-        delete next[key];
-        return next;
+  // Fixed weights: only real changes count, and an invalid draft is one, so
+  // Save can say what to fix. A deleted route shows no weight to edit.
+  const weightChanges = isRoutewise
+    ? []
+    : selectedRoutes.flatMap((route) => {
+        if (route.removed) return [];
+        const key = weightKeyFor(route);
+        const draft = draftWeights[key];
+        if (draft === undefined) return [];
+        const before = effectiveWeightFor(route);
+        const parsed = parseWeightDraft(draft);
+        if (parsed !== null && parsed === before) return [];
+        return [{ route, key, before, parsed }];
       });
-      toast.success(`Updated ${route.endpoint_id} weight.`);
-      void loadOffloadRoutes();
-    } catch (err) {
-      toast.error(`Weight update failed: ${getErrorMessage(err)}`);
-    } finally {
-      setSavingWeightKey(null);
-    }
-  };
 
-  const onSaveConcurrencyLimit = async (route: ProviderRoute) => {
-    const key = routeKey(route);
-    const draft = draftConcurrencyLimits[key] ?? String(route.concurrency_limit ?? '');
+  // A runtime OpenRouter concurrency limit, edited in its own row.
+  const concurrencyDraftFor = (route: ProviderRoute) => {
+    const draft = draftConcurrencyLimits[routeKey(route)];
+    if (draft === undefined) return { changed: false, parsed: route.concurrency_limit };
     const trimmed = draft.trim();
+    if (trimmed === '' && route.concurrency_limit == null) return { changed: false, parsed: null };
     const parsed = /^\d+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : null;
-    if (parsed === null || parsed < 1) {
-      toast.error('Concurrency limit must be a positive integer.');
+    return { changed: parsed === null || parsed !== route.concurrency_limit, parsed };
+  };
+  const limitsChanged =
+    isRoutewise &&
+    selectedRoutes.some(
+      (route) =>
+        !route.removed && canEditConcurrencyLimit(route) && concurrencyDraftFor(route).changed,
+    );
+
+  const weightsChanged = weightChanges.length > 0;
+  const strategyChanged = draftStrategy !== null && draftStrategy !== strategy;
+  const inlineChanged = weightsChanged || strategyChanged || limitsChanged;
+  // The offload and RouteWise panels keep drafts for the selected model too, and
+  // drop them when it changes; they report whether a draft is unsaved, a
+  // confirmation open or a write running.
+  const [panelEditing, setPanelEditing] = useState({ offload: false, routewise: false });
+  const onOffloadEditingChange = useCallback(
+    (active: boolean) => setPanelEditing((prev) => ({ ...prev, offload: active })),
+    [],
+  );
+  const onRoutewiseEditingChange = useCallback(
+    (active: boolean) => setPanelEditing((prev) => ({ ...prev, routewise: active })),
+    [],
+  );
+  const panelOpen = panelEditing.offload || panelEditing.routewise;
+  // Switching model, directly or by creating one, would drop any unsaved draft.
+  // The route, capability and create dialogs are modal, but their drafts belong
+  // to this model too, as do an open confirmation and a write still running.
+  // Unchanged fields hold nothing back.
+  const modelLocked =
+    inlineChanged ||
+    panelOpen ||
+    editingRoute !== null ||
+    capabilityRoute !== null ||
+    createFormOpen ||
+    confirmation.open ||
+    confirmation.busy;
+  // So would switching the routing policy: it unmounts the panel of the current
+  // policy (Queue offload for fixed, RouteWise parameters for routewise) and
+  // swaps the table's weights for limits or back.
+  const policyHeld = weightsChanged || limitsChanged || panelOpen;
+
+  // Reset config and Delete discard what the route had, so they ask first. Each
+  // `run` throws on failure, so the confirmation stays open with the error and
+  // the same action can be retried.
+  const confirmResetYaml = (route: ProviderRoute) =>
+    confirmation.request({
+      title: `Reset ${routeTarget(route)}?`,
+      body: (
+        <p>
+          The changes made in the console are removed, and the route goes back to the values in the
+          configuration file.
+        </p>
+      ),
+      confirmLabel: 'Reset',
+      busyLabel: 'Resetting…',
+      tone: 'danger',
+      run: async () => {
+        const key = routeKey(route);
+        setResettingKey(key);
+        try {
+          const updated = await deleteProviderRoute(route.model_id, route.route_id);
+          updateRoute(updated);
+          setEditingRoute((current) => (current && routeKey(current) === key ? null : current));
+          toast.success('Reset route to config');
+        } finally {
+          setResettingKey(null);
+        }
+      },
+    });
+
+  const refreshAfterRouteChange = () => {
+    void listRouteWeights()
+      .then(setRouteWeights)
+      .catch(() => undefined);
+    void loadOffloadRoutes();
+  };
+
+  const confirmDeleteRoute = (route: ProviderRoute) => {
+    if (selectedOffload?.route_id === route.route_id) {
+      toast.error(
+        `${route.route_id} is this model's offload route. Clear the offload route first, then delete it.`,
+      );
       return;
     }
-
-    setSavingConcurrencyKey(key);
-    try {
-      const updated = await updateProviderRouteCandidate(route.model_id, route.route_id, {
-        concurrency_limit: parsed,
-      });
-      updateRoute(updated);
-      setDraftConcurrencyLimits((current) => {
-        const next = { ...current };
-        delete next[key];
-        return next;
-      });
-      toast.success('Concurrency limit updated');
-    } catch (err) {
-      toast.error(`Concurrency update failed: ${getErrorMessage(err)}`);
-    } finally {
-      setSavingConcurrencyKey(null);
-    }
+    const runtime = route.source === 'runtime';
+    const lastRoute = selectedRoutes.filter((item) => !item.removed).length === 1;
+    confirmation.request({
+      title: `Delete ${runtime ? 'runtime' : 'config'} route ${route.route_id}?`,
+      body: (
+        <p>
+          {runtime
+            ? lastRoute
+              ? `It is the last route of ${route.model_id}, so the model is deleted too. This cannot be undone.`
+              : 'It stops serving now and its saved configuration is deleted from the database. This cannot be undone: add the route again to bring it back.'
+            : 'It stops serving now and stays deleted after restarts; models.yaml is not changed. You can bring it back with Restore, together with its edits and weight. Reset config is different: it only discards edits.'}
+        </p>
+      ),
+      confirmLabel: 'Delete',
+      busyLabel: 'Deleting…',
+      tone: 'danger',
+      run: async () => {
+        const key = routeKey(route);
+        setDeletingKey(key);
+        try {
+          const updated = runtime
+            ? await deleteProviderRouteCandidate(route.model_id, route.route_id)
+            : await removeProviderRoute(route.model_id, route.route_id);
+          replaceModelRoutes(updated.model_id ?? route.model_id, updated.routes);
+          setEditingRoute((current) => (current && routeKey(current) === key ? null : current));
+          // A deleted route has no weight or limit to edit; Restore starts it afresh.
+          dropWeightDraft(weightKeyFor(route));
+          dropConcurrencyDraft(key);
+          toast.success(
+            runtime ? 'Provider route deleted' : 'Config route deleted; Restore brings it back',
+          );
+          refreshAfterRouteChange();
+        } catch (err) {
+          throw new Error(routeErrorMessage(err));
+        } finally {
+          setDeletingKey(null);
+        }
+      },
+    });
   };
 
-  const onClearWeight = async (route: ProviderRoute) => {
-    const key = routeWeightKey({ model_id: route.model_id, endpoint_id: route.endpoint_id });
-    setSavingWeightKey(key);
-    try {
-      const updated = await clearRouteWeight(route.model_id, route.endpoint_id);
-      replaceRouteWeight(updated);
-      setDraftWeights((current) => {
-        const next = { ...current };
-        delete next[key];
-        return next;
-      });
-      toast.success(`Cleared ${route.endpoint_id} weight override.`);
-      void loadOffloadRoutes();
-    } catch (err) {
-      toast.error(`Weight reset failed: ${getErrorMessage(err)}`);
-    } finally {
-      setSavingWeightKey(null);
-    }
+  // Disable, Enable, Restore and a weight Reset act on the click: each is undone
+  // from the same row. A failure shows in a toast.
+  const setRouteDisabled = async (route: ProviderRoute, disabled: boolean) => {
+    const failure = await confirmation.perform({
+      run: async () => {
+        setTogglingKey(routeKey(route));
+        try {
+          const updated = await updateProviderRouteState(route.model_id, route.route_id, {
+            disabled,
+          });
+          updateRoute(updated);
+          toast.success(`${disabled ? 'Disabled' : 'Enabled'} ${route.route_id}.`);
+          refreshAfterRouteChange();
+        } catch (err) {
+          throw new Error(routeErrorMessage(err));
+        } finally {
+          setTogglingKey(null);
+        }
+      },
+    });
+    if (failure) toast.error(`${disabled ? 'Disable' : 'Enable'} failed: ${failure}`);
   };
 
-  const onDisableRoute = async (route: ProviderRoute) => {
-    const key = routeWeightKey({ model_id: route.model_id, endpoint_id: route.endpoint_id });
-    setSavingWeightKey(key);
-    try {
-      const updated = await setRouteWeight(route.model_id, route.endpoint_id, 0);
-      replaceRouteWeight(updated);
-      setDraftWeights((current) => {
-        const next = { ...current };
-        delete next[key];
-        return next;
-      });
-      toast.success(`Disabled ${route.endpoint_id}.`);
-      void loadOffloadRoutes();
-    } catch (err) {
-      toast.error(`Disable failed: ${getErrorMessage(err)}`);
-    } finally {
-      setSavingWeightKey(null);
-    }
+  const restoreRoute = async (route: ProviderRoute) => {
+    const failure = await confirmation.perform({
+      run: async () => {
+        setDeletingKey(routeKey(route));
+        try {
+          const updated = await restoreProviderRoute(route.model_id, route.route_id);
+          replaceModelRoutes(updated.model_id ?? route.model_id, updated.routes);
+          toast.success(`Restored ${route.route_id}.`);
+          refreshAfterRouteChange();
+        } catch (err) {
+          throw new Error(routeErrorMessage(err));
+        } finally {
+          setDeletingKey(null);
+        }
+      },
+    });
+    if (failure) toast.error(`Restore failed: ${failure}`);
   };
 
-  const onEnableRoute = async (route: ProviderRoute) => {
-    const key = routeWeightKey({ model_id: route.model_id, endpoint_id: route.endpoint_id });
-    setSavingWeightKey(key);
-    try {
-      const updated = await clearRouteWeight(route.model_id, route.endpoint_id);
-      replaceRouteWeight(updated);
-      setDraftWeights((current) => {
-        const next = { ...current };
-        delete next[key];
-        return next;
-      });
-      toast.success(`Enabled ${route.endpoint_id}.`);
-      void loadOffloadRoutes();
-    } catch (err) {
-      toast.error(`Enable failed: ${getErrorMessage(err)}`);
-    } finally {
-      setSavingWeightKey(null);
+  // The runtime override goes, and the route is back on its configured weight.
+  const resetWeight = async (route: ProviderRoute) => {
+    const key = weightKeyFor(route);
+    const failure = await confirmation.perform({
+      run: async () => {
+        setSavingWeightKey(key);
+        try {
+          const updated = await clearRouteWeight(route.model_id, route.endpoint_id);
+          replaceRouteWeight(updated);
+          dropWeightDraft(key);
+          toast.success(`Cleared ${route.endpoint_id} weight override.`);
+          void loadOffloadRoutes();
+        } finally {
+          setSavingWeightKey(null);
+        }
+      },
+    });
+    if (failure) toast.error(`Weight reset failed: ${failure}`);
+  };
+
+  // A route's capabilities: the dialog's fields are a draft, and Save writes it.
+  const openCapabilityEditor = (route: ProviderRoute) => {
+    if (!route.capabilities) return;
+    setCapabilityRoute(route);
+    setCapabilityDraft(capabilityDraftFrom(route.capabilities));
+    setCapabilityError(null);
+    setEditingRoute(null);
+    setAddingRoute(false);
+    setCreatingModel(false);
+  };
+
+  const closeCapabilityEditor = () => {
+    if (confirmation.busy) return;
+    setCapabilityRoute(null);
+  };
+
+  const capabilityReading = readCapabilityDraft(capabilityDraft);
+  const capabilityEditChanges: Change[] =
+    capabilityRoute?.capabilities && capabilityReading.payload
+      ? capabilityChanges(capabilityRoute.capabilities, capabilityReading.payload)
+      : [];
+
+  const onSaveCapabilities = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!capabilityRoute || !capabilityReading.payload || capabilityEditChanges.length === 0) {
+      return;
     }
+    const target = capabilityRoute;
+    const payload = capabilityReading.payload;
+    setCapabilityError(null);
+    const failure = await confirmation.perform({
+      run: async () => {
+        const updated = await updateProviderRouteCapabilities(
+          target.model_id,
+          target.route_id,
+          payload,
+        ).catch((err: unknown) => {
+          throw new Error(routeErrorMessage(err));
+        });
+        updateRoute(updated);
+        setCapabilityRoute(null);
+        toast.success('Route capabilities updated');
+      },
+    });
+    if (failure) setCapabilityError(failure);
+  };
+
+  const confirmResetCapabilities = () => {
+    if (!capabilityRoute) return;
+    const target = capabilityRoute;
+    const changes =
+      target.capabilities && target.capabilities_baseline
+        ? capabilityChanges(target.capabilities, target.capabilities_baseline)
+        : [];
+    confirmation.request({
+      title: `Reset ${target.endpoint_id} capabilities to config?`,
+      confirmLabel: 'Reset',
+      busyLabel: 'Resetting…',
+      tone: 'danger',
+      body: (
+        <>
+          {changes.length > 0 ? <ChangeList changes={changes} /> : null}
+          <p>
+            The values set in the console are removed, and the route goes back to the capabilities
+            it has from its configuration.
+          </p>
+        </>
+      ),
+      run: async () => {
+        const updated = await resetProviderRouteCapabilities(
+          target.model_id,
+          target.route_id,
+        ).catch((err: unknown) => {
+          throw new Error(routeErrorMessage(err));
+        });
+        updateRoute(updated);
+        setCapabilityRoute(null);
+        toast.success('Route capabilities reset');
+      },
+    });
+  };
+
+  // Routing policy: chosen in place, written on Save.
+  const discardStrategy = () => {
+    if (confirmation.busy) return;
+    setDraftStrategy(null);
+    setStrategyError(null);
+  };
+
+  const saveStrategy = async () => {
+    const model = selectedModel;
+    const next = draftStrategy;
+    if (!model || next === null || next === strategy || policyHeld) return;
+    setStrategyError(null);
+    const failure = await confirmation.perform({
+      key: `${model} routing policy`,
+      run: async () => {
+        const updated = await updateProviderRouteStrategy(model, next);
+        replaceModelRoutes(updated.model_id ?? model, updated.routes);
+        setEditingRoute(null);
+        // Nothing else was changed (the save waits until it is not), so the
+        // controls the new policy shows start from what is saved.
+        resetInlineDrafts();
+        toast.success('Routing policy updated');
+        void loadOffloadRoutes();
+      },
+    });
+    if (failure) setStrategyError(failure);
+  };
+
+  const discardWeights = () => {
+    if (confirmation.busy) return;
+    setDraftWeights({});
+    setWeightsError(null);
+  };
+
+  const saveWeights = async () => {
+    if (weightChanges.length === 0) return;
+    if (weightChanges.some((change) => change.parsed === null)) {
+      setWeightsError('Weight must be a non-negative number.');
+      return;
+    }
+    setWeightsError(null);
+    const model = selectedModel;
+    const pending = weightChanges.map((change) => ({ ...change, weight: change.parsed as number }));
+    // One request per route: a failure keeps only the weights still unsaved.
+    const failure = await confirmation.perform({
+      key: `${model} weights`,
+      run: async () => {
+        try {
+          await writeEach(
+            pending,
+            ({ route }) => route.endpoint_id,
+            async ({ route, key, weight }) => {
+              const updated = await setRouteWeight(route.model_id, route.endpoint_id, weight);
+              replaceRouteWeight(updated);
+              dropWeightDraft(key);
+            },
+          );
+        } finally {
+          void loadOffloadRoutes();
+        }
+        toast.success(
+          pending.length === 1
+            ? `Updated ${pending[0].route.endpoint_id} weight.`
+            : `Updated ${pending.length} weights.`,
+        );
+      },
+    });
+    setWeightsError(failure);
+  };
+
+  // Each row's limit is saved, or discarded, on its own; another row's draft is
+  // never touched.
+  const discardConcurrencyLimit = (route: ProviderRoute) => {
+    if (confirmation.busy) return;
+    dropConcurrencyDraft(routeKey(route));
+  };
+
+  const saveConcurrencyLimit = async (route: ProviderRoute) => {
+    const key = routeKey(route);
+    const { changed, parsed } = concurrencyDraftFor(route);
+    if (!changed) return;
+    if (parsed === null || parsed < 1) {
+      setConcurrencyErrors((current) => ({
+        ...current,
+        [key]: 'Concurrency limit must be a positive integer.',
+      }));
+      return;
+    }
+    setConcurrencyErrors((current) => {
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+    const failure = await confirmation.perform({
+      key: `${route.endpoint_id} concurrency limit`,
+      run: async () => {
+        const updated = await updateProviderRouteCandidate(route.model_id, route.route_id, {
+          concurrency_limit: parsed,
+        });
+        updateRoute(updated);
+        dropConcurrencyDraft(key);
+        toast.success('Concurrency limit updated');
+      },
+    });
+    if (failure) setConcurrencyErrors((current) => ({ ...current, [key]: failure }));
   };
 
   return (
@@ -1557,49 +2053,64 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
           <label className="text-[12px] font-medium text-gray-500" htmlFor="provider-route-model">
             Selected model
           </label>
-          <select
+          <Select
             id="provider-route-model"
             value={selectedModel}
-            onChange={(event) => {
-              setSelectedModel(event.target.value);
+            onValueChange={(next) => {
+              setSelectedModel(next);
+              resetInlineDrafts();
               setEditingRoute(null);
+              setCapabilityRoute(null);
               setAddingRoute(false);
               setCreatingModel(false);
             }}
-            className="mt-1 w-full min-w-[240px] max-w-sm rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
-          >
-            {models.length === 0 && <option value="">(no models loaded)</option>}
-            {models.map((model) => (
-              <option key={model} value={model}>
-                {model}
-              </option>
-            ))}
-          </select>
+            options={models.map((model) => ({ value: model, label: model }))}
+            placeholder={models.length === 0 ? '(no models loaded)' : 'Choose a model'}
+            searchable
+            searchPlaceholder="Search models…"
+            emptyText="No models match"
+            // Unsaved weight, policy, limit, capability, offload or RouteWise drafts
+            // belong to this model; save or discard them before switching.
+            disabled={modelLocked}
+            title={modelLocked ? HELD_FOR_DRAFTS : undefined}
+            size="lg"
+            className="mt-1 w-full min-w-[240px] max-w-sm"
+          />
         </div>
         <div className="flex items-center gap-2">
           {loading && (
             <span className="h-4 w-4 animate-spin rounded-full border-2 border-gray-200 border-t-gray-900" />
           )}
-          <label className="sr-only" htmlFor="provider-route-strategy">
+          <label className="text-[13px] text-gray-500" htmlFor="provider-route-strategy">
             Routing policy
           </label>
-          <select
+          <Select<ProviderRouteStrategy>
             id="provider-route-strategy"
-            value={strategy}
-            onChange={(event) => void onStrategyChange(event.target.value as ProviderRouteStrategy)}
-            disabled={!selectedModel || loading || savingStrategy}
-            className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] font-medium text-gray-700 focus:border-gray-400 focus:outline-none disabled:opacity-50"
-          >
-            <option value="routewise">routewise</option>
-            <option value="fixed">fixed</option>
-          </select>
-          {savingStrategy && (
-            <span className="h-4 w-4 animate-spin rounded-full border-2 border-gray-200 border-t-gray-900" />
-          )}
+            value={draftStrategy ?? (strategy === 'routewise' ? 'routewise' : 'fixed')}
+            // A draft only; Save changes writes it.
+            onValueChange={(next) => {
+              setDraftStrategy(next === strategy ? null : next);
+              setStrategyError(null);
+            }}
+            // Held while another routing draft is unsaved, since a switch would
+            // drop it. A policy chosen first stays changeable; its Save waits.
+            disabled={
+              !selectedModel || loading || confirmation.busy || (!strategyChanged && policyHeld)
+            }
+            title={!strategyChanged && policyHeld ? HELD_FOR_DRAFTS : undefined}
+            options={[
+              { value: 'routewise', label: 'routewise' },
+              { value: 'fixed', label: 'fixed' },
+            ]}
+            size="md"
+            className={`w-32 font-medium ${strategyChanged ? '!border-amber-400' : ''}`}
+          />
           <button
             type="button"
             onClick={openAddForm}
-            disabled={!selectedModel || loading || providerOptions.length === 0}
+            disabled={
+              !selectedModel || loading || providerOptions.length === 0 || confirmation.busy
+            }
             className="rounded-lg border border-gray-900 bg-gray-900 px-3 py-2 text-[13px] font-medium text-white hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
           >
             Add provider
@@ -1607,7 +2118,8 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
           <button
             type="button"
             onClick={openCreateModelForm}
-            disabled={loading || providerOptions.length === 0}
+            disabled={loading || providerOptions.length === 0 || modelLocked}
+            title={modelLocked ? HELD_FOR_DRAFTS : undefined}
             className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] font-medium text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
           >
             Create model
@@ -1615,11 +2127,27 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
         </div>
       </div>
 
-      {selectedModel && selectedRoutes.length > 0 && (!isRoutewise || selectedOffload) && (
-        // RouteWise does not use offload routes, and the console refuses to switch
-        // a model that has one. The panel still appears for a RouteWise model
-        // when a policy is stored for it anyway (its registry `router:` changed),
-        // so the leftover can be seen and cleared.
+      {selectedModel ? (
+        <EditBar
+          target={`${selectedModel} routing policy`}
+          changeCount={strategyChanged ? 1 : 0}
+          onCancel={discardStrategy}
+          onSave={() => void saveStrategy()}
+          // Several bars can be up at once; only the one being saved reads "Saving…",
+          // and the others wait for it.
+          busy={confirmation.savingKey === `${selectedModel} routing policy`}
+          held={confirmation.busy}
+          error={strategyError}
+          // A weight, limit or panel draft made after the policy was chosen
+          // would be dropped by the switch.
+          blocked={
+            strategyChanged && policyHeld ? 'Save or discard the other unsaved changes first' : null
+          }
+          inPlace
+        />
+      ) : null}
+
+      {showOffloadPanel && (
         <OffloadRoutePanel
           modelId={selectedModel}
           routes={selectedRoutes}
@@ -1633,6 +2161,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
             })`
           }
           onChange={onOffloadChange}
+          onEditingChange={onOffloadEditingChange}
         />
       )}
 
@@ -1647,11 +2176,20 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
               openRouterSelectOptions,
             )}`,
           }))}
+          onEditingChange={onRoutewiseEditingChange}
         />
       )}
 
       {isRoutewise && (
         <RoutewiseDecisionsPanel modelId={selectedModel} quotaRoutes={selectedQuotaRoutes} />
+      )}
+
+      {!isRoutewise && selectedRoutes.length > 0 && (
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <p className="text-[12px] text-gray-500">
+            Fixed weights decide each route&apos;s share of {selectedModel}&apos;s requests.
+          </p>
+        </div>
       )}
 
       {loading && routes.length === 0 ? (
@@ -1663,7 +2201,11 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
           <p className="text-[13px] text-gray-400">No provider routes available.</p>
         </div>
       ) : (
-        <div className="overflow-hidden rounded-lg border border-gray-200 bg-white text-[13px]">
+        <div
+          className={`overflow-hidden rounded-lg border bg-white text-[13px] ${
+            weightsChanged || limitsChanged ? 'border-gray-400 shadow-sm' : 'border-gray-200'
+          }`}
+        >
           <div className="hidden grid-cols-[minmax(0,1.1fr)_minmax(0,1.6fr)_minmax(0,.95fr)_minmax(176px,.9fr)_minmax(86px,.6fr)_minmax(96px,.6fr)] gap-3 rounded-t-lg bg-gray-50 px-4 py-2 text-[12px] font-semibold uppercase tracking-wide text-gray-500 lg:grid">
             <div>Candidate</div>
             <div>Target</div>
@@ -1687,28 +2229,23 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
               const yamlWeight = routeWeight?.yaml_weight ?? route.yaml_weight;
               const effectiveWeight = routeWeight?.effective_weight ?? route.effective_weight;
               const draftWeight = draftWeights[weightKey] ?? formatWeight(effectiveWeight);
-              const parsedDraftWeight = parseWeightDraft(draftWeight);
-              const weightDirty =
-                parsedDraftWeight !== null && parsedDraftWeight !== effectiveWeight;
+              const draftWeightInvalid = parseWeightDraft(draftWeight) === null;
+              const weightChanged = weightChanges.some((change) => change.key === weightKey);
               const isSavingWeight = savingWeightKey === weightKey;
               const hasWeightOverride = routeWeight?.override_weight != null;
-              const routeDisabled = effectiveWeight <= 0;
-              const isRoutewiseConfigRoute = isRoutewise && route.source !== 'runtime';
-              const canDisableRoute = isRoutewiseConfigRoute && !routeDisabled;
-              const canEnableRoute = isRoutewiseConfigRoute && routeDisabled && hasWeightOverride;
+              const routeRemoved = route.removed === true;
+              // Disabled by its flag, or by a weight of 0 (how Disable worked
+              // before the flag): either way routing sends it nothing.
+              const routeDisabled = route.disabled === true || effectiveWeight <= 0;
+              const canDisableRoute = !routeRemoved && !routeDisabled;
+              // A weight of 0 from models.yaml is not something Enable can undo.
+              const canEnableRoute =
+                !routeRemoved && (route.disabled === true || routeWeight?.override_weight === 0);
+              const isToggling = togglingKey === key;
               const editableConcurrencyLimit = canEditConcurrencyLimit(route);
               const draftConcurrencyLimit =
                 draftConcurrencyLimits[key] ?? String(route.concurrency_limit ?? '');
-              const trimmedConcurrencyLimit = draftConcurrencyLimit.trim();
-              const parsedDraftConcurrencyLimit = /^\d+$/.test(trimmedConcurrencyLimit)
-                ? Number.parseInt(trimmedConcurrencyLimit, 10)
-                : null;
-              const concurrencyLimitDirty =
-                parsedDraftConcurrencyLimit !== null &&
-                parsedDraftConcurrencyLimit !== route.concurrency_limit;
-              const concurrencyLimitValid =
-                parsedDraftConcurrencyLimit !== null && parsedDraftConcurrencyLimit > 0;
-              const isSavingConcurrencyLimit = savingConcurrencyKey === key;
+              const concurrencyLimitChanged = concurrencyDraftFor(route).changed;
               const isOffloadRoute = selectedOffload?.route_id === route.route_id;
               return (
                 <div
@@ -1770,37 +2307,46 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                     <div className="text-[11px] font-semibold uppercase tracking-wide text-gray-400 lg:hidden">
                       {routeLimitHeading(isRoutewise)}
                     </div>
-                    {isRoutewise ? (
+                    {routeRemoved ? (
+                      <div>—</div>
+                    ) : isRoutewise ? (
                       editableConcurrencyLimit ? (
-                        <div className="flex flex-wrap items-center gap-1.5">
+                        <div>
                           <input
                             aria-label={`Concurrency limit for ${route.endpoint_id}`}
-                            className="h-8 w-20 rounded-md border border-gray-300 px-2 text-right text-[13px] text-gray-900"
-                            disabled={isSavingConcurrencyLimit}
+                            className={`h-8 w-20 rounded-md border px-2 text-right text-[13px] text-gray-900 ${
+                              concurrencyLimitChanged ? 'border-amber-400' : 'border-gray-300'
+                            }`}
+                            disabled={confirmation.busy}
                             min={1}
                             step={1}
                             type="number"
                             value={draftConcurrencyLimit}
-                            onChange={(event) =>
-                              setDraftConcurrencyLimits((current) => ({
-                                ...current,
-                                [key]: event.target.value,
-                              }))
-                            }
+                            onChange={(event) => {
+                              const value = event.target.value;
+                              // Typed back to what is saved, it is no draft: a
+                              // refresh of the saved limit shows through.
+                              setDraftConcurrencyLimits((current) => {
+                                const next = { ...current };
+                                if (value === String(route.concurrency_limit ?? '')) {
+                                  delete next[key];
+                                } else next[key] = value;
+                                return next;
+                              });
+                            }}
                           />
-                          <button
-                            aria-label={`Save ${route.endpoint_id} concurrency limit`}
-                            type="button"
-                            disabled={
-                              isSavingConcurrencyLimit ||
-                              !concurrencyLimitDirty ||
-                              !concurrencyLimitValid
+                          <EditBar
+                            target={`${route.endpoint_id} concurrency limit`}
+                            changeCount={concurrencyLimitChanged ? 1 : 0}
+                            onCancel={() => discardConcurrencyLimit(route)}
+                            onSave={() => void saveConcurrencyLimit(route)}
+                            busy={
+                              confirmation.savingKey === `${route.endpoint_id} concurrency limit`
                             }
-                            onClick={() => void onSaveConcurrencyLimit(route)}
-                            className="h-8 rounded-md bg-gray-900 px-2.5 text-[12px] font-medium text-white disabled:opacity-50"
-                          >
-                            Save
-                          </button>
+                            held={confirmation.busy}
+                            error={concurrencyErrors[key] ?? null}
+                            inPlace
+                          />
                         </div>
                       ) : route.route_type === 'quota' ? (
                         <RouteQuotaCell route={route} />
@@ -1813,42 +2359,56 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                           YAML {formatWeight(yamlWeight)} · Effective{' '}
                           {formatWeight(effectiveWeight)}
                         </div>
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <input
-                            aria-label={`Runtime weight for ${route.endpoint_id}`}
-                            className="h-8 w-20 rounded-md border border-gray-300 px-2 text-right text-[13px] text-gray-900"
-                            disabled={isSavingWeight}
-                            min={0}
-                            step={0.1}
-                            type="number"
-                            value={draftWeight}
-                            onChange={(event) =>
-                              setDraftWeights((current) => ({
-                                ...current,
-                                [weightKey]: event.target.value,
-                              }))
-                            }
-                          />
-                          <button
-                            aria-label={`Save ${route.endpoint_id} weight`}
-                            type="button"
-                            disabled={isSavingWeight || !weightDirty}
-                            onClick={() => void onSaveWeight(route)}
-                            className="h-8 rounded-md bg-gray-900 px-2.5 text-[12px] font-medium text-white disabled:opacity-50"
-                          >
-                            Save
-                          </button>
-                          {hasWeightOverride ? (
-                            <button
-                              aria-label={`Clear ${route.endpoint_id} weight override`}
-                              type="button"
-                              disabled={isSavingWeight}
-                              onClick={() => void onClearWeight(route)}
-                              className="h-8 rounded-md border border-gray-300 px-2 text-[12px] font-medium text-gray-600 disabled:opacity-50"
-                            >
-                              Reset
-                            </button>
-                          ) : null}
+                        <div>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <input
+                              aria-label={`Runtime weight for ${route.endpoint_id}`}
+                              aria-invalid={draftWeightInvalid || undefined}
+                              className={`h-8 w-20 rounded-md border px-2 text-right text-[13px] text-gray-900 ${
+                                draftWeightInvalid
+                                  ? 'border-red-400'
+                                  : weightChanged
+                                    ? 'border-amber-400'
+                                    : 'border-gray-300'
+                              }`}
+                              disabled={confirmation.busy}
+                              min={0}
+                              step={0.1}
+                              type="number"
+                              value={draftWeight}
+                              onChange={(event) => {
+                                const value = event.target.value;
+                                // Typed back to the effective weight, it is no
+                                // draft: a refresh (a Reset, say) shows through.
+                                setDraftWeights((current) => {
+                                  const next = { ...current };
+                                  if (value === formatWeight(effectiveWeight)) {
+                                    delete next[weightKey];
+                                  } else next[weightKey] = value;
+                                  return next;
+                                });
+                              }}
+                            />
+                            {hasWeightOverride ? (
+                              // The reset replaces the weight this row's draft
+                              // was typed against, so it waits for the draft.
+                              <button
+                                aria-label={`Clear ${route.endpoint_id} weight override`}
+                                type="button"
+                                disabled={confirmation.busy || weightChanged}
+                                title={weightChanged ? HELD_FOR_DRAFTS : undefined}
+                                onClick={() => void resetWeight(route)}
+                                className="h-8 rounded-md border border-gray-300 px-2 text-[12px] font-medium text-gray-600 disabled:opacity-50"
+                              >
+                                {isSavingWeight ? 'Resetting…' : 'Reset'}
+                              </button>
+                            ) : null}
+                          </div>
+                          {draftWeightInvalid && (
+                            <p className="mt-1 text-[11px] text-red-600">
+                              Enter a non-negative number.
+                            </p>
+                          )}
                         </div>
                         {isOffloadRoute && (
                           // The weight still decides whether routing may use the
@@ -1866,18 +2426,41 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                       Status
                     </div>
                     <div className="flex flex-wrap gap-1">
+                      {(routeRemoved || routeDisabled) && (
+                        <span
+                          className={
+                            routeRemoved
+                              ? 'inline-flex rounded bg-red-50 px-1.5 py-0.5 text-[11px] font-medium text-red-700'
+                              : 'inline-flex rounded bg-gray-100 px-1.5 py-0.5 text-[11px] font-medium text-gray-600'
+                          }
+                          title={
+                            routeRemoved
+                              ? 'Deleted from this deployment: it serves nothing and stays deleted after restarts. Restore brings it back with its edits and weight.'
+                              : route.disabled
+                                ? 'Disabled: kept with its weight, but no request, retry, fallback or offload goes to it.'
+                                : 'Its weight is 0, so routing sends it nothing.'
+                          }
+                        >
+                          {routeRemoved ? 'Deleted' : 'Disabled'}
+                        </span>
+                      )}
                       <span
                         className={
-                          routeDisabled
-                            ? 'inline-flex rounded bg-gray-100 px-1.5 py-0.5 text-[11px] font-medium text-gray-600'
+                          overrideNotApplied(route)
+                            ? 'inline-flex rounded bg-red-50 px-1.5 py-0.5 text-[11px] font-medium text-red-700'
                             : route.source === 'override'
                               ? 'inline-flex rounded bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-700'
                               : route.source === 'runtime'
                                 ? 'inline-flex rounded bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium text-blue-700'
                                 : 'inline-flex rounded bg-gray-100 px-1.5 py-0.5 text-[11px] font-medium text-gray-600'
                         }
+                        title={
+                          !routeRemoved && overrideNotApplied(route)
+                            ? 'The saved override failed to apply at startup, so the config default shown here is serving. Edit the route or reset its config.'
+                            : undefined
+                        }
                       >
-                        {routeDisabled ? 'Disabled' : sourceLabel(route)}
+                        {sourceLabel(route)}
                       </span>
                       {isOffloadRoute && selectedOffload && (
                         <span
@@ -1896,60 +2479,93 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                           Offload
                         </span>
                       )}
+                      {route.capabilities_overridden && route.capabilities_baseline && (
+                        <span
+                          className="inline-flex rounded bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-700"
+                          title={`Set in the console. From config: ${describeCapabilities(route.capabilities_baseline)}`}
+                        >
+                          Capabilities edited
+                        </span>
+                      )}
                     </div>
                   </div>
                   <div className="flex flex-wrap items-start justify-end gap-1 justify-self-end">
-                    {route.source === 'override' && (
+                    {routeRemoved ? (
                       <button
                         type="button"
-                        onClick={() => void onResetYaml(route)}
-                        disabled={resettingKey === key}
-                        className="rounded-md px-2 py-1 text-[12px] font-medium text-amber-700 hover:bg-amber-50 disabled:opacity-50"
-                      >
-                        {resettingKey === key ? 'Resetting...' : 'Reset config'}
-                      </button>
-                    )}
-                    {canDisableRoute && (
-                      <button
-                        type="button"
-                        onClick={() => void onDisableRoute(route)}
-                        disabled={isSavingWeight}
-                        className="rounded-md px-2 py-1 text-[12px] font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
-                      >
-                        {isSavingWeight ? 'Disabling...' : 'Disable'}
-                      </button>
-                    )}
-                    {canEnableRoute && (
-                      <button
-                        type="button"
-                        onClick={() => void onEnableRoute(route)}
-                        disabled={isSavingWeight}
+                        onClick={() => void restoreRoute(route)}
+                        disabled={confirmation.busy}
                         className="rounded-md px-2 py-1 text-[12px] font-medium text-gray-900 hover:bg-gray-100 disabled:opacity-50"
                       >
-                        {isSavingWeight ? 'Enabling...' : 'Enable'}
-                      </button>
-                    )}
-                    {route.source === 'runtime' ? (
-                      <button
-                        type="button"
-                        onClick={() => void onDeleteRuntimeRoute(route)}
-                        disabled={deletingKey === key}
-                        className="rounded-md px-2 py-1 text-[12px] font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
-                      >
-                        {deletingKey === key ? 'Deleting…' : 'Delete'}
+                        {deletingKey === key ? 'Restoring…' : 'Restore'}
                       </button>
                     ) : (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEditingRoute(route);
-                          setAddingRoute(false);
-                          setCreatingModel(false);
-                        }}
-                        className="rounded-md px-2 py-1 text-[12px] font-medium text-gray-900 hover:bg-gray-100"
-                      >
-                        Edit
-                      </button>
+                      <>
+                        {route.source === 'override' && (
+                          <button
+                            type="button"
+                            onClick={() => confirmResetYaml(route)}
+                            disabled={confirmation.busy}
+                            className="rounded-md px-2 py-1 text-[12px] font-medium text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                          >
+                            {resettingKey === key ? 'Resetting...' : 'Reset config'}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingRoute(route);
+                            setRouteEditError(null);
+                            setAddingRoute(false);
+                            setCreatingModel(false);
+                            setCapabilityRoute(null);
+                          }}
+                          disabled={confirmation.busy}
+                          className="rounded-md px-2 py-1 text-[12px] font-medium text-gray-900 hover:bg-gray-100 disabled:opacity-50"
+                        >
+                          Edit
+                        </button>
+                        {canDisableRoute && (
+                          <button
+                            type="button"
+                            onClick={() => void setRouteDisabled(route, true)}
+                            disabled={confirmation.busy}
+                            className="rounded-md px-2 py-1 text-[12px] font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
+                          >
+                            {isToggling ? 'Disabling...' : 'Disable'}
+                          </button>
+                        )}
+                        {canEnableRoute && (
+                          <button
+                            type="button"
+                            onClick={() => void setRouteDisabled(route, false)}
+                            disabled={confirmation.busy}
+                            className="rounded-md px-2 py-1 text-[12px] font-medium text-gray-900 hover:bg-gray-100 disabled:opacity-50"
+                          >
+                            {isToggling ? 'Enabling...' : 'Enable'}
+                          </button>
+                        )}
+                        {route.capabilities && (
+                          <button
+                            type="button"
+                            aria-label={`Edit ${route.endpoint_id} capabilities`}
+                            title={describeCapabilities(route.capabilities)}
+                            onClick={() => openCapabilityEditor(route)}
+                            disabled={confirmation.busy}
+                            className="rounded-md px-2 py-1 text-[12px] font-medium text-gray-900 hover:bg-gray-100 disabled:opacity-50"
+                          >
+                            Capabilities
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => confirmDeleteRoute(route)}
+                          disabled={confirmation.busy}
+                          className="rounded-md px-2 py-1 text-[12px] font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
+                        >
+                          {deletingKey === key ? 'Deleting…' : 'Delete'}
+                        </button>
+                      </>
                     )}
                   </div>
                 </div>
@@ -1957,6 +2573,20 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
             })}
           </div>
         </div>
+      )}
+
+      {!isRoutewise && (
+        <EditBar
+          target={`${selectedModel} weights`}
+          changeCount={weightChanges.length}
+          onCancel={discardWeights}
+          onSave={() => void saveWeights()}
+          busy={confirmation.savingKey === `${selectedModel} weights`}
+          held={confirmation.busy}
+          error={weightsError}
+          sticky
+          inPlace
+        />
       )}
 
       {createFormOpen && (
@@ -1967,7 +2597,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
             aria-labelledby="create-provider-route-title"
             className="mx-auto w-full max-w-5xl rounded-lg border border-gray-200 bg-white p-4 shadow-xl"
           >
-            <form onSubmit={onCreateSubmit}>
+            <form onSubmit={(event) => void onCreateSubmit(event)}>
               <div className="mb-4 flex items-start justify-between gap-3">
                 <div>
                   <h3
@@ -1986,7 +2616,8 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                     setAddingRoute(false);
                     setCreatingModel(false);
                   }}
-                  className="rounded-md px-2 py-1 text-[12px] text-gray-500 hover:bg-gray-100"
+                  disabled={confirmation.busy}
+                  className="rounded-md px-2 py-1 text-[12px] text-gray-500 hover:bg-gray-100 disabled:opacity-40"
                 >
                   Close
                 </button>
@@ -2009,6 +2640,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                       className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 font-mono text-[13px] focus:border-gray-400 focus:outline-none"
                       placeholder="deepseek-v4-flash"
                       required
+                      disabled={confirmation.busy}
                     />
                     {!newModelIdAvailable && (
                       <p className="mt-1 text-[11px] leading-5 text-red-600">
@@ -2023,18 +2655,21 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                     >
                       Initial routing policy
                     </label>
-                    <select
+                    <Select<ProviderRouteStrategy>
                       id="new-model-strategy"
                       value={newModelStrategy}
-                      onChange={(event) => {
-                        setNewModelStrategy(event.target.value as ProviderRouteStrategy);
+                      onValueChange={(next) => {
+                        setNewModelStrategy(next);
                         setVerifiedCreateSignature(null);
                       }}
-                      className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
-                    >
-                      <option value="fixed">fixed</option>
-                      <option value="routewise">routewise</option>
-                    </select>
+                      options={[
+                        { value: 'fixed', label: 'fixed' },
+                        { value: 'routewise', label: 'routewise' },
+                      ]}
+                      size="lg"
+                      className="mt-1 w-full"
+                      disabled={confirmation.busy}
+                    />
                   </div>
                   <div>
                     <label
@@ -2043,21 +2678,18 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                     >
                       Visibility
                     </label>
-                    <select
+                    <Select<Role>
                       id="new-model-required-role"
                       value={newModelRequiredRole}
-                      onChange={(event) => {
-                        setNewModelRequiredRole(event.target.value as Role);
+                      onValueChange={(next) => {
+                        setNewModelRequiredRole(next);
                         setVerifiedCreateSignature(null);
                       }}
-                      className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
-                    >
-                      {MODEL_ROLE_OPTIONS.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
+                      options={MODEL_ROLE_OPTIONS}
+                      size="lg"
+                      className="mt-1 w-full"
+                      disabled={confirmation.busy}
+                    />
                   </div>
                 </div>
               )}
@@ -2086,6 +2718,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                       }}
                       className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
                       required
+                      disabled={confirmation.busy}
                     />
                   </div>
                   <div>
@@ -2110,6 +2743,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                       }}
                       className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
                       required
+                      disabled={confirmation.busy}
                     />
                   </div>
                   <div>
@@ -2133,6 +2767,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                         setVerifiedCreateSignature(null);
                       }}
                       className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
+                      disabled={confirmation.busy}
                     />
                   </div>
                   <div>
@@ -2156,30 +2791,60 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                         setVerifiedCreateSignature(null);
                       }}
                       className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
+                      disabled={confirmation.busy}
                     />
                   </div>
                 </div>
               )}
+
+              <div className="mb-3">
+                <RouteCapabilityFields
+                  idPrefix="new-model"
+                  draft={createForm}
+                  reading={createCapabilityReading}
+                  onChange={(change) => {
+                    setCreateForm((current) => ({ ...current, ...change }));
+                    setVerifiedCreateSignature(null);
+                  }}
+                  help={
+                    creatingModel
+                      ? "Take these from the provider's model page. Requests follow them: tool definitions are dropped without tool calling, max_tokens is capped at the max output, and images reach the model only if it accepts them."
+                      : "This route's own values, started from the model's first route. Providers can serve the same model with a smaller window or without images or tools; set what this one serves."
+                  }
+                  disabled={confirmation.busy}
+                />
+              </div>
 
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 <div>
                   <label className="text-[12px] font-medium text-gray-500" htmlFor="new-route-type">
                     Route type
                   </label>
-                  <select
-                    id="new-route-type"
-                    value={createForm.routeType}
-                    onChange={(event) =>
-                      onCreateRouteTypeChange(event.target.value as ProviderRouteType)
-                    }
-                    className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
-                  >
-                    {createRouteTypeOptions.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
+                  {createRouteTypeOptions.length > 1 ? (
+                    <Select<ProviderRouteType>
+                      id="new-route-type"
+                      value={createForm.routeType}
+                      onValueChange={onCreateRouteTypeChange}
+                      options={createRouteTypeOptions}
+                      size="lg"
+                      className="mt-1 w-full"
+                      disabled={confirmation.busy}
+                    />
+                  ) : (
+                    // Fixed routing takes on_demand routes only: nothing to choose.
+                    <>
+                      <output
+                        id="new-route-type"
+                        aria-describedby="new-route-type-help"
+                        className="mt-1 flex h-9 items-center text-[13px] text-gray-900"
+                      >
+                        {createForm.routeType}
+                      </output>
+                      <p id="new-route-type-help" className="text-[11px] leading-5 text-gray-400">
+                        Quota and concurrency routes require the routewise routing policy.
+                      </p>
+                    </>
+                  )}
                 </div>
                 <div>
                   <label
@@ -2188,22 +2853,25 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                   >
                     Provider
                   </label>
-                  <select
+                  <Select
                     id="new-route-provider"
                     value={createForm.upstreamProvider}
-                    onChange={(event) => onCreateProviderChange(event.target.value)}
-                    className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
-                    required
-                  >
-                    {createProviderOptions.length === 0 && (
-                      <option value="">{noProviderOptionLabel(createForm.routeType)}</option>
-                    )}
-                    {createProviderOptions.map((option) => (
-                      <option key={option.provider} value={option.provider}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
+                    onValueChange={onCreateProviderChange}
+                    options={createProviderOptions.map((option) => ({
+                      value: option.provider,
+                      label: option.label,
+                    }))}
+                    placeholder={
+                      createProviderOptions.length === 0
+                        ? noProviderOptionLabel(createForm.routeType)
+                        : 'Choose a provider'
+                    }
+                    searchPlaceholder="Search providers…"
+                    aria-required
+                    size="lg"
+                    className="mt-1 w-full"
+                    disabled={confirmation.busy}
+                  />
                   {createProviderOptions.length === 0 && (
                     <p className="mt-1 text-[11px] leading-5 text-gray-400">
                       {noProviderHelpText(createForm.routeType)}
@@ -2217,23 +2885,23 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                   >
                     API key
                   </label>
-                  <select
+                  <Select
                     id="new-route-api-key"
                     value={createForm.apiKeyId}
-                    onChange={(event) =>
-                      setCreateForm((current) => ({ ...current, apiKeyId: event.target.value }))
+                    onValueChange={(apiKeyId) =>
+                      setCreateForm((current) => ({ ...current, apiKeyId }))
                     }
-                    disabled={createKeysLoading}
-                    className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none disabled:opacity-50"
-                  >
-                    <option value="">{defaultKeyOptionLabel(createKeyProvider)}</option>
-                    {createKeyOptions.map((key) => (
-                      <option key={key.id ?? key.key_prefix} value={key.id ?? ''}>
-                        {key.label ? `${key.label} · ` : ''}
-                        {key.key_prefix} ({key.source})
-                      </option>
-                    ))}
-                  </select>
+                    disabled={createKeysLoading || confirmation.busy}
+                    options={[
+                      { value: '', label: defaultKeyOptionLabel(createKeyProvider) },
+                      ...createKeyOptions.map((key) => ({
+                        value: key.id ?? '',
+                        label: `${key.label ? `${key.label} · ` : ''}${key.key_prefix} (${key.source})`,
+                      })),
+                    ]}
+                    size="lg"
+                    className="mt-1 w-full"
+                  />
                 </div>
               </div>
 
@@ -2251,6 +2919,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                     }
                     className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
                     required
+                    disabled={confirmation.busy}
                   />
                 </div>
                 <div>
@@ -2272,9 +2941,19 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                     }
                     className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 font-mono text-[13px] focus:border-gray-400 focus:outline-none"
                     required
+                    disabled={confirmation.busy}
                   />
                 </div>
               </div>
+
+              <RouteDeploymentField
+                id="new-route-deployment-type"
+                value={createForm.deploymentType}
+                onChange={(deploymentType) =>
+                  setCreateForm((current) => ({ ...current, deploymentType }))
+                }
+                disabled={confirmation.busy}
+              />
 
               {createForm.upstreamProvider === 'openrouter' && (
                 <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -2290,14 +2969,13 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                         <span className="h-3 w-3 animate-spin rounded-full border border-gray-200 border-t-gray-700" />
                       )}
                     </div>
-                    <select
+                    <Select
                       id="new-route-openrouter-routing"
                       value={openRouterRoutingValue(
                         createForm.openRouterProvider,
                         createForm.openRouterSort,
                       )}
-                      onChange={(event) => {
-                        const routingValue = event.target.value;
+                      onValueChange={(routingValue) => {
                         const openRouterProvider = openRouterProviderFromRoutingValue(routingValue);
                         setCreateForm((current) => ({
                           ...current,
@@ -2309,14 +2987,12 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                               : '',
                         }));
                       }}
-                      className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
-                    >
-                      {createOpenRouterRoutingOptions.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
+                      options={groupOpenRouterRouting(createOpenRouterRoutingOptions)}
+                      searchPlaceholder="Search OpenRouter providers…"
+                      size="lg"
+                      className="mt-1 w-full"
+                      disabled={confirmation.busy}
+                    />
                   </div>
                   {createForm.openRouterProvider === OPENROUTER_PROVIDER_CUSTOM && (
                     <div>
@@ -2339,6 +3015,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                         className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 font-mono text-[13px] focus:border-gray-400 focus:outline-none"
                         placeholder="provider-slug"
                         required
+                        disabled={confirmation.busy}
                       />
                     </div>
                   )}
@@ -2369,6 +3046,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                         }
                         className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
                         required
+                        disabled={confirmation.busy}
                       />
                     </div>
                   )}
@@ -2394,6 +3072,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                         }
                         className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
                         required
+                        disabled={confirmation.busy}
                       />
                     </div>
                   )}
@@ -2416,17 +3095,26 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                         }
                         className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
                         required
+                        disabled={confirmation.busy}
                       />
                     </div>
                   )}
                 </div>
               )}
 
+              {createError ? (
+                <p
+                  className="mt-4 rounded-lg bg-red-50 px-3 py-2 text-[12px] text-red-600 [overflow-wrap:anywhere]"
+                  role="alert"
+                >
+                  {createError}
+                </p>
+              ) : null}
               <div className="mt-4 flex justify-end gap-2">
                 <button
                   type="button"
                   onClick={onCreateVerify}
-                  disabled={verifyingCreateRoute || creatingRoute || !createFormValid}
+                  disabled={verifyingCreateRoute || confirmation.busy || !createFormValid}
                   className={
                     createRouteVerified
                       ? 'rounded-md border border-emerald-600 bg-emerald-600 px-4 py-2 text-[13px] font-medium text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40'
@@ -2441,16 +3129,120 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                 </button>
                 <button
                   type="submit"
-                  disabled={creatingRoute || !createFormValid}
+                  disabled={confirmation.busy || !createFormValid}
                   className="rounded-md bg-gray-900 px-4 py-2 text-[13px] font-medium text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  {creatingRoute
+                  {confirmation.busy
                     ? creatingModel
                       ? 'Creating…'
                       : 'Adding…'
                     : creatingModel
                       ? 'Create'
                       : 'Add'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {capabilityRoute && (
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-gray-900/30 px-4 py-8">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="route-capabilities-title"
+            className="mx-auto w-full max-w-3xl rounded-lg border border-gray-200 bg-white p-4 shadow-xl"
+          >
+            <form onSubmit={(event) => void onSaveCapabilities(event)}>
+              <div className="mb-4 flex items-start justify-between gap-3">
+                <div>
+                  <h3
+                    id="route-capabilities-title"
+                    className="text-[14px] font-semibold text-gray-900"
+                  >
+                    Route capabilities
+                  </h3>
+                  <p className="mt-1 font-mono text-[12px] text-gray-400">
+                    {capabilityRoute.model_id} / {capabilityRoute.endpoint_id}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeCapabilityEditor}
+                  disabled={confirmation.busy}
+                  className="rounded-md px-2 py-1 text-[12px] text-gray-500 hover:bg-gray-100 disabled:opacity-40"
+                >
+                  Close
+                </button>
+              </div>
+              <RouteCapabilityFields
+                idPrefix="route-capabilities"
+                draft={capabilityDraft}
+                reading={capabilityReading}
+                onChange={(change) => setCapabilityDraft((current) => ({ ...current, ...change }))}
+                help="Requests through this route follow these values from the next request on, and they hold across restarts. Tool definitions are dropped without tool calling, max_tokens is capped at the max output, and images reach this route only if it accepts them."
+                disabled={confirmation.busy}
+              />
+              {capabilityRoute.capabilities_baseline && (
+                <p className="mt-3 text-[12px] text-gray-500">
+                  {capabilityRoute.capabilities_overridden ? 'Set in the console. ' : ''}
+                  From config: {describeCapabilities(capabilityRoute.capabilities_baseline)}
+                </p>
+              )}
+              {capabilityError ? (
+                <p
+                  className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-[12px] text-red-600 [overflow-wrap:anywhere]"
+                  role="alert"
+                >
+                  {capabilityError}
+                </p>
+              ) : null}
+              <div className="mt-4 flex flex-wrap items-center justify-end gap-2 border-t border-gray-100 pt-3">
+                <span
+                  className={`mr-auto text-[12px] ${
+                    capabilityEditChanges.length > 0
+                      ? 'font-medium text-amber-700'
+                      : 'text-gray-500'
+                  }`}
+                  role="status"
+                >
+                  {capabilityEditChanges.length > 0
+                    ? `${plural(capabilityEditChanges.length, 'unsaved change')}`
+                    : capabilityReading.payload === null
+                      ? 'Answer every field to save'
+                      : 'No changes yet'}
+                </span>
+                {capabilityRoute.capabilities_overridden && (
+                  <button
+                    type="button"
+                    onClick={confirmResetCapabilities}
+                    disabled={confirmation.busy}
+                    className="h-9 rounded-lg px-3 text-[13px] font-medium text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                  >
+                    Reset to config
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={closeCapabilityEditor}
+                  disabled={confirmation.busy}
+                  aria-label={`Cancel editing ${capabilityRoute.endpoint_id} capabilities`}
+                  className={BUTTON_GHOST}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  // Disabled for a no-op and while a value is invalid.
+                  disabled={
+                    confirmation.busy ||
+                    capabilityReading.payload === null ||
+                    capabilityEditChanges.length === 0
+                  }
+                  className={BUTTON_PRIMARY}
+                >
+                  {confirmation.busy ? 'Saving…' : 'Save capabilities'}
                 </button>
               </div>
             </form>
@@ -2466,7 +3258,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
             aria-labelledby="edit-provider-route-title"
             className="mx-auto w-full max-w-5xl rounded-lg border border-gray-200 bg-white p-4 shadow-xl"
           >
-            <form onSubmit={onSubmit}>
+            <form onSubmit={(event) => void onSubmit(event)}>
               <div className="mb-4 flex items-start justify-between gap-3">
                 <div>
                   <h3
@@ -2481,8 +3273,9 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                 </div>
                 <button
                   type="button"
-                  onClick={() => setEditingRoute(null)}
-                  className="rounded-md px-2 py-1 text-[12px] text-gray-500 hover:bg-gray-100"
+                  onClick={closeRouteEdit}
+                  disabled={confirmation.busy}
+                  className="rounded-md px-2 py-1 text-[12px] text-gray-500 hover:bg-gray-100 disabled:opacity-40"
                 >
                   Close
                 </button>
@@ -2491,43 +3284,42 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 <div>
                   <label className="text-[12px] font-medium text-gray-500" htmlFor="route-provider">
-                    Override provider
+                    {editingRuntimeRoute ? 'Provider' : 'Override provider'}
                   </label>
-                  <select
+                  <Select
                     id="route-provider"
                     value={form.upstreamProvider}
-                    onChange={(event) => onUpstreamProviderChange(event.target.value)}
-                    className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
-                    required
-                  >
-                    {providerSelectOptions.map((option) => (
-                      <option key={option.provider} value={option.provider}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
+                    onValueChange={onUpstreamProviderChange}
+                    options={providerSelectOptions.map((option) => ({
+                      value: option.provider,
+                      label: option.label,
+                    }))}
+                    searchPlaceholder="Search providers…"
+                    aria-required
+                    size="lg"
+                    className="mt-1 w-full"
+                    disabled={confirmation.busy}
+                  />
                 </div>
                 <div>
                   <label className="text-[12px] font-medium text-gray-500" htmlFor="route-api-key">
                     API key
                   </label>
-                  <select
+                  <Select
                     id="route-api-key"
                     value={form.apiKeyId}
-                    onChange={(event) =>
-                      setForm((current) => ({ ...current, apiKeyId: event.target.value }))
-                    }
-                    disabled={keysLoading}
-                    className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none disabled:opacity-50"
-                  >
-                    <option value="">{defaultKeyOptionLabel(keyProvider)}</option>
-                    {keyOptions.map((key) => (
-                      <option key={key.id ?? key.key_prefix} value={key.id ?? ''}>
-                        {key.label ? `${key.label} · ` : ''}
-                        {key.key_prefix} ({key.source})
-                      </option>
-                    ))}
-                  </select>
+                    onValueChange={(apiKeyId) => setForm((current) => ({ ...current, apiKeyId }))}
+                    disabled={keysLoading || confirmation.busy}
+                    options={[
+                      { value: '', label: defaultKeyOptionLabel(keyProvider) },
+                      ...keyOptions.map((key) => ({
+                        value: key.id ?? '',
+                        label: `${key.label ? `${key.label} · ` : ''}${key.key_prefix} (${key.source})`,
+                      })),
+                    ]}
+                    size="lg"
+                    className="mt-1 w-full"
+                  />
                 </div>
               </div>
 
@@ -2540,12 +3332,26 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                   type="url"
                   value={form.baseUrl}
                   onChange={(event) =>
-                    setForm((current) => ({ ...current, baseUrl: event.target.value }))
+                    setForm((current) => ({
+                      ...current,
+                      baseUrl: event.target.value,
+                      deploymentType: null,
+                    }))
                   }
                   className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
                   required
+                  disabled={confirmation.busy}
                 />
               </div>
+
+              <RouteDeploymentField
+                id="route-deployment-type"
+                value={editDeploymentType}
+                onChange={(deploymentType) =>
+                  setForm((current) => ({ ...current, deploymentType }))
+                }
+                disabled={confirmation.busy}
+              />
 
               <div className="mt-3">
                 <label
@@ -2563,6 +3369,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                   }
                   className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 font-mono text-[13px] focus:border-gray-400 focus:outline-none"
                   required
+                  disabled={confirmation.busy}
                 />
               </div>
 
@@ -2580,11 +3387,10 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                         <span className="h-3 w-3 animate-spin rounded-full border border-gray-200 border-t-gray-700" />
                       )}
                     </div>
-                    <select
+                    <Select
                       id="route-openrouter-routing"
                       value={openRouterRoutingValue(form.openRouterProvider, form.openRouterSort)}
-                      onChange={(event) => {
-                        const routingValue = event.target.value;
+                      onValueChange={(routingValue) => {
                         const openRouterProvider = openRouterProviderFromRoutingValue(routingValue);
                         setForm((current) => ({
                           ...current,
@@ -2596,14 +3402,12 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                               : '',
                         }));
                       }}
-                      className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
-                    >
-                      {editOpenRouterRoutingOptions.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
+                      options={groupOpenRouterRouting(editOpenRouterRoutingOptions)}
+                      searchPlaceholder="Search OpenRouter providers…"
+                      size="lg"
+                      className="mt-1 w-full"
+                      disabled={confirmation.busy}
+                    />
                   </div>
                   {form.openRouterProvider === OPENROUTER_PROVIDER_CUSTOM && (
                     <div>
@@ -2626,6 +3430,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                         className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 font-mono text-[13px] focus:border-gray-400 focus:outline-none"
                         placeholder="provider-slug"
                         required
+                        disabled={confirmation.busy}
                       />
                     </div>
                   )}
@@ -2651,6 +3456,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                     }
                     className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
                     required
+                    disabled={confirmation.busy}
                   />
                 </div>
               )}
@@ -2677,6 +3483,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                     }
                     className="mt-1 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] focus:border-gray-400 focus:outline-none"
                     required
+                    disabled={confirmation.busy}
                   />
                 </div>
               )}
@@ -2686,9 +3493,7 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                   type="button"
                   onClick={onVerify}
                   disabled={
-                    verifyingKey === routeKey(editingRoute) ||
-                    savingKey === routeKey(editingRoute) ||
-                    !editFormValid
+                    verifyingKey === routeKey(editingRoute) || confirmation.busy || !editFormValid
                   }
                   className={
                     editRouteVerified
@@ -2702,20 +3507,22 @@ export function ProviderRoutesTab({ showRoutewiseSettings = false }: ProviderRou
                       ? 'Verified'
                       : 'Verify'}
                 </button>
-                <button
-                  type="submit"
-                  disabled={savingKey === routeKey(editingRoute) || !editFormValid}
-                  className="rounded-md bg-gray-900 px-4 py-2 text-[13px] font-medium text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  {savingKey === routeKey(editingRoute) ? 'Applying…' : 'Apply'}
-                </button>
               </div>
+              <EditBar
+                target={`${editingRoute.model_id} / ${editingRoute.provider}`}
+                changeCount={routeEditChanges.length}
+                onCancel={closeRouteEdit}
+                busy={confirmation.busy}
+                error={routeEditError}
+                submit
+              />
             </form>
           </div>
         </div>
       )}
+
+      {/* Last, so it stacks over the capabilities dialog whose reset it confirms. */}
+      {confirmation.dialog}
     </div>
   );
 }
-
-export default ProviderRoutesTab;

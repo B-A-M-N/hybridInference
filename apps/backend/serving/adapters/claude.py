@@ -34,17 +34,13 @@ from .base import BaseAdapter
 from .claude_format import (
     ToolCallAccumulator,
     build_final_usage,
-    convert_content_block,
-    convert_content_blocks,
     convert_messages,
     convert_tool_choice,
     convert_tools,
     extract_system,
     handle_stream_event,
-    infer_media_type_from_url,
     is_output_event,
     map_stop_reason,
-    parse_data_url,
     parse_response_content,
     parse_usage,
 )
@@ -75,6 +71,7 @@ class ClaudeAdapter(BaseAdapter):
             _key_pool_provider_label(self.config),
             self.config.api_key,
             base_url=self.config.base_url,
+            deployment_type=self.config.deployment_type,
         )
 
     def _upstream_slot(self) -> AbstractAsyncContextManager[UpstreamSlot]:
@@ -83,23 +80,8 @@ class ClaudeAdapter(BaseAdapter):
             _key_pool_provider_label(self.config),
             self.config.api_key,
             base_url=self.config.base_url,
+            deployment_type=self.config.deployment_type,
         )
-
-    def _convert_content_block(self, block: dict[str, Any] | str) -> dict[str, Any]:
-        """Convert a single content block from OpenAI format to Claude format."""
-        return convert_content_block(block)
-
-    def _parse_data_url(self, data_url: str) -> dict[str, Any]:
-        """Parse a data URL and convert to Claude image format."""
-        return parse_data_url(data_url)
-
-    def _infer_media_type_from_url(self, url: str) -> str:
-        """Infer media type from URL extension."""
-        return infer_media_type_from_url(url)
-
-    def _convert_content_blocks(self, content: str | list[Any] | Any) -> list[dict[str, Any]]:
-        """Convert content from OpenAI format to Claude content block list."""
-        return convert_content_blocks(content)
 
     async def chat_completion(
         self, messages: list[dict[str, Any]], **params: Any
@@ -155,8 +137,15 @@ class ClaudeAdapter(BaseAdapter):
             if converted_tools:
                 payload["tools"] = converted_tools
 
-                if params.get("tool_choice"):
-                    convert_tool_choice(params["tool_choice"], payload)
+                if params.get("tool_choice") or params.get("parallel_tool_calls") is False:
+                    convert_tool_choice(params.get("tool_choice"), payload)
+                    if params.get("parallel_tool_calls") is False:
+                        choice = payload.get("tool_choice")
+                        if choice is None:
+                            choice = {"type": "auto"}
+                            payload["tool_choice"] = choice
+                        if choice.get("type") in {"auto", "any", "tool"}:
+                            choice["disable_parallel_tool_use"] = True
 
         # Build endpoint URL (non-streaming)
         endpoint = f"{self.config.base_url.rstrip('/')}/v1:rawPredict"
@@ -248,8 +237,15 @@ class ClaudeAdapter(BaseAdapter):
             if converted_tools:
                 payload["tools"] = converted_tools
 
-                if params.get("tool_choice"):
-                    convert_tool_choice(params["tool_choice"], payload)
+                if params.get("tool_choice") or params.get("parallel_tool_calls") is False:
+                    convert_tool_choice(params.get("tool_choice"), payload)
+                    if params.get("parallel_tool_calls") is False:
+                        choice = payload.get("tool_choice")
+                        if choice is None:
+                            choice = {"type": "auto"}
+                            payload["tool_choice"] = choice
+                        if choice.get("type") in {"auto", "any", "tool"}:
+                            choice["disable_parallel_tool_use"] = True
 
         # Build endpoint URL (streaming)
         endpoint = f"{self.config.base_url.rstrip('/')}/v1:streamRawPredict"

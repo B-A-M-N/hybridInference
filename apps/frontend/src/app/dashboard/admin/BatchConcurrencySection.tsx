@@ -1,0 +1,265 @@
+'use client';
+
+import { useCallback, useEffect, useState } from 'react';
+
+import {
+  AdminEmptyState,
+  AdminLoading,
+  AdminNotice,
+  AdminSection,
+} from '@/components/features/admin/AdminPrimitives';
+import {
+  CONTROL,
+  FIELD_INVALID,
+  NOTICE_ACTION,
+  PANEL,
+  TABLE_HEAD_CELL,
+} from '@/components/features/admin/adminStyles';
+import { EditBar } from '@/components/features/admin/confirm/EditBar';
+import { useConfirmAction } from '@/components/features/admin/confirm/useConfirmAction';
+import { writeEach } from '@/components/features/admin/confirm/writeEach';
+import type { AdminBatchModelLimit } from '@/lib/api/admin';
+import {
+  listBatchModelLimits,
+  MAX_BATCH_MODEL_CONCURRENCY,
+  updateBatchModelLimit,
+} from '@/lib/api/admin';
+import { getErrorMessage } from '@/lib/utils/errors';
+
+import { validateNumericSettingInput } from './numericSettingValidation';
+import { useReportUnsaved } from './useReportUnsaved';
+
+const SECTION = 'Batch Concurrency';
+
+interface BatchConcurrencySectionProps {
+  onToast: (msg: string) => void;
+  /** Called with the number of unsaved changes whenever it changes. */
+  onUnsavedChange?: (count: number) => void;
+}
+
+/** A cap as the table shows it; `null` is the default. */
+function capLabel(cap: number | null, defaultCap: number): string {
+  if (cap === null) return `Default (${defaultCap === 0 ? '0, paused' : defaultCap})`;
+  return cap === 0 ? '0 (paused)' : String(cap);
+}
+
+/** The saved cap as the input holds it: empty for the default. */
+const savedText = (model: AdminBatchModelLimit) =>
+  model.max_concurrency === null ? '' : String(model.max_concurrency);
+
+type ParsedCap = { ok: true; value: number | null } | { ok: false; error: string };
+
+/** Empty clears the cap (the default applies); otherwise a whole number in range. */
+function parseCap(raw: string): ParsedCap {
+  if (raw.trim() === '') return { ok: true, value: null };
+  const validated = validateNumericSettingInput(raw, {
+    min: 0,
+    max: MAX_BATCH_MODEL_CONCURRENCY,
+    integer: true,
+  });
+  return validated.ok ? { ok: true, value: validated.value } : validated;
+}
+
+/**
+ * How many batch requests each model may run at once, across the deployment.
+ * The caps are edited in place; Save writes the changed models, one request
+ * per model.
+ */
+export function BatchConcurrencySection({
+  onToast,
+  onUnsavedChange,
+}: BatchConcurrencySectionProps) {
+  const writes = useConfirmAction();
+  const [models, setModels] = useState<AdminBatchModelLimit[]>([]);
+  const [defaultCap, setDefaultCap] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  // Model id → the typed cap ('' for the default); only edits away from the saved value are kept.
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await listBatchModelLimits();
+      setModels(response.models);
+      setDefaultCap(response.default_concurrency);
+    } catch (e) {
+      setError(getErrorMessage(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const changeDraft = (model: AdminBatchModelLimit, text: string) => {
+    setDrafts((prev) => {
+      const next = { ...prev };
+      if (text === savedText(model)) delete next[model.model_id];
+      else next[model.model_id] = text;
+      return next;
+    });
+  };
+
+  const cancel = () => {
+    if (writes.busy) return;
+    setDrafts({});
+    setSaveError(null);
+  };
+
+  // A model is changed when its draft is valid and differs from what is saved.
+  const changes = models.flatMap((model) => {
+    if (!(model.model_id in drafts)) return [];
+    const parsed = parseCap(drafts[model.model_id]);
+    if (!parsed.ok || parsed.value === model.max_concurrency) return [];
+    return [{ model, value: parsed.value }];
+  });
+  const invalid = models.filter(
+    (model) => model.model_id in drafts && !parseCap(drafts[model.model_id]).ok,
+  );
+  // An invalid cap is unsaved too: it keeps the bar up, with Save held back.
+  const unsaved = changes.length + invalid.length;
+  useReportUnsaved(unsaved, onUnsavedChange);
+  const blocked =
+    invalid.length > 0
+      ? `Correct the cap for ${invalid.map((model) => model.model_id).join(', ')} before saving.`
+      : null;
+
+  const save = async () => {
+    // Enter in a field reaches here too; the bar already says what to correct.
+    if (blocked || changes.length === 0) return;
+    setSaveError(null);
+    const pending = changes;
+    const failure = await writes.perform({
+      run: async () => {
+        await writeEach(
+          pending,
+          ({ model }) => model.model_id,
+          async ({ model, value }) => {
+            const updated = await updateBatchModelLimit(model.model_id, value);
+            setModels((prev) =>
+              prev.map((item) => (item.model_id === model.model_id ? updated : item)),
+            );
+            setDrafts((prev) => {
+              const next = { ...prev };
+              delete next[model.model_id];
+              return next;
+            });
+          },
+        );
+        onToast(
+          pending.length === 1
+            ? `Updated batch concurrency for ${pending[0].model.model_id}.`
+            : `Updated batch concurrency for ${pending.length} models.`,
+        );
+      },
+    });
+    setSaveError(failure);
+  };
+
+  return (
+    <AdminSection
+      title={SECTION}
+      description="How many batch requests each model may run at once. A cap is shared by every gateway process and applies within seconds; an empty cap uses the default and 0 pauses batch work on the model. The default, and who may submit batches, are set under Batch inference, above."
+    >
+      {error && (
+        <div className="mb-3">
+          <AdminNotice
+            action={
+              <button type="button" onClick={() => void load()} className={NOTICE_ACTION}>
+                Retry
+              </button>
+            }
+          >
+            {error}
+          </AdminNotice>
+        </div>
+      )}
+
+      {loading ? (
+        <AdminLoading size="sm" />
+      ) : models.length === 0 ? (
+        <AdminEmptyState title="No models available." />
+      ) : (
+        <div
+          className={`${PANEL} relative overflow-x-auto ${unsaved > 0 ? 'border-gray-400 shadow-sm' : ''}`}
+        >
+          <table className="w-full min-w-[36rem] text-[13px]">
+            <thead className="bg-gray-50/80">
+              <tr className="border-b border-gray-200">
+                <th className={TABLE_HEAD_CELL}>Model</th>
+                <th className={`${TABLE_HEAD_CELL} text-right`}>Max concurrent batch requests</th>
+                <th className={`${TABLE_HEAD_CELL} text-right`}>Running</th>
+                <th className={`${TABLE_HEAD_CELL} text-right`}>Queued</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {models.map((model) => {
+                const label = `Max concurrent batch requests for ${model.model_id}`;
+                const draft = drafts[model.model_id] ?? savedText(model);
+                const parsed = parseCap(draft);
+                const changed = model.model_id in drafts;
+                return (
+                  <tr key={model.model_id} className="bg-white">
+                    <td className="px-4 py-2.5 font-mono text-[12px] text-gray-900">
+                      {model.model_id}
+                    </td>
+                    <td className="px-4 py-2.5 text-right">
+                      <input
+                        type="number"
+                        min={0}
+                        max={MAX_BATCH_MODEL_CONCURRENCY}
+                        step={1}
+                        aria-label={label}
+                        aria-invalid={!parsed.ok || undefined}
+                        placeholder={capLabel(null, defaultCap)}
+                        className={`${CONTROL} w-32 text-right ${
+                          !parsed.ok ? FIELD_INVALID : changed ? 'border-amber-400' : ''
+                        }`}
+                        disabled={writes.busy}
+                        value={draft}
+                        onChange={(e) => changeDraft(model, e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            void save();
+                          }
+                        }}
+                      />
+                      {!parsed.ok && (
+                        <p className="mt-0.5 text-[11px] text-red-600" role="alert">
+                          {parsed.error}
+                        </p>
+                      )}
+                    </td>
+                    <td className="px-4 py-2.5 text-right tabular-nums text-gray-700">
+                      {model.running}
+                    </td>
+                    <td className="px-4 py-2.5 text-right tabular-nums text-gray-700">
+                      {model.queued}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <EditBar
+        target={SECTION}
+        changeCount={unsaved}
+        onCancel={cancel}
+        onSave={() => void save()}
+        busy={writes.busy}
+        error={saveError}
+        blocked={blocked}
+        inPlace
+      />
+    </AdminSection>
+  );
+}

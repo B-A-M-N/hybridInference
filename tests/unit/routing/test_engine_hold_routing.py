@@ -46,12 +46,6 @@ KEY = "EMPTY"
 ENGINE_URL = "http://localhost:18003/v1"
 ENGINE_ADDRESS = "localhost:18003"
 
-#: A held request that could be offloaded leaves at the wait; the first-token wait
-#: that follows a send is enforced with ``asyncio.timeout`` (Python 3.11+).
-needs_timeout = pytest.mark.skipif(
-    not hasattr(asyncio, "timeout"), reason="the first-token wait needs asyncio.timeout"
-)
-
 
 class _Engine(BaseAdapter):
     """A local engine whose every request waits for the test to release its first token.
@@ -244,7 +238,8 @@ def _routing(chunks: list[str]) -> list[dict[str, Any]]:
 
 
 def _line() -> dict[str, int]:
-    return get_upstream_limiter().engine_snapshot().get(ENGINE_ADDRESS, {})
+    gate = get_upstream_limiter()._gates.get(ENGINE_ADDRESS)
+    return {} if gate is None else {"pending": gate.pending, "waiting": len(gate.waiters)}
 
 
 async def _until(predicate) -> None:
@@ -280,7 +275,7 @@ async def test_a_model_without_an_engine_queue_limit_holds_nothing():
     await first
 
     assert engine.holds == [None]
-    assert get_upstream_limiter().engine_snapshot() == {}
+    assert get_upstream_limiter()._gates == {}
 
 
 @pytest.mark.parametrize(
@@ -339,7 +334,6 @@ async def test_a_response_that_arrives_whole_is_never_held():
 # ------------------------------------------------------ the line in action
 
 
-@needs_timeout
 async def test_a_held_request_past_its_wait_goes_to_the_offload_route_unsent():
     engine = _Engine()
     offload = _OffloadRoute()
@@ -426,7 +420,6 @@ async def test_a_place_frees_at_the_first_token_not_at_the_end_of_the_stream():
     assert _line() == {"pending": 0, "waiting": 0}
 
 
-@needs_timeout
 async def test_a_request_back_from_a_failed_offload_route_waits_its_turn_again():
     """The retry after a failed offload has nowhere else to go, so it keeps its line."""
     engine = _Engine()

@@ -4,12 +4,22 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, cast
 
 from serving.http import AsyncHTTPClient
 from serving.pricing import PricingSchedule
 from serving.stream import make_stream_chunk
+
+DeploymentType = Literal["auto", "self_hosted", "provider_api"]
+
+
+def validate_deployment_type(value: object) -> DeploymentType:
+    """Validate an endpoint's deployment classification without coercion."""
+    if not isinstance(value, str) or value not in ("auto", "self_hosted", "provider_api"):
+        raise ValueError("deployment_type must be one of: auto, self_hosted, provider_api")
+    return cast("DeploymentType", value)
 
 
 @dataclass
@@ -173,6 +183,9 @@ class ModelConfig:
     # Generic per-route metadata consumed by routing strategies. RouteWise
     # mirrors `provider_type` here during config loading.
     route_metadata: dict[str, Any] = field(default_factory=dict)
+    # Deployment ownership, independent of adapter protocol and RouteWise category.
+    # Auto preserves hostname detection; self_hosted also covers LAN/cluster engines.
+    deployment_type: DeploymentType = "auto"
     # RouteWise provider category for this endpoint.
     provider_type: str = "on_demand"
     # RouteWise route-level metadata. These fields are not sent upstream; they
@@ -209,6 +222,7 @@ class ModelConfig:
         ``TypeError: 'NoneType' object is not a mapping``. Coerce the dict-typed
         request/transport fields back to ``{}`` here as a last line of defense.
         """
+        self.deployment_type = validate_deployment_type(self.deployment_type)
         for _name in ("extra_body", "extra_headers", "extra_query", "route_metadata"):
             if getattr(self, _name) is None:
                 setattr(self, _name, {})
@@ -245,19 +259,7 @@ class BaseAdapter(ABC):
 
     def __init__(self, config: ModelConfig):
         self.config = config
-        # Legacy: some adapters still use self.session; keep for compatibility.
-        self.session = None
-        # Shared HTTP client for new/updated adapters.
         self.http = AsyncHTTPClient.shared()
-        # Populated after stream_messages() completes; consumed by the router
-        # for DB logging. Concrete subclasses with their own stream_messages()
-        # (e.g. AnthropicAdapter) overwrite this themselves.
-        self.last_stream_usage: dict[str, int] = {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
-        }
 
     @abstractmethod
     async def chat_completion(self, messages: list[dict[str, Any]], **params) -> dict[str, Any]:
@@ -321,21 +323,45 @@ class BaseAdapter(ABC):
         translator = OpenAIToAnthropicStreamTranslator(
             model=body.get("model", ""), input_tokens_estimate=input_estimate
         )
-        async for openai_chunk in self.stream_chat_completion(oai_messages, **oai_params):
-            data = openai_chunk.encode("utf-8") if isinstance(openai_chunk, str) else openai_chunk
-            for ant in translator.feed(data):
-                yield ant
+        upstream = self.stream_chat_completion(oai_messages, **oai_params)
+        # ``async for`` alone does not close the owned upstream generator when
+        # this generator is closed early (client disconnect / consumer aclose).
+        # ``aclosing`` makes the inner ``finally`` run on every exit -- normal
+        # end, upstream error, cancellation and GeneratorExit -- instead of
+        # leaving the provider stream to the event loop's finalizer.
+        async with aclosing(upstream) as upstream_iter:
+            try:
+                async for openai_chunk in upstream_iter:
+                    data = (
+                        openai_chunk.encode("utf-8")
+                        if isinstance(openai_chunk, str)
+                        else openai_chunk
+                    )
+                    for ant in translator.feed(data):
+                        yield ant
+            except Exception:
+                # The upstream failed mid-stream. Emit content the translator
+                # had already received (deferred behind a tool block) before
+                # unwinding, but never run finalize(): a failed stream must not
+                # end with a fabricated message_delta/message_stop.
+                # Cancellation is a BaseException and deliberately skips this
+                # branch -- the client is gone and the upstream did not fail.
+                for ant in translator.abort():
+                    yield ant
+                raise
         for ant in translator.finalize():
             yield ant
-        # Expose accumulated usage for the router's DB-logging step.
+        # Hand the accumulated usage to the router's DB-logging step.
         translator_usage = translator.usage
         final_usage = {
             "input_tokens": translator_usage.get("input_tokens", 0),
             "output_tokens": translator_usage.get("output_tokens", 0),
-            "cache_creation_input_tokens": translator_usage.get("cache_creation_input_tokens", 0),
-            "cache_read_input_tokens": translator_usage.get("cache_read_input_tokens", 0),
         }
-        self.last_stream_usage = final_usage  # keep for backward-compat with tests
+        # Cache usage is optional. Materializing absent provider fields as zero
+        # would turn an unknown into a measured miss in /v1/messages logging.
+        for key in ("cache_creation_input_tokens", "cache_read_input_tokens"):
+            if key in translator_usage:
+                final_usage[key] = translator_usage[key]
         if usage_sink is not None:
             usage_sink.update(final_usage)
 
@@ -429,8 +455,3 @@ class BaseAdapter(ABC):
             ],
         }
         return f"data: {json.dumps(chunk)}\n\n"
-
-    async def cleanup(self):
-        """Clean up adapter resources (override if needed)."""
-        if self.session:
-            await self.session.close()

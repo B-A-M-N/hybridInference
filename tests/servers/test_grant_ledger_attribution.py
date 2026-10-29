@@ -6,7 +6,9 @@ request's real start time. Neither existed on the row before this: the
 surfaces wrote only ``agent_job_id``, and the row's ``timestamp`` is the
 insert time of a write scheduled after the response completed. Every surface
 a grant can reach is covered because each builds its own metadata, and the
-Responses surface Codex uses delegates to chat completions.
+Responses surface Codex uses delegates to chat completions. /v1/embeddings
+is not such a surface: scopes are minted from chat routes only, so a grant
+can never authorize an embedding call, and the last test pins that refusal.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import pytest
 from fastapi import FastAPI, status
 from httpx import ASGITransport, AsyncClient
 
-from routing.executor import RouteExecutor
+from routing.routers import FixedRouter
 from serving.grant_auth import LEDGER_ATTRIBUTION_VERSION
 from serving.servers.auth import verify_api_key
 from serving.servers.deps import AppServices
@@ -49,7 +51,7 @@ ATTRIBUTION_KEYS = {"agent_grant_id", "request_started_at", "attribution_version
 
 
 def _app(module, user_ctx: dict, mock_db_logger, mock_log_store) -> FastAPI:
-    router_exec = RouteExecutor()
+    router_exec = FixedRouter()
     router_exec.register_route(MODEL, [(DummyAdapter(_mk_cfg(MODEL)), 1.0)])
     app = FastAPI()
     app.state.services = AppServices(
@@ -118,13 +120,25 @@ async def test_an_ordinary_call_carries_no_grant_attribution(
 
 
 @pytest.mark.asyncio
-async def test_an_embedding_call_is_attributed_too():
-    """Embeddings build their metadata separately from the chat surfaces."""
+async def test_a_grant_scoped_call_cannot_reach_embeddings():
+    """Grant scopes are minted from chat routes only, so /v1/embeddings sits
+    outside the grant surface: the minted list can never name an embedding
+    model, and the surface's access gate refuses the call as outside scope.
+
+    The injected scope here is exactly what the mint can produce (GRANT_CTX
+    names the chat model). No scope shape can authorize an embedding call, so
+    the adapter is never invoked; the refusal still lands in the request log
+    as a model-not-found error attributed to the grant, like every other
+    rejected call. Grant-attributed *served* calls are pinned on the chat
+    surfaces above, the only ones a grant can reach.
+    """
     logger = _CapturingLogger()
     app = _build_embeddings_app(_FakeAdapter(response=_ok_response()), logger)
     app.dependency_overrides[verify_api_key] = lambda: {**GRANT_CTX, "role": "internal"}
     before = time.time()
     resp = await _post_embeddings(app, {"model": "emb-model", "input": "hello"})
-    assert resp.status_code == status.HTTP_200_OK
-    assert logger.calls, "the call must be logged"
-    _assert_attributed(logger.calls[0][1]["metadata"], before=before)
+    assert resp.status_code == status.HTTP_404_NOT_FOUND
+    assert logger.calls, "the refusal is still logged"
+    kwargs = logger.calls[0][1]
+    assert kwargs["error"] == "Embedding model 'emb-model' not found"
+    _assert_attributed(kwargs["metadata"], before=before)

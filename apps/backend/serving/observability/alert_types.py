@@ -82,6 +82,16 @@ ALERT_TYPES: tuple[AlertType, ...] = (
         key_pattern="client_error_burst",
     ),
     AlertType(
+        id="key_pool_exhaustion_burst",
+        label="Key-pool exhaustion burst",
+        description=(
+            "One endpoint's key-pool refusals, which bypass the circuit breaker, piled up "
+            "within the window."
+        ),
+        group="Request errors",
+        key_pattern="key_pool_exhaustion_burst:<endpoint>",
+    ),
+    AlertType(
         id="stream_failure_rate",
         label="Streaming failures for a model",
         description="One model's streams keep dying mid-flight.",
@@ -144,6 +154,16 @@ ALERT_TYPES: tuple[AlertType, ...] = (
         ),
         group="Platform",
         key_pattern="tracked_task_failure:<task>",
+    ),
+    AlertType(
+        id="request_log_queue_saturation",
+        label="Request-log queue saturated; report rows dropped",
+        description=(
+            "The bounded api_logs queue fell behind and discarded report rows; quota-ledger "
+            "increments are separate, but usage reports undercount the dropped rows."
+        ),
+        group="Platform",
+        key_pattern="request_log_queue_saturation",
     ),
     AlertType(
         id="prefix_cache_pending_leak",

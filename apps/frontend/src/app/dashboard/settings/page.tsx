@@ -11,7 +11,7 @@ import { getErrorMessage } from '@/lib/utils/errors';
 import { fill } from '@/lib/utils/interpolate';
 import { Button } from '@/components/ui/Button';
 import { InputField } from '@/components/ui/InputField';
-import { LanguagePicker } from '@/components/ui/LanguageSwitcher';
+import { LanguagePicker } from '@/components/ui/LanguagePicker';
 import { cropImageToDataUrl, UserAvatar } from '@/components/ui/UserAvatar';
 import { ProtectedRoute } from '@/components/features/auth/ProtectedRoute';
 import { useAuth } from '@/components/providers';
@@ -353,29 +353,27 @@ function SettingsContent() {
         </form>
       </SettingsSection>
 
-      {!state.user?.login_name && (
-        <SettingsSection
-          title={t('settings.email.title', 'Email Address')}
-          description={
-            state.user?.email
-              ? t(
-                  'settings.email.description_bound',
-                  'Your verified email address for signing in and receiving account notifications.',
-                )
-              : t(
-                  'settings.email.description_unbound',
-                  'Bind an email address to receive notifications and sign in with email.',
-                )
-          }
-        >
-          <EmailBindForm
-            currentEmail={state.user?.email}
-            hasPassword={hasPassword}
-            phone={state.user?.phone_verified ? state.user.phone : null}
-            onSuccess={refreshUser}
-          />
-        </SettingsSection>
-      )}
+      <SettingsSection
+        title={t('settings.email.title', 'Email Address')}
+        description={
+          state.user?.email
+            ? t(
+                'settings.email.description_bound',
+                'Your verified email address for signing in and receiving account notifications.',
+              )
+            : t(
+                'settings.email.description_unbound',
+                'Bind an email address to receive notifications and sign in with email.',
+              )
+        }
+      >
+        <EmailBindForm
+          currentEmail={state.user?.email}
+          hasPassword={hasPassword}
+          phone={state.user?.phone_verified ? state.user.phone : null}
+          onSuccess={refreshUser}
+        />
+      </SettingsSection>
 
       {features.phoneAuth && (
         <SettingsSection

@@ -32,6 +32,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 from routing.routers import AllCircuitsOpenError, TargetUnavailableError
+from serving.adapters.key_pool import KeyPoolExhausted
 from serving.exceptions import scrub_error_for_user
 from serving.openai_chat_serializer import resolve_mode, sanitize_chunk
 from serving.servers.routers.routing_info import (
@@ -44,7 +45,11 @@ from serving.stream import make_role_chunk, new_completion_id, stamp_completion_
 from serving.utils import context as req_ctx
 from serving.utils.errors import format_exception_for_db
 from serving.utils.logging import get_logger
-from serving.utils.token_utils import normalize_usage, sanitize_usage
+from serving.utils.token_utils import (
+    normalize_usage,
+    optional_token_count,
+    sanitize_usage,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -65,6 +70,15 @@ def _extract_exception_status_code(exc: BaseException, default: int = 500) -> in
     """Return the HTTP status carried by common upstream exception shapes."""
     if isinstance(exc, (AllCircuitsOpenError, TargetUnavailableError)):
         return 503
+
+    # Key-pool exhaustion raised before anything was sent: a local
+    # precondition (every key muted, typically the tail of a provider 429
+    # storm, or reserved above the caller's tier), not an internal error.
+    # Answer 429 so clients back off for the mute window instead of hammering
+    # immediate retries — the same mapping the anthropic surface already
+    # applies (issue #1440).
+    if isinstance(exc, KeyPoolExhausted):
+        return 429
 
     status_code = None
 
@@ -491,7 +505,7 @@ class StreamSession:
                         item = await asyncio.wait_for(
                             chunk_queue.get(), timeout=_KEEPALIVE_INTERVAL
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         if not self._yielded_first_chunk:
                             # Out of time to hold it: the role chunk is this
                             # interval's byte.
@@ -876,12 +890,21 @@ class StreamSession:
         if self._tool_calls:
             response_for_db["choices"][0]["message"]["tool_calls"] = self._tool_calls.to_list()
         if self._usage_data:
-            response_for_db["usage"] = normalize_usage(self._usage_data) or self._usage_data
+            # An explicit None check, not a truthiness fallback: normalize_usage can
+            # return {} when every direct count was invalid, and restoring the raw
+            # mapping would put the invalid counts back into persistence.
+            normalized_usage = normalize_usage(self._usage_data)
+            response_for_db["usage"] = (
+                normalized_usage if normalized_usage is not None else self._usage_data
+            )
         return response_for_db
 
     async def _finalize_success(self) -> None:
         """Schedule cost increment, DB log, and routing observation."""
         response_for_db = self._build_response_for_db()
+        usage_for_log = response_for_db.get("usage")
+        if usage_for_log is None:
+            usage_for_log = self._usage_data
         is_empty_completion = _is_empty_completion(response_for_db)
         if is_empty_completion:
             self._metadata["empty_completion"] = True
@@ -923,8 +946,8 @@ class StreamSession:
                 total_tokens=(
                     int(_usage["total_tokens"]) if _usage.get("total_tokens") is not None else None
                 ),
-                cache_read_tokens=int(_usage.get("cache_read_tokens", 0) or 0),
-                cache_write_tokens=int(_usage.get("cache_write_tokens", 0) or 0),
+                cache_read_tokens=_usage.get("cache_read_tokens"),
+                cache_write_tokens=_usage.get("cache_write_tokens"),
                 reasoning_tokens=int(_usage.get("reasoning_tokens", 0) or 0),
             )
 
@@ -937,7 +960,7 @@ class StreamSession:
                     "provider": provider,
                     "prompt": self._messages,
                     "response": response_for_db,
-                    "usage": response_for_db.get("usage") or self._usage_data,
+                    "usage": usage_for_log,
                     "latency_ms": int((time.time() - self._start_time) * 1000),
                     "status_code": 200,
                     "params": self._completions_logger.build_db_params(
@@ -956,17 +979,11 @@ class StreamSession:
 
         if not self._is_synthetic_probe:
             stream_usage = normalize_usage(self._usage_data) if self._usage_data else {}
-            # Authoritative observed cache usage from the provider.
-            # None means "provider did not report" (NOT equivalent to 0).
-            cached_tokens_raw = stream_usage.get("cache_read_tokens")
-            cached_tokens: int | None = None
-            if cached_tokens_raw is not None:
-                try:
-                    cached_tokens = int(cached_tokens_raw)
-                    if cached_tokens < 0:
-                        cached_tokens = None
-                except (TypeError, ValueError):
-                    cached_tokens = None
+            # Authoritative observed cache usage from the provider, through the
+            # canonical helper so this path shares one validation rule with
+            # cost and persistence. None means "provider did not report" (NOT
+            # equivalent to 0).
+            cached_tokens = optional_token_count(stream_usage.get("cache_read_tokens"))
             self._completions_logger.record_routing_observation(
                 self._active_router,
                 self._model,
@@ -1116,6 +1133,9 @@ class StreamSession:
         metadata_for_log["terminal_state"] = terminal_state
 
         response_for_db = self._build_response_for_db()
+        usage_for_log = response_for_db.get("usage")
+        if usage_for_log is None:
+            usage_for_log = self._usage_data
         self._completions_logger.schedule_log(
             self._request_id,
             {
@@ -1124,7 +1144,7 @@ class StreamSession:
                 "provider": provider,
                 "prompt": self._messages,
                 "response": response_for_db,
-                "usage": response_for_db.get("usage") or self._usage_data,
+                "usage": usage_for_log,
                 "latency_ms": int((time.time() - self._start_time) * 1000),
                 "status_code": status_code,
                 "error": error_text,
