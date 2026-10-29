@@ -482,7 +482,15 @@ class UpdateUserResponse(BaseModel):
 
 
 class AuditLogEntry(BaseModel):
-    """Single entry from the admin audit log."""
+    """Single entry from the audit log (see ``serving.audit``).
+
+    ``admin_ip`` and ``target_user_id`` are returned exactly as stored: on a
+    legacy row ``admin_ip`` may hold an address, an email or a login name,
+    and ``target_user_id`` may hold a provider or model name. The
+    attribution fields are null on such a row ("not recorded"); on a row
+    that has them, ``source_ip`` is the trusted client address (null when
+    there was none) and ``target_user_id`` is set only for a ``user`` target.
+    """
 
     id: int
     timestamp: datetime
@@ -491,6 +499,11 @@ class AuditLogEntry(BaseModel):
     target_user_id: str | None = None
     details: dict[str, Any] | None = None
     success: bool = True
+    actor_type: str | None = None
+    actor_id: str | None = None
+    source_ip: str | None = None
+    target_type: str | None = None
+    target_id: str | None = None
 
 
 class ListAuditLogResponse(BaseModel):
@@ -672,7 +685,8 @@ class AdminTtftScatterPoint(BaseModel):
 
     prompt_tokens: int
     ttft_ms: int
-    cache_hit: bool
+    #: True = measured hit; False = measured miss; null = provider did not say.
+    cache_hit: bool | None
     timestamp: datetime
 
 
@@ -1345,7 +1359,6 @@ class RoutewiseSettingItem(BaseModel):
     key: Literal[
         "routewise_budget_alpha",
         "routewise_latency_slo_sec",
-        "routewise_latency_min_samples",
         "routewise_probe_enabled",
         "routewise_probe_interval_sec",
     ]
@@ -2257,6 +2270,7 @@ class ProviderObservabilityTotals(BaseModel):
     cache_eligible_count: int
     cache_hit_count: int
     input_tokens: int
+    cache_eligible_input_tokens: int = 0
     cache_read_tokens: int
     cache_write_tokens: int
 
@@ -2271,6 +2285,7 @@ class ProviderObservabilityBucket(BaseModel):
     cache_hit_count: int
     cache_read_tokens: int
     input_tokens: int
+    cache_eligible_input_tokens: int = 0
 
 
 class ProviderErrorTypeRow(BaseModel):

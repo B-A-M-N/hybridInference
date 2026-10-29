@@ -7,7 +7,12 @@ import json
 from typing import TYPE_CHECKING, Any, Literal
 
 from serving.analytics.automation_score import score_users_from_logs
-from serving.storage import admin_view_results, daily_activity_rollup, user_usage_rollup
+from serving.storage import (
+    admin_view_results,
+    alert_history_store,
+    daily_activity_rollup,
+    user_usage_rollup,
+)
 from serving.storage.base import LogStore, Row
 from serving.storage.log_schema import (
     check_erasure_fence,
@@ -189,7 +194,8 @@ class PostgresLogStore(LogStore):
         Defaults to ``model_id``. The served endpoint is recovered from the
         routing ``metadata`` and stored alongside it.
         """
-        usage = normalize_usage(usage) or usage
+        normalized_usage = normalize_usage(usage)
+        usage = normalized_usage if normalized_usage is not None else usage
 
         should_store_full = (
             store_full_content if store_full_content is not None else self.store_full_prompts
@@ -1135,7 +1141,9 @@ class PostgresLogStore(LogStore):
         """Wipe ``api_logs``, ``user_usage_daily`` and ``email_broadcast_recipients`` for *user_id*.
 
         All DELETEs run in a single transaction.  Returns row counts parsed
-        from asyncpg command tags.  ``user_usage_daily`` is the daily rollup of
+        from asyncpg command tags.  Retained public-stats language and client
+        rows for the account are removed too, when those tables exist.
+        ``user_usage_daily`` is the daily rollup of
         the user's ``api_logs`` rows, so it names the user too; it is purged
         under the rollup's lock so that no fill can write back what it read
         before the purge (see :func:`user_usage_rollup.purge_user`).  The
@@ -1240,6 +1248,25 @@ class PostgresLogStore(LogStore):
                         await admin_view_results.clear(conn)
                 except _asyncpg.UndefinedTableError:
                     pass
+            # Alert history names the account only through its fence digest;
+            # the rows about it go in this transaction, after the fence, so a
+            # history write still buffered anywhere finds the tombstone.
+            history_count: int | None
+            try:
+                async with conn.transaction():
+                    history_count = await alert_history_store.purge_subject(conn, _fence_key)
+            except _asyncpg.UndefinedTableError:
+                history_count = None
+            # Language and client checkpoints name the account only by digest.
+            # A missing table means the stats job has never run.
+            retained_count: int | None
+            try:
+                async with conn.transaction():
+                    from serving.analytics.public_stats import purge_retained_account
+
+                    retained_count = await purge_retained_account(conn, user_id)
+            except _asyncpg.UndefinedTableError:
+                retained_count = None
             recipients_count: int | None
             try:
                 # email_broadcast_recipients is created lazily by the broadcast
@@ -1262,6 +1289,10 @@ class PostgresLogStore(LogStore):
         counts = {"api_logs": int(purged["n"])}
         if usage_count is not None:
             counts["user_usage_daily"] = usage_count
+        if history_count is not None:
+            counts["alert_history_events"] = history_count
+        if retained_count:
+            counts["api_log_retained"] = retained_count
         if recipients_count is not None:
             counts["email_broadcast_recipients"] = recipients_count
         return counts

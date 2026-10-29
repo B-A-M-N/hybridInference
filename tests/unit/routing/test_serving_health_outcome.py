@@ -195,12 +195,8 @@ def test_process_liveness_is_not_serving_progress(monkeypatch):
 
 
 def test_serving_health_correction_does_not_disturb_locality_evidence():
-    """The breaker rule must not manufacture or destroy cache-locality evidence.
-
-    Serving health and locality are separate authorities. Gating one on the other
-    would either discard valid locality evidence during a health stall or treat a
-    cache hit as proof the model was doing useful work.
-    """
+    """Serving-health updates leave the remembered prefix history untouched."""
+    from routing.completion_outcome import CompletionOutcome
     from routing.routewise.prefix_cache import (
         Block,
         CacheScope,
@@ -227,9 +223,14 @@ def test_serving_health_correction_does_not_disturb_locality_evidence():
     )
     conversation = (Block(digest="a", token_count=4096),)
     coordinator.remember(scope, conversation)
-    coordinator.record_evidence(scope, 4096, blocks=conversation)
+    before = coordinator.memory.lookup(scope, conversation).matched_prefix_tokens
+    registry = EndpointHealthRegistry()
+    registry.record_failure(_ENDPOINT, reason="upstream_502")
+    registry.record_success(_ENDPOINT, outcome=CompletionOutcome.TRANSIENT_NO_PROGRESS)
+    after = coordinator.memory.lookup(scope, conversation).matched_prefix_tokens
 
-    assert coordinator.lookup_state(scope).verified is True
+    assert before == 4096
+    assert after == before
 
 
 # ---------------------------------------------------------------------------

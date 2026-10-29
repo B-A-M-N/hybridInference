@@ -13,10 +13,11 @@ from typing import Any
 from routing.completion_outcome import CompletionOutcome
 from routing.engine_wait import EngineWaitExpired
 from routing.usage_limit import MIN_ALERT_GAP, detect_usage_limit
-from serving.adapters.key_pool import KeyPoolRoleRestricted
+from serving.adapters.key_pool import KeyPoolExhausted, KeyPoolRoleRestricted
 from serving.adapters.upstream_limiter import UpstreamSaturated
 from serving.config.app_config import config_value
 from serving.exceptions import operator_safe_error
+from serving.observability.alert_history import hooks as alert_history
 from serving.observability.alerts import AlertSeverity, alert_on_transition
 from serving.observability.state_alert_policy import (
     circuit_open_policy,
@@ -94,11 +95,14 @@ _CALLERS_IN_ALERT = 10
 # Deriving ownership from the endpoint's base_url instead would mean threading it
 # (or an explicit ownership flag) through ``record_failure`` at every router,
 # RouteWise, and hedging call site — new plumbing on the failure path to widen an
-# escalation that is already covered indirectly: 403 is key-specific for
-# ``KeyPool``, so an endpoint answering 403 to everything mutes its keys and then
-# fails with ``KeyPoolExhausted``, which carries no HTTP status, is not exempt,
-# and trips the breaker into its own ``circuit_open`` page. So 403 keeps the
-# pre-existing exemption, and only the unambiguous statuses escalate.
+# escalation whose absence is tolerated: 402 and 403 are key-specific for
+# ``KeyPool``, so an endpoint answering either to everything mutes its keys and
+# then fails with ``KeyPoolExhausted`` — a local precondition refusal (nothing
+# was sent) that endpoint health never counts (see ``record_failure``). The
+# mutes keep the account quiet while they last, every upstream status lands in
+# ``api_logs``, and the key-pool exhaustion burst rule pages, per endpoint, when
+# the refusals pile up. So 402/403 keep the client-error exemption, and only the
+# unambiguous credential challenges escalate.
 _AUTH_MISCONFIG_STATUSES = frozenset({401, 407})
 
 # Cooldown for the upstream-auth page. Matches the circuit-open alert so a
@@ -702,8 +706,8 @@ class _CircuitBreaker:
             # the current generation is mid-delivery, or its mute deadline has not
             # passed — stay silent no matter how *this* failure presents. A
             # half-open re-trip often surfaces differently from the original 429
-            # (e.g. KeyPoolExhausted once the key's 429-backoff exceeds the circuit
-            # cooldown, or a timeout); those must not resurrect the storm. The
+            # (for example a timeout once key backoff exceeds the circuit
+            # cooldown); those must not resurrect the storm. The
             # in-flight guard is scoped to the generation, so a recovery (which
             # bumps it) does not let a stale in-flight page mute the *next* outage;
             # recovery also clears the deadline, re-arming the endpoint.
@@ -730,10 +734,10 @@ class _CircuitBreaker:
             #
             # Reason-agnostic within the floor, because the deadline alone does not
             # hold here: behind a key pool, one sibling key with quota left reads as
-            # a recovery and clears it, and the re-trip that follows is usually
-            # ``KeyPoolExhausted`` — no usage marker, so ``usage_limit`` is None and
-            # a text-scoped gate would let exactly the page this policy exists to
-            # remove through. So a trip within ``_MIN_ALERT_GAP_SEC`` of the last
+            # a recovery and clears it, and the next trip can surface without the
+            # usage marker, so ``usage_limit`` can be None and a text-scoped gate
+            # would let exactly the page this policy exists to remove through. So a
+            # trip within ``_MIN_ALERT_GAP_SEC`` of the last
             # recognized plan limit stays silent whatever it looks like. That does
             # mute an unrelated outage on the same endpoint for up to the floor —
             # the same trade the ``max()`` re-arm below already makes, and bounded
@@ -788,6 +792,28 @@ class _CircuitBreaker:
                         # Which gate held. Paging-off first: where the policy
                         # applies it is the reason, and the other two only
                         # describe how long the same silence had left to run.
+                        "gate": (
+                            "circuit_open_disabled"
+                            if alerting_off
+                            else "usage_limit_paging_off"
+                            if paging_off
+                            else "muted"
+                            if muted
+                            else "min_alert_gap"
+                        ),
+                    },
+                )
+                # The trip is still a fact for alert history, held back here
+                # before it could reach the alert path.
+                alert_history.external_decision(
+                    f"circuit_open:{self.provider}",
+                    reason="policy_disabled" if alerting_off or paging_off else "rate_limited",
+                    severity=AlertSeverity.ERROR,
+                    title="Provider circuit opened",
+                    kind="state",
+                    context={
+                        "provider": self.provider,
+                        "consecutive_failures": self.consecutive_failures,
                         "gate": (
                             "circuit_open_disabled"
                             if alerting_off
@@ -1076,6 +1102,29 @@ class EndpointHealthRegistry:
                 },
             )
             return
+        if exc is not None and isinstance(exc, KeyPoolExhausted):
+            # Every key this endpoint could use is muted (the tail of a provider
+            # 429/auth storm), removed, or already tried by this request, so
+            # ``acquire()`` refused before anything was sent. The pool's own
+            # mutes are what keep traffic off a struggling provider while they
+            # last, and the failures that did the muting were counted when they
+            # happened, so a real outage still opens the circuit from its own
+            # evidence. Charging the echo instead let one muted key pool open
+            # the circuit on every route sharing the provider's keys — streams
+            # died in ``AllCircuitsOpenError`` and every half-open probe
+            # re-tripped while the mutes outlived the cooldown (issue #1440:
+            # 462 dead streams in a 59h prod window). Filtered here rather than
+            # per-router so the FixedRouter, RouteWise and hedging paths all
+            # inherit it, mirroring the role-restricted case above.
+            logger.info(
+                "key_pool_exhausted_skip_breaker",
+                extra={
+                    "event": "key_pool_exhausted_skip_breaker",
+                    "endpoint_id": endpoint_id,
+                    "detail": _detail_str(detail or operator_safe_error(exc)),
+                },
+            )
+            return
         if exc is not None and isinstance(exc, UpstreamSaturated):
             # This gateway declined to open another concurrent request against
             # the provider account behind this endpoint (see
@@ -1204,12 +1253,22 @@ class EndpointHealthRegistry:
         now = time.monotonic()
         with self._lock:
             last_scheduled = self._auth_alert_at.get(endpoint_id)
-            if (
+            throttled = (
                 last_scheduled is not None
                 and (now - last_scheduled) < _AUTH_ALERT_SCHEDULE_INTERVAL_SEC
-            ):
-                return
-            self._auth_alert_at[endpoint_id] = now
+            )
+            if not throttled:
+                self._auth_alert_at[endpoint_id] = now
+        if throttled:
+            alert_history.external_decision(
+                _auth_alert_key(endpoint_id),
+                reason="rate_limited",
+                severity=AlertSeverity.ERROR,
+                title=_AUTH_ALERT_TITLE,
+                kind="state",
+                context={"endpoint_id": endpoint_id, "status": status},
+            )
+            return
         context: dict[str, Any] = {
             "endpoint_id": endpoint_id,
             "status": status,

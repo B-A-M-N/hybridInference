@@ -640,9 +640,17 @@ class OpenAICompatAdapter(BaseAdapter):
             "reasoning_effort",
             "thinking",
             "tool_stream",
+            # The Anthropic translator spells tool_choice's
+            # disable_parallel_tool_use as this top-level switch (issue #876
+            # P3). Like reasoning_effort it only travels for models whose
+            # supported_params declare it: a provider that rejects the field
+            # must not start seeing it.
+            "parallel_tool_calls",
         )
         for name in passthrough_params:
             if name in params and name in self.config.supported_params:
+                if name == "parallel_tool_calls" and not payload.get("tools"):
+                    continue
                 payload[name] = params[name]
 
     def _prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1255,14 +1263,14 @@ class OpenAICompatAdapter(BaseAdapter):
             "model": self._get_model_identifier(),
             **validated,
         }
-        self._apply_supported_passthrough_params(payload, params)
-
         # Add optional features
         if params.get("tools") and self.config.supports_tools:
             payload["tools"] = self._normalize_tools(params["tools"])
             tool_choice = self._resolve_tool_choice(params.get("tool_choice"))
             if tool_choice is not None:
                 payload["tool_choice"] = tool_choice
+
+        self._apply_supported_passthrough_params(payload, params)
 
         filtered_rf = filter_response_format(self._usage_profile, params.get("response_format"))
         if filtered_rf and self.config.supports_structured_output:
@@ -1317,14 +1325,14 @@ class OpenAICompatAdapter(BaseAdapter):
             "stream": True,
             **validated,
         }
-        self._apply_supported_passthrough_params(payload, params)
-
         # Add optional features
         if params.get("tools") and self.config.supports_tools:
             payload["tools"] = self._normalize_tools(params["tools"])
             tool_choice = self._resolve_tool_choice(params.get("tool_choice"))
             if tool_choice is not None:
                 payload["tool_choice"] = tool_choice
+
+        self._apply_supported_passthrough_params(payload, params)
 
         filtered_rf = filter_response_format(self._usage_profile, params.get("response_format"))
         if filtered_rf and self.config.supports_structured_output:
@@ -1546,8 +1554,17 @@ class OpenAICompatAdapter(BaseAdapter):
                         # than letting the loop fall out and report the missing
                         # terminator. Guarded on empty choices because a normal
                         # content chunk may legitimately carry a null `error`.
-                        if isinstance(data, dict) and data.get("error") and not raw_choices:
-                            error = data["error"]
+                        # OpenRouter's mid-stream error keeps its choices and
+                        # marks them ``finish_reason: "error"``: a failure, never
+                        # a finish, with or without the error object beside it.
+                        errored = isinstance(raw_choices, list) and any(
+                            isinstance(choice, dict) and choice.get("finish_reason") == "error"
+                            for choice in raw_choices
+                        )
+                        if isinstance(data, dict) and (
+                            (data.get("error") and not raw_choices) or errored
+                        ):
+                            error = data.get("error")
                             raise UpstreamStreamError(
                                 _stream_error_message(error),
                                 _stream_error_status(error),
@@ -1639,8 +1656,9 @@ class OpenAICompatAdapter(BaseAdapter):
             if abandoned:
                 slot_status = release_status = None
             elif stream_error:
-                slot_status = 0
-                release_status = stream_error_status if stream_error_status else 0
+                # An error frame's own status, so a 429 one shrinks the AIMD
+                # limit as a 429 response would; 0 for everything statusless.
+                slot_status = release_status = stream_error_status if stream_error_status else 0
             else:
                 slot_status = release_status = 200
             if active_slot is not None:

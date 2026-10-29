@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -30,7 +31,7 @@ def _request() -> Request:
             "path": "/v1/messages",
             "headers": [],
             "query_string": b"",
-            "app": None,
+            "app": SimpleNamespace(state=SimpleNamespace(services=None)),
         }
     )
 

@@ -14,6 +14,7 @@ from typing import Any
 import asyncpg
 
 from serving.config.settings import get_settings
+from serving.storage.audit_schema import ensure_admin_audit_log_schema
 from serving.storage.browser_session_schema import ensure_browser_session_tables
 from serving.storage.log_schema import (
     ErasureFenceUnavailable,
@@ -571,34 +572,12 @@ class DatabaseLogger:
                 ON password_reset_tokens(expires_at)
             """)
 
-            # Admin audit log table for tracking all admin operations
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS admin_audit_log (
-                    id BIGSERIAL PRIMARY KEY,
-                    timestamp TIMESTAMPTZ DEFAULT NOW(),
-                    admin_ip TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    target_user_id TEXT,
-                    details JSONB,
-                    success BOOLEAN DEFAULT TRUE
-                )
-            """)
-
-            # Indexes for admin audit log
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_admin_audit_timestamp
-                ON admin_audit_log(timestamp DESC)
-            """)
-
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_admin_audit_user
-                ON admin_audit_log(target_user_id, timestamp DESC)
-            """)
-
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_admin_audit_action
-                ON admin_audit_log(action, timestamp DESC)
-            """)
+            # Admin audit log: table, indexes and attribution columns, shared
+            # with PostgresOperationalStore (serving.storage.audit_schema). A
+            # lock timeout here is deferred like this builder's other
+            # migrations; the operational store's pass, which runs next on the
+            # same database, is the one that refuses to serve without them.
+            await ensure_admin_audit_log_schema(conn)
 
             # Signup domain allowlist (admin-editable approval policy).
             # Empty table = all signups auto-approve; non-empty table requires
@@ -817,7 +796,7 @@ class DatabaseLogger:
             """)
 
             # Migration: token totals + cost on provider_hourly_stats.
-            # Added by per-provider Token Usage tab. Nullable so the
+            # Added for the Analytics overview's token usage. Nullable so the
             # change is metadata-only on existing tables; rows pre-dating
             # this migration are filled by backfill_token_columns at
             # startup and by subsequent hourly rollups.
@@ -927,7 +906,10 @@ class DatabaseLogger:
         if not self.pool:
             raise RuntimeError("DatabaseLogger not initialized")
 
-        usage = normalize_usage(usage) or usage
+        # Same explicit-None rule as the router paths: an all-invalid usage dict
+        # must not be restored to its raw form.
+        normalized = normalize_usage(usage)
+        usage = normalized if normalized is not None else usage
 
         # Privacy control: use per-request override or instance default
         should_store_full = (
