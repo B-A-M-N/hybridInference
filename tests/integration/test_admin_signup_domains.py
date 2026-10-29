@@ -8,7 +8,7 @@ integration tests in ``test_signup_flow.py`` (which run under ``dbtest``).
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,12 +16,13 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from serving.audit import AuditTarget
 from serving.auth import signup_policy
 from serving.servers.deps import AppServices
 from serving.servers.routers import admin as admin_router
 
 AUTH = {"Authorization": "Bearer test-admin"}
-_NOW = datetime(2025, 6, 15, tzinfo=timezone.utc)
+_NOW = datetime(2025, 6, 15, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -235,8 +236,10 @@ async def test_post_normalizes_and_persists(admin_client):
     assert kwargs["is_wildcard"] is False
     audit.assert_awaited()
     audit_args = audit.await_args
-    assert audit_args.args[2] == "signup_domain.add"
-    assert audit_args.args[4] == {"domain": "acme.com", "is_wildcard": False}
+    assert audit_args.kwargs["action"] == "signup_domain.add"
+    assert audit_args.kwargs["details"] == {"domain": "acme.com", "is_wildcard": False}
+    assert audit_args.kwargs["target"] == AuditTarget("signup_domain", "acme.com")
+    assert audit_args.kwargs["actor"].type == "admin_token"
 
 
 @pytest.mark.asyncio
@@ -370,8 +373,10 @@ async def test_delete_exact_default_wildcard_false(admin_client):
     assert kwargs == {"domain": "acme.com", "is_wildcard": False}
     audit.assert_awaited()
     audit_args = audit.await_args
-    assert audit_args.args[2] == "signup_domain.remove"
-    assert audit_args.args[4] == {"domain": "acme.com", "is_wildcard": False}
+    assert audit_args.kwargs["action"] == "signup_domain.remove"
+    assert audit_args.kwargs["details"] == {"domain": "acme.com", "is_wildcard": False}
+    assert audit_args.kwargs["target"] == AuditTarget("signup_domain", "acme.com")
+    assert audit_args.kwargs["actor"].type == "admin_token"
 
 
 @pytest.mark.asyncio

@@ -396,9 +396,9 @@ that token (`apps/backend/routing/engine_wait.py`):
 Only streaming requests are watched: a non-streaming response arrives whole, so
 there is no first token to wait for. The first-token wait includes the engine's
 prefill, so a model serving very long prompts needs a wait above the time it
-takes to start answering them. The wait needs Python 3.11 or newer: its
-deadline is `asyncio.timeout`, which can tell its own cancellation from a client
-that hangs up at the same moment. On Python 3.10 streams are never timed.
+takes to start answering them. The wait's deadline is `asyncio.timeout`, which
+can tell its own cancellation from a client that hangs up at the same moment, so
+a request whose client has gone is never offloaded.
 
 A response served by the offload route carries `_routing.offload` beside the
 usual `fallback` and `failed_attempts`: `queue_wait` or `engine_wait` after an
@@ -602,6 +602,19 @@ Resource limits used to live in `router_params:`. Those keys are now rejected
 at boot with a message naming their route-level replacement, so a stale
 registry fails loudly rather than silently using defaults.
 
+RouteWise does not read prefill load: the latency estimates used by its LP and
+hedge choice have no backlog penalty, and it takes no prefill lease. The three keys of that
+withdrawn feature — `prefill_load_routing_enabled`,
+`prefill_load_scale_ms_per_1k` and `prefill_load_max_penalty_ms` — are still
+accepted so an older registry keeps starting, but they have no effect whatever
+their value, and the backend logs a warning naming them once per process.
+Remove them from `models.yaml`. FixedRouter's
+[prefill-aware selection](#prefill-aware-selection) is unchanged.
+
+`latency_min_samples` is accepted the same way. Provider selection never read
+it, so it was removed, and a registry that still sets it starts with the same
+warning.
+
 **Quota sources.** `quota_source:` is a selector, not a fetcher. It names
 `provider` / `usage_label` / `unit`, and `_find_usage` matches all three
 exactly against the usage records a provider's quota fetcher returns. RouteWise
@@ -797,7 +810,9 @@ auto:
 Each profile is served as `auto-<name>`. The auto models exist only while the
 `auto_mode_enabled` runtime setting is on, and it is off by default. While it
 is off, a request naming one gets 404 and `/v1/models` does not list them.
-Requests that name a real model are never affected.
+Requests that name a real model are never affected. The admin Settings tab
+offers the switch only once the backend has started with a valid `auto:`
+section; without one it has nothing to serve.
 
 **Which candidate serves.** The first one in the list that can serve the
 request. A candidate is skipped for any of these reasons:
@@ -904,6 +919,8 @@ endpoints:
 | `POST /admin/routing/provider-route-models` | Create a runtime model with its first route. |
 | `POST /admin/routing/provider-route-candidates/{model_id}` | Add a route to a model; `PATCH` and `DELETE` on `.../{model_id}/{route_id}` edit or remove it. |
 | `PUT /admin/routing/provider-routes/{model_id}/{route_id}` | Retarget a registry route; `DELETE` restores the YAML route. |
+| `PATCH /admin/routing/provider-route-states/{model_id}/{route_id}` | Disable or enable a route of either source; a disabled route keeps its weights but takes no request, retry, fallback or offload. |
+| `POST` / `DELETE /admin/routing/provider-route-removals/{model_id}/{route_id}` | Delete a registry route from this deployment, or restore it; models.yaml is not changed. |
 | `PUT` / `DELETE /admin/routing/weights/{model_id}/{endpoint_id}` | Set or clear a weight override. |
 | `PATCH /admin/routing/provider-route-strategies/{model_id}` | Switch a model's router. |
 | `GET /admin/routing/offload-routes` | Every model's offload route and whether routing applies it; `PUT` / `DELETE .../{model_id}` sets or clears one — see [Queue-wait offload](#queue-wait-offload). |
@@ -925,10 +942,6 @@ Four pieces, all under `apps/backend/routing/`:
 | Per-model router selection | `model_router_registry.py` + `strategies/__init__.py` | Maps each model id to a `RouterProtocol` implementation, chosen by that model's `router:` field. |
 | Routing | `routers.py` (`FixedRouter`), `routewise/`, `hybrid.py` (`HybridRouter`) | Chooses the endpoint for a request, admits it against capacity, walks the fallback order, and records endpoint health. |
 | Execution | `backends.py` + `dispatch.py` | Runs the one endpoint the router already chose, or delegates the request to a pool that chooses inside its own declared range. |
-
-`apps/backend/routing/executor.py` is a backward-compatibility shim that re-exports
-`FixedRouter` as `RouteExecutor` along with `AllCircuitsOpenError`,
-`ProviderPinError`, and `RouteConfig`. Do not edit it — edit `routers.py`.
 
 How the router hands a request to the adapter it chose, and the experimental
 composition that plans across a local and a cloud pool, are described in

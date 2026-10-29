@@ -680,7 +680,7 @@ class UpstreamConcurrencyLimiter:
         bucket.waiters.append(waiter)
         try:
             await asyncio.wait_for(waiter, wait)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             bucket.abandon(waiter)
             if deadline_bound:
                 raise self._queue_wait_expired(bucket) from None
@@ -743,7 +743,7 @@ class UpstreamConcurrencyLimiter:
         gate.waiters.append(waiter)
         try:
             await asyncio.wait_for(waiter, wait)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             gate.abandon(waiter)
             if deadline_bound:
                 raise self._engine_hold_expired(gate) from None
@@ -878,18 +878,6 @@ class UpstreamConcurrencyLimiter:
             gate = _EngineGate(address=address)
             self._gates[address] = gate
         return gate
-
-    def engine_snapshot(self) -> dict[str, dict[str, int]]:
-        """Return each held-for local engine's live count, keyed by ``host:port``.
-
-        ``pending`` is the held dispatches sent to the engine without a first
-        token yet, and ``waiting`` the ones still held here. Like
-        :meth:`snapshot`, an engine appears once a held dispatch has created it.
-        """
-        return {
-            address: {"pending": gate.pending, "waiting": len(gate.waiters)}
-            for address, gate in self._gates.items()
-        }
 
     def snapshot(self) -> dict[tuple[str, str], dict[str, int | bool]]:
         """Return each bucket's live AIMD state, keyed by (provider, fingerprint).

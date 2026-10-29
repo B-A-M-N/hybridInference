@@ -207,6 +207,26 @@ def test_pricing_lookup_raw_dict_prefers_embedded_extra_over_registry():
     assert lookup.raw_dict_for_routing(routing) == embedded
 
 
+def test_empty_attempt_snapshot_does_not_borrow_replacement_route_price():
+    adapter = _make_adapter(
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        pricing={"prompt": "9", "completion": "15"},
+        endpoint_id="openai-prod",
+    )
+    lookup = PricingLookup(router=_make_router({"gpt-4": [adapter]}))
+    routing = RoutingInfo(
+        request_id="rid",
+        model="gpt-4",
+        provider="openai",
+        endpoint_id="openai-prod",
+        extra={"pricing": {}},
+    )
+
+    assert lookup.for_routing(routing) is None
+    assert lookup.raw_dict_for_routing(routing) == {}
+
+
 def test_pricing_lookup_does_not_cache_across_scheduled_price_windows():
     adapter = _make_adapter(
         provider="deepseek",
@@ -234,9 +254,9 @@ def test_pricing_lookup_does_not_cache_across_scheduled_price_windows():
         endpoint_id="deepseek-v4-flash:deepseek-api",
     )
 
-    with req_ctx.push(pricing_time=dt.datetime(2026, 8, 17, 2, tzinfo=dt.timezone.utc)):
+    with req_ctx.push(pricing_time=dt.datetime(2026, 8, 17, 2, tzinfo=dt.UTC)):
         peak = lookup.raw_dict_for_routing(routing)
-    with req_ctx.push(pricing_time=dt.datetime(2026, 8, 17, 12, tzinfo=dt.timezone.utc)):
+    with req_ctx.push(pricing_time=dt.datetime(2026, 8, 17, 12, tzinfo=dt.UTC)):
         off_peak = lookup.raw_dict_for_routing(routing)
 
     assert peak == {"prompt": "0.44", "completion": "1.32"}
@@ -277,6 +297,45 @@ def test_pricing_lookup_caches_provider_base_url_fallback():
     adapter.config.pricing = {"prompt": "999.0", "completion": "999.0"}
     second = lookup.for_routing(routing)
     assert first == second
+
+
+@pytest.mark.parametrize("old_pricing", [{"prompt": "1", "completion": "2"}, None])
+def test_pricing_lookup_follows_an_adapter_replaced_under_the_same_endpoint_id(old_pricing):
+    """An admin route edit installs a new adapter and keeps the endpoint id.
+
+    The edited route must be billed and logged at its new price from the next
+    request on, including a route first seen with no pricing at all.
+    """
+    old = _make_adapter(
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        pricing=old_pricing,
+        endpoint_id="m:openrouter-api",
+    )
+    router = _make_router({"m": [old]})
+    lookup = PricingLookup(router=router)
+    routing = RoutingInfo(
+        request_id="rid",
+        model="m",
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        endpoint_id="m:openrouter-api",
+    )
+    lookup.for_routing(routing)
+    lookup.raw_dict_for_routing(routing)
+
+    new = _make_adapter(
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        pricing={"prompt": "10", "completion": "20"},
+        endpoint_id="m:openrouter-api",
+    )
+    router.routes["m"].adapters = [(new, 1.0)]
+
+    pricing = lookup.for_routing(routing)
+    assert pricing is not None
+    assert (pricing.prompt_price, pricing.completion_price) == (10.0, 20.0)
+    assert lookup.raw_dict_for_routing(routing) == {"prompt": "10", "completion": "20"}
 
 
 # ---------------------------------------------------------------------------
@@ -541,3 +600,111 @@ def test_cost_tracker_compute_cost_matches_calculate_cost_byte_for_byte(usage, p
         assert actual is None or actual == 0.0
     else:
         assert actual == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# Unknown vs zero cache in the cost path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cost_tracker_unknown_cache_uses_full_prompt_rate(op_store, empty_lookup):
+    """Unreported cache usage earns no discount in billing arithmetic.
+
+    The persisted usage dict owns the distinction between an unknown cache
+    state and a measured miss; CostTracker only calculates the bill.
+    """
+    tracker = CostTracker(op_store=op_store, pricing=empty_lookup)
+    pricing = Pricing(prompt_price=0.60, completion_price=2.40, cache_read_price=0.03)
+    routing = RoutingInfo(request_id="rid", model="deepseek-v4.1-flash", pricing=pricing)
+
+    # Unknown cache: no cache field was reported at all.
+    enriched = await tracker.schedule_increment(
+        user_id="u1",
+        routing=routing,
+        prompt_tokens=259400,
+        completion_tokens=0,
+        cache_read_tokens=None,
+    )
+    # Full input rate: no discount, because there is no cached count to discount.
+    assert enriched.upstream_cost_usd == pytest.approx(259400 * 0.60 / 1_000_000)
+
+
+@pytest.mark.asyncio
+async def test_cost_tracker_reported_zero_and_unknown_cost_the_same(op_store, empty_lookup):
+    """A measured miss and an unknown state bill identically, but differ in meaning.
+
+    Both apply no cache discount. The distinction is preserved upstream (log
+    NULL vs 0); this pins that the *arithmetic* is deliberately identical so
+    the earlier fix is not mistaken for a billing change.
+    """
+    tracker = CostTracker(op_store=op_store, pricing=empty_lookup)
+    pricing = Pricing(prompt_price=0.60, completion_price=2.40, cache_read_price=0.03)
+
+    zero = await tracker.schedule_increment(
+        user_id="u1",
+        routing=RoutingInfo(request_id="r1", model="m", pricing=pricing),
+        prompt_tokens=1000,
+        completion_tokens=0,
+        cache_read_tokens=0,
+    )
+    unknown = await tracker.schedule_increment(
+        user_id="u1",
+        routing=RoutingInfo(request_id="r2", model="m", pricing=pricing),
+        prompt_tokens=1000,
+        completion_tokens=0,
+        cache_read_tokens=None,
+    )
+    assert zero.upstream_cost_usd == pytest.approx(unknown.upstream_cost_usd)
+
+
+@pytest.mark.asyncio
+async def test_cost_tracker_reported_cache_hit_earns_the_discount(op_store, empty_lookup):
+    """A real reported hit at a configured cache rate is discounted."""
+    tracker = CostTracker(op_store=op_store, pricing=empty_lookup)
+    pricing = Pricing(prompt_price=0.60, completion_price=2.40, cache_read_price=0.03)
+    enriched = await tracker.schedule_increment(
+        user_id="u1",
+        routing=RoutingInfo(request_id="rid", model="m", pricing=pricing),
+        prompt_tokens=1000,
+        completion_tokens=0,
+        cache_read_tokens=900,
+    )
+    expected = (100 * 0.60 / 1_000_000) + (900 * 0.03 / 1_000_000)
+    assert enriched.upstream_cost_usd == pytest.approx(expected)
+
+
+def test_calculate_cost_unknown_cache_uses_full_prompt_rate():
+    """The billing function applies no cache discount without a reported count."""
+    usage = {"prompt_tokens": 1000, "completion_tokens": 0}  # no cache key at all
+    pricing = {"prompt": "0.60", "completion": "2.40", "input_cache_reads": "0.03"}
+    cost = calculate_cost(usage, pricing)
+    assert cost == pytest.approx(1000 * 0.60 / 1_000_000)
+
+
+def test_calculate_cost_explicit_none_cache_does_not_crash():
+    """An explicit None (not merely absent) must not raise."""
+    usage = {"prompt_tokens": 1000, "completion_tokens": 0, "cache_read_tokens": None}
+    pricing = {"prompt": "0.60", "completion": "2.40", "input_cache_reads": "0.03"}
+    cost = calculate_cost(usage, pricing)
+    assert cost == pytest.approx(1000 * 0.60 / 1_000_000)
+
+
+def test_calculate_cost_explicit_none_for_all_token_fields_is_unreported():
+    """Explicit nulls for ordinary and cache usage fields are handled uniformly."""
+    usage = {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "reasoning_tokens": None,
+        "total_tokens": None,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+    }
+    pricing = {
+        "prompt": "0.60",
+        "completion": "2.40",
+        "input_cache_reads": "0.03",
+        "input_cache_writes": "0.03",
+    }
+
+    assert calculate_cost(usage, pricing) == pytest.approx(0.0)

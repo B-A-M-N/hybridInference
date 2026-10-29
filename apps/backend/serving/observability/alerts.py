@@ -12,12 +12,14 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import enum
+import functools
 import logging
 import platform
 import socket
 import threading
 import time
 import traceback
+import weakref
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
@@ -30,7 +32,9 @@ if TYPE_CHECKING:
 
 
 from serving.config.app_config import config_value
-from serving.config.settings import get_settings
+from serving.observability import alert_runtime
+from serving.observability.alert_history import hooks as _history
+from serving.observability.alert_history.capture import DeliveryOutcome
 from serving.observability.alert_transitions import (
     ThresholdTransitionTracker,
 )
@@ -63,16 +67,6 @@ _ANNOUNCED: set[str] = set()
 #: without a message — see ``_closes_silently``. An incident announced before
 #: its type was muted never lands here, so its close is still posted.
 _MUTED_UNANNOUNCED: set[str] = set()
-
-#: Failed webhook deliveries since process start, keyed by HTTP status as a
-#: string (or ``"exception"`` for a transport error). WeCom also reports its
-#: application failures over a 2xx, keyed ``"errcode:<n>"``, with
-#: ``"invalid-errcode"`` and ``"invalid-response"`` for a body that cannot
-#: confirm delivery. Delivery health cannot be alerted on over the transport
-#: that is failing, so this is deliberately just a counter: the independent
-#: control-plane path can read it, and nothing here turns it into a Slack alert
-#: that would have to survive the same broken sink.
-_DELIVERY_FAILURES_TOTAL: dict[str, int] = defaultdict(int)
 
 #: How long a resolution waits for an in-flight send of the same key, and how
 #: many times. Bounded so a hung sink cannot pin the caller — the alert path
@@ -212,32 +206,48 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+#: Tasks currently inside an alert call, with their nesting depth. Read by
+#: alert history at shutdown, which waits (bounded) for every one of them —
+#: request handlers, background alert tasks, scheduler jobs — before it seals.
+_ACTIVE_CALLS: dict[asyncio.Task[Any], int] = {}
+
+
+def _tracked(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Count the calling task as active for the duration of ``fn``."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        task = asyncio.current_task()
+        if task is not None:
+            _ACTIVE_CALLS[task] = _ACTIVE_CALLS.get(task, 0) + 1
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            if task is not None:
+                depth = _ACTIVE_CALLS.get(task, 1) - 1
+                if depth <= 0:
+                    _ACTIVE_CALLS.pop(task, None)
+                else:
+                    _ACTIVE_CALLS[task] = depth
+
+    return wrapper
+
+
+def active_alert_tasks() -> set[asyncio.Task[Any]]:
+    """Tasks inside :func:`alert_slack`, :func:`alert_on_transition` or the sweep."""
+    return {task for task in _ACTIVE_CALLS if not task.done()}
+
+
 def reset_dedupe_state() -> None:
-    """Test helper — clears in-memory dedupe table and delivery counters."""
+    """Test helper — clears the in-memory dedupe state."""
     _LAST_FIRED.clear()
     _IN_FLIGHT.clear()
     _FAILED_DELIVERIES.clear()
-    _DELIVERY_FAILURES_TOTAL.clear()
     _ANNOUNCED.clear()
     _MUTED_UNANNOUNCED.clear()
 
 
-def alert_delivery_failures_total() -> dict[str, int]:
-    """Failed webhook deliveries since process start, keyed by failure kind.
-
-    HTTP refusals use their status as the key and transport errors use
-    ``"exception"``. WeCom's 2xx application failures use ``"errcode:<n>"``,
-    ``"invalid-errcode"`` or ``"invalid-response"``.
-
-    A revoked webhook is invisible from inside the alert path — every post is
-    answered, just not with a 2xx — so the only honest signal of a dead sink is
-    a count of what it refused. Exposed as a plain counter on purpose: an alert
-    about the alert transport would travel over that same transport.
-    """
-    return dict(_DELIVERY_FAILURES_TOTAL)
-
-
-class AlertSeverity(str, enum.Enum):
+class AlertSeverity(str, enum.Enum):  # noqa: UP042 -- StrEnum changes str()/format(); convert after review
     """Severity of an outgoing Slack alert."""
 
     CRITICAL = "critical"
@@ -360,7 +370,7 @@ def _format_message(
     timestamp line (identity for a channel without italics), and ``escape``
     neutralises caller-controlled context values.
     """
-    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     info = server_info()
     # Titles are written as breach statements ("Provider circuit opened"), so a
     # resolution rendered with the breach's own severity emoji is indis-
@@ -404,14 +414,12 @@ async def _post_json(
     *,
     channel: str,
     dedupe_key: str = "",
-    record_failure: bool = True,
 ) -> tuple[httpx.Response | None, str, UrlRedaction]:
     """POST ``payload`` to ``webhook_url`` and return ``(response, failure_key, redaction)``.
 
-    The shared half of the two senders: the request, the non-2xx check, the
-    transport-failure line and the failure counter. ``failure_key`` is ``""``
-    when the post got a 2xx, the status string for a refusal, and ``"exception"``
-    for a transport error — the same keys :data:`_DELIVERY_FAILURES_TOTAL` uses.
+    The shared half of the two senders: the request, the non-2xx check and the
+    transport-failure line. ``failure_key`` is ``""`` when the post got a 2xx,
+    the status string for a refusal, and ``"exception"`` for a transport error.
     The response is returned so a channel that reports application failures over
     a 2xx (WeCom's ``errcode``) can finish the decision itself, and the
     ``redaction`` so it can name the sink without re-deriving the hash.
@@ -426,9 +434,15 @@ async def _post_json(
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.post(webhook_url, json=payload)
-        except Exception:
-            if record_failure:
-                _DELIVERY_FAILURES_TOTAL["exception"] += 1
+        except Exception as exc:
+            # A connection that was never made sent nothing; anything later
+            # (a read timeout, a reset) may have delivered the message.
+            _history.note_delivery(
+                "not_sent"
+                if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout)
+                else "unknown",
+                error_code=f"transport:{type(exc).__name__.lower()}"[:100],
+            )
             # Rendered and scrubbed here rather than handed to ``log.exception``:
             # a transport that words its error in terms of the request puts the
             # URL in the traceback, and the traceback is formatted inside the
@@ -443,10 +457,12 @@ async def _post_json(
             )
             return None, "exception", redaction
         if 200 <= resp.status_code < 300:
+            _history.note_delivery("accepted", status=resp.status_code)
             return resp, "", redaction
         failure_key = str(resp.status_code)
-        if record_failure:
-            _DELIVERY_FAILURES_TOTAL[failure_key] += 1
+        _history.note_delivery(
+            "rejected", error_code=f"http_{resp.status_code}", status=resp.status_code
+        )
         # A refusal raises nothing, so without this line a webhook that had been
         # revoked failed in complete silence: it answered every post with 404,
         # the caller saw a bare ``False``, and the sole trace was httpx's INFO
@@ -462,16 +478,13 @@ async def _post_json(
         return resp, failure_key, redaction
 
 
-async def _post_to_slack(
-    webhook_url: str, message: str, *, dedupe_key: str = "", record_failure: bool = True
-) -> bool:
+async def _post_to_slack(webhook_url: str, message: str, *, dedupe_key: str = "") -> bool:
     """Post ``{"text": message}`` to Slack incoming webhook. Returns True on 2xx."""
     _, failure_key, _ = await _post_json(
         webhook_url,
         {"text": message},
         channel="slack",
         dedupe_key=dedupe_key,
-        record_failure=record_failure,
     )
     return not failure_key
 
@@ -496,9 +509,7 @@ def _truncate_utf8(text: str, limit: int = _WECOM_CONTENT_LIMIT_BYTES) -> str:
     return encoded[:budget].decode("utf-8", errors="ignore") + _WECOM_ELLIPSIS
 
 
-async def _post_to_wecom(
-    webhook_url: str, message: str, *, dedupe_key: str = "", record_failure: bool = True
-) -> bool:
+async def _post_to_wecom(webhook_url: str, message: str, *, dedupe_key: str = "") -> bool:
     """Post a WeCom group-bot markdown message. Returns True only on success.
 
     WeCom answers transport failures and application failures differently: a
@@ -512,7 +523,6 @@ async def _post_to_wecom(
         payload,
         channel="wecom",
         dedupe_key=dedupe_key,
-        record_failure=record_failure,
     )
     if failure_key or resp is None:
         return False
@@ -520,8 +530,7 @@ async def _post_to_wecom(
     try:
         body = resp.json()
     except Exception:
-        if record_failure:
-            _DELIVERY_FAILURES_TOTAL["invalid-response"] += 1
+        _history.note_delivery("unknown", error_code="wecom_non_json", status=resp.status_code)
         log.warning(
             "wecom webhook post rejected: non-JSON response alert=%s sink=%s",
             dedupe_key or "-",
@@ -529,16 +538,19 @@ async def _post_to_wecom(
         )
         return False
     errcode = body.get("errcode") if isinstance(body, dict) else None
+    # Only an integer zero confirms delivery. Missing, null or non-integer: the
+    # response cannot confirm delivery, so it is a failure rather than a success.
+    if isinstance(errcode, int) and not isinstance(errcode, bool) and errcode == 0:
+        _history.note_delivery("accepted", status=resp.status_code)
+        return True
     if isinstance(errcode, int) and not isinstance(errcode, bool):
-        if errcode == 0:
-            return True
-        failure_key = f"errcode:{errcode}"
+        _history.note_delivery(
+            "rejected", error_code=f"wecom_errcode_{errcode}"[:100], status=resp.status_code
+        )
     else:
-        # Missing, null or non-integer: the response cannot confirm
-        # delivery, so it is a failure rather than a success.
-        failure_key = "invalid-errcode"
-    if record_failure:
-        _DELIVERY_FAILURES_TOTAL[failure_key] += 1
+        _history.note_delivery(
+            "unknown", error_code="wecom_errcode_missing", status=resp.status_code
+        )
     log.warning(
         "wecom webhook post rejected: errcode=%s alert=%s sink=%s",
         errcode,
@@ -564,9 +576,22 @@ class AlertSink(Protocol):
         """Render one alert in the channel's markup."""
         ...
 
-    async def post(self, message: str, *, dedupe_key: str, record_failure: bool = True) -> bool:
-        """Deliver a message; admin tests opt out of runtime failure counters."""
+    async def post(self, message: str, *, dedupe_key: str) -> bool:
+        """Deliver a message."""
         ...
+
+
+async def post_detailed(sink: AlertSink, message: str, *, dedupe_key: str) -> DeliveryOutcome:
+    """Deliver through ``sink`` and say what happened.
+
+    ``DeliveryOutcome.accepted`` is exactly the bool :meth:`AlertSink.post`
+    returns, so a caller converting back gets the old contract unchanged. A
+    sink without a ``post_detailed`` of its own is wrapped.
+    """
+    detailed = getattr(sink, "post_detailed", None)
+    if detailed is not None:
+        return await detailed(message, dedupe_key=dedupe_key)
+    return await _history.post_detailed(sink, message, dedupe_key=dedupe_key)
 
 
 @dataclass(frozen=True)
@@ -594,14 +619,13 @@ class SlackSink:
             escape=escape_slack_text,
         )
 
-    async def post(self, message: str, *, dedupe_key: str, record_failure: bool = True) -> bool:
+    async def post(self, message: str, *, dedupe_key: str) -> bool:
         """Post ``{"text": message}`` to this webhook."""
-        return await _post_to_slack(
-            self.webhook_url,
-            message,
-            dedupe_key=dedupe_key,
-            record_failure=record_failure,
-        )
+        return await _post_to_slack(self.webhook_url, message, dedupe_key=dedupe_key)
+
+    async def post_detailed(self, message: str, *, dedupe_key: str) -> DeliveryOutcome:
+        """Post, and report accepted / rejected / not_sent / unknown."""
+        return await _history.post_detailed(self, message, dedupe_key=dedupe_key)
 
 
 @dataclass(frozen=True)
@@ -629,14 +653,13 @@ class WeComSink:
             escape=escape_wecom_text,
         )
 
-    async def post(self, message: str, *, dedupe_key: str, record_failure: bool = True) -> bool:
+    async def post(self, message: str, *, dedupe_key: str) -> bool:
         """Post a markdown card to this webhook."""
-        return await _post_to_wecom(
-            self.webhook_url,
-            message,
-            dedupe_key=dedupe_key,
-            record_failure=record_failure,
-        )
+        return await _post_to_wecom(self.webhook_url, message, dedupe_key=dedupe_key)
+
+    async def post_detailed(self, message: str, *, dedupe_key: str) -> DeliveryOutcome:
+        """Post, and report accepted / rejected / not_sent / unknown."""
+        return await _history.post_detailed(self, message, dedupe_key=dedupe_key)
 
 
 def configured_sink() -> AlertSink | None:
@@ -649,24 +672,15 @@ def configured_sink() -> AlertSink | None:
     raises instead of fanning out. A blank value — whitespace only — is no
     channel, the same rule the failed-request alerter and bootstrap use, so a
     ``" "`` webhook cannot select a channel that can never deliver.
+
+    The channel comes from the ``alerts.runtime`` configuration in force
+    (:mod:`serving.observability.alert_runtime`): validated as one value, the
+    Slack fallback included, and replaced only as a whole. Each call takes the
+    configuration in force at that moment, so a recovery, or a retry of one,
+    goes to the channel configured then rather than the one its incident
+    opened on.
     """
-    # The overlay may reject a stored value or set aside a conflicting
-    # environment value. Raw config_value() still exposes those candidates;
-    # Settings contains the validated runtime values, including Slack fallback.
-    settings = get_settings()
-    slack_url = settings.slack_alerts_webhook_url.strip()
-    wecom_url = settings.wecom_alerts_webhook_url.strip()
-    if slack_url and wecom_url:
-        raise ValueError(
-            "SLACK_ALERTS_WEBHOOK_URL / SLACK_WEBHOOK_URL and "
-            "WECOM_ALERTS_WEBHOOK_URL are mutually exclusive; "
-            "configure one alert channel"
-        )
-    if slack_url:
-        return SlackSink(slack_url)
-    if wecom_url:
-        return WeComSink(wecom_url)
-    return None
+    return alert_runtime.current().sink()
 
 
 async def _type_muted(key: str) -> bool:
@@ -685,6 +699,28 @@ async def _type_muted(key: str) -> bool:
         return False
 
 
+async def _wait_for_in_flight(key: str) -> bool:
+    """Wait, within the resolution bound, for a send already running on ``key`` to finish.
+
+    True once none is; False if the bound ran out with one still running.
+    """
+    for _ in range(_RESOLUTION_WAIT_ATTEMPTS):
+        async with _DEDUPE_LOCK:
+            done = _IN_FLIGHT.get(key)
+        if done is None:
+            return True
+        try:
+            await asyncio.wait_for(done.wait(), timeout=_RESOLUTION_WAIT_SEC)
+        except TimeoutError:
+            # Keep waiting up to the attempt bound. A firing send that tries the
+            # relay and then falls back to the webhook takes both timeouts, so
+            # giving up on the first would drop exactly the resolution this
+            # wait exists to save.
+            continue
+    return key not in _IN_FLIGHT
+
+
+@_tracked
 async def alert_slack(
     severity: AlertSeverity,
     title: str,
@@ -693,19 +729,27 @@ async def alert_slack(
     dedupe_key: str | None = None,
     cooldown_sec: int = 300,
     status: Literal["firing", "resolved"] = "firing",
+    history_episode: str | None = None,
+    fence: Callable[[], bool] | None = None,
 ) -> bool:
     """Send an alert to the one configured channel.
 
     Returns True if the channel accepted the message, False otherwise.
-    """
-    try:
-        sink = configured_sink()
-    except ValueError:
-        log.exception("alert channel configuration is invalid; suppressing")
-        return False
-    if sink is None:
-        return False
 
+    ``fence``, when given, is checked at the send's admission — synchronously,
+    right before the in-flight marker is registered — and again after the mute
+    and snooze lookups, right before the message is rendered and posted. A
+    false answer at either point drops the send without touching the
+    cooldown: the evaluation that asked for it was made under a configuration
+    that has since been replaced. The channel is read again at admission, so
+    the send uses the configuration in force when it was admitted. A post
+    already under way finishes on the channel it started with.
+
+    ``history_episode`` names the alert-history episode a *resolution* belongs
+    to; the callers in this module pass it, because by the time a recovery is
+    sent its episode has already ended. A firing joins whatever episode is
+    open on the key. History never changes what this function decides.
+    """
     # Both suppressions below exist to stop a *breach* from repeating, and
     # neither may swallow a resolution. Under the alert control plane a dropped
     # resolution leaves its incident open forever, holding principal quota until
@@ -714,6 +758,22 @@ async def alert_slack(
     resolution = status == "resolved"
 
     key = dedupe_key or f"{severity.value}:{title}"
+    # Bound here, synchronously, before anything below can await: a result that
+    # returns after a new breach opened must not be attributed to it.
+    episode_id = history_episode or (
+        _history.closed_episode(key) if resolution else _history.open_episode(key)
+    )
+    try:
+        sink = configured_sink()
+    except ValueError:
+        log.exception("alert channel configuration is invalid; suppressing")
+        _history.decision(
+            key, episode_id=episode_id, reason="channel_config_invalid", resolution=resolution
+        )
+        return False
+    if sink is None:
+        _history.decision(key, episode_id=episode_id, reason="no_channel", resolution=resolution)
+        return False
     # A resolution waits for a send already running for this key rather than
     # being dropped by the guard. Dropping it costs a repeat for a breach —
     # another evaluation follows — but for a state alert the recovery edge is
@@ -731,26 +791,35 @@ async def alert_slack(
     # recovery it precedes, opening an incident whose only healthy edge is
     # already spent. That is why the snooze lookup runs *after* the
     # registration rather than here.
-    for _ in range(_RESOLUTION_WAIT_ATTEMPTS):
-        async with _DEDUPE_LOCK:
-            done = _IN_FLIGHT.get(key)
-        if done is None or not resolution:
-            break
-        try:
-            await asyncio.wait_for(done.wait(), timeout=_RESOLUTION_WAIT_SEC)
-        except (TimeoutError, asyncio.TimeoutError):
-            # Keep waiting up to the attempt bound. A firing send that tries the
-            # relay and then falls back to the webhook takes both timeouts, so
-            # giving up on the first would drop exactly the resolution this
-            # wait exists to save.
-            continue
+    if resolution:
+        await _wait_for_in_flight(key)
 
     now = _monotonic()
     async with _DEDUPE_LOCK:
+        # Admission. Nothing between here and the in-flight registration
+        # awaits, so the configuration checked is the one the send uses.
+        if fence is not None and not fence():
+            _history.decision(key, episode_id=episode_id, reason="other", resolution=resolution)
+            log.debug("alert %s dropped: its evaluation predates the configuration in force", key)
+            return False
+        try:
+            sink = configured_sink()
+        except ValueError:
+            log.exception("alert channel configuration is invalid; suppressing")
+            _history.decision(
+                key, episode_id=episode_id, reason="channel_config_invalid", resolution=resolution
+            )
+            return False
+        if sink is None:
+            _history.decision(
+                key, episode_id=episode_id, reason="no_channel", resolution=resolution
+            )
+            return False
         last = _LAST_FIRED.get(key, 0.0)
         # Two concurrent sends of the same key would duplicate rather than
         # repeat, so one of them still has to yield.
         if key in _IN_FLIGHT:
+            _history.decision(key, episode_id=episode_id, reason="in_flight", resolution=resolution)
             return False
         # The cooldown is armed on the *attempt* (see the ``finally`` below), so
         # a sink that is refusing everything suppresses repeats instead of being
@@ -763,6 +832,7 @@ async def alert_slack(
         # cooldown per key instead of one per evaluation, forever.
         retry_after_failure = _FAILED_DELIVERIES.get(key, 0) == 1
         if not resolution and last > 0.0 and now - last < cooldown_sec and not retry_after_failure:
+            _history.decision(key, episode_id=episode_id, reason="cooldown")
             return False
         _IN_FLIGHT[key] = asyncio.Event()
 
@@ -784,14 +854,24 @@ async def alert_slack(
         if not resolution:
             if await _type_muted(key):
                 muted = True
+                _history.decision(key, episode_id=episode_id, reason="type_muted")
                 return False
             try:
                 from serving.observability.alert_snooze import is_snoozed
 
                 if await is_snoozed():
+                    _history.decision(key, episode_id=episode_id, reason="snoozed")
                     return False
             except Exception:
                 log.debug("alert snooze check failed; sending alert", exc_info=True)
+        # The final admission: the mute and snooze lookups above awaited, so a
+        # fenced send checks once more, synchronously, before it renders,
+        # records an attempt or posts. Only a post already under way may finish
+        # on a configuration that has since been replaced.
+        if fence is not None and not fence():
+            _history.decision(key, episode_id=episode_id, reason="other", resolution=resolution)
+            log.debug("alert %s dropped: the configuration changed before it was sent", key)
+            return False
         # Name the request that tripped the alert, so the page can be joined to
         # a row in ``api_logs`` instead of to a minute of traffic. Firing only:
         # a resolution's context is just the alert key, and the id of whichever
@@ -809,9 +889,37 @@ async def alert_slack(
                 detail = {**context, "request_id": request_id}
         # Render before attempting delivery: a rendering failure then behaves
         # like it always did (no cooldown armed).
-        message = sink.render(severity, title, detail, status)
+        try:
+            message = sink.render(severity, title, detail, status)
+        except Exception:
+            _history.render_failed(key, episode_id=episode_id, resolution=resolution, sink=sink)
+            raise
+        handle = _history.attempt_begin(
+            key,
+            episode_id=episode_id,
+            resolution=resolution,
+            sink=sink,
+            severity=severity,
+            title=title,
+            context=detail,
+            status=status,
+            sent_message=message,
+        )
         attempted = True
-        sent = await sink.post(message, dedupe_key=key)
+        if handle is None:
+            sent = await sink.post(message, dedupe_key=key)
+            return sent
+        # The same post, with its outcome explained; ``accepted`` is the bool.
+        try:
+            outcome = await post_detailed(sink, message, dedupe_key=key)
+        except asyncio.CancelledError:
+            _history.attempt_end(handle, DeliveryOutcome(False, "unknown", "cancelled"))
+            raise
+        except Exception:
+            _history.attempt_end(handle, DeliveryOutcome(False, "unknown", "exception"))
+            raise
+        _history.attempt_end(handle, outcome)
+        sent = outcome.accepted
         return sent
     except Exception:
         log.exception("alert_slack post raised; suppressing")
@@ -918,7 +1026,7 @@ _RESOLUTION_DETAIL: dict[str, dict[str, Any]] = {}
 _SILENT_RESOLUTIONS: set[str] = set()
 
 
-def _forget_resolution_detail(key: str) -> None:
+def _forget_resolution_detail(key: str, *, history_episode: str | None = None) -> None:
     """Drop an incident's summary, its builder and its silence. For a close.
 
     The ``_SILENT_RESOLUTIONS`` entry goes with them: every breached evaluation
@@ -926,12 +1034,17 @@ def _forget_resolution_detail(key: str) -> None:
     dynamic key and keep a rule silent after it stopped asking to be. So does
     what ``alert_slack`` recorded about the incident's firings, which describes
     this incident and must not carry over to the next one on the same key.
+
+    ``history_episode`` is the alert-history episode this close confirms; only
+    that episode's retry association is released, so a late confirmation for an
+    older episode cannot detach a newer one's.
     """
     _RESOLUTION_CONTEXT.pop(key, None)
     _RESOLUTION_DETAIL.pop(key, None)
     _SILENT_RESOLUTIONS.discard(key)
     _ANNOUNCED.discard(key)
     _MUTED_UNANNOUNCED.discard(key)
+    _history.forget(key, episode_id=history_episode)
 
 
 def _closes_silently(key: str) -> bool:
@@ -998,6 +1111,9 @@ class _PendingResolution:
     queued_at: float = field(default_factory=time.time)
     #: Retries spent by the sweep, for the attempt cap below.
     attempts: int = 0
+    #: The alert-history episode whose recovery this is, fixed when the send
+    #: failed, so retries never attach to a later episode on the same key.
+    history_episode: str | None = None
 
 
 #: Failed resolution sends by key, retried each sweep tick. In-memory like the
@@ -1027,6 +1143,72 @@ _PENDING_RESOLUTION_MAX_AGE_SEC = 900.0
 #: what increments this, so attempts and elapsed time are the same clock.
 _STALE_RETRY_ATTEMPTS: dict[str, int] = {}
 
+#: Metric incidents a producer holds open while it is not evaluating them, by
+#: key: the producer's own answer, asked at each sweep. A paused producer is
+#: not a silent rule, so its incident is neither swept ("no recent samples")
+#: nor its queued recovery retried, aged or dropped on its behalf; both wait
+#: for the producer to evaluate again. Held weakly, so a replaced producer
+#: releases its keys.
+_HOLDS: dict[str, weakref.WeakMethod[Callable[[], bool]]] = {}
+
+
+def hold_while(key: str, held: Callable[[], bool]) -> None:
+    """Keep the sweep off ``key``'s incident while the bound method ``held`` says so.
+
+    ``held`` is asked synchronously at every sweep, so it must read the
+    producer's state in force then, not rely on the producer having run.
+    """
+    _HOLDS[key] = weakref.WeakMethod(held)  # type: ignore[arg-type]
+
+
+def _hold_of(key: str) -> Callable[[], bool] | None:
+    reference = _HOLDS.get(key)
+    return reference() if reference is not None else None
+
+
+def _held(key: str) -> bool:
+    held = _hold_of(key)
+    if held is None:
+        return False
+    try:
+        return bool(held())
+    except Exception:
+        log.debug("alert hold check failed for %s; sweeping", key, exc_info=True)
+        return False
+
+
+def _hold_fence(key: str, published: Any) -> Callable[[], bool] | None:
+    """The fence for a send the sweep makes on behalf of a held key, or ``None``.
+
+    True while the configuration *published* — read when the sweep began — is
+    still in force and the producer does not hold the key. The generation is
+    what catches a pause and a resumption, and a check under the resumed
+    configuration, all inside one await: the hold alone reads clear again by
+    then. A key nothing holds is not fenced, so other rules sweep as before.
+    """
+    if _hold_of(key) is None:
+        return None
+    return lambda: alert_runtime.is_current(published) and not _held(key)
+
+
+def restart_settling(key: str, *, healthy: bool = False) -> None:
+    """Make the metric incident on ``key`` settle afresh from its next healthy observation.
+
+    With ``healthy`` -- the observation about to be made is healthy -- a
+    recovery card queued for a retry is dropped as well: it reports a close
+    that settled before the restart (before a pause, or under an earlier
+    configuration), which is no evidence now. The incident stays open and
+    settles afresh, and its own close sends the recovery then. A breached
+    observation leaves the queued card to the breach, which supersedes it.
+    """
+    pending = _PENDING_RESOLUTIONS.get(key)
+    if healthy and pending is not None and _TRANSITIONS.is_firing(key):
+        del _PENDING_RESOLUTIONS[key]
+        _history.retry_terminated(
+            key, episode_id=pending.history_episode, reason="other", attempts=pending.attempts
+        )
+    _TRANSITIONS.restart_settling(key)
+
 
 def reset_transition_state() -> None:
     """Drop all open-breach state. For tests and for a clean engine restart."""
@@ -1042,6 +1224,7 @@ def reset_transition_state() -> None:
     _MUTED_UNANNOUNCED.clear()
 
 
+@_tracked
 async def alert_on_transition(
     *,
     key: str,
@@ -1055,6 +1238,7 @@ async def alert_on_transition(
     now: float | None = None,
     resolution_context: Callable[[], dict[str, Any]] | None = None,
     announce_resolution: bool = True,
+    fence: Callable[[], bool] | None = None,
 ) -> bool:
     """Send only when the breach state changes, so incidents open and close once.
 
@@ -1095,7 +1279,15 @@ async def alert_on_transition(
     forever nor leaks an entry. Only the message is dropped, which is why such a
     close returns ``False`` — the return says whether a message was sent, not
     whether the incident closed.
+
+    ``fence`` is for an evaluation that read a configuration (a threshold, a
+    window) before awaiting: it is checked before the tracker or any incident
+    state changes, and again at the send's admission (see :func:`alert_slack`).
+    False at either point leaves this call without effect on the tracker it
+    had not yet touched, and no message is sent.
     """
+    if fence is not None and not fence():
+        return False
     tracker = _TRANSITIONS if kind == "metric" else _STATE_TRANSITIONS
     moment = now or time.time()
     transition = tracker.observe(
@@ -1108,7 +1300,7 @@ async def alert_on_transition(
         # The incident is (still or again) real, so any resolution queued for a
         # retry is stale — sending it later would announce a live breach as
         # recovered.
-        _PENDING_RESOLUTIONS.pop(key, None)
+        superseded = _PENDING_RESOLUTIONS.pop(key, None)
         _STALE_RETRY_ATTEMPTS.pop(key, None)
         # A summary built for a close that then failed to send describes an
         # incident this breach has reopened; the next close builds its own.
@@ -1125,6 +1317,18 @@ async def alert_on_transition(
             _SILENT_RESOLUTIONS.discard(key)
         else:
             _SILENT_RESOLUTIONS.add(key)
+        detail = context()
+        # History follows the observation, not the tracker: a breach after a
+        # recovery whose card failed (the tracker re-armed and never left
+        # "firing") is a new episode, and the old one's retry ends here.
+        if superseded is not None:
+            _history.retry_terminated(
+                key,
+                episode_id=superseded.history_episode,
+                reason="superseded_by_new_episode",
+                attempts=superseded.attempts,
+            )
+        _history.breach(key, severity=severity, title=title, kind=kind, context=detail, now=moment)
         # Every breached evaluation still goes to the sink, exactly as before.
         # The cooldown there decides whether it becomes a message, and under the
         # control plane each repeat is what advances the incident's occurrence
@@ -1133,13 +1337,22 @@ async def alert_on_transition(
         return await alert_slack(
             severity,
             title,
-            context(),
+            detail,
             dedupe_key=key,
             cooldown_sec=cooldown_sec,
+            fence=fence,
         )
     if transition != "resolved":
+        if not tracker.is_firing(key) and _history.open_episode(key) is not None:
+            # An episode the tracker never held — a producer held its breach
+            # back before it got here — ends at this healthy observation.
+            _history.condition_ended(key, basis="observed_healthy", now=moment)
         return False
+    # Ended now, before the recovery card awaits: whatever the card's fate, the
+    # condition is over, and a breach during the send opens a new episode.
+    episode_id = _history.condition_ended(key, basis="observed_healthy", now=moment)
     if _closes_silently(key):
+        _history.decision(key, episode_id=episode_id, reason="resolution_silenced", resolution=True)
         # Close it, say nothing. There is no send to confirm and so nothing to
         # retry: no ``_PendingResolution`` is queued and the key is not re-armed,
         # since a retry could only reproduce the card this close suppresses.
@@ -1150,7 +1363,7 @@ async def alert_on_transition(
         # dropped here too, so the sweep cannot post on this key's behalf.
         if not tracker.is_firing(key):
             tracker.forget(key)
-            _forget_resolution_detail(key)
+            _forget_resolution_detail(key, history_episode=episode_id)
         _PENDING_RESOLUTIONS.pop(key, None)
         return False
     detail = {"alert": key, **_resolution_detail(key)}
@@ -1161,7 +1374,17 @@ async def alert_on_transition(
         dedupe_key=key,
         cooldown_sec=cooldown_sec,
         status="resolved",
+        history_episode=episode_id,
+        fence=fence,
     )
+    if not sent and fence is not None and not fence():
+        # The healthy reading belongs to a configuration replaced while the
+        # recovery waited to be sent. Neither announce it nor queue it for a
+        # retry: put the incident back as it was, so the next evaluation,
+        # under the configuration now in force, decides whether it is over.
+        if not tracker.is_firing(key):
+            tracker.rearm(key, moment)
+        return False
     if sent:
         # Confirmed close — but only when no re-breach slipped in while the
         # send was in flight. ``observe`` deleted the firing state on the
@@ -1173,7 +1396,7 @@ async def alert_on_transition(
         # budgets) would otherwise leak one entry each.
         if not tracker.is_firing(key):
             tracker.forget(key)
-            _forget_resolution_detail(key)
+            _forget_resolution_detail(key, history_episode=episode_id)
         _PENDING_RESOLUTIONS.pop(key, None)
     else:
         # ``observe`` already cleared the key, so without this the only
@@ -1187,10 +1410,12 @@ async def alert_on_transition(
             kind=kind,
             title=title,
             queued_at=moment,
+            history_episode=episode_id,
         )
     return sent
 
 
+@_tracked
 async def sweep_stale_breaches() -> None:
     """Resolve breaches that nothing is evaluating any more.
 
@@ -1201,9 +1426,15 @@ async def sweep_stale_breaches() -> None:
 
     Only metric alerts are swept. For a state alert silence means nothing was
     observed, not that the condition cleared, so sweeping one would report an
-    ongoing outage as recovered.
+    ongoing outage as recovered. For the same reason a metric incident whose
+    producer holds it (:func:`hold_while`) is skipped, with its queued recovery:
+    neither is sent, retried, aged or dropped until the producer evaluates again.
+    A held key is fenced against the configuration in force when the sweep
+    began: one that changes during any of the sweep's awaits leaves such a key,
+    or its queued recovery, as it was for the next sweep.
     """
     now = time.time()
+    published = alert_runtime.acquire()
 
     # First, retry resolutions whose delivery failed on their transition edge.
     # This runs off observations entirely: for a state alert it is the only
@@ -1214,7 +1445,23 @@ async def sweep_stale_breaches() -> None:
             # A re-breach cancelled this entry after the snapshot: the breach
             # is live again and this recovery would announce it as over.
             continue
+        fence = _hold_fence(key, published) if pending.kind == "metric" else None
+        if fence is not None and not fence():
+            # Its producer is paused, or its configuration changed during an
+            # earlier send: the recovery waits, untouched, for it to evaluate
+            # again, which either confirms it or supersedes it.
+            continue
+        if fence is not None and not await _wait_for_in_flight(key):
+            # A send still running on the key outlasted the wait: try again
+            # next sweep, rather than let the send's own wait run a second
+            # bound. Nothing about the entry has changed.
+            continue
+        if fence is not None and (_PENDING_RESOLUTIONS.get(key) is not pending or not fence()):
+            # Superseded, paused or reconfigured during the wait. With no send
+            # running on the key, nothing awaits between here and admission.
+            continue
         tracker = _TRANSITIONS if pending.kind == "metric" else _STATE_TRANSITIONS
+        retry_episode = pending.history_episode
         if _closes_silently(key):
             # A silent close queues nothing — it has no send that can fail — so
             # this is an entry left by an announcing close on a key that has
@@ -1222,9 +1469,15 @@ async def sweep_stale_breaches() -> None:
             # exists to prevent, so drop it and finish the close here instead:
             # the entry is the only thing holding the incident open, and the
             # identity check above already ruled out a live re-breach.
+            _history.retry_terminated(
+                key,
+                episode_id=retry_episode,
+                reason="resolution_silenced",
+                attempts=pending.attempts,
+            )
             _PENDING_RESOLUTIONS.pop(key, None)
             tracker.forget(key)
-            _forget_resolution_detail(key)
+            _forget_resolution_detail(key, history_episode=retry_episode)
             continue
         pending.attempts += 1
         sent = False
@@ -1236,6 +1489,8 @@ async def sweep_stale_breaches() -> None:
                 dedupe_key=key,
                 cooldown_sec=0,
                 status="resolved",
+                history_episode=retry_episode,
+                fence=fence,
             )
         except Exception:
             # One stuck resolution must not strand every other pending one.
@@ -1250,12 +1505,17 @@ async def sweep_stale_breaches() -> None:
         # await sits between the send returning and this line.
         if _PENDING_RESOLUTIONS.get(key) is not pending:
             continue
+        if not sent and fence is not None and not fence():
+            # Paused or reconfigured while the send was prepared: nothing was
+            # delivered for it, so it costs no attempt and waits as it was.
+            pending.attempts -= 1
+            continue
         if sent:
             _PENDING_RESOLUTIONS.pop(key, None)
             # Confirmed close: clears the re-armed firing state and the key's
             # staleness bound in one step.
             tracker.forget(key)
-            _forget_resolution_detail(key)
+            _forget_resolution_detail(key, history_episode=retry_episode)
         elif (
             pending.attempts >= _PENDING_RESOLUTION_MAX_ATTEMPTS
             or now - pending.queued_at >= _PENDING_RESOLUTION_MAX_AGE_SEC
@@ -1268,6 +1528,18 @@ async def sweep_stale_breaches() -> None:
             # that turns a down sink into a once-a-minute repeat of every
             # resolution ever queued.
             _PENDING_RESOLUTIONS.pop(key, None)
+            _history.retry_terminated(
+                key,
+                episode_id=retry_episode,
+                reason=(
+                    "max_attempts"
+                    if pending.attempts >= _PENDING_RESOLUTION_MAX_ATTEMPTS
+                    else "max_age"
+                ),
+                attempts=pending.attempts,
+            )
+            # The tracker stays re-armed, so the episode keeps its retry
+            # association for the stale sweep's own close of this key.
             _forget_resolution_detail(key)
             log.warning(
                 "giving up on resolution delivery for %s after %d attempts",
@@ -1275,14 +1547,49 @@ async def sweep_stale_breaches() -> None:
                 pending.attempts,
             )
 
-    for key in _TRANSITIONS.sweep(now):
+    # A key whose producer can hold it is chosen here but stays firing until it
+    # is claimed, right before its own close: the sweep awaits each send in
+    # turn, and an observation the producer makes meanwhile must land on the
+    # incident, not on a key the sweep has already taken. Every other key is
+    # taken now, as it always was.
+    marks = {
+        key: _TRANSITIONS.mark(key)
+        for key in _TRANSITIONS.stale(now, held=_held)
+        if _hold_of(key) is not None
+    }
+    swept = _TRANSITIONS.sweep(now, held=lambda key: _hold_of(key) is not None)
+    for key in sorted([*swept, *marks]):
+        fence = _hold_fence(key, published) if key in marks else None
+        if fence is not None:
+            # The send would wait for this anyway. Waiting first leaves no await
+            # between the checks below, the episode's end and the send's
+            # admission, so a close stopped by any of them records nothing.
+            # A wait that runs out defers the key to the next sweep as it is.
+            if not await _wait_for_in_flight(key):
+                continue
+            if not fence() or not _TRANSITIONS.claim(key, marks[key]):
+                # Paused or reconfigured, or the producer observed the
+                # incident (or a new one opened) since it was chosen.
+                continue
+        elif _TRANSITIONS.is_firing(key):
+            # A breach during an earlier send opened a new incident: it is not
+            # this sweep's to close.
+            continue
         # A rule that opted out of announcing its close opts out of this card
         # above all: "no recent samples" is the most misleading thing that can
         # be said about a key whose rule only ever speaks on a transition, since
         # having no recent samples is that rule's normal state. Everything below
         # the send still runs, so the incident closes here as it always did. An
         # incident a type mute kept out of the channel closes here silently too.
+        # The sweep is the "no samples" observation. For a key the tracker had
+        # re-armed after a failed recovery card the episode already ended on
+        # an observed-healthy edge; this only retries that card.
+        episode_id = _history.condition_ended(key, basis="no_samples", now=now)
         silent = _closes_silently(key)
+        if silent:
+            _history.decision(
+                key, episode_id=episode_id, reason="resolution_silenced", resolution=True
+            )
         sent = False
         if not silent:
             try:
@@ -1304,6 +1611,8 @@ async def sweep_stale_breaches() -> None:
                     dedupe_key=key,
                     cooldown_sec=0,
                     status="resolved",
+                    history_episode=episode_id,
+                    fence=fence,
                 )
             except Exception:
                 # One stuck resolution must not strand every other open incident.
@@ -1315,6 +1624,11 @@ async def sweep_stale_breaches() -> None:
             # re-arming would overwrite its liveness clock with a backdated one
             # and set up a premature no-samples close.
             continue
+        if not sent and fence is not None and not fence():
+            # Paused or reconfigured during the post itself, which was refused:
+            # the incident stays open, and no retry is counted.
+            _TRANSITIONS.reinstate(key, marks[key])
+            continue
         if sent or silent:
             # Confirmed close: without this, dynamic keys (per-user cost,
             # per-period budgets) each leave a ``_bounds`` entry behind forever.
@@ -1324,7 +1638,7 @@ async def sweep_stale_breaches() -> None:
             # back for a card that will never be sent.
             _STALE_RETRY_ATTEMPTS.pop(key, None)
             _TRANSITIONS.forget(key)
-            _forget_resolution_detail(key)
+            _forget_resolution_detail(key, history_episode=episode_id)
             continue
         attempts = _STALE_RETRY_ATTEMPTS.get(key, 0) + 1
         if attempts >= _PENDING_RESOLUTION_MAX_ATTEMPTS:
@@ -1336,8 +1650,11 @@ async def sweep_stale_breaches() -> None:
             # armed — a swept key is one nothing is evaluating any more, so
             # leaving it firing only guarantees it comes back next tick.
             _STALE_RETRY_ATTEMPTS.pop(key, None)
+            _history.retry_terminated(
+                key, episode_id=episode_id, reason="max_attempts", attempts=attempts
+            )
             _TRANSITIONS.forget(key)
-            _forget_resolution_detail(key)
+            _forget_resolution_detail(key, history_episode=episode_id)
             log.warning(
                 "giving up on no-samples resolution for %s after %d attempts",
                 key,

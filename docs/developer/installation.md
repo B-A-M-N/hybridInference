@@ -13,7 +13,7 @@ This page is the next step: your own deployment, with your own providers.
 | For | Requirement |
 |---|---|
 | The Docker stack | Docker Engine 24+ and Docker Compose v2+ |
-| A source checkout | Python 3.10–3.13 (3.12 recommended, per `pyproject.toml`) and [uv](https://github.com/astral-sh/uv) |
+| A source checkout | Python 3.11–3.13 (3.12 recommended, per `pyproject.toml`) and [uv](https://github.com/astral-sh/uv) |
 | Running the console outside Docker | Node.js 22 (the version CI installs) |
 
 Linux or macOS.
@@ -101,7 +101,7 @@ and:
    needs it.
 
 Everything set here can be changed later on the admin console's
-**Configuration** tab; [Settings stored in the database](configuration.md#settings-stored-in-the-database)
+**Settings** tab; [Settings stored in the database](configuration.md#settings-stored-in-the-database)
 explains how. [The first admin account](deployment.md#the-first-admin-account)
 covers the other ways to create an administrator and how to reset its
 password.
@@ -218,7 +218,7 @@ The settings you are most likely to want:
 
 [Trusted Proxies and Client IPs](trusted-proxies-and-client-ips.md) says which
 of the proxy settings above to set for your setup. Put them in `.env` before
-the first start, or set them on the Configuration tab afterwards: the first
+the first start, or set them on the Settings tab afterwards: the first
 start stores them, and from then on a `.env` edit changes nothing. Under
 Compose that includes `TRUST_PROXY_HEADERS` and `TRUST_CLOUDFLARE_HEADERS`
 when `.env` does not set them, stored as the Compose file's default `0`.
@@ -251,7 +251,7 @@ can be added with **Add variable**. The registry reads these values at
 startup, so restart the backend after changing one. A gateway without a
 database reads them from `.env` instead.
 
-A provider key whose description on the Configuration tab mentions numbered
+A provider key whose description on the Settings tab mentions numbered
 extras, such as `OPENROUTER_API_KEY` or `MINIMAX_API_KEY`, can have extras
 numbered `1` to `20` (`MINIMAX_API_KEY2`, say). Every one that has a value
 joins that provider's key pool, whichever numbers are used, and a key entered

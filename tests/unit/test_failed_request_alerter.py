@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -153,7 +153,7 @@ def _make_alerter(pool, *, threshold=20, window=5, cooldown=5, now_fn=None):
         threshold=threshold,
         window_minutes=window,
         cooldown_minutes=cooldown,
-        now_fn=now_fn or (lambda: datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)),
+        now_fn=now_fn or (lambda: datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)),
     )
 
 
@@ -299,8 +299,8 @@ async def test_alerter_cooldown_suppresses_repeat():
     pool.fetchrow = AsyncMock(return_value=None)
 
     times = [
-        datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
-        datetime(2026, 1, 1, 12, 2, 0, tzinfo=timezone.utc),  # +2 min, cooldown is 5
+        datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 12, 2, 0, tzinfo=UTC),  # +2 min, cooldown is 5
     ]
 
     def _clock():
@@ -327,8 +327,8 @@ async def test_alerter_cooldown_expires_then_fires():
     pool.fetchrow = AsyncMock(return_value=None)
 
     times = [
-        datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
-        datetime(2026, 1, 1, 12, 6, 0, tzinfo=timezone.utc),  # +6 min, cooldown is 5
+        datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 12, 6, 0, tzinfo=UTC),  # +6 min, cooldown is 5
     ]
 
     def _clock():
@@ -355,8 +355,8 @@ async def test_alerter_failed_post_does_not_start_cooldown():
     pool.fetchrow = AsyncMock(return_value=None)
 
     times = [
-        datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
-        datetime(2026, 1, 1, 12, 0, 30, tzinfo=timezone.utc),  # +30s, well inside cooldown
+        datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 12, 0, 30, tzinfo=UTC),  # +30s, well inside cooldown
     ]
 
     def _clock():
@@ -389,38 +389,58 @@ def _settings_stub(webhook_url="", wecom_url="", slack_alerts_url=""):
     )
 
 
-def test_register_disabled_when_webhook_empty():
-    """Empty SLACK_WEBHOOK_URL must skip registration entirely."""
+def _published(config):
+    from serving.config import live
+
+    return live.Published(config, None, 7)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "webhooks",
+    [
+        {},
+        {"slack_webhook_url": "   "},
+        # Only SLACK_WEBHOOK_URL or WeCom enables this detector; the alerting
+        # URL alone does not. That asymmetry predates the live configuration.
+        {"slack_alerts_webhook_url": "https://hooks.slack.test/alerting"},
+    ],
+    ids=["empty", "whitespace", "only-slack-alerts-url"],
+)
+async def test_one_job_is_registered_and_paused_without_the_detectors_webhook(webhooks):
+    """The job always exists; without its webhook a check queries and sends nothing.
+
+    A webhook saved later then starts the detector without registering a job
+    or restarting, and the cooldown and incident it keeps are the same ones.
+    """
     from serving.admin import failed_request_alerter
+    from serving.observability.alert_runtime import AlertRuntimeConfig
 
     fake_scheduler = MagicMock()
     pool = MagicMock()
+    pool.fetchval = AsyncMock(return_value=10_000)
+    pool.fetchrow = AsyncMock(return_value={"failures": 10_000, "total": 10_000})
 
-    with patch.object(
-        failed_request_alerter,
-        "get_scheduler",
-        return_value=fake_scheduler,
+    with (
+        patch.object(failed_request_alerter, "get_scheduler", return_value=fake_scheduler),
+        patch.object(
+            failed_request_alerter.alert_runtime,
+            "acquire",
+            return_value=_published(AlertRuntimeConfig(**webhooks)),
+        ),
+        patch.object(
+            failed_request_alerter, "alert_on_transition", new=AsyncMock(return_value=True)
+        ) as transition,
     ):
-        failed_request_alerter.register_alerter_job(pool, _settings_stub(webhook_url=""))
+        alerter = failed_request_alerter.register_alerter_job(pool)
+        assert alerter is not None
+        await alerter.run_check()
 
-    fake_scheduler.add_job.assert_not_called()
-
-
-def test_register_disabled_when_webhook_whitespace():
-    """Whitespace-only SLACK_WEBHOOK_URL must be treated as unset — no job registered."""
-    from serving.admin import failed_request_alerter
-
-    fake_scheduler = MagicMock()
-    pool = MagicMock()
-
-    with patch.object(
-        failed_request_alerter,
-        "get_scheduler",
-        return_value=fake_scheduler,
-    ):
-        failed_request_alerter.register_alerter_job(pool, _settings_stub(webhook_url="   "))
-
-    fake_scheduler.add_job.assert_not_called()
+    fake_scheduler.add_job.assert_called_once()
+    pool.fetchval.assert_not_awaited()
+    pool.fetchrow.assert_not_awaited()
+    transition.assert_not_awaited()
+    assert alerter.last_state == "paused"
 
 
 def test_register_adds_job_when_webhook_set():
@@ -469,31 +489,6 @@ def test_register_adds_job_when_only_wecom_is_set():
     fake_scheduler.add_job.assert_called_once()
 
 
-def test_register_disabled_when_only_slack_alerts_webhook_is_set():
-    """Only SLACK_WEBHOOK_URL enables this detector; the alerting URL does not.
-
-    That asymmetry predates this change: deployments that set just
-    SLACK_ALERTS_WEBHOOK_URL never registered the DB-query detector, and the
-    WeCom channel must not alter that.
-    """
-    from serving.admin import failed_request_alerter
-
-    fake_scheduler = MagicMock()
-    pool = MagicMock()
-
-    with patch.object(
-        failed_request_alerter,
-        "get_scheduler",
-        return_value=fake_scheduler,
-    ):
-        failed_request_alerter.register_alerter_job(
-            pool,
-            _settings_stub(slack_alerts_url="https://hooks.slack.test/alerting"),
-        )
-
-    fake_scheduler.add_job.assert_not_called()
-
-
 def test_register_no_scheduler_is_safe():
     """If get_scheduler returns None, registration logs and bails — no crash."""
     from serving.admin import failed_request_alerter
@@ -505,92 +500,6 @@ def test_register_no_scheduler_is_safe():
         failed_request_alerter.register_alerter_job(
             pool, _settings_stub(webhook_url="https://hooks.slack.test/xyz")
         )
-
-
-# ── post_slack_alert error swallowing ────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_slack_post_failure_is_swallowed():
-    """httpx errors inside post_slack_alert must NOT propagate — returns False."""
-    import httpx
-
-    from serving.admin.failed_request_alerter import post_slack_alert
-
-    class _BoomCtx:
-        async def __aenter__(self_inner):
-            raise httpx.ConnectError("boom")
-
-        async def __aexit__(self_inner, *_a):
-            return False
-
-    with patch(
-        "serving.admin.failed_request_alerter.httpx.AsyncClient",
-        return_value=_BoomCtx(),
-    ):
-        ok = await post_slack_alert("https://hooks.slack.test/abc", "hi")
-
-    assert ok is False
-
-
-@pytest.mark.asyncio
-async def test_slack_post_does_not_leak_the_webhook_into_the_httpx_log(caplog):
-    """The legacy sender holds the same credential as the framework one.
-
-    A Slack incoming-webhook URL *is* the secret, and httpx logs the full
-    request URL at INFO for every call, so this sender leaked it exactly like
-    ``_post_to_slack`` did. Driven over a real client with a mock transport
-    because the leaking line is httpx's, not this module's.
-    """
-    import logging
-
-    import httpx
-
-    from serving.admin.failed_request_alerter import post_slack_alert
-
-    webhook = "https://hooks.slack.test/services/T00000000/B00000000/nOtArEaLtOkEn"
-    real_client = httpx.AsyncClient
-
-    def factory(*args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(lambda _req: httpx.Response(200))
-        return real_client(*args, **kwargs)
-
-    with (
-        patch("serving.admin.failed_request_alerter.httpx.AsyncClient", factory),
-        caplog.at_level(logging.DEBUG),
-    ):
-        ok = await post_slack_alert(webhook, "hi")
-
-    assert ok is True
-    assert webhook not in caplog.text
-    assert "nOtArEaLtOkEn" not in caplog.text
-    # Redacted rather than muted: the call is still in the log.
-    assert "hooks.slack.test" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_slack_post_non_2xx_returns_false():
-    """A non-2xx response must be treated as a failed post (False)."""
-    from serving.admin.failed_request_alerter import post_slack_alert
-
-    fake_resp = MagicMock(status_code=500, text="upstream broken")
-    fake_client = AsyncMock()
-    fake_client.post = AsyncMock(return_value=fake_resp)
-
-    class _ClientCtx:
-        async def __aenter__(self_inner):
-            return fake_client
-
-        async def __aexit__(self_inner, *_a):
-            return False
-
-    with patch(
-        "serving.admin.failed_request_alerter.httpx.AsyncClient",
-        return_value=_ClientCtx(),
-    ):
-        ok = await post_slack_alert("https://hooks.slack.test/abc", "hi")
-
-    assert ok is False
 
 
 @pytest.mark.asyncio
@@ -613,7 +522,7 @@ async def test_alerter_swallows_query_exception():
 
 # Smoke check: timedelta math is what we expect — fences the cooldown semantics.
 def test_cooldown_arithmetic_uses_timedelta():
-    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     assert (base + timedelta(minutes=5)) - base == timedelta(minutes=5)
 
 
@@ -628,7 +537,7 @@ def _rate_alerter(pool, *, threshold=200, rate=0.02, min_count=10):
         threshold=threshold,
         window_minutes=5,
         cooldown_minutes=5,
-        now_fn=lambda: datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        now_fn=lambda: datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
         rate_threshold=rate,
         rate_min_count=min_count,
     )
@@ -702,7 +611,7 @@ async def test_rate_zero_restores_pure_absolute_counting():
         threshold=200,
         window_minutes=5,
         cooldown_minutes=5,
-        now_fn=lambda: datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        now_fn=lambda: datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
         rate_threshold=0.0,
     )
     with patch(

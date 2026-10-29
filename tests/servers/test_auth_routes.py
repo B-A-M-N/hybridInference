@@ -4,7 +4,7 @@ Run with: make test-db
 """
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -45,7 +45,7 @@ async def _create_refresh_session(op_store, user_id: str, refresh_token: str) ->
         refresh_token_hash=hash_refresh_token(refresh_token),
         jti=str(uuid4()),
         sid=str(uuid4()),
-        expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+        expires_at=datetime.now(UTC) + timedelta(days=1),
     )
 
 
@@ -99,7 +99,8 @@ class TestSignup:
         async with auth_db_logger.pool.acquire() as conn:
             audit_row = await conn.fetchrow(
                 """
-                SELECT action, target_user_id, details, success
+                SELECT action, target_user_id, details, success,
+                       actor_type, actor_id, target_type, target_id
                 FROM admin_audit_log
                 WHERE target_user_id = $1 AND action = 'create_user'
                 ORDER BY timestamp DESC
@@ -114,6 +115,11 @@ class TestSignup:
             details = json.loads(details)
         assert details["email"] == signup_data["email"].lower()
         assert "password" not in details
+        # Registration is unauthenticated: the actor is anonymous, with no
+        # account id (not the account it was creating), and the new account
+        # is the typed target.
+        assert (audit_row["actor_type"], audit_row["actor_id"]) == ("anonymous", None)
+        assert (audit_row["target_type"], audit_row["target_id"]) == ("user", data["user_id"])
 
     @pytest.mark.asyncio
     async def test_signup_duplicate_email(
@@ -797,7 +803,7 @@ class TestEmailVerification:
         operational_store, _, _, _ = auth_backend
 
         token = secrets.token_urlsafe(32)
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        expires_at = datetime.now(UTC) + timedelta(hours=24)
 
         # Mark user as unverified
         await operational_store.update_user_fields(test_user["id"], email_verified=False)
@@ -846,7 +852,7 @@ class TestEmailVerification:
         await operational_store.create_verification_token(
             token=token,
             user_id=test_user["id"],
-            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+            expires_at=datetime.now(UTC) + timedelta(hours=24),
             pending_email=new_email,
         )
 
@@ -878,7 +884,7 @@ class TestEmailVerification:
         operational_store, _, _, _ = auth_backend
 
         token = secrets.token_urlsafe(32)
-        expires_at = datetime.now(timezone.utc) - timedelta(hours=1)  # Expired
+        expires_at = datetime.now(UTC) - timedelta(hours=1)  # Expired
 
         await operational_store.create_verification_token(
             token=token,
@@ -900,7 +906,7 @@ class TestEmailVerification:
         operational_store, _, _, _ = auth_backend
 
         token = secrets.token_urlsafe(32)
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        expires_at = datetime.now(UTC) + timedelta(hours=24)
 
         await operational_store.create_verification_token(
             token=token,
@@ -926,7 +932,7 @@ class TestEmailVerification:
         operational_store, _, _, _ = auth_backend
 
         token = secrets.token_urlsafe(32)
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        expires_at = datetime.now(UTC) + timedelta(hours=24)
 
         await operational_store.update_user_fields(test_user["id"], email_verified=False)
         await operational_store.create_verification_token(

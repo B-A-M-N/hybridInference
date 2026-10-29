@@ -49,7 +49,7 @@ from serving.config.app_config import config_value, on_change
 from serving.utils.logging import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
 logger = get_logger(__name__)
 
@@ -669,9 +669,10 @@ class PrefillLease:
 class PrefillLoadTracker:
     """Per-endpoint in-flight prefill accounting and load-aware selection.
 
-    Thread safety: all mutable state is guarded by a single lock. Critical
-    sections do no I/O and hold no awaits, matching the router-owned lock
-    pattern used elsewhere in ``routing/``.
+    Thread safety: ``_lock`` protects the accounting maps, while
+    ``_routing_lock`` serializes a route's load snapshot and lease reservation
+    across routers that share this tracker. Routing transactions contain only
+    synchronous local work; no upstream I/O or await is allowed inside them.
 
     What is counted is *un-cached* prefill, not prompt size. Nearly all large
     prompts here are warm continuations -- the production fleet runs above 90%
@@ -695,11 +696,11 @@ class PrefillLoadTracker:
         elephant_limit: int | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        # RLock lets a routing transaction hold the tracker while the router
-        # calls the ordinary read/lease methods.  The transaction is short and
-        # contains only local selection/accounting work; provider I/O never
-        # runs while it is held.
+        # The state lock protects the accounting maps.  A separate RLock
+        # serializes route snapshots and reservations without keeping the
+        # accounting lock held through expensive candidate computation.
         self._lock = threading.RLock()
+        self._routing_lock = threading.RLock()
         self._backlog: dict[str, int] = {}
         self._elephants: dict[str, int] = {}
         # Load attributed to one caller on one endpoint, so a caller's own work
@@ -718,9 +719,11 @@ class PrefillLoadTracker:
         Route selection must observe the same load state that its primary
         reservation updates.  Callers should hold this context only around
         local candidate construction/selection and lease acquisition; it must
-        not span an upstream request.
+        not span an upstream request. Lease releases may run outside this
+        transaction: the accounting lock keeps those mutations coherent, and
+        a concurrent release only reduces the outstanding load snapshot.
         """
-        with self._lock:
+        with self._routing_lock:
             yield
 
     def uncached_estimate(
@@ -801,11 +804,6 @@ class PrefillLoadTracker:
         """Return in-flight prefill tokens currently charged to an endpoint."""
         with self._lock:
             return self._backlog.get(endpoint_id, 0)
-
-    def backlog_snapshot(self, endpoint_ids: Iterable[str]) -> dict[str, int]:
-        """Return one short, consistent backlog snapshot for route selection."""
-        with self._lock:
-            return {endpoint_id: self._backlog.get(endpoint_id, 0) for endpoint_id in endpoint_ids}
 
     def elephants(self, endpoint_id: str) -> int:
         """Return the number of elephants currently prefilling on an endpoint."""
@@ -1096,17 +1094,22 @@ class PrefillLoadTracker:
             remaining = [i for i in eligible if keys[i] != avoid]
             if remaining:
                 eligible = remaining
-        uncached_here: dict[int, int] = {}
         if PREFILL_AWARE_ENABLED:
             # Keyed by candidate index, not by position in ``eligible``: ``avoid``
             # may already have dropped entries, so a positional list would be
             # shorter than ``count`` while the loop below still indexes it with
             # indices into ``keys``.
             # Computed before taking the lock; uncached_estimate locks too.
-            uncached_here = {
-                i: self.uncached_estimate(keys[i], tokens, affinity_key) for i in eligible
+            # Gated on the fingerprint as in ``acquire``: judged on the loose
+            # discount, a sibling conversation looked warm here and kept an
+            # endpoint at its elephant limit eligible, and ``acquire`` then
+            # counted it as one more elephant on that endpoint.
+            elephant_here = {
+                i: self.is_elephant(
+                    self.uncached_estimate(keys[i], tokens, affinity_key, fingerprint=fingerprint)
+                )
+                for i in eligible
             }
-            elephant_here = {i: self.is_elephant(uncached_here[i]) for i in eligible}
             if any(elephant_here.values()):
                 with self._lock:
                     unsaturated = [

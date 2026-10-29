@@ -45,7 +45,7 @@ def test_admin_router_has_expected_route_count() -> None:
 
     Bump this number deliberately when adding/removing admin routes.
     """
-    expected = 131  # includes role-quota, provider-key verification/probe, key min-role (db+env)
+    expected = 149  # includes role-quota, provider-key verification/probe, key min-role (db+env)
     # (incl. disable/enable/enable-env and the by-ref disable/enable pair used
     # by the quota dashboard), visibility, concurrency,
     # global + per-model routewise settings/probes/decisions, routing-weight,
@@ -59,6 +59,8 @@ def test_admin_router_has_expected_route_count() -> None:
     # plus provider availability list + disable/enable toggle,
     # plus the geo-temporal analytics endpoint,
     # plus the daily growth-rate analytics endpoint.
+    # +3: batch/jobs, batch/summary and batch/jobs/{id}/cancel, the overview of
+    # every user's batches.
     # 111 -> 108 at H4: agent runner-hosts list/set-active/forget went to
     # the cloud agent's repository with the pool they administer.
     # 110 -> 111: recent-requests/performance, the per-(model, endpoint) TTFT
@@ -81,6 +83,17 @@ def test_admin_router_has_expected_route_count() -> None:
     # and system/restart so a restart-required change can be applied.
     # 129 -> 130: users/usage-totals, deferred lifetime request/token metrics.
     # 130 -> 131: alerts/test, an admin-only test notification for the selected channel.
+    # 131 -> 133: routing/provider-route-capabilities PUT and DELETE, to set or
+    # reset one route's context window, output cap, modalities and tool support.
+    # 133 -> 136: provider-route-states (disable/enable any route) and
+    # provider-route-removals POST/DELETE (delete and restore a config route).
+    # 136 -> 138: batch/models list and per-model update, the batch
+    # concurrency caps an administrator sets per model.
+    # 138 -> 140: config/backup GET and config/restore POST, portable
+    # configuration backup and restore across all admin-editable domains.
+    # 140 -> 145: alert-history status, events, episode, source-incident and
+    # request-evidence reads (read-only; scoped reader tokens accepted).
+    # 148 -> 149: config/live, how each process applied the live configuration groups.
     routes = [r for r in _admin_api_routes() if r.path.startswith("/admin")]
     assert len(routes) == expected, (
         f"admin route count drifted: expected {expected}, got {len(routes)}"

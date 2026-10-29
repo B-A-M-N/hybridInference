@@ -10,9 +10,11 @@ from __future__ import annotations
 import json
 import secrets
 import time
+from datetime import UTC
 from typing import TYPE_CHECKING, Any, Literal
 
 from serving import grants, quota
+from serving.audit import AuditTarget, audit_columns
 from serving.config.settings import ROLE_RANK, VALID_ROLES, get_settings
 from serving.exceptions import (
     AccountSchemaPending,
@@ -27,6 +29,11 @@ from serving.storage.account_schema import (
     migrate_login_events_account_schema,
     migrate_users_account_schema,
     read_account_schema,
+)
+from serving.storage.audit_schema import (
+    SELECT_COLUMNS as AUDIT_SELECT_COLUMNS,
+    ensure_admin_audit_log_schema,
+    insert_audit_row,
 )
 from serving.storage.base import OperationalStore, ProviderDefinitionRow, ProviderKeyRow, Row
 from serving.storage.browser_session_schema import ensure_browser_session_tables
@@ -50,6 +57,8 @@ if TYPE_CHECKING:
     from decimal import Decimal
 
     import asyncpg
+
+    from serving.audit import AuditActor
 
 logger = get_logger(__name__)
 
@@ -127,15 +136,17 @@ _FIRST_RUN_SETUP_LOCK_SQL = (
 
 
 class RequiredOperationalSchemaUnavailable(SchemaLockUnavailable):
-    """A hard-delete safety column could not be installed at startup.
+    """A column the store cannot serve without could not be installed at startup.
 
-    Unlike ordinary operational migrations, the hard-delete claim marker is
-    required before the store can be exposed: resume_user and both hard-delete
-    phases select it on every request. A lock timeout therefore must fail
-    startup rather than defer the migration while serving against an unsafe
-    schema. Only a database older than the marker (#1421) can hit this; the
-    account columns added since are deferrable instead (see
-    :mod:`serving.storage.account_schema`).
+    Unlike ordinary operational migrations, two are required before the store
+    can be exposed. The hard-delete claim marker: resume_user and both
+    hard-delete phases select it on every request. The ``admin_audit_log``
+    attribution columns (:mod:`serving.storage.audit_schema`): every audit
+    write names them, and an audit row without them would lose who acted. A
+    lock timeout on either therefore must fail startup rather than defer the
+    migration while serving against an unsafe schema. Only a database older
+    than the column can hit this; the account columns are deferrable instead
+    (see :mod:`serving.storage.account_schema`).
     """
 
 
@@ -201,17 +212,16 @@ def _coerce_user_row(row: Any) -> Row | None:
 class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
     """OperationalStore backed by an asyncpg connection pool."""
 
-    def __init__(self, pool: asyncpg.Pool, *, fence_secret: str | None = None) -> None:
+    def __init__(self, pool: asyncpg.Pool) -> None:
         """Initialize with a shared asyncpg pool.
+
+        The LogStore owns the erasure-fence schema and tombstone checks; this
+        store owns the operational hard-delete claim.
 
         Args:
             pool: Shared asyncpg pool.
-            fence_secret: Retained for constructor compatibility. The
-                LogStore owns erasure-fence schema and tombstone checks;
-                this store owns the operational hard-delete claim.
         """
         self._pool = pool
-        self.fence_secret = fence_secret
         # Which account columns the users table has, read from the catalog
         # by initialize(); until then, the schema this release creates.
         self._set_account_schema(COMPLETE_ACCOUNT_SCHEMA)
@@ -364,6 +374,24 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             raise RequiredOperationalSchemaUnavailable(
                 "hard-delete claim columns are required before the operational store "
                 "can serve; refusing deferred startup while its migration is locked"
+            ) from exc
+
+        # --- admin_audit_log ---
+        # Shared with DatabaseLogger (serving.storage.audit_schema). Every
+        # audit write names the attribution columns, so like the hard-delete
+        # claim columns they are required: a lock timeout refuses startup
+        # rather than serving writes that would fail or lose their actor. Also
+        # like them, installed here, before any migration whose lock timeout
+        # propagates and lets bootstrap expose the store with the rest
+        # deferred (the role default below, the api_keys columns). The table
+        # references no other, so nothing it needs is built later.
+        try:
+            await ensure_admin_audit_log_schema(conn)
+        except SchemaLockUnavailable as exc:
+            raise RequiredOperationalSchemaUnavailable(
+                "admin_audit_log attribution columns are required before the "
+                "operational store can serve; refusing deferred startup while "
+                "their migration is locked"
             ) from exc
 
         # The account columns (login names, phone numbers, accounts without an
@@ -776,10 +804,9 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         )
 
         # --- agent_grants ---
-        # DDL lives in serving/grants.py, the module that owns this table.
-        # Deliberately not in agent_job_store: that file is frozen and leaves
-        # with the cloud agent, while minting capabilities for this gateway's
-        # models stays here.
+        # DDL lives in serving/grants.py, the module that owns this table. It
+        # stayed behind when agent_job_store left with the cloud agent:
+        # minting capabilities for this gateway's models is the gateway's job.
         await conn.execute(grants.CREATE_TABLE_SQL)
         for statement in grants.CREATE_INDEX_SQL:
             await conn.execute(statement)
@@ -801,31 +828,6 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_identity_auth_codes_expires "
             "ON identity_auth_codes(expires_at)"
-        )
-
-        # --- admin_audit_log ---
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS admin_audit_log (
-                id BIGSERIAL PRIMARY KEY,
-                timestamp TIMESTAMPTZ DEFAULT NOW(),
-                admin_ip TEXT NOT NULL,
-                action TEXT NOT NULL,
-                target_user_id TEXT,
-                details JSONB,
-                success BOOLEAN DEFAULT TRUE
-            )
-        """)
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_admin_audit_timestamp "
-            "ON admin_audit_log(timestamp DESC)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_admin_audit_user "
-            "ON admin_audit_log(target_user_id, timestamp DESC)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_admin_audit_action "
-            "ON admin_audit_log(action, timestamp DESC)"
         )
 
         # --- user_daily_cost ---
@@ -945,6 +947,20 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             "CREATE INDEX IF NOT EXISTS idx_pwo_model ON provider_weight_overrides(model_id)"
         )
 
+        # Admin-set capabilities for one route (context window, output cap, input
+        # modalities, tool support). A row overrides the route's models.yaml values
+        # or the values it was created with; no row means the route keeps those.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS provider_route_capabilities (
+                model_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                capabilities JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_by TEXT,
+                PRIMARY KEY (model_id, route_id)
+            )
+        """)
+
         # Admin-controlled kill switch: a row here means the provider label is
         # excluded from routing (all its endpoints treated as weight 0). Empty
         # table = every provider enabled, so the default state needs no seeding.
@@ -1020,6 +1036,7 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                 weight DOUBLE PRECISION NOT NULL DEFAULT 1.0,
                 pricing JSONB,
                 capabilities JSONB,
+                endpoint_id TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_by TEXT,
@@ -1052,8 +1069,29 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                     "ALTER TABLE provider_route_candidates "
                     "ADD COLUMN IF NOT EXISTS deployment_type TEXT NOT NULL DEFAULT 'auto'",
                 ),
+                # Set only after an edit moved the route to another endpoint;
+                # NULL means the endpoint id is the route id.
+                (
+                    "endpoint_id",
+                    "ALTER TABLE provider_route_candidates ADD COLUMN IF NOT EXISTS endpoint_id TEXT",
+                ),
             ],
         )
+
+        # Admin state of one route, by its stable route id: disabled (kept,
+        # selected by nothing) and/or removed (a config route taken out of this
+        # deployment). No row means enabled and present.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS provider_route_states (
+                model_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                disabled BOOLEAN NOT NULL DEFAULT FALSE,
+                removed BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_by TEXT,
+                PRIMARY KEY (model_id, route_id)
+            )
+        """)
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS routewise_probe_samples (
@@ -1341,7 +1379,8 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         marker_key: str,
         marker_value: str,
         code_key: str,
-        admin_ip: str,
+        admin_ip: str | None = None,
+        actor: AuditActor | None = None,
     ) -> bool:
         """Create the first administrator unless setup has already completed.
 
@@ -1356,6 +1395,9 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                 a login name and no email yet; nothing was written.
         """
         await self._require_account_schema("login_names")
+        audit = audit_columns(
+            admin_ip=admin_ip, target_user_id=None, actor=actor, target=AuditTarget.user(user_id)
+        )
         async with self._pool.acquire() as conn, conn.transaction():
             await conn.execute(_FIRST_RUN_SETUP_LOCK_SQL)
             if await conn.fetchval("SELECT 1 FROM site_settings WHERE key = $1", marker_key):
@@ -1380,15 +1422,12 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             )
             # The code has done its job; it must not outlive the setup it guards.
             await conn.execute("DELETE FROM site_settings WHERE key = $1", code_key)
-            await conn.execute(
-                "INSERT INTO admin_audit_log "
-                "(admin_ip, action, target_user_id, details, success) "
-                "VALUES ($1, $2, $3, $4::jsonb, $5)",
-                admin_ip,
-                "setup.admin_created",
-                user_id,
-                json.dumps({"login_name": login_name.lower(), "user_name": user_name}),
-                True,
+            await insert_audit_row(
+                conn,
+                columns=audit,
+                action="setup.admin_created",
+                details={"login_name": login_name.lower(), "user_name": user_name},
+                success=True,
             )
         return True
 
@@ -1442,11 +1481,12 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         self,
         user_id: str,
         *,
-        admin_ip: str,
-        admin_id: str,
+        admin_ip: str | None = None,
+        admin_id: str | None = None,
         reason: str | None = None,
         email: str | None = None,
         self_service: bool = False,
+        actor: AuditActor | None = None,
     ) -> None:
         """Soft-delete: set status='deleted', revoke keys, purge sessions/tokens.
 
@@ -1455,6 +1495,14 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         requires the account to still be active and not an administrator
         under the row lock; otherwise ``SelfDeleteRefused`` rolls it all back.
         """
+        audit = audit_columns(
+            admin_ip=admin_ip, target_user_id=None, actor=actor, target=AuditTarget.user(user_id)
+        )
+        details: dict[str, Any] = {"email": email, "reason": reason}
+        if admin_id is not None:
+            details["admin_id"] = admin_id
+        if self_service:
+            details["self_service"] = True
         async with self._pool.acquire() as conn, conn.transaction():
             if self_service:
                 # The route checked these before proving ownership; a promotion
@@ -1475,18 +1523,8 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             await self._forget_browser_session_account(conn, user_id)
             await conn.execute("DELETE FROM email_verification_tokens WHERE user_id = $1", user_id)
             await conn.execute("DELETE FROM password_reset_tokens WHERE user_id = $1", user_id)
-            await conn.execute(
-                "INSERT INTO admin_audit_log "
-                "(admin_ip, action, target_user_id, details, success) "
-                "VALUES ($1, $2, $3, $4::jsonb, $5)",
-                admin_ip,
-                "delete_user",
-                user_id,
-                json.dumps(
-                    {"email": email, "reason": reason}
-                    | ({"self_service": True} if self_service else {})
-                ),
-                True,
+            await insert_audit_row(
+                conn, columns=audit, action="delete_user", details=details, success=True
             )
 
     @staticmethod
@@ -1575,12 +1613,13 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         self,
         user_id: str,
         *,
-        admin_ip: str,
-        admin_id: str,
+        admin_ip: str | None = None,
+        admin_id: str | None = None,
         reason: str | None = None,
         email: str | None = None,
+        actor: AuditActor | None = None,
     ) -> None:
-        """Resume a soft-deleted user: set status='active' and audit.
+        """Resume a soft-deleted user: set status='active' and audit it as *actor*.
 
         API keys remain ``revoked`` — the user re-creates one through the
         normal flow.  All mutations and the audit-log insert are atomic.
@@ -1590,6 +1629,9 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         hard-delete claim. The row lock makes resume and the operational
         hard-delete claim mutually exclusive.
         """
+        audit = audit_columns(
+            admin_ip=admin_ip, target_user_id=None, actor=actor, target=AuditTarget.user(user_id)
+        )
         async with self._pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 "SELECT status, hard_delete_pending FROM users WHERE id = $1 FOR UPDATE",
@@ -1598,15 +1640,12 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             if row is not None and row["hard_delete_pending"]:
                 raise HardDeleteStateChanged(f"Account {user_id} has a hard-delete in progress.")
             await conn.execute("UPDATE users SET status = 'active' WHERE id = $1", user_id)
-            await conn.execute(
-                "INSERT INTO admin_audit_log "
-                "(admin_ip, action, target_user_id, details, success) "
-                "VALUES ($1, $2, $3, $4::jsonb, $5)",
-                admin_ip,
-                "resume_user",
-                user_id,
-                json.dumps({"admin_id": admin_id, "email": email, "reason": reason}),
-                True,
+            await insert_audit_row(
+                conn,
+                columns=audit,
+                action="resume_user",
+                details={"admin_id": admin_id, "email": email, "reason": reason},
+                success=True,
             )
 
     async def hard_delete_user(
@@ -1614,10 +1653,11 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         user_id: str,
         *,
         claim_token: str,
-        admin_ip: str,
-        admin_id: str,
+        admin_ip: str | None = None,
+        admin_id: str | None = None,
         reason: str | None = None,
         email: str | None = None,
+        actor: AuditActor | None = None,
     ) -> dict[str, int]:
         """Permanently delete a user row and all operationally-linked rows.
 
@@ -1625,7 +1665,13 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         the caller must purge them separately via
         ``LogStore.hard_delete_user_data``.  Returns ``{table_name: row_count}``
         for audit details.
+
+        The erased audit rows are those whose user target is this account;
+        rows it wrote as an actor about something else keep its id.
         """
+        audit = audit_columns(
+            admin_ip=admin_ip, target_user_id=None, actor=actor, target=AuditTarget.user(user_id)
+        )
 
         def _row_count(status: str) -> int:
             # asyncpg execute() returns "DELETE <n>" / "UPDATE <n>" — parse n
@@ -1689,22 +1735,17 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             # entries for this user were wiped above — the caller accepted
             # that compliance loss.  No FK on target_user_id, so an orphan
             # reference here is fine.
-            await conn.execute(
-                "INSERT INTO admin_audit_log "
-                "(admin_ip, action, target_user_id, details, success) "
-                "VALUES ($1, $2, $3, $4::jsonb, $5)",
-                admin_ip,
-                "hard_delete_user",
-                user_id,
-                json.dumps(
-                    {
-                        "admin_id": admin_id,
-                        "email": email,
-                        "reason": reason,
-                        "rows_wiped": counts,
-                    }
-                ),
-                True,
+            await insert_audit_row(
+                conn,
+                columns=audit,
+                action="hard_delete_user",
+                details={
+                    "admin_id": admin_id,
+                    "email": email,
+                    "reason": reason,
+                    "rows_wiped": counts,
+                },
+                success=True,
             )
 
         return counts
@@ -1797,15 +1838,15 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         # Shared SQL fragments used by both the count query and the row
         # query so total/rows are guaranteed consistent.
         # ──────────────────────────────────────────────────────────────────
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
         from decimal import Decimal as _Decimal
 
         anomaly_multiplier = _Decimal("5.0")
         anomaly_min_today = _Decimal("1.00")
         anomaly_min_history_days = 3
-        today_str = datetime.now(timezone.utc).date().isoformat()
-        prior_7d_start = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
-        prior_7d_end = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+        today_str = datetime.now(UTC).date().isoformat()
+        prior_7d_start = (datetime.now(UTC).date() - timedelta(days=7)).isoformat()
+        prior_7d_end = (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
         schema = self._account_schema
 
         where_clauses: list[str] = []
@@ -2227,6 +2268,35 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                 f"{identity}, u.role, u.email_verified, u.preferences, u.max_concurrent_requests "
                 "FROM api_keys k "
                 "LEFT JOIN users u ON u.id = k.user_id "
+                "WHERE k.key_hash = $1 "
+                "  AND k.status = 'active' "
+                "  AND (k.expires_at IS NULL OR k.expires_at > NOW()) "
+                "  AND u.id IS NOT NULL AND u.status = 'active'",
+                key_hash,
+            )
+        return _coerce_user_row(row)
+
+    async def get_auth_context_with_spend(self, key_hash: str) -> Row | None:
+        """Auth context and today's spend in one round-trip (issue #185).
+
+        The identity projection and filters are :meth:`get_auth_context_by_key_hash`'s
+        exactly; the LEFT JOIN adds the owner's ``user_daily_cost`` counter for
+        the UTC-midnight day, ``COALESCE``d to ``0.0`` so a caller with no
+        counter row yet reads the same as the separate query's default. The
+        day expression is the counter write path's, so both sides of the quota
+        gate bucket midnight identically.
+        """
+        identity = self._account_schema.select(_JOINED_USER_IDENTITY, "u")
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT k.id, k.user_id, k.user_name, k.quota_daily_cost_usd, "
+                f"{identity}, u.role, u.email_verified, u.preferences, u.max_concurrent_requests, "
+                "COALESCE(s.cost_usd, 0) AS cost_usd "
+                "FROM api_keys k "
+                "LEFT JOIN users u ON u.id = k.user_id "
+                "LEFT JOIN user_daily_cost s "
+                "  ON s.user_id = k.user_id "
+                " AND s.day = to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') "
                 "WHERE k.key_hash = $1 "
                 "  AND k.status = 'active' "
                 "  AND (k.expires_at IS NULL OR k.expires_at > NOW()) "
@@ -3106,23 +3176,21 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
     async def log_admin_action(
         self,
         *,
-        admin_ip: str,
+        admin_ip: str | None = None,
         action: str,
         target_user_id: str | None = None,
         details: dict[str, Any] | None = None,
         success: bool = True,
+        actor: AuditActor | None = None,
+        target: AuditTarget | None = None,
     ) -> None:
-        """Insert a row into admin_audit_log."""
+        """Insert a row into admin_audit_log, attributed to *actor* and *target*."""
+        columns = audit_columns(
+            admin_ip=admin_ip, target_user_id=target_user_id, actor=actor, target=target
+        )
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO admin_audit_log "
-                "(admin_ip, action, target_user_id, details, success) "
-                "VALUES ($1, $2, $3, $4::jsonb, $5)",
-                admin_ip,
-                action,
-                target_user_id,
-                json.dumps(details) if details else None,
-                success,
+            await insert_audit_row(
+                conn, columns=columns, action=action, details=details, success=success
             )
 
     async def list_audit_log(
@@ -3156,8 +3224,7 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             total = count_row["total"] if count_row else 0
 
             rows = await conn.fetch(
-                f"SELECT id, timestamp, admin_ip, action, target_user_id, "
-                f"details, success FROM admin_audit_log "
+                f"SELECT {AUDIT_SELECT_COLUMNS} FROM admin_audit_log "
                 f"{where_sql} ORDER BY timestamp DESC "
                 f"LIMIT ${len(params) - 1} OFFSET ${len(params)}",
                 *params,
@@ -3632,6 +3699,58 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             )
         return _parse_command_tag_count(tag) > 0
 
+    async def list_route_capability_overrides_for_model(self, model_id: str) -> list[Row]:
+        """Return admin capability overrides for one model's routes, ordered by route_id."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT model_id, route_id, capabilities, updated_at, updated_by "
+                "FROM provider_route_capabilities WHERE model_id = $1 ORDER BY route_id",
+                model_id,
+            )
+        return [dict(r) for r in rows]
+
+    async def list_all_route_capability_overrides(self) -> list[Row]:
+        """Return all admin capability override rows ordered by model_id and route_id."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT model_id, route_id, capabilities, updated_at, updated_by "
+                "FROM provider_route_capabilities ORDER BY model_id, route_id"
+            )
+        return [dict(r) for r in rows]
+
+    async def upsert_route_capability_override(
+        self,
+        model_id: str,
+        route_id: str,
+        capabilities: dict[str, Any],
+        updated_by: str | None,
+    ) -> None:
+        """Upsert the capabilities an admin set for one route."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO provider_route_capabilities "
+                "(model_id, route_id, capabilities, updated_at, updated_by) "
+                "VALUES ($1, $2, $3::jsonb, NOW(), $4) "
+                "ON CONFLICT (model_id, route_id) DO UPDATE SET "
+                "capabilities = EXCLUDED.capabilities, "
+                "updated_at = NOW(), "
+                "updated_by = EXCLUDED.updated_by",
+                model_id,
+                route_id,
+                json.dumps(capabilities),
+                updated_by,
+            )
+
+    async def delete_route_capability_override(self, model_id: str, route_id: str) -> bool:
+        """Delete one route's capability override. Returns True when removed."""
+        async with self._pool.acquire() as conn:
+            tag = await conn.execute(
+                "DELETE FROM provider_route_capabilities WHERE model_id = $1 AND route_id = $2",
+                model_id,
+                route_id,
+            )
+        return _parse_command_tag_count(tag) > 0
+
     async def list_provider_route_configs_for_model(self, model_id: str) -> list[Row]:
         """Return provider route override rows for one model ordered by route_id."""
         async with self._pool.acquire() as conn:
@@ -3717,7 +3836,7 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             rows = await conn.fetch(
                 "SELECT model_id, route_id, route_type, provider, openrouter_sort, base_url, api_key_id, "
                 "provider_model_id, quota_limit, concurrency_limit, weight, pricing, capabilities, "
-                "created_at, updated_at, updated_by, deployment_type "
+                "created_at, updated_at, updated_by, deployment_type, endpoint_id "
                 "FROM provider_route_candidates WHERE model_id = $1 ORDER BY route_id",
                 model_id,
             )
@@ -3729,7 +3848,7 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             rows = await conn.fetch(
                 "SELECT model_id, route_id, route_type, provider, openrouter_sort, base_url, api_key_id, "
                 "provider_model_id, quota_limit, concurrency_limit, weight, pricing, capabilities, "
-                "created_at, updated_at, updated_by, deployment_type "
+                "created_at, updated_at, updated_by, deployment_type, endpoint_id "
                 "FROM provider_route_candidates ORDER BY model_id, route_id"
             )
         return [dict(r) for r in rows]
@@ -3751,6 +3870,7 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         capabilities: dict[str, Any] | None,
         updated_by: str | None,
         deployment_type: str = "auto",
+        endpoint_id: str | None = None,
     ) -> None:
         """Upsert a DB-backed runtime provider route candidate row."""
         async with self._pool.acquire() as conn:
@@ -3758,9 +3878,9 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                 "INSERT INTO provider_route_candidates "
                 "(model_id, route_id, route_type, provider, openrouter_sort, base_url, api_key_id, "
                 "provider_model_id, quota_limit, concurrency_limit, weight, pricing, capabilities, "
-                "created_at, updated_at, updated_by, deployment_type) "
+                "created_at, updated_at, updated_by, deployment_type, endpoint_id) "
                 "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, "
-                "NOW(), NOW(), $14, $15) "
+                "NOW(), NOW(), $14, $15, $16) "
                 "ON CONFLICT (model_id, route_id) DO UPDATE SET "
                 "route_type = EXCLUDED.route_type, "
                 "provider = EXCLUDED.provider, "
@@ -3779,7 +3899,8 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                 "provider_route_candidates.capabilities), "
                 "updated_at = NOW(), "
                 "updated_by = EXCLUDED.updated_by, "
-                "deployment_type = EXCLUDED.deployment_type",
+                "deployment_type = EXCLUDED.deployment_type, "
+                "endpoint_id = EXCLUDED.endpoint_id",
                 model_id,
                 route_id,
                 route_type,
@@ -3795,7 +3916,180 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                 json.dumps(capabilities) if capabilities is not None else None,
                 updated_by,
                 deployment_type,
+                endpoint_id,
             )
+
+    async def update_provider_route_candidate(
+        self,
+        model_id: str,
+        route_id: str,
+        *,
+        expected_updated_at: datetime,
+        provider: str,
+        openrouter_sort: str | None,
+        base_url: str,
+        api_key_id: str | None,
+        provider_model_id: str,
+        quota_limit: int | None,
+        concurrency_limit: int | None,
+        pricing: dict[str, str] | None,
+        deployment_type: str,
+        endpoint_id: str | None,
+        previous_endpoint_id: str,
+        updated_by: str | None,
+    ) -> datetime | None:
+        """Edit one runtime provider route candidate in place, moving its weight override."""
+        new_endpoint_id = endpoint_id or route_id
+        async with self._pool.acquire() as conn, conn.transaction():
+            updated_at = await conn.fetchval(
+                "UPDATE provider_route_candidates SET "
+                "provider = $4, openrouter_sort = $5, base_url = $6, api_key_id = $7, "
+                "provider_model_id = $8, quota_limit = $9, concurrency_limit = $10, "
+                "pricing = $11::jsonb, deployment_type = $12, endpoint_id = $13, "
+                "updated_at = clock_timestamp(), updated_by = $14 "
+                "WHERE model_id = $1 AND route_id = $2 AND updated_at = $3 "
+                "RETURNING updated_at",
+                model_id,
+                route_id,
+                expected_updated_at,
+                provider,
+                openrouter_sort,
+                base_url,
+                api_key_id,
+                provider_model_id,
+                quota_limit,
+                concurrency_limit,
+                json.dumps(pricing) if pricing is not None else None,
+                deployment_type,
+                endpoint_id,
+                updated_by,
+            )
+            if updated_at is None:
+                return None
+            if new_endpoint_id != previous_endpoint_id:
+                # A row already at the new id belongs to no live route (the
+                # caller refuses a move onto one), so it must not start
+                # weighting this route.
+                await conn.execute(
+                    "DELETE FROM provider_weight_overrides "
+                    "WHERE model_id = $1 AND endpoint_id = $2",
+                    model_id,
+                    new_endpoint_id,
+                )
+                await conn.execute(
+                    "UPDATE provider_weight_overrides SET endpoint_id = $3 "
+                    "WHERE model_id = $1 AND endpoint_id = $2",
+                    model_id,
+                    previous_endpoint_id,
+                    new_endpoint_id,
+                )
+        return updated_at
+
+    async def list_all_provider_route_states(self) -> list[Row]:
+        """Return every stored route state ordered by model and route."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT model_id, route_id, disabled, removed, updated_at, updated_by "
+                "FROM provider_route_states ORDER BY model_id, route_id"
+            )
+        return [dict(r) for r in rows]
+
+    async def set_provider_route_state(
+        self,
+        model_id: str,
+        route_id: str,
+        *,
+        disabled: bool,
+        removed: bool,
+        updated_by: str | None,
+        expected_disabled: bool | None = None,
+        expected_removed: bool | None = None,
+    ) -> bool:
+        """Upsert one route's state, or delete its row when neither flag is set.
+
+        With an expectation, each case is one statement, so a concurrent write
+        either lands first and makes this one match nothing, or lands after it.
+        """
+        if (expected_disabled is None) != (expected_removed is None):
+            raise ValueError("expected_disabled and expected_removed go together")
+        expecting = expected_disabled is not None
+        # A route with neither flag set has no row.
+        expected_row = bool(expected_disabled or expected_removed)
+        async with self._pool.acquire() as conn:
+            if expecting and not expected_row:
+                if not disabled and not removed:
+                    # Nothing to write; the route must still have no state.
+                    current = await conn.fetchrow(
+                        "SELECT disabled, removed FROM provider_route_states "
+                        "WHERE model_id = $1 AND route_id = $2",
+                        model_id,
+                        route_id,
+                    )
+                    return current is None or not (current["disabled"] or current["removed"])
+                # Insert, or take over a row that sets neither flag; a row any
+                # other process stored in between keeps its flags.
+                written = await conn.fetchval(
+                    "INSERT INTO provider_route_states "
+                    "(model_id, route_id, disabled, removed, updated_at, updated_by) "
+                    "VALUES ($1, $2, $3, $4, NOW(), $5) "
+                    "ON CONFLICT (model_id, route_id) DO UPDATE SET "
+                    "disabled = EXCLUDED.disabled, removed = EXCLUDED.removed, "
+                    "updated_at = NOW(), updated_by = EXCLUDED.updated_by "
+                    "WHERE provider_route_states.disabled = FALSE "
+                    "AND provider_route_states.removed = FALSE "
+                    "RETURNING TRUE",
+                    model_id,
+                    route_id,
+                    disabled,
+                    removed,
+                    updated_by,
+                )
+                return bool(written)
+            if expected_row:
+                if not disabled and not removed:
+                    tag = await conn.execute(
+                        "DELETE FROM provider_route_states "
+                        "WHERE model_id = $1 AND route_id = $2 AND disabled = $3 AND removed = $4",
+                        model_id,
+                        route_id,
+                        expected_disabled,
+                        expected_removed,
+                    )
+                else:
+                    tag = await conn.execute(
+                        "UPDATE provider_route_states SET disabled = $5, removed = $6, "
+                        "updated_at = NOW(), updated_by = $7 "
+                        "WHERE model_id = $1 AND route_id = $2 AND disabled = $3 AND removed = $4",
+                        model_id,
+                        route_id,
+                        expected_disabled,
+                        expected_removed,
+                        disabled,
+                        removed,
+                        updated_by,
+                    )
+                return _parse_command_tag_count(tag) > 0
+            if not disabled and not removed:
+                await conn.execute(
+                    "DELETE FROM provider_route_states WHERE model_id = $1 AND route_id = $2",
+                    model_id,
+                    route_id,
+                )
+                return True
+            await conn.execute(
+                "INSERT INTO provider_route_states "
+                "(model_id, route_id, disabled, removed, updated_at, updated_by) "
+                "VALUES ($1, $2, $3, $4, NOW(), $5) "
+                "ON CONFLICT (model_id, route_id) DO UPDATE SET "
+                "disabled = EXCLUDED.disabled, removed = EXCLUDED.removed, "
+                "updated_at = NOW(), updated_by = EXCLUDED.updated_by",
+                model_id,
+                route_id,
+                disabled,
+                removed,
+                updated_by,
+            )
+            return True
 
     async def delete_provider_route_candidate(self, model_id: str, route_id: str) -> bool:
         """Delete a runtime provider route candidate row. Returns True when removed."""
@@ -3812,10 +4106,15 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         model_id: str,
         route_id: str,
     ) -> bool:
-        """Atomically delete a route candidate and any matching override row."""
+        """Atomically delete a route candidate, its override row and its route state."""
         async with self._pool.acquire() as conn, conn.transaction():
             await conn.execute(
                 "DELETE FROM provider_route_configs WHERE model_id = $1 AND route_id = $2",
+                model_id,
+                route_id,
+            )
+            await conn.execute(
+                "DELETE FROM provider_route_states WHERE model_id = $1 AND route_id = $2",
                 model_id,
                 route_id,
             )
@@ -3842,6 +4141,10 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                 model_id,
             )
             await conn.execute(
+                "DELETE FROM provider_route_states WHERE model_id = $1",
+                model_id,
+            )
+            await conn.execute(
                 "DELETE FROM model_visibility_overrides WHERE model_id = $1",
                 model_id,
             )
@@ -3851,6 +4154,10 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             )
             await conn.execute(
                 "DELETE FROM provider_weight_overrides WHERE model_id = $1",
+                model_id,
+            )
+            await conn.execute(
+                "DELETE FROM provider_route_capabilities WHERE model_id = $1",
                 model_id,
             )
             await conn.execute(
@@ -3962,10 +4269,10 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         day: str | None = None,
     ) -> None:
         """Atomically increment the daily cost counter via upsert."""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         if day is None:
-            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            day = datetime.now(UTC).strftime("%Y-%m-%d")
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO user_daily_cost (user_id, day, cost_usd, requests, last_request_at) "
@@ -4140,9 +4447,9 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         if days <= 0:
             return []
         # ``day`` is stored as TEXT (YYYY-MM-DD) — compute cutoff in Python.
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
-        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days - 1)).isoformat()
+        cutoff = (datetime.now(UTC).date() - timedelta(days=days - 1)).isoformat()
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT day, cost_usd, requests "
@@ -4170,9 +4477,9 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         """Bulk variant of get_user_cost_history — one query, grouped by user."""
         if not user_ids or days <= 0:
             return {}
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
-        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days - 1)).isoformat()
+        cutoff = (datetime.now(UTC).date() - timedelta(days=days - 1)).isoformat()
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT user_id, day, cost_usd, requests "
@@ -4215,15 +4522,15 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         of their key's quota_daily_cost_usd. Users without quota set are
         excluded.
         """
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
         from decimal import Decimal as _Decimal
 
         if anomaly_min_today is None:
             anomaly_min_today = _Decimal("1.00")
 
-        today_str = datetime.now(timezone.utc).date().isoformat()
-        prior_7d_start = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
-        prior_7d_end = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+        today_str = datetime.now(UTC).date().isoformat()
+        prior_7d_start = (datetime.now(UTC).date() - timedelta(days=7)).isoformat()
+        prior_7d_end = (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
         identity = ("id", "email", "login_name", "phone", "user_name", "role")
         schema = self._account_schema
 
@@ -4848,6 +5155,25 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
                 provider,
             )
         return {r["key_hash"]: r["min_role"] for r in rows}
+
+    async def list_all_disabled_provider_env_keys(self) -> list[tuple[str, str, str]]:
+        """Return ``(provider, key_hash, key_prefix)`` for all disabled env keys."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT provider, key_hash, key_prefix FROM disabled_provider_env_keys "
+                "ORDER BY provider ASC, key_hash ASC"
+            )
+        return [(r["provider"], r["key_hash"], r["key_prefix"]) for r in rows]
+
+    async def list_all_provider_env_key_reservations(self) -> list[tuple[str, str, str, str]]:
+        """Return ``(provider, key_hash, key_prefix, min_role)`` for all reserved env keys."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT provider, key_hash, key_prefix, min_role "
+                "FROM provider_env_key_min_roles "
+                "ORDER BY provider ASC, key_hash ASC"
+            )
+        return [(r["provider"], r["key_hash"], r["key_prefix"], r["min_role"]) for r in rows]
 
 
 def _mask_provider_key(api_key: str) -> str:

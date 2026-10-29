@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from decimal import Decimal
     from typing import Literal
 
+    from serving.audit import AuditActor, AuditTarget
+
 
 # ---------------------------------------------------------------------------
 # Cached wrapper
@@ -186,6 +188,16 @@ class CachedOperationalStore(OperationalStore):
             )
         return result
 
+    async def get_auth_context_with_spend(self, key_hash: str) -> Row | None:
+        """Delegate to wrapped store — deliberately not cached.
+
+        The merged row (issue #185) carries the ``user_daily_cost`` spend the
+        quota gate reads on every request; caching it would stale the gate by
+        the auth TTL. One round-trip is also what the identity cache saves on
+        the miss path, so there is nothing left for a cache to buy here.
+        """
+        return await self._store.get_auth_context_with_spend(key_hash)
+
     async def get_auth_context_lightweight(self, key_hash: str) -> Row | None:
         """Return cached lightweight auth context (30 s TTL), generation-fenced."""
         ck = self._auth_light_key(key_hash)
@@ -257,11 +269,12 @@ class CachedOperationalStore(OperationalStore):
         self,
         user_id: str,
         *,
-        admin_ip: str,
-        admin_id: str,
+        admin_ip: str | None = None,
+        admin_id: str | None = None,
         reason: str | None = None,
         email: str | None = None,
         self_service: bool = False,
+        actor: AuditActor | None = None,
     ) -> None:
         """Delegate then invalidate user + auth caches."""
         await self._store.delete_user(
@@ -271,6 +284,7 @@ class CachedOperationalStore(OperationalStore):
             reason=reason,
             email=email,
             self_service=self_service,
+            actor=actor,
         )
         await self._cache.delete(self._user_key(user_id))
         # Also purge any auth entries referencing this user's keys
@@ -293,14 +307,20 @@ class CachedOperationalStore(OperationalStore):
         self,
         user_id: str,
         *,
-        admin_ip: str,
-        admin_id: str,
+        admin_ip: str | None = None,
+        admin_id: str | None = None,
         reason: str | None = None,
         email: str | None = None,
+        actor: AuditActor | None = None,
     ) -> None:
         """Delegate then invalidate user + auth caches."""
         await self._store.resume_user(
-            user_id, admin_ip=admin_ip, admin_id=admin_id, reason=reason, email=email
+            user_id,
+            admin_ip=admin_ip,
+            admin_id=admin_id,
+            reason=reason,
+            email=email,
+            actor=actor,
         )
         await self._cache.delete(self._user_key(user_id))
         await self.invalidate_auth_caches()
@@ -310,10 +330,11 @@ class CachedOperationalStore(OperationalStore):
         user_id: str,
         *,
         claim_token: str,
-        admin_ip: str,
-        admin_id: str,
+        admin_ip: str | None = None,
+        admin_id: str | None = None,
         reason: str | None = None,
         email: str | None = None,
+        actor: AuditActor | None = None,
     ) -> dict[str, int]:
         """Delegate then invalidate user + auth caches."""
         counts = await self._store.hard_delete_user(
@@ -323,6 +344,7 @@ class CachedOperationalStore(OperationalStore):
             admin_id=admin_id,
             reason=reason,
             email=email,
+            actor=actor,
         )
         await self._cache.delete(self._user_key(user_id))
         await self.invalidate_auth_caches()
@@ -454,7 +476,8 @@ class CachedOperationalStore(OperationalStore):
         marker_key: str,
         marker_value: str,
         code_key: str,
-        admin_ip: str,
+        admin_ip: str | None = None,
+        actor: AuditActor | None = None,
     ) -> bool:
         """Delegate to wrapped store (a new user id has nothing cached)."""
         return await self._store.create_first_admin(
@@ -466,6 +489,7 @@ class CachedOperationalStore(OperationalStore):
             marker_value=marker_value,
             code_key=code_key,
             admin_ip=admin_ip,
+            actor=actor,
         )
 
     async def get_user_counts_by_status(self) -> dict[str, int]:
@@ -910,11 +934,13 @@ class CachedOperationalStore(OperationalStore):
     async def log_admin_action(
         self,
         *,
-        admin_ip: str,
+        admin_ip: str | None = None,
         action: str,
         target_user_id: str | None = None,
         details: dict[str, Any] | None = None,
         success: bool = True,
+        actor: AuditActor | None = None,
+        target: AuditTarget | None = None,
     ) -> None:
         """Delegate to wrapped store."""
         return await self._store.log_admin_action(
@@ -923,6 +949,8 @@ class CachedOperationalStore(OperationalStore):
             target_user_id=target_user_id,
             details=details,
             success=success,
+            actor=actor,
+            target=target,
         )
 
     async def list_audit_log(
@@ -1125,6 +1153,30 @@ class CachedOperationalStore(OperationalStore):
         """Delegate to wrapped store."""
         return await self._store.delete_weight_override(model_id, endpoint_id)
 
+    async def list_route_capability_overrides_for_model(self, model_id: str) -> list[Row]:
+        """Delegate to wrapped store."""
+        return await self._store.list_route_capability_overrides_for_model(model_id)
+
+    async def list_all_route_capability_overrides(self) -> list[Row]:
+        """Delegate to wrapped store."""
+        return await self._store.list_all_route_capability_overrides()
+
+    async def upsert_route_capability_override(
+        self,
+        model_id: str,
+        route_id: str,
+        capabilities: dict[str, Any],
+        updated_by: str | None,
+    ) -> None:
+        """Delegate to wrapped store."""
+        await self._store.upsert_route_capability_override(
+            model_id, route_id, capabilities, updated_by
+        )
+
+    async def delete_route_capability_override(self, model_id: str, route_id: str) -> bool:
+        """Delegate to wrapped store."""
+        return await self._store.delete_route_capability_override(model_id, route_id)
+
     async def list_provider_route_configs_for_model(self, model_id: str) -> list[Row]:
         """Delegate to wrapped store."""
         return await self._store.list_provider_route_configs_for_model(model_id)
@@ -1191,6 +1243,7 @@ class CachedOperationalStore(OperationalStore):
         capabilities: dict[str, Any] | None,
         updated_by: str | None,
         deployment_type: str = "auto",
+        endpoint_id: str | None = None,
     ) -> None:
         """Delegate to wrapped store."""
         await self._store.upsert_provider_route_candidate(
@@ -1209,6 +1262,71 @@ class CachedOperationalStore(OperationalStore):
             capabilities,
             updated_by,
             deployment_type=deployment_type,
+            endpoint_id=endpoint_id,
+        )
+
+    async def update_provider_route_candidate(
+        self,
+        model_id: str,
+        route_id: str,
+        *,
+        expected_updated_at: datetime,
+        provider: str,
+        openrouter_sort: str | None,
+        base_url: str,
+        api_key_id: str | None,
+        provider_model_id: str,
+        quota_limit: int | None,
+        concurrency_limit: int | None,
+        pricing: dict[str, str] | None,
+        deployment_type: str,
+        endpoint_id: str | None,
+        previous_endpoint_id: str,
+        updated_by: str | None,
+    ) -> datetime | None:
+        """Delegate to wrapped store."""
+        return await self._store.update_provider_route_candidate(
+            model_id,
+            route_id,
+            expected_updated_at=expected_updated_at,
+            provider=provider,
+            openrouter_sort=openrouter_sort,
+            base_url=base_url,
+            api_key_id=api_key_id,
+            provider_model_id=provider_model_id,
+            quota_limit=quota_limit,
+            concurrency_limit=concurrency_limit,
+            pricing=pricing,
+            deployment_type=deployment_type,
+            endpoint_id=endpoint_id,
+            previous_endpoint_id=previous_endpoint_id,
+            updated_by=updated_by,
+        )
+
+    async def list_all_provider_route_states(self) -> list[Row]:
+        """Delegate to wrapped store."""
+        return await self._store.list_all_provider_route_states()
+
+    async def set_provider_route_state(
+        self,
+        model_id: str,
+        route_id: str,
+        *,
+        disabled: bool,
+        removed: bool,
+        updated_by: str | None,
+        expected_disabled: bool | None = None,
+        expected_removed: bool | None = None,
+    ) -> bool:
+        """Delegate to wrapped store."""
+        return await self._store.set_provider_route_state(
+            model_id,
+            route_id,
+            disabled=disabled,
+            removed=removed,
+            updated_by=updated_by,
+            expected_disabled=expected_disabled,
+            expected_removed=expected_removed,
         )
 
     async def delete_provider_route_candidate(self, model_id: str, route_id: str) -> bool:
@@ -1496,6 +1614,14 @@ class CachedOperationalStore(OperationalStore):
     ) -> list[tuple[str, str, str]]:
         """Delegate to wrapped store."""
         return await self._store.list_provider_env_key_reservations(provider)
+
+    async def list_all_disabled_provider_env_keys(self) -> list[tuple[str, str, str]]:
+        """Delegate to wrapped store."""
+        return await self._store.list_all_disabled_provider_env_keys()
+
+    async def list_all_provider_env_key_reservations(self) -> list[tuple[str, str, str, str]]:
+        """Delegate to wrapped store."""
+        return await self._store.list_all_provider_env_key_reservations()
 
 
 __all__ = [

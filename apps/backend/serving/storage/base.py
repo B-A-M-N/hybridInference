@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from datetime import datetime
     from decimal import Decimal
 
+    from serving.audit import AuditActor, AuditTarget
+
 
 @dataclass
 class ProviderKeyRow:
@@ -249,7 +251,8 @@ class OperationalStore(ABC):
         marker_key: str,
         marker_value: str,
         code_key: str,
-        admin_ip: str,
+        admin_ip: str | None = None,
+        actor: AuditActor | None = None,
     ) -> bool:
         """Create the deployment's first administrator, at most once.
 
@@ -257,8 +260,9 @@ class OperationalStore(ABC):
         users table is empty and the setup marker *marker_key* absent, insert
         an active, verified ``admin`` without an email address, write the
         marker, delete the setup code stored under *code_key* and audit
-        ``setup.admin_created``. Returns False, writing nothing, when setup
-        has already been completed.
+        ``setup.admin_created`` by *actor* (a ``bootstrap`` actor: no account
+        existed to act) with the new account as its user target. Returns
+        False, writing nothing, when setup has already been completed.
         """
 
     @abstractmethod
@@ -294,16 +298,20 @@ class OperationalStore(ABC):
         self,
         user_id: str,
         *,
-        admin_ip: str,
-        admin_id: str,
+        admin_ip: str | None = None,
+        admin_id: str | None = None,
         reason: str | None = None,
         email: str | None = None,
         self_service: bool = False,
+        actor: AuditActor | None = None,
     ) -> None:
         """Soft-delete: set status='deleted', revoke keys, purge sessions/tokens.
 
         All mutations and the audit-log insert must be atomic (single
-        transaction). *self_service* marks the audit entry as the account
+        transaction). The audit row is attributed to *actor* (see
+        ``log_admin_action``); *admin_id*, the actor's display identity, is
+        kept in its details as ``admin_id`` like the resume and hard-delete
+        rows. *self_service* marks the audit entry as the account
         owner's own deletion rather than an administrator's, and must raise
         ``SelfDeleteRefused`` without changing anything unless the account,
         read under the same transaction's row lock, is still active and not
@@ -338,12 +346,13 @@ class OperationalStore(ABC):
         self,
         user_id: str,
         *,
-        admin_ip: str,
-        admin_id: str,
+        admin_ip: str | None = None,
+        admin_id: str | None = None,
         reason: str | None = None,
         email: str | None = None,
+        actor: AuditActor | None = None,
     ) -> None:
-        """Resume a soft-deleted user: set status='active' and audit.
+        """Resume a soft-deleted user: set status='active' and audit it as *actor*.
 
         API keys remain ``revoked`` — the user must re-create one through
         the normal flow.  All mutations and the audit-log insert are atomic.
@@ -355,10 +364,11 @@ class OperationalStore(ABC):
         user_id: str,
         *,
         claim_token: str,
-        admin_ip: str,
-        admin_id: str,
+        admin_ip: str | None = None,
+        admin_id: str | None = None,
         reason: str | None = None,
         email: str | None = None,
+        actor: AuditActor | None = None,
     ) -> dict[str, int]:
         """Permanently delete a user row and all operationally-linked rows.
 
@@ -369,10 +379,12 @@ class OperationalStore(ABC):
         - ``email_verification_tokens``
         - ``password_reset_tokens``
         - ``user_daily_cost``
-        - ``admin_audit_log`` rows referencing this user (compliance loss
-          accepted at the caller level)
+        - ``admin_audit_log`` rows whose user target is this user (compliance
+          loss accepted at the caller level); rows the account performed as
+          an actor about other objects are kept
         - ``users`` row itself
-        - Inserts a NEW ``admin_audit_log`` row for the hard-delete itself.
+        - Inserts a NEW ``admin_audit_log`` row for the hard-delete itself,
+          attributed to *actor*.
 
         ``api_logs`` and ``email_broadcast_recipients`` live in the LogStore,
         not this contract — the caller must purge them separately via
@@ -507,6 +519,21 @@ class OperationalStore(ABC):
 
         Do NOT split into narrower lookups — this is the hot-path method
         and must resolve in one round-trip.
+        """
+
+    @abstractmethod
+    async def get_auth_context_with_spend(self, key_hash: str) -> Row | None:
+        """Auth context plus today's spend, for one round-trip (issue #185).
+
+        Same projection and the same active-key/active-user filters as
+        :meth:`get_auth_context_by_key_hash`, plus a ``cost_usd`` field: the
+        ``user_daily_cost`` counter for the key's owner, UTC-midnight day,
+        ``0.0`` when no counter row exists. ``None`` means the key did not
+        resolve, exactly like the identity-only lookup.
+
+        Not cached: the quota gate reads ``cost_usd`` on every request, and
+        caching the merged row would stale the gate by the auth TTL. The
+        identity-only lookup above keeps its cache; this one stays fresh.
         """
 
     @abstractmethod
@@ -933,13 +960,26 @@ class OperationalStore(ABC):
     async def log_admin_action(
         self,
         *,
-        admin_ip: str,
+        admin_ip: str | None = None,
         action: str,
         target_user_id: str | None = None,
         details: dict[str, Any] | None = None,
         success: bool = True,
+        actor: AuditActor | None = None,
+        target: AuditTarget | None = None,
     ) -> None:
-        """Insert a row into admin_audit_log."""
+        """Insert a row into admin_audit_log.
+
+        *actor* and *target* are the row's attribution (see
+        :mod:`serving.audit`): ``actor_type`` / ``actor_id`` / ``source_ip``
+        come from the actor, with ``admin_ip`` mirroring its address, and
+        ``target_user_id`` is set only for a user target. A caller that
+        passes neither writes a legacy row: *admin_ip* and *target_user_id*
+        stored raw as given, and every attribution column NULL. A legacy
+        *target_user_id* stays untyped; its type is never inferred from it.
+        Passing a legacy argument together with the actor or target it would
+        contradict raises ``ValueError``.
+        """
 
     @abstractmethod
     async def list_audit_log(
@@ -950,7 +990,12 @@ class OperationalStore(ABC):
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[int, list[Row]]:
-        """Return ``(total_count, audit_rows)`` with optional filters."""
+        """Return ``(total_count, audit_rows)`` with optional filters.
+
+        Each row has the legacy columns and the attribution columns
+        (``actor_type``, ``actor_id``, ``target_type``, ``target_id``), NULL
+        for a row written without them.
+        """
 
     # -- cost counters (user_daily_cost table) ---------------------------------
 
@@ -1265,6 +1310,32 @@ class OperationalStore(ABC):
         """Delete a provider weight override row. Returns True if removed."""
 
     @abstractmethod
+    async def list_route_capability_overrides_for_model(self, model_id: str) -> list[Row]:
+        """Return admin capability overrides for one model's routes, ordered by route_id."""
+
+    @abstractmethod
+    async def list_all_route_capability_overrides(self) -> list[Row]:
+        """Return all admin capability override rows ordered by model_id and route_id."""
+
+    @abstractmethod
+    async def upsert_route_capability_override(
+        self,
+        model_id: str,
+        route_id: str,
+        capabilities: dict[str, Any],
+        updated_by: str | None,
+    ) -> None:
+        """Upsert the capabilities an admin set for one route.
+
+        The row overrides what the route was given by ``models.yaml`` or declared
+        with when it was created; deleting it returns the route to that value.
+        """
+
+    @abstractmethod
+    async def delete_route_capability_override(self, model_id: str, route_id: str) -> bool:
+        """Delete one route's capability override. Returns True if removed."""
+
+    @abstractmethod
     async def list_provider_route_configs_for_model(self, model_id: str) -> list[Row]:
         """Return provider route override rows for one model ordered by route_id."""
 
@@ -1319,6 +1390,7 @@ class OperationalStore(ABC):
         capabilities: dict[str, Any] | None,
         updated_by: str | None,
         deployment_type: str = "auto",
+        endpoint_id: str | None = None,
     ) -> None:
         """Upsert a DB-backed runtime provider route candidate.
 
@@ -1326,6 +1398,71 @@ class OperationalStore(ABC):
         cap, input modalities and tool support. None declares nothing: a new
         row stores NULL and an existing row keeps what it has, so a stored
         declaration is never cleared by a write that did not carry one.
+        ``endpoint_id`` is the route's endpoint id when an edit moved it away
+        from ``route_id``; None means the two are the same.
+        """
+
+    @abstractmethod
+    async def update_provider_route_candidate(
+        self,
+        model_id: str,
+        route_id: str,
+        *,
+        expected_updated_at: datetime,
+        provider: str,
+        openrouter_sort: str | None,
+        base_url: str,
+        api_key_id: str | None,
+        provider_model_id: str,
+        quota_limit: int | None,
+        concurrency_limit: int | None,
+        pricing: dict[str, str] | None,
+        deployment_type: str,
+        endpoint_id: str | None,
+        previous_endpoint_id: str,
+        updated_by: str | None,
+    ) -> datetime | None:
+        """Edit one runtime provider route candidate in place.
+
+        The row is written only while its ``updated_at`` still equals
+        ``expected_updated_at``, so an edit made from stale state matches
+        nothing. ``endpoint_id`` None means the route's endpoint id is its
+        ``route_id``. When the effective endpoint id differs from
+        ``previous_endpoint_id``, the route's weight override moves with it in
+        the same transaction, replacing any leftover row at the new id. Route
+        type, weight and capabilities are left as stored.
+
+        Returns the row's new ``updated_at``, or None when no row matched.
+        """
+
+    @abstractmethod
+    async def list_all_provider_route_states(self) -> list[Row]:
+        """Return every route's admin state: disabled and/or removed, by (model, route id)."""
+
+    @abstractmethod
+    async def set_provider_route_state(
+        self,
+        model_id: str,
+        route_id: str,
+        *,
+        disabled: bool,
+        removed: bool,
+        updated_by: str | None,
+        expected_disabled: bool | None = None,
+        expected_removed: bool | None = None,
+    ) -> bool:
+        """Store one route's admin state; neither flag set deletes its row.
+
+        ``disabled`` keeps the route configured but out of selection, retries,
+        fallback and offload. ``removed`` takes a config (models.yaml) route out
+        of this deployment without touching the file. Both are keyed by the
+        route id, which survives edits that move the route's endpoint.
+
+        ``expected_disabled`` and ``expected_removed`` (given together) make the
+        write a compare-and-set: it happens only while the stored flags still
+        equal them, a route without a row counting as neither flag set, so a
+        write built from a stale snapshot cannot overwrite the other flag.
+        Returns whether the state was written (always True without them).
         """
 
     @abstractmethod
@@ -1338,7 +1475,7 @@ class OperationalStore(ABC):
         model_id: str,
         route_id: str,
     ) -> bool:
-        """Atomically delete a route candidate and any matching override row."""
+        """Atomically delete a route candidate, its override row and its route state."""
 
     @abstractmethod
     async def delete_runtime_model_state(
@@ -1616,6 +1753,14 @@ class OperationalStore(ABC):
         invisible and unclearable, while still applying the moment the credential
         returns.
         """
+
+    async def list_all_disabled_provider_env_keys(self) -> list[tuple[str, str, str]]:
+        """Return ``(provider, key_hash, key_prefix)`` for all disabled env keys."""
+        return []
+
+    async def list_all_provider_env_key_reservations(self) -> list[tuple[str, str, str, str]]:
+        """Return ``(provider, key_hash, key_prefix, min_role)`` for all reserved env keys."""
+        return []
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 """Tests for password reset functionality."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -48,7 +48,7 @@ async def test_reset_password_success(test_app, test_client, mock_operational_st
     """Test successful password reset with valid token."""
     mock_operational_store.get_reset_token.return_value = {
         "user_id": "user123",
-        "expires_at": datetime.now(timezone.utc) + timedelta(hours=1),
+        "expires_at": datetime.now(UTC) + timedelta(hours=1),
         "used_at": None,
     }
     mock_operational_store.update_user_fields.return_value = None
@@ -62,6 +62,25 @@ async def test_reset_password_success(test_app, test_client, mock_operational_st
     assert response.status_code == 200
     data = response.json()
     assert "password has been reset" in data["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_reset_password_retires_every_outstanding_link(
+    test_app, test_client, mock_operational_store
+):
+    """Every link the account still holds was sent to reset the password just replaced."""
+    mock_operational_store.get_reset_token.return_value = {
+        "user_id": "user123",
+        "expires_at": datetime.now(UTC) + timedelta(hours=1),
+        "used_at": None,
+    }
+
+    response = await test_client.post(
+        "/auth/reset-password", json={"token": "valid_token_123", "new_password": "NewPassword123"}
+    )
+
+    assert response.status_code == 200
+    mock_operational_store.delete_user_reset_tokens.assert_awaited_once_with("user123")
 
 
 @pytest.mark.asyncio
@@ -82,7 +101,7 @@ async def test_reset_password_expired_token(test_app, test_client, mock_operatio
     """Test password reset with expired token."""
     mock_operational_store.get_reset_token.return_value = {
         "user_id": "user123",
-        "expires_at": datetime.now(timezone.utc) - timedelta(hours=1),  # Expired
+        "expires_at": datetime.now(UTC) - timedelta(hours=1),  # Expired
         "used_at": None,
     }
 
@@ -99,8 +118,8 @@ async def test_reset_password_already_used_token(test_app, test_client, mock_ope
     """Test password reset with already used token."""
     mock_operational_store.get_reset_token.return_value = {
         "user_id": "user123",
-        "expires_at": datetime.now(timezone.utc) + timedelta(hours=1),
-        "used_at": datetime.now(timezone.utc) - timedelta(minutes=10),  # Already used
+        "expires_at": datetime.now(UTC) + timedelta(hours=1),
+        "used_at": datetime.now(UTC) - timedelta(minutes=10),  # Already used
     }
 
     response = await test_client.post(

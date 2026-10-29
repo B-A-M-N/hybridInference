@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { SettingsTab } from '../SettingsTab';
+import { chooseOption } from '@/test-utils/select';
+
+import { EMPTY_CONFIG, renderSettings } from './settingsTabHarness';
 
 vi.mock('next/navigation', () => ({
   usePathname: () => '/dashboard/admin/settings',
@@ -21,6 +22,7 @@ vi.mock('@/lib/api/admin', async () => {
     // SettingsTab issues these reads on mount regardless of which tab
     // the test exercises; unmocked they reach the real gateway.
     listModelConcurrency: vi.fn(async () => ({ models: [] })),
+    listBatchModelLimits: vi.fn(async () => ({ default_concurrency: 4, models: [] })),
     listRoutewiseSettings: vi.fn(async () => ({ settings: [] })),
     listRouteWeights: vi.fn(async () => []),
     getAlertSnooze: vi.fn(async () => ({
@@ -55,27 +57,18 @@ vi.mock('@/lib/api/admin', async () => {
   };
 });
 
+vi.mock('@/lib/api/config', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/api/config')>()),
+  // The page also holds the configuration; these tests need none of it.
+  getConfig: vi.fn(async () => EMPTY_CONFIG),
+}));
+
 vi.mock('react-hot-toast', () => ({
   default: {
     error: vi.fn(),
     success: vi.fn(),
   },
 }));
-
-function renderSettings() {
-  const queryClient = new QueryClient({
-    defaultOptions: {
-      queries: { retry: false },
-      mutations: { retry: false },
-    },
-  });
-
-  return render(
-    <QueryClientProvider client={queryClient}>
-      <SettingsTab />
-    </QueryClientProvider>,
-  );
-}
 
 describe('SettingsTab model visibility', () => {
   afterEach(() => {
@@ -85,11 +78,13 @@ describe('SettingsTab model visibility', () => {
   it('renders the section inside Admin Settings and shows update toasts', async () => {
     const api = await import('@/lib/api/admin');
 
-    renderSettings();
+    await renderSettings('Models');
 
-    expect(await screen.findByText('Model Visibility')).toBeInTheDocument();
-    const select = await screen.findByLabelText('Runtime override for gpt-4o-mini');
-    fireEvent.change(select, { target: { value: 'internal' } });
+    expect(await screen.findByRole('heading', { name: 'Model Visibility' })).toBeInTheDocument();
+    await screen.findByRole('combobox', { name: 'Runtime override for gpt-4o-mini' });
+    chooseOption('Runtime override for gpt-4o-mini', 'internal');
+    expect(api.updateModelVisibility).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes to Model Visibility' }));
 
     await waitFor(() => {
       expect(api.updateModelVisibility).toHaveBeenCalledWith('gpt-4o-mini', 'internal');
@@ -98,9 +93,9 @@ describe('SettingsTab model visibility', () => {
   });
 
   it('does not render routing subtabs inside Settings', async () => {
-    renderSettings();
+    await renderSettings('Setup');
 
-    expect(await screen.findByText('Feature Flags')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Usage Insights' })).toBeInTheDocument();
     expect(screen.queryByRole('tab', { name: 'Routing' })).not.toBeInTheDocument();
     expect(screen.queryByRole('tab', { name: 'Routewise' })).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Routing Weights' })).not.toBeInTheDocument();

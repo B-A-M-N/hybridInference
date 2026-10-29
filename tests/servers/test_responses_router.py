@@ -15,7 +15,7 @@ import pytest_asyncio
 from fastapi import FastAPI, Header, HTTPException
 from httpx import ASGITransport, AsyncClient
 
-from routing.executor import RouteExecutor
+from routing.routers import FixedRouter
 from serving.adapters.base import BaseAdapter, ModelConfig
 from serving.servers.auth import verify_api_key
 from serving.servers.concurrency import enforce_user_concurrency
@@ -179,7 +179,7 @@ async def responses_store() -> _FakeResponseStore:
 
 @pytest_asyncio.fixture
 async def responses_app(responses_store, mock_db_logger, mock_operational_store, mock_log_store):
-    router = RouteExecutor()
+    router = FixedRouter()
     router.register_route(TEXT_MODEL, [(TextAdapter(_cfg(TEXT_MODEL)), 1.0)])
     router.register_route(TOOL_MODEL, [(ToolAdapter(_cfg(TOOL_MODEL)), 1.0)])
 
@@ -781,10 +781,12 @@ async def test_a_malformed_request_is_a_400(responses_client, content, detail):
 
 @pytest.mark.asyncio
 async def test_a_non_dict_chat_result_is_a_502(responses_client, monkeypatch, responses_store):
-    async def odd_delegate(*args, **kwargs):
-        return "not a completion"
+    from serving.servers.routers.completions import ChatResponse
 
-    monkeypatch.setattr(responses, "chat_completions", odd_delegate)
+    async def odd_delegate(*args, **kwargs):
+        return ChatResponse("not a completion", None)
+
+    monkeypatch.setattr(responses, "execute_chat", odd_delegate)
 
     r = await responses_client.post(
         "/v1/responses", json={"model": TEXT_MODEL, "input": "hi"}, headers=_auth()
@@ -810,7 +812,7 @@ def _chunk(content: str | None = None, finish: str | None = None) -> bytes:
 
 
 async def _open_stream(monkeypatch, store, chunks: list[bytes], *, keep: bool = True):
-    """Run the streaming path over a delegate that yields ``chunks`` then hangs."""
+    """Re-frame a chat stream that yields ``chunks`` then hangs."""
     import asyncio
 
     async def upstream():
@@ -818,22 +820,8 @@ async def _open_stream(monkeypatch, store, chunks: list[bytes], *, keep: bool = 
             yield chunk
         await asyncio.Event().wait()  # the client leaves before the upstream finishes
 
-    async def delegate(*args, **kwargs):
-        return type("Delegate", (), {"body_iterator": upstream()})()
-
-    monkeypatch.setattr(responses, "chat_completions", delegate)
-    streaming = await responses._stream_response(
-        request=None,
-        http_response=None,
-        authorization=None,
-        user_ctx={},
-        router_exec=None,
-        log_store=None,
-        model_router_registry=None,
-        model_visibility_resolver=None,
-        completions_logger=None,
-        pricing_lookup=None,
-        cost_tracker=None,
+    return responses._response_events(
+        upstream(),
         response_store=store,
         body={"model": TEXT_MODEL, "input": "hi", "stream": True},
         model=TEXT_MODEL,
@@ -844,7 +832,6 @@ async def _open_stream(monkeypatch, store, chunks: list[bytes], *, keep: bool = 
         convo_messages=[{"role": "user", "content": "hi"}],
         user_id="test-user",
     )
-    return streaming.body_iterator
 
 
 async def _drain_background() -> None:
@@ -912,22 +899,8 @@ async def test_a_failed_stream_ends_with_response_failed_and_keeps_nothing(
         yield _chunk("Hel")
         yield b'data: {"error": {"code": "overloaded", "message": "try later"}}\n\n'
 
-    async def delegate(*args, **kwargs):
-        return type("Delegate", (), {"body_iterator": upstream()})()
-
-    monkeypatch.setattr(responses, "chat_completions", delegate)
-    streaming = await responses._stream_response(
-        request=None,
-        http_response=None,
-        authorization=None,
-        user_ctx={},
-        router_exec=None,
-        log_store=None,
-        model_router_registry=None,
-        model_visibility_resolver=None,
-        completions_logger=None,
-        pricing_lookup=None,
-        cost_tracker=None,
+    events = responses._response_events(
+        upstream(),
         response_store=responses_store,
         body={"model": TEXT_MODEL, "input": "hi", "stream": True},
         model=TEXT_MODEL,
@@ -939,7 +912,7 @@ async def test_a_failed_stream_ends_with_response_failed_and_keeps_nothing(
         user_id="test-user",
     )
 
-    text = "".join([event.decode() async for event in streaming.body_iterator])
+    text = "".join([event.decode() async for event in events])
 
     assert "event: response.failed" in text
     assert '"code": "overloaded"' in text or '"code":"overloaded"' in text

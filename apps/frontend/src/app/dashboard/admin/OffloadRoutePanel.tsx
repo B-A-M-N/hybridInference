@@ -3,10 +3,15 @@
 import { useEffect, useState } from 'react';
 import { useAccountToast } from '@/lib/hooks/useAccountToast';
 
+import { EditBar } from '@/components/features/admin/confirm/EditBar';
+import { useConfirmAction } from '@/components/features/admin/confirm/useConfirmAction';
+import { useReportEditing } from '@/components/features/admin/confirm/useReportEditing';
 import type { OffloadRoute, ProviderRoute } from '@/lib/api/admin';
 import { clearOffloadRoute, setOffloadRoute } from '@/lib/api/admin';
-import { getErrorMessage } from '@/lib/utils/errors';
 import { validateNumericSettingInput } from './numericSettingValidation';
+import { Select } from '@/components/ui/Select';
+
+const SECTION = 'Queue offload';
 
 // Prefilled for a model that has no offload route yet: long enough that a brief
 // burst is absorbed by the queue, short enough to be well inside the default
@@ -28,7 +33,15 @@ interface OffloadRoutePanelProps {
   loadError?: string | null;
   routeLabel: (route: ProviderRoute) => string;
   onChange: (modelId: string, offload: OffloadRoute | null) => void;
+  /**
+   * Whether a change is unsaved, a confirmation open or a write running, so the
+   * parent can hold the model selection.
+   */
+  onEditingChange?: (active: boolean) => void;
 }
+
+/** The fields as typed; a field left out shows what is stored. */
+type OffloadDrafts = Partial<Record<'routeId' | 'wait' | 'limit' | 'maxInput', string>>;
 
 type ValidatedLimit = { ok: true; value: number | null } | { ok: false; error: string };
 
@@ -67,23 +80,40 @@ export function OffloadRoutePanel({
   loadError,
   routeLabel,
   onChange,
+  onEditingChange,
 }: OffloadRoutePanelProps) {
   const toast = useAccountToast();
-  const [draftRouteId, setDraftRouteId] = useState(offload?.route_id ?? '');
-  const [draftWait, setDraftWait] = useState(
-    offload ? String(offload.wait_seconds) : DEFAULT_WAIT_SECONDS,
-  );
-  const [draftLimit, setDraftLimit] = useState(storedLimitText(offload?.engine_queue_limit));
-  const [draftMaxInput, setDraftMaxInput] = useState(storedLimitText(offload?.max_input_tokens));
-  const [saving, setSaving] = useState(false);
+  const confirmation = useConfirmAction();
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<OffloadDrafts>({});
 
-  // Start over whenever the model, or what is stored for it, changes.
+  // The form shows what is stored, or the defaults for a new route, until a
+  // field is changed.
+  const stored: Required<OffloadDrafts> = {
+    routeId: offload?.route_id ?? '',
+    wait: offload ? String(offload.wait_seconds) : DEFAULT_WAIT_SECONDS,
+    limit: storedLimitText(offload?.engine_queue_limit),
+    maxInput: storedLimitText(offload?.max_input_tokens),
+  };
+  const draftRouteId = drafts.routeId ?? stored.routeId;
+  const draftWait = drafts.wait ?? stored.wait;
+  const draftLimit = drafts.limit ?? stored.limit;
+  const draftMaxInput = drafts.maxInput ?? stored.maxInput;
+
+  // A field set back to what it shows unchanged is no draft.
+  const changeDraft = (field: keyof OffloadDrafts, value: string) =>
+    setDrafts((current) => {
+      const next = { ...current };
+      if (value === stored[field]) delete next[field];
+      else next[field] = value;
+      return next;
+    });
+
+  // Another model's drafts are never carried over.
   useEffect(() => {
-    setDraftRouteId(offload?.route_id ?? '');
-    setDraftWait(offload ? String(offload.wait_seconds) : DEFAULT_WAIT_SECONDS);
-    setDraftLimit(storedLimitText(offload?.engine_queue_limit));
-    setDraftMaxInput(storedLimitText(offload?.max_input_tokens));
-  }, [modelId, offload]);
+    setDrafts({});
+    setSaveError(null);
+  }, [modelId]);
 
   const maxWaitSeconds = queue?.maxWaitSeconds ?? null;
   const validatedWait = validateWait(draftWait);
@@ -92,58 +122,99 @@ export function OffloadRoutePanel({
   const storedRouteMissing =
     offload !== null && !routes.some((route) => route.route_id === offload.route_id);
   const hasOtherRoute = routes.length >= 2;
-  const dirty =
-    offload === null
-      ? draftRouteId !== ''
-      : draftRouteId !== offload.route_id ||
-        (validatedWait.ok && validatedWait.value !== offload.wait_seconds) ||
-        (validatedLimit.ok && validatedLimit.value !== (offload.engine_queue_limit ?? null)) ||
-        (validatedMaxInput.ok && validatedMaxInput.value !== (offload.max_input_tokens ?? null));
-  const canSave =
+  const busy = confirmation.busy;
+
+  const routeName = (routeId: string) => {
+    const route = routes.find((candidate) => candidate.route_id === routeId);
+    return route ? routeLabel(route) : `${routeId} (no longer a route)`;
+  };
+
+  // The fields of a stored route that differ from what is stored. A field
+  // typed back to its stored value is no change. An invalid field counts as
+  // one, so Save can say what to fix instead of doing nothing.
+  const changedFields =
+    offload === null || !editable || draftRouteId === ''
+      ? 0
+      : [
+          draftRouteId !== offload.route_id,
+          !validatedWait.ok || validatedWait.value !== offload.wait_seconds,
+          !validatedLimit.ok || validatedLimit.value !== (offload.engine_queue_limit ?? null),
+          !validatedMaxInput.ok || validatedMaxInput.value !== (offload.max_input_tokens ?? null),
+        ].filter(Boolean).length;
+  // A new offload route is one change, whatever its prefilled settings. Its
+  // other fields can be filled in first, but it can be saved only with a route.
+  const newRouteTouched =
+    offload === null &&
     editable &&
-    hasOtherRoute &&
-    draftRouteId !== '' &&
-    validatedWait.ok &&
-    validatedLimit.ok &&
-    validatedMaxInput.ok &&
-    dirty &&
-    !saving;
+    (draftRouteId !== '' ||
+      draftWait !== stored.wait ||
+      draftLimit !== stored.limit ||
+      draftMaxInput !== stored.maxInput);
+  const changeCount = offload === null ? (newRouteTouched ? 1 : 0) : changedFields;
+  const changed = changeCount > 0;
+  const routeMissing = newRouteTouched && draftRouteId === '';
+  useReportEditing(changed || confirmation.open || confirmation.busy, onEditingChange);
 
   const status = offload === null ? null : offload.active ? 'Active' : 'Inactive';
 
-  const onSave = async () => {
-    if (!validatedWait.ok || !validatedLimit.ok || !validatedMaxInput.ok || !draftRouteId) return;
-    setSaving(true);
-    try {
-      const updated = await setOffloadRoute(modelId, draftRouteId, validatedWait.value, {
-        engineQueueLimit: validatedLimit.value,
-        maxInputTokens: validatedMaxInput.value,
-      });
-      onChange(modelId, updated.offload);
-      toast.success('Offload route saved');
-    } catch (err) {
-      toast.error(`Offload route update failed: ${getErrorMessage(err)}`);
-    } finally {
-      setSaving(false);
-    }
+  const discard = () => {
+    if (busy) return;
+    setDrafts({});
+    setSaveError(null);
   };
 
-  const onClear = async () => {
-    setSaving(true);
-    try {
-      await clearOffloadRoute(modelId);
-      onChange(modelId, null);
-      toast.success('Offload route cleared');
-    } catch (err) {
-      toast.error(`Offload route clear failed: ${getErrorMessage(err)}`);
-    } finally {
-      setSaving(false);
+  // Save writes at once. A failure shows on the bar, and the drafts stay.
+  const onSave = async () => {
+    if (changeCount === 0) return;
+    if (!validatedWait.ok || !validatedLimit.ok || !validatedMaxInput.ok) {
+      setSaveError('Fix the values marked below before saving.');
+      return;
     }
+    if (!editable || !hasOtherRoute || !draftRouteId) return;
+    setSaveError(null);
+    const routeId = draftRouteId;
+    const wait = validatedWait.value;
+    const limits = {
+      engineQueueLimit: validatedLimit.value,
+      maxInputTokens: validatedMaxInput.value,
+    };
+    const failure = await confirmation.perform({
+      run: async () => {
+        const updated = await setOffloadRoute(modelId, routeId, wait, limits);
+        onChange(modelId, updated.offload);
+        setDrafts({});
+        toast.success('Offload route saved');
+      },
+    });
+    setSaveError(failure);
+  };
+
+  const onClear = () => {
+    if (!offload) return;
+    confirmation.request({
+      title: `Clear the offload route for ${modelId}?`,
+      body: (
+        <p>
+          {routeName(offload.route_id)} is no longer reserved: requests that wait too long are no
+          longer sent to it, and it is no longer the last resort when every other route fails.
+        </p>
+      ),
+      confirmLabel: 'Clear',
+      busyLabel: 'Clearing…',
+      tone: 'danger',
+      run: async () => {
+        await clearOffloadRoute(modelId);
+        onChange(modelId, null);
+        setDrafts({});
+        toast.success('Offload route cleared');
+      },
+    });
   };
 
   return (
     <section
-      className="rounded-lg border border-gray-200 bg-white p-4"
+      aria-label={SECTION}
+      className={`rounded-lg border bg-white p-4 ${changed ? 'border-gray-400 shadow-sm' : 'border-gray-200'}`}
       data-testid="offload-route-panel"
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -158,18 +229,20 @@ export function OffloadRoutePanel({
             route fails.
           </p>
         </div>
-        {status && (
-          <span
-            className={
-              offload?.active
-                ? 'inline-flex rounded bg-violet-50 px-1.5 py-0.5 text-[11px] font-medium text-violet-700'
-                : 'inline-flex rounded bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-700'
-            }
-            data-testid="offload-route-status"
-          >
-            {status}
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {status && (
+            <span
+              className={
+                offload?.active
+                  ? 'inline-flex rounded bg-violet-50 px-1.5 py-0.5 text-[11px] font-medium text-violet-700'
+                  : 'inline-flex rounded bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-700'
+              }
+              data-testid="offload-route-status"
+            >
+              {status}
+            </span>
+          )}
+        </div>
       </div>
 
       {loadError && (
@@ -200,93 +273,92 @@ export function OffloadRoutePanel({
         </div>
       )}
 
-      <div className="mt-3 flex flex-wrap items-end gap-2">
-        {editable && (
-          <>
-            <label className="flex min-w-[240px] flex-col gap-1 text-[12px] font-medium text-gray-500">
-              Offload route
-              <select
-                aria-label="Offload route"
-                value={draftRouteId}
-                onChange={(event) => setDraftRouteId(event.target.value)}
-                disabled={saving || !hasOtherRoute}
-                className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-[13px] font-normal text-gray-900 focus:border-gray-400 focus:outline-none disabled:opacity-50"
-              >
-                <option value="" disabled>
-                  Choose a route…
-                </option>
-                {routes.map((route) => (
-                  <option key={route.route_id} value={route.route_id}>
-                    {routeLabel(route)}
-                  </option>
-                ))}
-                {storedRouteMissing && offload && (
-                  <option value={offload.route_id}>{offload.route_id} (no longer a route)</option>
-                )}
-              </select>
-            </label>
-            <label className="flex flex-col gap-1 text-[12px] font-medium text-gray-500">
-              Wait before offloading (s)
-              <input
-                aria-label="Offload wait seconds"
-                type="number"
-                min={0}
-                step={0.5}
-                value={draftWait}
-                onChange={(event) => setDraftWait(event.target.value)}
-                disabled={saving || !hasOtherRoute}
-                className="h-9 w-28 rounded-md border border-gray-300 px-2 text-right text-[13px] font-normal text-gray-900 disabled:opacity-50"
-              />
-            </label>
-            <label className="flex flex-col gap-1 text-[12px] font-medium text-gray-500">
-              Engine queue limit
-              <input
-                aria-label="Engine queue limit"
-                type="number"
-                min={1}
-                step={1}
-                placeholder="Off"
-                value={draftLimit}
-                onChange={(event) => setDraftLimit(event.target.value)}
-                disabled={saving || !hasOtherRoute}
-                className="h-9 w-28 rounded-md border border-gray-300 px-2 text-right text-[13px] font-normal text-gray-900 disabled:opacity-50"
-              />
-            </label>
-            <label className="flex flex-col gap-1 text-[12px] font-medium text-gray-500">
-              Max offload input (tokens)
-              <input
-                aria-label="Max offload input tokens"
-                type="number"
-                min={1}
-                step={1}
-                placeholder="No limit"
-                value={draftMaxInput}
-                onChange={(event) => setDraftMaxInput(event.target.value)}
-                disabled={saving || !hasOtherRoute}
-                className="h-9 w-36 rounded-md border border-gray-300 px-2 text-right text-[13px] font-normal text-gray-900 disabled:opacity-50"
-              />
-            </label>
-            <button
-              type="button"
-              onClick={() => void onSave()}
-              disabled={!canSave}
-              className="h-9 rounded-md bg-gray-900 px-3 text-[12px] font-medium text-white disabled:opacity-50"
-            >
-              {saving ? 'Saving…' : 'Save offload route'}
-            </button>
-          </>
-        )}
-        {offload && (
+      {editable && (
+        // Without a second route there is nothing to reserve: the fields stay
+        // disabled and show what is stored.
+        <div className="mt-3 flex flex-wrap items-end gap-2">
+          <label className="flex min-w-[240px] flex-col gap-1 text-[12px] font-medium text-gray-500">
+            Offload route
+            {/* A choice only changes the draft; nothing is written before Save. */}
+            <Select
+              aria-label="Offload route"
+              value={draftRouteId}
+              onValueChange={(value) => changeDraft('routeId', value)}
+              disabled={busy || !hasOtherRoute}
+              placeholder="Choose a route…"
+              options={[
+                ...routes.map((route) => ({ value: route.route_id, label: routeLabel(route) })),
+                ...(storedRouteMissing && offload
+                  ? [
+                      {
+                        value: offload.route_id,
+                        label: `${offload.route_id} (no longer a route)`,
+                      },
+                    ]
+                  : []),
+              ]}
+              size="lg"
+              className="w-full font-normal"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-[12px] font-medium text-gray-500">
+            Wait before offloading (s)
+            <input
+              aria-label="Offload wait seconds"
+              type="number"
+              min={0}
+              step={0.5}
+              value={draftWait}
+              onChange={(event) => changeDraft('wait', event.target.value)}
+              disabled={busy || !hasOtherRoute}
+              className="h-9 w-28 rounded-md border border-gray-300 px-2 text-right text-[13px] font-normal text-gray-900 disabled:opacity-50"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-[12px] font-medium text-gray-500">
+            Engine queue limit
+            <input
+              aria-label="Engine queue limit"
+              type="number"
+              min={1}
+              step={1}
+              placeholder="Off"
+              value={draftLimit}
+              onChange={(event) => changeDraft('limit', event.target.value)}
+              disabled={busy || !hasOtherRoute}
+              className="h-9 w-28 rounded-md border border-gray-300 px-2 text-right text-[13px] font-normal text-gray-900 disabled:opacity-50"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-[12px] font-medium text-gray-500">
+            Max offload input (tokens)
+            <input
+              aria-label="Max offload input tokens"
+              type="number"
+              min={1}
+              step={1}
+              placeholder="No limit"
+              value={draftMaxInput}
+              onChange={(event) => changeDraft('maxInput', event.target.value)}
+              disabled={busy || !hasOtherRoute}
+              className="h-9 w-36 rounded-md border border-gray-300 px-2 text-right text-[13px] font-normal text-gray-900 disabled:opacity-50"
+            />
+          </label>
+        </div>
+      )}
+
+      {offload && (
+        <div className="mt-3">
           <button
             type="button"
-            onClick={() => void onClear()}
-            disabled={saving}
+            onClick={onClear}
+            // Clearing replaces what the drafts were typed against.
+            disabled={busy || changed}
+            title={changed ? 'Save or discard the unsaved changes first' : undefined}
             className="h-9 rounded-md border border-gray-300 px-3 text-[12px] font-medium text-gray-700 disabled:opacity-50"
           >
             Clear offload route
           </button>
-        )}
-      </div>
+        </div>
+      )}
 
       {editable && !validatedWait.ok && draftWait !== '' && (
         <p className="mt-1 text-[11px] text-red-600" role="alert">
@@ -329,6 +401,19 @@ export function OffloadRoutePanel({
           provider&apos;s own count. Leave it empty to offload requests of any size.
         </p>
       )}
+      {editable ? (
+        <EditBar
+          target={SECTION}
+          changeCount={changeCount}
+          onCancel={discard}
+          onSave={() => void onSave()}
+          busy={busy}
+          error={saveError}
+          blocked={routeMissing ? 'Choose the offload route to save these settings' : null}
+          inPlace
+        />
+      ) : null}
+      {confirmation.dialog}
     </section>
   );
 }

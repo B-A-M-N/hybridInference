@@ -112,26 +112,9 @@ export async function listUsers(opts: ListUsersOptions = {}): Promise<ListUsersR
 // Users cost-history + summary (new in admin Users redesign)
 // ========================================
 
-export interface UserCostHistoryResponse {
-  user_id: string;
-  days: number;
-  points: CostHistoryPoint[];
-}
-
 export interface BulkCostHistoryResponse {
   days: number;
   histories: Record<string, CostHistoryPoint[]>;
-}
-
-export async function getUserCostHistory(
-  userId: string,
-  days = 7,
-): Promise<UserCostHistoryResponse> {
-  const resp = await fetchWithAuth(
-    API_BASE,
-    `/admin/users/${encodeURIComponent(userId)}/cost-history?days=${days}`,
-  );
-  return jsonOrThrow<UserCostHistoryResponse>(resp);
 }
 
 export async function getBulkCostHistory(
@@ -409,14 +392,55 @@ export async function hardDeleteUser(
 // Audit Log
 // ========================================
 
+/**
+ * Who made a change. `admin` and `user` are signed-in accounts with a stable
+ * `actor_id`; `admin_token` is the shared admin token, which names no account;
+ * `anonymous` is a registration, `bootstrap` the first-run setup.
+ */
+export type AuditActorType =
+  | 'admin'
+  | 'user'
+  | 'admin_token'
+  | 'anonymous'
+  | 'bootstrap'
+  | 'system';
+
+/** What a change was made to. The list is open: a newer gateway may add kinds. */
+export type AuditTargetType =
+  | 'user'
+  | 'model'
+  | 'provider'
+  | 'provider_key'
+  | 'setting'
+  | 'config'
+  | 'alert_type'
+  | 'auth_block'
+  | 'signup_domain'
+  | 'site_update'
+  | 'broadcast'
+  | (string & {});
+
 export interface AuditLogEntry {
   id: number;
   timestamp: string;
+  /**
+   * The source as historically recorded, unvalidated: an address, a login or
+   * an email. Newer entries carry `source_ip` and may repeat it here.
+   */
   admin_ip: string;
   action: string;
+  /** Affected user for typed entries; an untyped raw ID on legacy entries. */
   target_user_id: string | null;
   details: Record<string, unknown> | null;
   success: boolean;
+  // Absent from an older gateway, and null on entries recorded before it
+  // stored them: nothing about the actor, target or source is known then.
+  actor_type?: AuditActorType | null;
+  actor_id?: string | null;
+  /** The trusted request address, or null when unavailable. */
+  source_ip?: string | null;
+  target_type?: AuditTargetType | null;
+  target_id?: string | null;
 }
 
 export interface ListAuditLogResponse {
@@ -538,7 +562,7 @@ export async function getPerformanceMetrics({
 export interface AdminTtftScatterPoint {
   prompt_tokens: number;
   ttft_ms: number;
-  cache_hit: boolean;
+  cache_hit: boolean | null;
   timestamp: string;
 }
 
@@ -1681,6 +1705,7 @@ export interface ProviderObservabilityTotals {
   cache_eligible_count: number;
   cache_hit_count: number;
   input_tokens: number;
+  cache_eligible_input_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
 }
@@ -1693,6 +1718,7 @@ export interface ProviderObservabilityBucket {
   cache_hit_count: number;
   cache_read_tokens: number;
   input_tokens: number;
+  cache_eligible_input_tokens: number;
 }
 
 export interface ProviderErrorTypeRow {
@@ -2034,6 +2060,45 @@ export async function updateModelConcurrency(
     },
   );
   return jsonOrThrow<AdminModelConcurrencyItem>(resp);
+}
+
+/** Highest per-model batch concurrency cap the backend accepts. */
+export const MAX_BATCH_MODEL_CONCURRENCY = 10000;
+
+export interface AdminBatchModelLimit {
+  model_id: string;
+  /** The model's own cap; `null` when it takes the default. */
+  max_concurrency: number | null;
+  /** The cap in force across every gateway process; 0 pauses batch work on the model. */
+  effective_concurrency: number;
+  /** Batch requests of the model running now. */
+  running: number;
+  /** Batch requests of the model waiting to run. */
+  queued: number;
+}
+
+export interface ListAdminBatchModelLimitsResponse {
+  /** `BATCH_MODEL_CONCURRENCY`: the cap of a model without its own. */
+  default_concurrency: number;
+  models: AdminBatchModelLimit[];
+}
+
+export async function listBatchModelLimits(): Promise<ListAdminBatchModelLimitsResponse> {
+  const resp = await fetchWithAuth(API_BASE, '/admin/batch/models');
+  return jsonOrThrow<ListAdminBatchModelLimitsResponse>(resp);
+}
+
+/** Set a model's batch concurrency cap, or clear it with `null` so the default applies. */
+export async function updateBatchModelLimit(
+  modelId: string,
+  maxConcurrency: number | null,
+): Promise<AdminBatchModelLimit> {
+  const resp = await fetchWithAuth(API_BASE, `/admin/batch/models/${encodeURIComponent(modelId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ max_concurrency: maxConcurrency }),
+  });
+  return jsonOrThrow<AdminBatchModelLimit>(resp);
 }
 
 export interface RouteWeight {
@@ -2419,8 +2484,25 @@ export interface ProviderRoute {
   effective_weight: number;
   source: ProviderRouteSource;
   override_applied?: boolean;
+  /** Disabled by an admin: kept with its weights, selected by nothing. */
+  disabled?: boolean;
+  /** A config route deleted from this deployment; listed so it can be restored. */
+  removed?: boolean;
   updated_at: string | null;
   updated_by: string | null;
+  /** What the route serves with now. */
+  capabilities?: RouteCapabilities;
+  /** What it has from models.yaml or its creation; differs only while overridden. */
+  capabilities_baseline?: RouteCapabilities;
+  capabilities_overridden?: boolean;
+}
+
+/** A route's context window, output cap, input modalities and tool support, as served. */
+export interface RouteCapabilities {
+  context_length: number;
+  max_output_length: number;
+  input_modalities: string[];
+  supports_tools: boolean;
 }
 
 export interface ListProviderRoutesResponse {
@@ -2463,17 +2545,34 @@ export interface CreateProviderRoutePayload {
   quota_limit?: number | null;
   concurrency_limit?: number | null;
   weight: number;
+  /** Each route declares its own; a new route never takes the first route's. */
+  capabilities: RuntimeModelCapabilities;
 }
 
+/**
+ * Edit of a runtime-added route, applied in place. A field left out keeps the
+ * route's value; sending the target (provider, base URL, key, provider model
+ * ID) replaces it whole, and the gateway checks a changed target upstream
+ * before saving it.
+ */
 export interface UpdateProviderRouteCandidatePayload {
-  concurrency_limit: number;
+  upstream_provider?: string;
+  openrouter_provider?: string | null;
+  openrouter_sort?: OpenRouterSortPolicy | null;
+  base_url?: string;
+  deployment_type?: RouteDeploymentType;
+  api_key_id?: string | null;
+  provider_model_id?: string;
+  quota_limit?: number | null;
+  concurrency_limit?: number | null;
 }
 
-/** What a runtime model accepts; every field is required when it is created. */
+/** What a route accepts; every field is required when it is declared or edited. */
 export interface RuntimeModelCapabilities {
   context_length: number;
   max_output_length: number;
-  input_modalities: Array<'text' | 'image'>;
+  /** `text`, plus any of `image`, `audio` and `video`. */
+  input_modalities: string[];
   supports_tools: boolean;
 }
 
@@ -2482,7 +2581,6 @@ export interface CreateProviderRouteModelPayload extends CreateProviderRoutePayl
   strategy: ProviderRouteStrategy;
   required_role?: Role;
   pricing: Record<string, string>;
-  capabilities: RuntimeModelCapabilities;
 }
 
 export interface VerifyProviderRouteResponse {
@@ -2630,6 +2728,37 @@ export async function updateProviderRouteCandidate(
   return jsonOrThrow<ProviderRoute>(resp);
 }
 
+/** Set one route's capabilities; they hold until reset and survive restarts. */
+export async function updateProviderRouteCapabilities(
+  modelId: string,
+  routeId: string,
+  capabilities: RuntimeModelCapabilities,
+): Promise<ProviderRoute> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    `/admin/routing/provider-route-capabilities/${encodeURIComponent(modelId)}/${encodeURIComponent(routeId)}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(capabilities),
+    },
+  );
+  return jsonOrThrow<ProviderRoute>(resp);
+}
+
+/** Return one route to the capabilities it has from models.yaml or its creation. */
+export async function resetProviderRouteCapabilities(
+  modelId: string,
+  routeId: string,
+): Promise<ProviderRoute> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    `/admin/routing/provider-route-capabilities/${encodeURIComponent(modelId)}/${encodeURIComponent(routeId)}`,
+    { method: 'DELETE' },
+  );
+  return jsonOrThrow<ProviderRoute>(resp);
+}
+
 export async function verifyProviderRouteCandidate(
   modelId: string,
   payload: CreateProviderRoutePayload,
@@ -2658,6 +2787,54 @@ export async function deleteProviderRoute(
     },
   );
   return jsonOrThrow<ProviderRoute>(resp);
+}
+
+function providerRoutePath(prefix: string, modelId: string, routeId: string) {
+  return `/admin/routing/${prefix}/${encodeURIComponent(modelId)}/${encodeURIComponent(routeId)}`;
+}
+
+/** Disable or enable a route of either source; its config and weights are kept. */
+export async function updateProviderRouteState(
+  modelId: string,
+  routeId: string,
+  payload: { disabled: boolean },
+): Promise<ProviderRoute> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    providerRoutePath('provider-route-states', modelId, routeId),
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+  );
+  return jsonOrThrow<ProviderRoute>(resp);
+}
+
+/** Delete a config (models.yaml) route from this deployment; it can be restored. */
+export async function removeProviderRoute(
+  modelId: string,
+  routeId: string,
+): Promise<ListProviderRoutesResponse> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    providerRoutePath('provider-route-removals', modelId, routeId),
+    { method: 'POST' },
+  );
+  return jsonOrThrow<ListProviderRoutesResponse>(resp);
+}
+
+/** Restore a deleted config route, with the edits and weight it had. */
+export async function restoreProviderRoute(
+  modelId: string,
+  routeId: string,
+): Promise<ListProviderRoutesResponse> {
+  const resp = await fetchWithAuth(
+    API_BASE,
+    providerRoutePath('provider-route-removals', modelId, routeId),
+    { method: 'DELETE' },
+  );
+  return jsonOrThrow<ListProviderRoutesResponse>(resp);
 }
 
 export async function deleteProviderRouteCandidate(

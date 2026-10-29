@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 
 import { getProviderStats, getTtftScatter } from '@/lib/api/admin';
 import { ProviderPerformanceTab } from '../ProviderPerformanceTab';
+import { chooseOption } from '@/test-utils/select';
 
 vi.mock('recharts', () => ({
   CartesianGrid: () => null,
@@ -68,7 +69,8 @@ vi.mock('@/lib/api/admin', async () => {
         cache_eligible_count: 10,
         cache_hit_count: 4,
         input_tokens: 1200,
-        cache_read_tokens: 320,
+        cache_eligible_input_tokens: 2000,
+        cache_read_tokens: 900,
         cache_write_tokens: 80,
       },
       buckets: [
@@ -78,8 +80,9 @@ vi.mock('@/lib/api/admin', async () => {
           error_count: 12,
           cache_eligible_count: 10,
           cache_hit_count: 4,
-          cache_read_tokens: 320,
+          cache_read_tokens: 900,
           input_tokens: 1200,
+          cache_eligible_input_tokens: 2000,
         },
       ],
       error_types: [
@@ -134,6 +137,8 @@ describe('ProviderPerformanceTab', () => {
     expect(screen.getByRole('heading', { name: 'Cache' })).toBeInTheDocument();
     expect(screen.queryByText('Cache by model')).not.toBeInTheDocument();
     expect(screen.getByText('Eligible reqs')).toBeInTheDocument();
+    const cachedInputLabel = screen.getByText('Cached input');
+    expect(cachedInputLabel.nextElementSibling?.textContent).toBe('45.00%');
     expect(screen.getByText('Error breakdown')).toBeInTheDocument();
     expect(screen.getByText('rate_limited')).toBeInTheDocument();
     expect(screen.getByText('other')).toBeInTheDocument();
@@ -145,8 +150,8 @@ describe('ProviderPerformanceTab', () => {
 
     // The label is what api_logs and provider_hourly_stats are keyed on, so it
     // stays next to the display name rather than being replaced by it.
-    const option = await screen.findByRole('option', { name: 'OpenAI · openai' });
-    expect(option).toHaveValue('openai');
+    const provider = await screen.findByRole('combobox', { name: 'Provider' });
+    await waitFor(() => expect(provider).toHaveTextContent('OpenAI · openai'));
     // Also captioned under the Errors section, so a shared screenshot says
     // which endpoint the numbers belong to. Its data loads separately from
     // the provider options, so wait for that caption rather than only the option.
@@ -174,9 +179,7 @@ describe('ProviderPerformanceTab', () => {
     await waitFor(() =>
       expect(getTtftScatter).toHaveBeenCalledWith({ refresh: true, provider: 'openai' }),
     );
-    fireEvent.change(screen.getByRole('combobox', { name: 'Provider' }), {
-      target: { value: 'zai' },
-    });
+    chooseOption('Provider', /zai/);
 
     // A switch only reads what the server keeps; it does not recompute again.
     await waitFor(() =>

@@ -21,7 +21,7 @@ gateway's own cancellation path records.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -29,14 +29,15 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from routing.executor import RouteExecutor
-from serving.servers.deps import AppServices, verify_admin_access
+from routing.routers import FixedRouter
+from serving.servers.deps import AppServices, get_admin_audit_actor, verify_admin_access
 from serving.servers.routers import admin
 from serving.servers.routers.admin import metrics, request_volume
 from serving.servers.routers.admin._common import (
     CLIENT_DISCONNECT_STATUS_CODE,
     CLIENT_DISCONNECT_TERMINAL_STATE,
 )
+from tests.fixtures.audit import ADMIN_ACTOR
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -103,8 +104,9 @@ def _isolate_count_cache():
 
 def _build_app(logger: Any) -> FastAPI:
     app = FastAPI(title="Admin Client Disconnect Test")
-    app.state.services = AppServices(router=RouteExecutor(), db_logger=logger)  # type: ignore[attr-defined]
+    app.state.services = AppServices(router=FixedRouter(), db_logger=logger)  # type: ignore[attr-defined]
     app.dependency_overrides[verify_admin_access] = lambda: "admin-1"
+    app.dependency_overrides[get_admin_audit_actor] = lambda: ADMIN_ACTOR
     app.include_router(admin.router)
     return app
 
@@ -170,7 +172,7 @@ def _make_metrics_db_logger(
 @pytest.mark.asyncio
 async def test_request_metrics_counts_disconnects_apart_from_errors():
     """499 lands in client_disconnect_count and is excluded from error_count."""
-    end_time = datetime(2026, 10, 18, 12, 37, tzinfo=timezone.utc)
+    end_time = datetime(2026, 10, 18, 12, 37, tzinfo=UTC)
     # The hour card's first 5-minute bar, counted live.
     first_bar = end_time - timedelta(hours=1)
     logger, calls = _make_metrics_db_logger(end_time, counted_from=first_bar)

@@ -27,13 +27,6 @@ MODEL_NOT_FOUND = "model_not_found"
 # REQUEST_SCOPED_KEYS is what makes "absent" trustworthy.
 USER_ROLE = "user_role"
 
-# Request-local online traffic classification. These are routing hints, not
-# durable user attributes; keeping them in the scope reset list prevents a
-# request handled by the same task from inheriting the prior request's signal.
-TRAFFIC_CLASSIFICATION = "traffic_classification"
-TRAFFIC_AUTOMATION_SCORE = "traffic_automation_score"
-TRAFFIC_CONFIDENCE = "traffic_confidence"
-TRAFFIC_REASONS = "traffic_reasons"
 # UTC datetime captured once at the HTTP request boundary. Scheduled pricing
 # consumers use it so routing, logs, and quota charging cannot disagree when a
 # long-running request crosses a price-window boundary.
@@ -86,6 +79,14 @@ UPSTREAM_DISPATCH_WATCH = "upstream_dispatch_watch"
 # place up for the next request. Only ever pushed, like the watch above.
 UPSTREAM_ENGINE_HOLD = "upstream_engine_hold"
 
+# req_ctx key holding the ``anthropic-version`` a batch item was created under
+# (serving/batch/profiles.py). Published only by the Messages execution for a
+# batch item (``MessagesConstraints.for_batch_item``), in the request scope the
+# batch worker opens for that item; the native Anthropic adapter sends it
+# upstream instead of its fixed default when it is one of the versions it
+# knows. Interactive requests never carry it, so their behaviour is unchanged.
+ANTHROPIC_VERSION = "anthropic_version"
+
 # req_ctx key naming the upstream that served (or refused) this request.
 PROVIDER = "provider"
 #: Provider label meaning "no upstream was ever selected" — a pre-routing failure.
@@ -115,10 +116,6 @@ REQUEST_SCOPED_KEYS = (
     "auth_key_hash",
     "affinity_key",
     USER_ROLE,
-    TRAFFIC_CLASSIFICATION,
-    TRAFFIC_AUTOMATION_SCORE,
-    TRAFFIC_CONFIDENCE,
-    TRAFFIC_REASONS,
     PRICING_TIME,
     PRICING_SNAPSHOT,
     CLIENT_ERROR_KIND,
@@ -136,6 +133,8 @@ REQUEST_SCOPED_KEYS = (
     # A leftover value would rewrite the next request's error messages, for a
     # model it did not ask for.
     CONCEALED_MODEL,
+    # Batch-only; cleared anyway so no later scope on a task could inherit it.
+    ANTHROPIC_VERSION,
 )
 
 
@@ -234,10 +233,6 @@ __all__ = [
     "PROVIDER",
     "REQUEST_SCOPED_KEYS",
     "ROUTER_PROVIDER_SENTINEL",
-    "TRAFFIC_AUTOMATION_SCORE",
-    "TRAFFIC_CLASSIFICATION",
-    "TRAFFIC_CONFIDENCE",
-    "TRAFFIC_REASONS",
     "USER_ROLE",
     "get",
     "mark_model_not_found",

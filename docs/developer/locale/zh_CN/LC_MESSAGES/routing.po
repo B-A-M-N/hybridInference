@@ -1015,15 +1015,14 @@ msgid ""
 "Only streaming requests are watched: a non-streaming response arrives "
 "whole, so there is no first token to wait for. The first-token wait "
 "includes the engine's prefill, so a model serving very long prompts needs"
-" a wait above the time it takes to start answering them. The wait needs "
-"Python 3.11 or newer: its deadline is `asyncio.timeout`, which can tell "
-"its own cancellation from a client that hangs up at the same moment. On "
-"Python 3.10 streams are never timed."
+" a wait above the time it takes to start answering them. The wait's "
+"deadline is `asyncio.timeout`, which can tell its own cancellation from a "
+"client that hangs up at the same moment, so a request whose client has "
+"gone is never offloaded."
 msgstr ""
 "只有流式请求会计时：非流式响应是一次性整体返回的，没有首个 token 可等。首 token 等待包含引擎的 prefill 时间，所以处理超长 "
-"prompt 的模型，等待时间要比它开始回答这些 prompt 所需的时间更长。这个等待需要 Python 3.11 或更新版本：截止时间用 "
-"`asyncio.timeout` 实现，它能分清是自己触发的取消，还是客户端恰好在同一时刻断开。在 Python 3.10 "
-"上，流式请求一律不计时。"
+"prompt 的模型，等待时间要比它开始回答这些 prompt 所需的时间更长。这个等待的截止时间用 "
+"`asyncio.timeout` 实现，它能分清是自己触发的取消，还是客户端恰好在同一时刻断开，所以客户端已经断开的请求绝不会被卸载。"
 
 #: ../developer/routing.md:385
 msgid ""
@@ -1345,6 +1344,29 @@ msgid ""
 msgstr ""
 "资源上限以前放在 `router_params:` "
 "里。现在启动时会拒绝这些键，报错里会指出对应的路由级替代写法，所以过时的注册表会直接报错，而不是悄悄用上默认值。"
+
+#: ../developer/routing.md:605
+msgid ""
+"RouteWise does not read prefill load: the latency estimates used by its LP and "
+"hedge choice have no backlog penalty, and it takes no prefill lease. The "
+"three keys of that withdrawn feature — `prefill_load_routing_enabled`, "
+"`prefill_load_scale_ms_per_1k` and `prefill_load_max_penalty_ms` — are "
+"still accepted so an older registry keeps starting, but they have no "
+"effect whatever their value, and the backend logs a warning naming them "
+"once per process. Remove them from `models.yaml`. FixedRouter's "
+"[prefill-aware selection](#prefill-aware-selection) is unchanged."
+msgstr ""
+"RouteWise 不读取 prefill 负载：它的 LP 和 hedge 选择使用的延迟估计不包含积压惩罚，也不占用 prefill "
+"租约。这项已撤回功能的三个键——`prefill_load_routing_enabled`、`prefill_load_scale_ms_per_1k` "
+"和 `prefill_load_max_penalty_ms`——仍然会被接受，以便旧的注册表照常启动，但不论取什么值都不起作用；后端会在每个进程里记录一次警告，列出这些键。请把它们从 "
+"`models.yaml` 里删掉。FixedRouter 的 [prefill 感知的选路](#prefill-aware-selection)保持不变。"
+
+#: ../developer/routing.md:614
+msgid ""
+"`latency_min_samples` is accepted the same way. Provider selection never "
+"read it, so it was removed, and a registry that still sets it starts with "
+"the same warning."
+msgstr "`latency_min_samples` 也以同样的方式接受。选路从来没有读取过它，所以它已被删除；仍然设置它的注册表照常启动，后端同样会记录警告。"
 
 #: ../developer/routing.md:490
 msgid ""
@@ -1716,13 +1738,13 @@ msgstr "档位定义在模型注册表的 `auto:` 段里，和 `models:` 并列�
 
 #: ../developer/routing.md:781
 msgid ""
-"Each profile is served as `auto-<name>`. The auto models exist only while"
-" the `auto_mode_enabled` runtime setting is on, and it is off by default."
-" While it is off, a request naming one gets 404 and `/v1/models` does not"
-" list them. Requests that name a real model are never affected."
-msgstr ""
-"每个档位以 `auto-<name>` 的名字提供。只有运行时设置 `auto_mode_enabled` 打开时 auto "
-"模型才存在，它默认关闭。关闭时，点名 auto 模型的请求得到 404，`/v1/models` 也不列出它们。点名真实模型的请求不受任何影响。"
+"Each profile is served as `auto-<name>`. The auto models exist only while "
+"the `auto_mode_enabled` runtime setting is on, and it is off by default. "
+"While it is off, a request naming one gets 404 and `/v1/models` does not "
+"list them. Requests that name a real model are never affected. The admin "
+"Settings tab offers the switch only once the backend has started with a "
+"valid `auto:` section; without one it has nothing to serve."
+msgstr "每个档位以 `auto-<name>` 的名字提供。只有运行时设置 `auto_mode_enabled` 打开时 auto 模型才存在，它默认关闭。关闭时，点名 auto 模型的请求得到 404，`/v1/models` 也不列出它们。点名真实模型的请求不受任何影响。只有后端启动时读到了有效的 `auto:` 段，管理后台的 Settings 标签页才会提供这个开关；没有这个段，开关也就没有模型可提供。"
 
 #: ../developer/routing.md:786
 msgid ""
@@ -2016,6 +2038,28 @@ msgstr "把注册表里的路由改指向别处；`DELETE` 恢复 YAML 路由。
 
 #: ../developer/routing.md:661
 #, python-brace-format
+msgid "`PATCH /admin/routing/provider-route-states/{model_id}/{route_id}`"
+msgstr ""
+
+#: ../developer/routing.md:661
+msgid ""
+"Disable or enable a route of either source; a disabled route keeps its "
+"weights but takes no request, retry, fallback or offload."
+msgstr "停用或启用一条路由（两种来源都可以）；停用的路由保留权重，但不接收任何请求、重试、fallback 或 offload。"
+
+#: ../developer/routing.md:661
+#, python-brace-format
+msgid "`POST` / `DELETE /admin/routing/provider-route-removals/{model_id}/{route_id}`"
+msgstr ""
+
+#: ../developer/routing.md:661
+msgid ""
+"Delete a registry route from this deployment, or restore it; models.yaml "
+"is not changed."
+msgstr "从当前部署中删除注册表里的一条路由，或恢复它；models.yaml 不会被修改。"
+
+#: ../developer/routing.md:661
+#, python-brace-format
 msgid "`PUT` / `DELETE /admin/routing/weights/{model_id}/{endpoint_id}`"
 msgstr ""
 
@@ -2138,17 +2182,6 @@ msgid ""
 "Runs the one endpoint the router already chose, or delegates the request "
 "to a pool that chooses inside its own declared range."
 msgstr "调用 router 已经选定的那个端点，或者把请求交给一个池，由池在自己声明的范围内选择。"
-
-#: ../developer/routing.md:706
-msgid ""
-"`apps/backend/routing/executor.py` is a backward-compatibility shim that "
-"re-exports `FixedRouter` as `RouteExecutor` along with "
-"`AllCircuitsOpenError`, `ProviderPinError`, and `RouteConfig`. Do not "
-"edit it — edit `routers.py`."
-msgstr ""
-"`apps/backend/routing/executor.py` 只是为向后兼容保留的一层转发：它把 `FixedRouter` 重新导出为 "
-"`RouteExecutor`，同时导出 `AllCircuitsOpenError`、`ProviderPinError` 和 "
-"`RouteConfig`。不要改它——要改就改 `routers.py`。"
 
 #: ../developer/routing.md:710
 msgid ""

@@ -1,6 +1,6 @@
 // Unsaved edits to configuration entries, and the PATCH body they become.
 //
-// Shared by the admin Configuration tab and the first-run setup wizard, so the
+// Shared by the admin Settings tab and the first-run setup wizard, so the
 // rule for what counts as a change, and the JSON type each setting is sent as,
 // exist once.
 
@@ -31,7 +31,7 @@ export function isLocked(entry: ConfigEntry): boolean {
 }
 
 /** What a non-secret editor shows before any edit. */
-export function initialInput(entry: ConfigEntry): string | boolean {
+function initialInput(entry: ConfigEntry): string | boolean {
   if (entry.secret) return '';
   if (entry.type === 'bool') return entry.value === true;
   return entry.value === null || entry.value === undefined ? '' : String(entry.value);
@@ -99,7 +99,7 @@ export function draftError(entry: ConfigEntry, draft: ConfigDraft | undefined): 
  * for `int`/`float`, a string for everything else (a `list` as its
  * comma-separated string). Clearing a secret sends `""`.
  */
-export function patchValue(entry: ConfigEntry, draft: ConfigDraft): ConfigScalar {
+function patchValue(entry: ConfigEntry, draft: ConfigDraft): ConfigScalar {
   if (draft.kind === 'clear') return '';
   const raw = draft.value;
   if (typeof raw === 'boolean') return raw;
