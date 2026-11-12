@@ -403,11 +403,21 @@ async def _refuse_claimed_account(conn: asyncpg.Connection, user_id: str) -> Non
     missing row is not a claim, and a claim cannot be installed on a row that
     is not there.
 
-    Every write to the ``users`` table goes through this, so that a pending
-    erasure claim refuses the write whatever column it names — the account
-    is being erased, so nothing about it may change. This matches every other
-    store, which refuses any work for an account marked
-    ``hard_delete_pending`` (see ``batch_store._lock_owner``).
+    The account-mutating writers that do not read the account row themselves
+    use this, so that a pending erasure claim refuses the write whatever
+    column it names — the account is being erased, so nothing about it may
+    change. This matches every other store, which refuses any work for an
+    account marked ``hard_delete_pending`` (see ``batch_store._lock_owner``).
+
+    Not every write to the ``users`` table goes through here. The state
+    machine's own writes (``update_user_fields``, ``suspend_user``,
+    ``delete_user``, ``resume_user``, approve, reject) carry their own
+    claim guard, the startup role seeding carries an equivalent predicate in
+    its own statement, and the phone and email binding statements carry
+    ``status = 'active'``. ``update_user_last_login`` is the one account
+    write with no claim guard: the login route requires an ``active``
+    account, so a claimed account cannot reach it, and it writes a timestamp
+    rather than an identity field.
     """
     row = await conn.fetchrow(
         "SELECT hard_delete_pending FROM users WHERE id = $1 FOR UPDATE", user_id
@@ -609,6 +619,13 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
         it runs at every start: an address added to the setting promotes its
         account the next time the gateway starts, as long as the account still
         has the default role. An account without an email never matches.
+
+        Only an active account is promoted. A soft-deleted one is not a
+        candidate for the admin role whatever its claim state, and a
+        hard-delete claim is in progress means the account is being erased:
+        promoting it would change an identity field during the erasure, which
+        the claim exists to prevent. A backend restart therefore leaves such
+        an account exactly as it found it.
         """
         admin_emails = _parse_admin_emails(get_settings().admin_emails or "")
         if not admin_emails:
@@ -617,7 +634,9 @@ class PostgresOperationalStore(PostgresPhoneAuthMixin, OperationalStore):
             tag = await conn.execute(
                 "UPDATE users SET role = 'admin' "
                 "WHERE lower(trim(email)) = ANY($1::text[]) "
-                "AND role IN ('free')",
+                "AND role IN ('free') "
+                "AND status = 'active' "
+                "AND hard_delete_pending IS NOT TRUE",
                 admin_emails,
             )
         seeded = _parse_command_tag_count(tag)

@@ -270,6 +270,7 @@ gap exactly:
 | `mark_user_email_verified` | wrote | **refused** |
 | `update_user_fields(user_name)` | refused | refused |
 | `update_user_fields(preferences)` | refused | refused |
+| `initialize()` startup role seeding | **promoted** | **not promoted** |
 
 Each of the first five writes the ``users`` table directly, so it inherited
 neither `update_user_fields`'s guard nor any other. The fix is one shared
@@ -286,6 +287,40 @@ login route requires an `active` account, so a claimed account (always
 soft-deleted) cannot reach it, and it writes a timestamp rather than an
 identity field. `tests/integration/storage/test_pr1733_other_mutation_probe.py`
 asserts that decision, so changing it is deliberate rather than accidental.
+It is still subject to the authentication-to-write race, so it is described
+as what it is: a timestamp write that a claimed account cannot reach through
+the login route, not a write the claim refuses.
+
+### The startup role seeding was a sixth writer
+
+A further review of the integration commit found one more: the startup role
+seeding in `PostgresOperationalStore.initialize()`. It promotes the accounts
+named in `ADMIN_EMAILS` to the admin role, and it runs at every backend
+start, so a restart could change an account's role while its hard-delete
+claim was active. Its update carried no ``status`` and no
+``hard_delete_pending`` predicate:
+
+```sql
+UPDATE users SET role = 'admin'
+WHERE lower(trim(email)) = ANY($1::text[]) AND role IN ('free')
+```
+
+It now carries both predicates, so a restart leaves a soft-deleted account
+and an account under a claim exactly as it found them, and still promotes an
+eligible active account. `tests/integration/storage/test_pr1733_admin_role_seeding_claim.py`
+(4 tests) covers it; they are red on the unguarded code (3 failures).
+
+### The rule, stated exactly
+
+Not every write to the ``users`` table passes through the helper, and the
+claim is not described as if it did. The account-mutating writers that read
+the account row themselves — the avatar write, the three preference writers
+and ``mark_user_email_verified`` — use it. The state machine's own writes
+(``update_user_fields``, ``suspend_user``, ``delete_user``,
+``resume_user``, approve, reject) carry their own claim guard. The startup
+role seeding carries an equivalent predicate in its own statement. The phone
+and email binding statements carry ``status = 'active'``.
+``update_user_last_login`` is the one account write with no claim guard.
 
 ### The CLI's recovery guidance was wrong
 
